@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- lib.gt.fallback.search — Fallback trade search with relaxed parameters.
+     Ported from 0.7.6 gt_trading_search.xml / SearchFallbackTrades cue.
+
+     Called when the normal pipeline (cache / live / tradematch / scoring) yields
+    no results. Searches with reduced distance and relaxed profit/price-range
+    thresholds. Fallback center is dynamic:
+      - ship sector if ship is still within home maxDistance
+      - home sector if ship drifted outside home maxDistance
+    Resulting trades are still validated against original home sector + maxDistance
+    to prevent ships from leaving their authorized trading range.
+
+     Returns table:
+       $Found              (bool)  — whether fallback found tradeable offers
+       $TradeList           (list)  — sorted trade list (empty if not found)
+       $FallbackMaxDistance (int)   — the reduced search radius that was used
+-->
+<aiscript name="lib.gt.fallback.search" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <params>
+    <param name="ship"                  default="this.ship"/>
+    <param name="homeSector"            comment="Original home sector (for distance guard in tradematch)"/>
+    <param name="maxDistance"           comment="Original pilot maxDistance (for distance guard in tradematch)"/>
+    <param name="minROI"               default="0"      comment="Normal pipeline minROI (will be halved)"/>
+    <param name="distancePenalty"      default="0.1"    comment="Distance penalty multiplier"/>
+    <param name="factionPriority"      default="null"   comment="Faction priority filter"/>
+    <param name="wareBasket"           default="[]"     comment="Ware basket for search"/>
+    <param name="allowIllegal"         default="false"  comment="Allow illegal wares"/>
+    <param name="enforceRouteIllegalLegality" default="false" comment="If true, illegal wares must be legal on full jump path"/>
+    <param name="ignoreMK1Supply"      default="true"   comment="Ignore MK1 supply stations"/>
+    <param name="ignoreTradeRules"     default="false"  comment="Ignore trade rules"/>
+    <param name="ignoreBuildStorage"   default="false"  comment="Ignore build storage"/>
+    <param name="ignoreCarrierAux"     default="false"  comment="Ignore carrier aux storage"/>
+    <param name="blacklistGroup"       default="blacklistgroup.civilian" comment="Blacklist group for pathfinding"/>
+    <param name="debugchance"          default="0"      comment="Debug log chance"/>
+    <param name="priorityWares"        default="[]"     comment="Optional: MK3 Priority Wares for score boost"/>
+    <param name="priorityScoreMultiplier" default="125"  comment="Optional: score multiplier for priority wares (125=+25%%, 200=2x)"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <!-- ══════════════════════════════════════════════════════════════════
+           Calculate fallback parameters
+           ══════════════════════════════════════════════════════════════════ -->
+      <!-- Distance: max(1, floor(maxDistance / 3)) — search near the ship -->
+      <set_value name="$fallbackMaxDistance" exact="[($maxDistance / 3)i, 1].max"/>
+
+      <!-- Profit: ROI halved (min 0), absolute profit fixed at 100 Cr (10000 units) -->
+      <set_value name="$fallbackMinROI" exact="[$minROI / 2, 0].max"/>
+      <set_value name="$fallbackMinAbsoluteProfit" exact="10000"/>
+
+      <!-- Price ranges from fallback config -->
+      <set_value name="$fallbackSellPriceMax" exact="if global.$GT_Config? and global.$GT_Config.$Trading? and global.$GT_Config.$Trading.$FallbackSellPriceMax? then @global.$GT_Config.$Trading.$FallbackSellPriceMax else 0.2"/>
+      <set_value name="$fallbackBuyPriceMin" exact="if global.$GT_Config? and global.$GT_Config.$Trading? and global.$GT_Config.$Trading.$FallbackBuyPriceMin? then @global.$GT_Config.$Trading.$FallbackBuyPriceMin else -0.2"/>
+
+      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[GT-Fallback] ' + $ship.idcode + ': Starting fallback search. ' +
+          'OrigDist=' + $maxDistance + ' FallbackDist=' + $fallbackMaxDistance +
+          ' OrigROI=' + $minROI + ' FallbackROI=' + $fallbackMinROI +
+          ' FallbackProfit=100Cr PriceRange=[' + $fallbackSellPriceMax + ',' + $fallbackBuyPriceMin + ']'" chance="100"/>
+      </do_if>
+
+      <!-- ══════════════════════════════════════════════════════════════════
+           1) Pathfinding center selection
+              - Use ship sector only while ship is still within home maxDistance
+              - If ship drifted beyond home range, center fallback on home sector
+           ══════════════════════════════════════════════════════════════════ -->
+      <set_value name="$fallbackCenter" exact="$ship.sector"/>
+      <set_value name="$fallbackCenterReason" exact="'ship'"/>
+      <set_value name="$homeToShipDistance" exact="-1"/>
+      <do_if value="$homeSector? and $homeSector.exists and $ship? and $ship.sector? and $ship.sector.exists">
+        <set_value name="$homeToShipDistance" exact="$homeSector.gatedistance.{$ship.sector}"/>
+        <do_if value="$homeToShipDistance lt 0 or $homeToShipDistance gt $maxDistance">
+          <set_value name="$fallbackCenter" exact="$homeSector"/>
+          <set_value name="$fallbackCenterReason" exact="'home'"/>
+        </do_if>
+      </do_if>
+      <do_if value="$fallbackCenter == null">
+        <set_value name="$fallbackCenter" exact="$ship.sector"/>
+        <set_value name="$fallbackCenterReason" exact="'ship'"/>
+      </do_if>
+      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[GT-Fallback] ' + $ship.idcode + ': center=' + (if $fallbackCenter? then @$fallbackCenter.knownname else 'null') + ' reason=' + $fallbackCenterReason + ' homeToShip=' + $homeToShipDistance + ' maxDist=' + $maxDistance" chance="100"/>
+      </do_if>
+
+      <run_script name="'lib.gt.pathfinding'" result="$pathResult">
+        <param name="ship" value="$ship"/>
+        <param name="homeSector" value="$fallbackCenter"/>
+        <param name="maxDistance" value="$fallbackMaxDistance"/>
+        <param name="blacklistGroup" value="$blacklistGroup"/>
+      </run_script>
+
+      <!-- ══════════════════════════════════════════════════════════════════
+           2) Live search with fallback price ranges
+           ══════════════════════════════════════════════════════════════════ -->
+      <run_script name="'lib.gt.live.search'" result="$liveResult">
+        <param name="ship" value="$ship"/>
+        <param name="searchMode" value="'buy_and_sell'"/>
+        <param name="buySpaces" value="$pathResult.$BuySpaces"/>
+        <param name="sellSpaces" value="$pathResult.$SellSpaces"/>
+        <param name="homeSector" value="$fallbackCenter"/>
+        <param name="maxDistance" value="$fallbackMaxDistance"/>
+        <param name="wareBasket" value="$wareBasket"/>
+        <param name="allowIllegal" value="$allowIllegal"/>
+        <param name="ownerFilter" value="'any'"/>
+        <param name="ignoreMK1Supply" value="$ignoreMK1Supply"/>
+        <param name="ignoreTradeRules" value="$ignoreTradeRules"/>
+        <param name="maxOffersPerWare" value="@global.$GT_GlobalSettings.$Performance.$MaxOffersPerWare"/>
+        <param name="sellPriceMax" value="$fallbackSellPriceMax"/>
+        <param name="buyPriceMin" value="$fallbackBuyPriceMin"/>
+        <param name="priorityWares" value="if $priorityWares? then $priorityWares else []"/>
+        <param name="debugchance" value="$debugchance"/>
+      </run_script>
+
+      <!-- ══════════════════════════════════════════════════════════════════
+           3) Trade matching — SAFETY: uses original homeSector + maxDistance
+              to prevent trades outside the ship's authorized range
+           ══════════════════════════════════════════════════════════════════ -->
+      <run_script name="'lib.gt.tradematch'" result="$matchResult">
+        <param name="ship" value="$ship"/>
+        <param name="sellOffers" value="$liveResult.$SellOffers"/>
+        <param name="buyOffers" value="$liveResult.$BuyOffers"/>
+        <param name="homeSector" value="$homeSector"/>
+        <param name="maxDistance" value="$maxDistance"/>
+        <param name="minROI" value="$fallbackMinROI"/>
+        <param name="minAbsoluteProfit" value="$fallbackMinAbsoluteProfit"/>
+        <param name="distancePenalty" value="$distancePenalty"/>
+        <param name="factionPriority" value="$factionPriority"/>
+        <param name="ignoreBuildStorage" value="$ignoreBuildStorage"/>
+        <param name="ignoreCarrierAux" value="$ignoreCarrierAux"/>
+        <param name="allowIllegal" value="$allowIllegal"/>
+        <param name="enforceRouteIllegalLegality" value="$enforceRouteIllegalLegality"/>
+        <param name="blacklistGroup" value="$blacklistGroup"/>
+        <param name="scoreMode" value="'sell'"/>
+      </run_script>
+
+      <!-- ══════════════════════════════════════════════════════════════════
+           4) Score and sort
+           ══════════════════════════════════════════════════════════════════ -->
+      <set_value name="$matchTradeList" exact="[]"/>
+      <do_if value="$matchResult?">
+        <do_if value="$matchResult.$TradeList?">
+          <set_value name="$matchTradeList" exact="@$matchResult.$TradeList"/>
+        </do_if>
+      </do_if>
+      <run_script name="'lib.gt.score.trades'" result="$scoreResult">
+        <param name="tradeList" value="$matchTradeList"/>
+        <param name="priorityWares" value="if $priorityWares? then $priorityWares else []"/>
+        <param name="priorityScoreMultiplier" value="if $priorityScoreMultiplier? then $priorityScoreMultiplier else 125"/>
+      </run_script>
+
+      <!-- ══════════════════════════════════════════════════════════════════
+           Build result
+           ══════════════════════════════════════════════════════════════════ -->
+      <set_value name="$found" exact="false"/>
+      <set_value name="$tradeList" exact="[]"/>
+      <do_if value="$scoreResult?">
+        <do_if value="$scoreResult.$Found?">
+          <set_value name="$found" exact="@$scoreResult.$Found"/>
+        </do_if>
+        <do_if value="$found and $scoreResult.$SortedTrades?">
+          <set_value name="$tradeList" exact="@$scoreResult.$SortedTrades"/>
+        </do_if>
+      </do_if>
+
+      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[GT-Fallback] ' + $ship.idcode + ': Fallback search ' + (if $found then 'SUCCESS: ' + $tradeList.count + ' trades' else 'FAILED: no trades found even with relaxed parameters')" chance="100"/>
+      </do_if>
+
+      <return value="table[$Found = $found, $TradeList = $tradeList, $FallbackMaxDistance = $fallbackMaxDistance]"/>
+    </actions>
+  </attention>
+</aiscript>

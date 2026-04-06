@@ -1,0 +1,2236 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_Maintenance" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4 Foundations/libraries/md.xsd">
+  <cues>
+    <!-- ============================================================================= -->
+    <!-- GALAXY TRADER MK3 - UNIFIED MAINTENANCE SYSTEM                                -->
+    <!-- Handles ALL ship maintenance (repair + equipment) in one place                -->
+    <!-- Pattern: AI script signals MD processes EVERYTHING signals completion    -->
+    <!-- ============================================================================= -->
+    
+    <!-- Main Maintenance Handler -->
+    <cue name="DoMaintenance" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_DoMaintenance'"/>
+      </conditions>
+      <actions>
+        <set_value name="$ship" exact="event.param2"/>
+        
+        <!-- Check if there's an existing maintenance order -->
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <do_if value="global.$GT_MaintenanceOrders?">
+            <set_value name="$existingOrderCheck" exact="@global.$GT_MaintenanceOrders.{$ship}"/>
+            <do_if value="$existingOrderCheck?">
+              <set_value name="$existingWaitingForEquipmentCheck" exact="@$existingOrderCheck.$WaitingForEquipment"/>
+              <set_value name="$existingWaitingForRepairCheck" exact="@$existingOrderCheck.$WaitingForRepair"/>
+              <set_value name="$existingNeededCMCheck" exact="@$existingOrderCheck.$NeededCM"/>
+              <set_value name="$existingNeededUnitsCheck" exact="@$existingOrderCheck.$NeededUnits"/>
+              <set_value name="$isValidCheck" exact="$existingWaitingForEquipmentCheck or $existingWaitingForRepairCheck"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]  WARNING: ' + $ship.idcode + ' has existing maintenance order: WaitingForEquipment=' + $existingWaitingForEquipmentCheck + ', WaitingForRepair=' + $existingWaitingForRepairCheck + ', NeededCM=' + $existingNeededCMCheck + ', NeededUnits=' + $existingNeededUnitsCheck + ' (Valid=' + $isValidCheck + ')'" chance="100"/>
+              </do_if>
+              <do_if value="not $isValidCheck">
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance] Clearing stale maintenance order with null values for ' + $ship.idcode" chance="100"/>
+                </do_if>
+                <remove_value name="global.$GT_MaintenanceOrders.{$ship}"/>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Maintenance] Starting maintenance check for ' + $ship.idcode" chance="100"/>
+        </do_if>
+        
+        <!-- Initialize pilot level before use -->
+        <set_value name="$pilotLevel" exact="1"/>
+        <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}?">
+          <set_value name="$pilotLevel" exact="@global.$GT_Pilots.{$ship.pilot}.$Level"/>
+        </do_if>
+        
+        <!-- Clear stale maintenance orders before checks -->
+        <!-- Old orders from previous sessions can persist in save files -->
+        <!-- Always start fresh to prevent executing obsolete repair/resupply orders -->
+        <do_if value="global.$GT_RepairOrders? and global.$GT_RepairOrders.{$ship}?">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] Clearing stale repair order for ' + $ship.idcode" chance="100"/>
+          </do_if>
+          <remove_value name="global.$GT_RepairOrders.{$ship}"/>
+        </do_if>
+        
+        <do_if value="global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{$ship}?">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] Clearing stale resupply order for ' + $ship.idcode" chance="100"/>
+          </do_if>
+          <remove_value name="global.$GT_ResupplyOrders.{$ship}"/>
+        </do_if>
+          
+        <!-- Flags for what needs to be done -->
+        <set_value name="$needsRepair" exact="false"/>
+        <set_value name="$needsEquipment" exact="false"/>
+        <set_value name="$shipIsGalaxyMiner" exact="false"/>
+        <set_value name="$autoDeployResourceProbes" exact="false"/>
+        
+        <!-- Miner-specific option gate (future-proof): only enabled when ship runs GalaxyMiner
+             and AI parameters explicitly enable AutoDeployResourceProbes -->
+        <do_if value="$ship.defaultorder? and @$ship.defaultorder != null and @$ship.defaultorder.id == 'GalaxyMiner'">
+          <set_value name="$shipIsGalaxyMiner" exact="true"/>
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$AutoDeployResourceProbes?">
+            <set_value name="$autoDeployResourceProbes" exact="global.$GT_AIParameters.{$ship}.$AutoDeployResourceProbes"/>
+          </do_if>
+          <do_elseif value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$autoDeployResourceProbes?">
+            <set_value name="$autoDeployResourceProbes" exact="global.$GT_AIParameters.{$ship}.$autoDeployResourceProbes"/>
+          </do_elseif>
+          <do_elseif value="$ship.defaultorder.$autoDeployResourceProbes?">
+            <set_value name="$autoDeployResourceProbes" exact="$ship.defaultorder.$autoDeployResourceProbes"/>
+          </do_elseif>
+        </do_if>
+        
+        <!-- ========================================================================= -->
+        <!-- 1. CHECK REPAIR (Level 12+)                                              -->
+        <!-- ========================================================================= -->
+        
+        <!-- DIAGNOSTIC: Log repair prerequisites -->
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Maintenance] Repair gate: pilotLevel=' + $pilotLevel + ' (need 12+), AutoRepair.Enabled=' + @global.$GT_GlobalSettings.$AutoRepair.$Enabled + ', HullThreshold=' + @global.$GT_GlobalSettings.$AutoRepair.$HullThreshold + '%'" chance="100"/>
+        </do_if>
+        
+        <do_if value="$pilotLevel ge 12 and @global.$GT_GlobalSettings.$AutoRepair.$Enabled">
+          <set_value name="$hullPercentage" exact="$ship.hullpercentage"/>
+          <set_value name="$repairThreshold" exact="@global.$GT_GlobalSettings.$AutoRepair.$HullThreshold"/>
+          
+          <do_if value="$hullPercentage lt $repairThreshold">
+            <set_value name="$needsRepair" exact="true"/>
+            <!-- Set flag for ship name operational state -->
+            <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
+              <set_value name="global.$GT_Ships.{$ship}.$NeedsRepair" exact="true"/>
+            </do_if>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] ' + $ship.idcode + ' needs repair (hull: ' + $hullPercentage + '%, threshold: ' + $repairThreshold + '%)'" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- ========================================================================= -->
+        <!-- 2. CHECK EQUIPMENT (Level 15+)                                           -->
+        <!-- ========================================================================= -->
+        
+        <do_if value="$pilotLevel ge 15 and @global.$GT_Config.$Defense.$Enabled and @global.$GT_GlobalSettings.$DefensiveEquipment.$Enabled">
+          <!-- Check countermeasures and deployables -->
+          <set_value name="$countermeasureCapacity" exact="$ship.ammostorage.countermeasure.capacity"/>
+          <set_value name="$currentCountermeasures" exact="$ship.ammostorage.countermeasure.count"/>
+          <set_value name="$countermeasurePercentage" exact="if $countermeasureCapacity gt 0 then ($currentCountermeasures * 100) / $countermeasureCapacity else 100"/>
+          
+          <set_value name="$deployableCapacity" exact="$ship.ammostorage.deployable.capacity"/>
+          <set_value name="$currentDeployables" exact="$ship.ammostorage.deployable.count"/>
+          <set_value name="$deployablePercentage" exact="if $deployableCapacity gt 0 then ($currentDeployables * 100) / $deployableCapacity else 100"/>
+          
+          <!-- Also check UNITS (drones in docking bays) -->
+        <set_value name="$unitsCapacity" exact="$ship.units.maxcount"/>
+        <set_value name="$currentUnits" exact="$ship.units.count"/>
+        <set_value name="$unitsPercentage" exact="if $unitsCapacity gt 0 then ($currentUnits * 100) / $unitsCapacity else 100"/>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Maintenance] ' + $ship.idcode + ' storage check: CM cap=' + $countermeasureCapacity + ', Deployables cap=' + $deployableCapacity + ', Units maxcount=' + $unitsCapacity" chance="100"/>
+          <debug_text text="'[GT-Maintenance] ' + $ship.idcode + ' current: CM=' + $currentCountermeasures + ', Deployables=' + $currentDeployables + ', Units=' + $currentUnits" chance="100"/>
+        </do_if>
+          
+          <set_value name="$countermeasureThreshold" exact="@global.$GT_GlobalSettings.$DefensiveEquipment.$CountermeasureThreshold"/>
+          <set_value name="$unifiedThreshold" exact="@global.$GT_GlobalSettings.$DefensiveEquipment.$UnifiedThreshold"/>
+          
+          <!-- Check if restocking needed -->
+          <set_value name="$needsCountermeasures" exact="$countermeasureCapacity gt 0 and $countermeasurePercentage lt $countermeasureThreshold"/>
+          <!-- NOTE: Don't check deployables (mines/satellites) here - only restock if ship's loadout explicitly defines them -->
+          <set_value name="$needsDeployables" exact="false"/>
+          <set_value name="$currentResourceProbes" exact="$ship.ammostorage.{deployablecategory.resourceprobe}.count"/>
+          <set_value name="$needsResourceProbes" exact="$shipIsGalaxyMiner and $autoDeployResourceProbes and $currentResourceProbes lt 1"/>
+          <!-- NOTE: For units, check if below threshold to trigger maintenance -->
+          <set_value name="$needsUnits" exact="$unitsCapacity gt 0 and $unitsPercentage lt $unifiedThreshold"/>
+          
+          <!-- Track exact values and logic -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] RESUPPLY CHECK DETAILS for ' + $ship.idcode + ':'" chance="100"/>
+            <debug_text text="'[GT-Maintenance]   CM: Current=' + $currentCountermeasures + '/' + $countermeasureCapacity + ' (' + $countermeasurePercentage + '%), Threshold=' + $countermeasureThreshold + '%, Needs=' + $needsCountermeasures + ' (capacity&gt;0=' + ($countermeasureCapacity gt 0) + ', percentage&lt;threshold=' + ($countermeasurePercentage lt $countermeasureThreshold) + ')'" chance="100"/>
+            <debug_text text="'[GT-Maintenance]   Units: Current=' + $currentUnits + '/' + $unitsCapacity + ' (' + $unitsPercentage + '%), Threshold=' + $unifiedThreshold + '%, Needs=' + $needsUnits + ' (capacity&gt;0=' + ($unitsCapacity gt 0) + ', percentage&lt;threshold=' + ($unitsPercentage lt $unifiedThreshold) + ')'" chance="100"/>
+            <debug_text text="'[GT-Maintenance]   Resource probes (Miner): AutoDeploy=' + $autoDeployResourceProbes + ', Current=' + $currentResourceProbes + ', Needs=' + $needsResourceProbes" chance="100"/>
+            <debug_text text="'[GT-Maintenance]   Result: needsCountermeasures=' + $needsCountermeasures + ', needsUnits=' + $needsUnits + ', needsResourceProbes=' + $needsResourceProbes + ', needsEquipment=' + ($needsCountermeasures or $needsUnits or $needsResourceProbes)" chance="100"/>
+          </do_if>
+          
+          <do_if value="$needsCountermeasures or $needsUnits or $needsResourceProbes">
+            <set_value name="$needsEquipment" exact="true"/>
+            <set_value name="$whatNeedsRestocking" exact="if $needsCountermeasures and $needsUnits and $needsResourceProbes then 'CM + units + resource probes' else if $needsCountermeasures and $needsUnits then 'CM + units' else if $needsCountermeasures and $needsResourceProbes then 'CM + resource probes' else if $needsUnits and $needsResourceProbes then 'units + resource probes' else if $needsCountermeasures then 'CM only' else if $needsUnits then 'Units only' else 'resource probes only'"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] ' + $ship.idcode + ' needs equipment (CM: ' + $countermeasurePercentage + '%, Units: ' + $unitsPercentage + '%, ResourceProbes: ' + $currentResourceProbes + ' - will restock ' + $whatNeedsRestocking + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- ========================================================================= -->
+        <!-- 3. EXECUTE MAINTENANCE                                                    -->
+        <!-- ========================================================================= -->
+        
+        <do_if value="not $needsRepair and not $needsEquipment">
+          <!-- No maintenance needed -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] ' + $ship.idcode + ' no maintenance needed'" chance="100"/>
+          </do_if>
+          <signal_objects object="$ship" param="'GT_Maintenance_Complete'" delay="1ms"/>
+        </do_if>
+        <do_else>
+          <!-- CRITICAL PERFORMANCE FIX: Queue maintenance execution to prevent CPU spikes -->
+          <!-- When many ships need maintenance simultaneously (save load, fleet init), unlimited concurrent instances cause massive spikes -->
+          <!-- Initialize queue if needed -->
+          <do_if value="not global.$GT_MaintenanceQueue?">
+            <set_value name="global.$GT_MaintenanceQueue" exact="table[]"/>
+            <set_value name="global.$GT_MaintenanceQueue.$Requests" exact="[]"/>
+            <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" exact="0"/>
+            <set_value name="global.$GT_MaintenanceQueue.$MaxConcurrent" exact="2"/>
+          </do_if>
+          
+          <!-- Check concurrency limit -->
+          <set_value name="$shouldQueue" exact="false"/>
+          <do_if value="global.$GT_MaintenanceQueue.$ActiveInstances ge global.$GT_MaintenanceQueue.$MaxConcurrent">
+            <set_value name="$shouldQueue" exact="true"/>
+          </do_if>
+          
+          <do_if value="$shouldQueue">
+            <!-- At max concurrent - queue request -->
+            <append_to_list name="global.$GT_MaintenanceQueue.$Requests" exact="table[
+              $Ship = $ship,
+              $PilotLevel = $pilotLevel,
+              $NeedsRepair = $needsRepair,
+              $NeedsEquipment = $needsEquipment,
+              $HullPercentage = $hullPercentage,
+              $RepairThreshold = $repairThreshold
+            ]"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] Maintenance request QUEUED for ' + $ship.idcode + ' (active: ' + global.$GT_MaintenanceQueue.$ActiveInstances + '/' + global.$GT_MaintenanceQueue.$MaxConcurrent + ', queued: ' + global.$GT_MaintenanceQueue.$Requests.count + ')'" chance="10"/>
+            </do_if>
+            <!-- Signal queue processor -->
+            <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
+          </do_if>
+          <do_else>
+            <!-- Below limit - process immediately -->
+            <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" operation="add"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] Processing maintenance immediately for ' + $ship.idcode + ' (active: ' + global.$GT_MaintenanceQueue.$ActiveInstances + '/' + global.$GT_MaintenanceQueue.$MaxConcurrent + ')'" chance="10"/>
+            </do_if>
+            <signal_cue_instantly cue="ExecuteMaintenance" param="table[
+              $Ship = $ship,
+              $PilotLevel = $pilotLevel,
+              $NeedsRepair = $needsRepair,
+              $NeedsEquipment = $needsEquipment,
+              $HullPercentage = $hullPercentage,
+              $RepairThreshold = $repairThreshold
+            ]"/>
+          </do_else>
+        </do_else>
+      </actions>
+    </cue>
+    
+    <!-- Maintenance Queue Processor -->
+    <cue name="ProcessMaintenanceQueue" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <!-- CPU YIELDING: Prevent queue-drain avalanches in a single frame when many ships enqueue maintenance at once -->
+      <delay exact="10ms"/>
+      <actions>
+        <!-- Process next request in queue if below concurrency limit -->
+        <do_if value="global.$GT_MaintenanceQueue? and global.$GT_MaintenanceQueue.$Requests? and global.$GT_MaintenanceQueue.$Requests.count gt 0">
+          <do_if value="global.$GT_MaintenanceQueue.$ActiveInstances lt global.$GT_MaintenanceQueue.$MaxConcurrent">
+            <!-- Below limit - process next request -->
+            <set_value name="$nextRequest" exact="global.$GT_MaintenanceQueue.$Requests.{1}"/>
+            <do_if value="$nextRequest?">
+              <remove_from_list name="global.$GT_MaintenanceQueue.$Requests" exact="$nextRequest"/>
+              <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" operation="add"/>
+              
+              <!-- Process request -->
+              <signal_cue_instantly cue="md.GT_Maintenance.ExecuteMaintenance" param="$nextRequest"/>
+              
+              <!-- Continue processing queue -->
+              <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
+            </do_if>
+            <do_else>
+              <!-- Invalid request - remove it and continue -->
+              <do_if value="global.$GT_MaintenanceQueue.$Requests.count gt 0">
+                <remove_from_list name="global.$GT_MaintenanceQueue.$Requests" exact="global.$GT_MaintenanceQueue.$Requests.{1}"/>
+              </do_if>
+              <!-- Continue processing queue -->
+              <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
+            </do_else>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Execute Maintenance Orders -->
+    <cue name="ExecuteMaintenance" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$params" exact="event.param"/>
+        <set_value name="$ship" exact="$params.$Ship"/>
+        <set_value name="$pilotLevel" exact="$params.$PilotLevel"/>
+        <set_value name="$needsRepair" exact="$params.$NeedsRepair"/>
+        <set_value name="$needsEquipment" exact="$params.$NeedsEquipment"/>
+        <set_value name="$hullPercentage" exact="@$params.$HullPercentage"/>
+        <set_value name="$repairThreshold" exact="@$params.$RepairThreshold"/>
+        <set_value name="$shipIsGalaxyMiner" exact="false"/>
+        <set_value name="$autoDeployResourceProbes" exact="false"/>
+        
+        <!-- Re-resolve Miner probe option in execution context (queue-safe) -->
+        <do_if value="$ship.defaultorder? and @$ship.defaultorder != null and @$ship.defaultorder.id == 'GalaxyMiner'">
+          <set_value name="$shipIsGalaxyMiner" exact="true"/>
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$AutoDeployResourceProbes?">
+            <set_value name="$autoDeployResourceProbes" exact="global.$GT_AIParameters.{$ship}.$AutoDeployResourceProbes"/>
+          </do_if>
+          <do_elseif value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$autoDeployResourceProbes?">
+            <set_value name="$autoDeployResourceProbes" exact="global.$GT_AIParameters.{$ship}.$autoDeployResourceProbes"/>
+          </do_elseif>
+          <do_elseif value="$ship.defaultorder.$autoDeployResourceProbes?">
+            <set_value name="$autoDeployResourceProbes" exact="$ship.defaultorder.$autoDeployResourceProbes"/>
+          </do_elseif>
+        </do_if>
+        
+        <!-- Get max jump distance -->
+        <set_value name="$maxJumpDistance" exact="15"/>
+        <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$MaxDistance?">
+          <set_value name="$maxJumpDistance" exact="global.$GT_AIParameters.{$ship}.$MaxDistance"/>
+        </do_if>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Maintenance] ExecuteMaintenance for ' + $ship.idcode + ': maxJumpDistance=' + $maxJumpDistance + ', needsRepair=' + $needsRepair + ', needsEquipment=' + $needsEquipment + ', hullPercentage=' + $hullPercentage + ', repairThreshold=' + $repairThreshold" chance="100"/>
+        </do_if>
+        
+        <!-- Track orders created -->
+        <set_value name="$repairOrderCreated" exact="false"/>
+        <set_value name="$equipmentOrderCreated" exact="false"/>
+        
+        <!-- ========================================================================= -->
+        <!-- REPAIR FIRST (Priority)                                                  -->
+        <!-- ========================================================================= -->
+        
+        <do_if value="$needsRepair">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] Finding repair station for ' + $ship.idcode" chance="100"/>
+          </do_if>
+          
+          <!-- Find repair station -->
+          <run_actions ref="FindNearestRepairStation" result="$repairStation">
+            <param name="ship" value="$ship"/>
+            <param name="maxJumpDistance" value="$maxJumpDistance"/>
+          </run_actions>
+          
+          <do_if value="$repairStation and $repairStation.exists">
+            <!-- Final reachability check BEFORE creating order using library function -->
+            <run_actions ref="md.GT_Libraries_Pathfinding.GT_IsStationReachable" result="$reachabilityCheck">
+              <param name="ship" value="$ship"/>
+              <param name="station" value="$repairStation"/>
+              <param name="returnDetails" value="true"/>
+            </run_actions>
+            
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] Final reachability check for repair station ' + $repairStation.knownname + ':'" chance="100"/>
+              <debug_text text="'[GT-Maintenance]    Station known: ' + $reachabilityCheck.$StationKnown" chance="100"/>
+              <debug_text text="'[GT-Maintenance]    Basic path (vanilla check): ' + $reachabilityCheck.$BasicPathDistance + ' jumps'" chance="100"/>
+              <debug_text text="'[GT-Maintenance]    Blacklist-aware path: ' + $reachabilityCheck.$BlacklistAwarePathDistance + ' jumps'" chance="100"/>
+            </do_if>
+            
+            <!-- Station is unreachable if check fails -->
+            <do_if value="not $reachabilityCheck.$IsReachable">
+              <!-- Station is unreachable - log and continue trading -->
+              <debug_text text="'[GT-Maintenance]   Repair station ' + $repairStation.knownname + ' is unreachable for ' + $ship.idcode + ' (' + $reachabilityCheck.$FailureReason + ') - will continue with trading'" chance="100"/>
+              
+              <!-- Write logbook message when repair station unreachable -->
+              <run_actions ref="md.GT_Libraries_General.GT_IsLogbookEnabled" result="$logbookEnabled">
+                <param name="ship" value="$ship"/>
+              </run_actions>
+              <do_if value="$logbookEnabled">
+                <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
+                <set_value name="$logbookMessage" exact="{77000,3212}.[$hullPercentage,$repairThreshold,$repairStation.knownname,$ship.knownname]"/>
+                
+                <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+                  <param name="Message" value="$logbookMessage"/>
+                  <param name="Category" value="'alerts'"/>
+                  <param name="Title" value="'Auto-Repair Unreachable: ' + $ship.knownname"/>
+                  <param name="Object" value="$ship"/>
+                  <param name="Interaction" value="'showonmap'"/>
+                  <param name="Highlighted" value="true"/>
+                  <param name="CheckGlobalSettings" value="false"/>
+                </run_actions>
+              </do_if>
+              
+              <!-- Clear repair station so we don't try to create order -->
+              <set_value name="$repairStation" exact="null"/>
+            </do_if>
+          </do_if>
+          
+          <do_if value="$repairStation and $repairStation.exists">
+            <!-- Final docking check BEFORE creating order -->
+            <set_value name="$checkDocking" exact="not $ship.iscapitalship or ($repairStation.isclass.station)"/>
+            
+            <do_if value="$checkDocking">
+              <set_value name="$canDock" exact="$repairStation.dockingallowed.{$ship}"/>
+              
+              <do_if value="not $canDock">
+                <!-- Station is not dockable - log and continue trading -->
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance]   Repair station ' + $repairStation.knownname + ' does not allow docking for ' + $ship.idcode + ' (trade restrictions, relation issues, or docking policy) - will continue with trading'" chance="100"/>
+                </do_if>
+                
+                <!-- Write logbook message when repair station not dockable -->
+                <run_actions ref="md.GT_Libraries_General.GT_IsLogbookEnabled" result="$logbookEnabled">
+                  <param name="ship" value="$ship"/>
+                </run_actions>
+                <do_if value="$logbookEnabled">
+                  <!-- Only write logbook when debug is enabled -->
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <set_value name="$message" exact="{77000,3212}.[$hullPercentage,$repairThreshold,$repairStation.knownname,$ship.knownname]"/>
+                    <write_to_logbook 
+                      category="alerts" 
+                      title="'Auto-Repair Unreachable: ' + $ship.knownname" 
+                      text="$message"
+                      interaction="showonmap" 
+                      object="$ship"
+                      highlighted="true"/>
+                  </do_if>
+                </do_if>
+                
+                <!-- Clear repair station so we don't try to create order -->
+                <set_value name="$repairStation" exact="null"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <do_if value="$repairStation and $repairStation.exists">
+            <!-- Calculate cost -->
+            <set_value name="$estimatedCost" exact="$ship.maxhull - $ship.hull"/>
+            <set_value name="$playerMoney" exact="player.money"/>
+            
+            <do_if value="$playerMoney ge $estimatedCost">
+              <!-- Prepare repair data for AI script -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] Repair data prepared for ' + $ship.idcode + ' at ' + $repairStation.knownname + ' (cost: ' + ($estimatedCost/100) + ' Cr)'" chance="100"/>
+              </do_if>
+              
+              <!-- Ensure table exists before accessing (handles race condition) -->
+              <do_if value="not global.$GT_RepairOrders?">
+                <set_value name="global.$GT_RepairOrders" exact="table[]"/>
+              </do_if>
+              
+              <set_value name="global.$GT_RepairOrders.{$ship}" exact="table[
+                $Station = $repairStation,
+                $AcceptedCost = $estimatedCost
+              ]"/>
+              
+              <!-- PERFORMANCE OPTIMIZATION: Defer UI operations (ship renaming, logbook messages) -->
+              <!-- These operations don't affect gameplay and can be processed later to reduce spike size -->
+              <do_if value="not global.$GT_DeferredUIUpdates?">
+                <set_value name="global.$GT_DeferredUIUpdates" exact="table[]"/>
+              </do_if>
+              <set_value name="global.$GT_DeferredUIUpdates.{$ship}" exact="table[
+                $Type = 'repair',
+                $Ship = $ship,
+                $Pilot = @$ship.pilot,
+                $LogbookMessage = '{77000,3205}.[' + $hullPercentage + ',' + $repairThreshold + ',' + $pilotLevel + ',' + $repairStation.knownname + ',' + ($estimatedCost/100) + ',' + $ship.knownname + ']',
+                $LogbookCategory = 'upkeep',
+                $LogbookTitle = 'Auto-Repair: ' + $ship.knownname,
+                $LogbookObject = $repairStation,
+                $LogbookInteraction = 'showonmap'
+              ]"/>
+              <signal_cue_instantly cue="md.GT_Maintenance.ProcessDeferredUIUpdates"/>
+              
+              <set_value name="$repairOrderCreated" exact="true"/>
+            </do_if>
+            <do_elseif value="$playerMoney ge 5000Cr">
+              <!-- Prepare partial repair data -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] Partial repair data prepared for ' + $ship.idcode + ' (max: ' + ($playerMoney/100) + ' Cr)'" chance="100"/>
+              </do_if>
+              
+              <!-- Ensure table exists before accessing (handles race condition) -->
+              <do_if value="not global.$GT_RepairOrders?">
+                <set_value name="global.$GT_RepairOrders" exact="table[]"/>
+              </do_if>
+              
+              <set_value name="global.$GT_RepairOrders.{$ship}" exact="table[
+                $Station = $repairStation,
+                $AcceptedCost = $playerMoney
+              ]"/>
+              
+              <!-- Write logbook entry about partial repair -->
+              <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
+              <set_value name="$logbookMessage" exact="{77000,3206}.[$hullPercentage,$repairThreshold,($playerMoney/100),($estimatedCost/100),$repairStation.knownname,$ship.knownname]"/>
+              
+              <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+                <param name="Message" value="$logbookMessage"/>
+                <param name="Category" value="'alerts'"/>
+                <param name="Title" value="'Auto-Repair (Partial): ' + $ship.knownname"/>
+                <param name="Object" value="$repairStation"/>
+                <param name="Interaction" value="'showonmap'"/>
+                <param name="Highlighted" value="true"/>
+                <param name="CheckGlobalSettings" value="false"/>
+              </run_actions>
+              
+              <set_value name="$repairOrderCreated" exact="true"/>
+              
+              <show_notification text="' ' + $ship.knownname + ' needs repairs but insufficient funds!\nCost: ' + ($estimatedCost/100) + ' Cr, Available: ' + ($playerMoney/100) + ' Cr\nAttempting partial repair.'" timeout="10s" priority="8"/>
+            </do_elseif>
+            <do_else>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] Insufficient funds for repair (' + ($playerMoney/100) + ' Cr available, need ' + ($estimatedCost/100) + ' Cr)'" chance="100"/>
+              </do_if>
+              <show_notification text="'' + $ship.knownname + ' needs repairs but insufficient funds!\nCost: ' + ($estimatedCost/100) + ' Cr, Available: ' + ($playerMoney/100) + ' Cr'" timeout="10s" priority="9"/>
+            </do_else>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-Maintenance] No repair station found for ' + $ship.idcode" chance="100"/>
+          </do_else>
+        </do_if>
+        
+        <!-- ========================================================================= -->
+        <!-- EQUIPMENT SECOND                                                          -->
+        <!-- ========================================================================= -->
+        
+        <do_if value="$needsEquipment">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] ═══════════════════════════════════════════════════════'" chance="100"/>
+            <debug_text text="'[GT-Maintenance] EQUIPMENT STATION SEARCH for ' + $ship.idcode" chance="100"/>
+            <debug_text text="'[GT-Maintenance] Ship location: ' + @$ship.sector.knownname + ' (ID: ' + $ship.idcode + ')'" chance="100"/>
+            <debug_text text="'[GT-Maintenance] Max jump distance: ' + $maxJumpDistance + ' jumps'" chance="100"/>
+          </do_if>
+          
+          <!-- PERFORMANCE OPTIMIZATION: Cache station search results (stations don't change often) -->
+          <!-- Cache key: 'equipment_stations' (same for all ships, stations rarely change) -->
+          <!-- Cache age: 300 seconds (5 minutes) - stations can be destroyed/built, but rarely -->
+          <set_value name="$cacheKey" exact="'equipment_stations'"/>
+          <set_value name="$cacheAge" exact="300s"/>
+          <set_value name="$useCache" exact="false"/>
+          
+          <!-- Check if cache exists and is fresh -->
+          <!-- CRITICAL: Use {'$' + $cacheKey} pattern for string keys in X4 tables -->
+          <set_value name="$cacheKeyWithDollar" exact="'$' + $cacheKey"/>
+          <do_if value="global.$GT_MaintenanceStationCache? and global.$GT_MaintenanceStationCache.{$cacheKeyWithDollar}?">
+            <set_value name="$cacheEntry" exact="global.$GT_MaintenanceStationCache.{$cacheKeyWithDollar}"/>
+            <set_value name="$cacheTime" exact="@$cacheEntry.$Timestamp"/>
+            <do_if value="(player.age - $cacheTime) lt $cacheAge">
+              <set_value name="$useCache" exact="true"/>
+              <!-- Extract cached lists and ensure they're lists (not null) -->
+              <!-- CRITICAL: Always initialize as empty lists if cache values are null -->
+              <set_value name="$cachedEquipmentDocks" exact="@$cacheEntry.$EquipmentDocks"/>
+              <set_value name="$cachedWharfs" exact="@$cacheEntry.$Wharfs"/>
+              <set_value name="$cachedShipyards" exact="@$cacheEntry.$Shipyards"/>
+              
+              <!-- Initialize as empty lists if null -->
+              <set_value name="$potentialStations" exact="if $cachedEquipmentDocks? then $cachedEquipmentDocks else []"/>
+              <set_value name="$wharfs" exact="if $cachedWharfs? then $cachedWharfs else []"/>
+              <set_value name="$shipyards" exact="if $cachedShipyards? then $cachedShipyards else []"/>
+              
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Using cached equipment station search (age: ' + (player.age - $cacheTime) + 's, EquipmentDocks: ' + $potentialStations.count + ', Wharfs: ' + $wharfs.count + ', Shipyards: ' + $shipyards.count + ')'" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <!-- Only search if cache miss or expired -->
+          <do_if value="not $useCache">
+            <!-- Use capability-based search instead of station type checks -->
+            <!-- Vanilla pattern: Stations can resupply if they can supply the ship's class -->
+            <!-- Find stations that can supply equipment, then validate cansupplyclass manually -->
+            <!-- Note: find_station doesn't support cansupplyclass filter directly, so we search broadly and validate capability -->
+            <find_station name="$potentialStations" 
+              space="player.galaxy" 
+              multiple="true" 
+              knownto="player.entity" 
+              checkoperational="true" 
+              sortbygatedistanceto="$ship"
+              equipmentdock="true">
+              <match class="class.station"/>
+              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+            </find_station>
+            
+            <!-- Also search wharfs and shipyards (they can also supply equipment) -->
+            <find_station name="$wharfs" 
+              space="player.galaxy" 
+              multiple="true" 
+              knownto="player.entity" 
+              checkoperational="true" 
+              sortbygatedistanceto="$ship"
+              wharf="true">
+              <match class="class.station"/>
+              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+            </find_station>
+            
+            <find_station name="$shipyards" 
+              space="player.galaxy" 
+              multiple="true" 
+              knownto="player.entity" 
+              checkoperational="true" 
+              sortbygatedistanceto="$ship"
+              shipyard="true">
+              <match class="class.station"/>
+              <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+            </find_station>
+            
+            <!-- Store in cache -->
+            <!-- CRITICAL: Ensure lists are never null before storing in cache -->
+            <do_if value="not global.$GT_MaintenanceStationCache?">
+              <set_value name="global.$GT_MaintenanceStationCache" exact="table[]"/>
+            </do_if>
+            <!-- Ensure all lists are initialized (never null) -->
+            <set_value name="$equipmentDocksToCache" exact="if $potentialStations? then $potentialStations else []"/>
+            <set_value name="$wharfsToCache" exact="if $wharfs? then $wharfs else []"/>
+            <set_value name="$shipyardsToCache" exact="if $shipyards? then $shipyards else []"/>
+            <set_value name="global.$GT_MaintenanceStationCache.{$cacheKeyWithDollar}" exact="table[
+              $EquipmentDocks = $equipmentDocksToCache,
+              $Wharfs = $wharfsToCache,
+              $Shipyards = $shipyardsToCache,
+              $Timestamp = player.age
+            ]"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Cached equipment station search results (EquipmentDocks: ' + $potentialStations.count + ', Wharfs: ' + $wharfs.count + ', Shipyards: ' + $shipyards.count + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- PERFORMANCE: Cap candidate station lists before expensive per-station distance/validation work -->
+          <!-- find_station results are already sorted by gate distance to ship; we only need "nearby enough" candidates -->
+          <set_value name="$maxStationsPerType" exact="30"/>
+
+          <!-- Limit equipment docks list -->
+          <set_value name="$limitedEquipmentDocks" exact="[]"/>
+          <set_value name="$equipCount" exact="if $potentialStations.count lt $maxStationsPerType then $potentialStations.count else $maxStationsPerType"/>
+          <do_all exact="$equipCount" counter="$i">
+            <append_to_list name="$limitedEquipmentDocks" exact="$potentialStations.{$i}"/>
+          </do_all>
+          <set_value name="$potentialStations" exact="$limitedEquipmentDocks"/>
+
+          <!-- Limit wharfs list -->
+          <set_value name="$limitedWharfs" exact="[]"/>
+          <set_value name="$wharfCount" exact="if $wharfs.count lt $maxStationsPerType then $wharfs.count else $maxStationsPerType"/>
+          <do_all exact="$wharfCount" counter="$i">
+            <append_to_list name="$limitedWharfs" exact="$wharfs.{$i}"/>
+          </do_all>
+          <set_value name="$wharfs" exact="$limitedWharfs"/>
+
+          <!-- Limit shipyards list -->
+          <set_value name="$limitedShipyards" exact="[]"/>
+          <set_value name="$shipyardCount" exact="if $shipyards.count lt $maxStationsPerType then $shipyards.count else $maxStationsPerType"/>
+          <do_all exact="$shipyardCount" counter="$i">
+            <append_to_list name="$limitedShipyards" exact="$shipyards.{$i}"/>
+          </do_all>
+          <set_value name="$shipyards" exact="$limitedShipyards"/>
+
+          <!-- Combine all station types into one list (always needed, even with cache) -->
+          <do_all exact="$wharfs.count" counter="$i">
+            <append_to_list name="$potentialStations" exact="$wharfs.{$i}"/>
+          </do_all>
+          <do_all exact="$shipyards.count" counter="$i">
+            <append_to_list name="$potentialStations" exact="$shipyards.{$i}"/>
+          </do_all>
+          
+          <!-- Re-sort combined list by gate distance (equipment docks + wharfs + shipyards merged). -->
+          <!-- Keep unreachable stations in list; native sort places them after reachable stations. -->
+          <sort_list list="$potentialStations" sortbygatedistanceto="$ship"/>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Found ' + $potentialStations.count + ' potential equipment stations (equipment docks + wharfs + shipyards, sorted by distance)'" chance="100"/>
+          </do_if>
+          
+          <!-- Get blacklist group for pathfinding (needed before distance checks) -->
+          <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroup">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          
+          <!-- Validate each station has resupply capability AND docking capability -->
+          <!-- Vanilla check: station must be able to supply this ship class (cansupplyclass.{ship.class}) -->
+          <set_value name="$validatedStations" exact="[]"/>
+          <do_all exact="$potentialStations.count" counter="$i">
+            <set_value name="$station" exact="$potentialStations.{$i}"/>
+            <set_value name="$isValid" exact="true"/>
+            
+            <!-- CHECK 1: Verify resupply capability: can supply this ship class -->
+            <set_value name="$canSupply" exact="@$station.cansupplyclass.{$ship.class}"/>
+            <do_if value="not $canSupply">
+              <set_value name="$isValid" exact="false"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]   SKIPPED station: ' + $station.knownname + ' - cannot supply ship class ' + $ship.class" chance="100"/>
+              </do_if>
+            </do_if>
+            
+            <!-- CHECK 2: Verify docking capability: station must have docking bay for this ship size -->
+            <do_if value="$isValid">
+              <find_dockingbay name="$testDock" object="$station" checkoperational="true" multiple="false">
+                <match_dock size="$ship.docksize" storage="false"/>
+              </find_dockingbay>
+              <do_if value="not $testDock">
+                <set_value name="$isValid" exact="false"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance]   SKIPPED station: ' + $station.knownname + ' - no docking bay for ship size ' + $ship.docksize" chance="100"/>
+                </do_if>
+              </do_if>
+            </do_if>
+            
+            <do_if value="$isValid">
+              <append_to_list name="$validatedStations" exact="$station"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]   ✓ Added station: ' + $station.knownname + ' (can supply class ' + $ship.class + ', docking bay size ' + $ship.docksize + ')'" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_all>
+          
+          <!-- CRITICAL: Use validatedStations directly to avoid list copy issues -->
+          <set_value name="$potentialStations" exact="$validatedStations"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Validated ' + $potentialStations.count + ' stations with resupply capability (can supply class ' + $ship.class + ') and docking capability (size ' + $ship.docksize + ')'" chance="100"/>
+          </do_if>
+          
+          <!-- ============================================================= -->
+          <!-- Find first station within distance that has STOCK           -->
+          <!-- Try stations in order (sorted by distance), skip those      -->
+          <!-- with no stock, take first one with ANY stock available      -->
+          <!-- ============================================================= -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] ───────────────────────────────────────────────────────'" chance="100"/>
+            <debug_text text="'[GT-Maintenance] EVALUATING ' + $potentialStations.count + ' STATIONS...'" chance="100"/>
+          </do_if>
+          
+          <set_value name="$equipmentStation" exact="null"/>
+          <set_value name="$playerStationJumpPreference" exact="2"/>
+          <set_value name="$nearestPlayerEquipmentStation" exact="null"/>
+          <set_value name="$nearestPlayerEquipmentDistance" exact="999999"/>
+          <set_value name="$nearestForeignEquipmentStation" exact="null"/>
+          <set_value name="$nearestForeignEquipmentDistance" exact="999999"/>
+          <set_value name="$stationsChecked" exact="0"/>
+          <set_value name="$stationsWithNoStock" exact="0"/>
+          <set_value name="$stationsSkippedDistance" exact="0"/>
+          <set_value name="$stationsSkippedBlacklist" exact="0"/>
+          <set_value name="$stationsSkippedDocking" exact="0"/>
+          
+          <!-- CRITICAL DEBUG: Verify list before loop -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] DEBUG: About to loop through ' + $potentialStations.count + ' stations, list exists: ' + $potentialStations?" chance="100"/>
+            <do_if value="$potentialStations.count gt 0">
+              <debug_text text="'[GT-Maintenance] DEBUG: First station: ' + $potentialStations.{1}.knownname" chance="100"/>
+              <debug_text text="'[GT-Maintenance] DEBUG: List type check - count: ' + $potentialStations.count + ', validatedStations count: ' + $validatedStations.count" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- CRITICAL: Ensure we have stations to process -->
+          <!-- PERFORMANCE: Limit to first 20 closest stations (already sorted by distance) -->
+          <!-- This prevents processing hundreds of stations when only a few nearby ones matter -->
+          <set_value name="$maxStationsToCheck" exact="20"/>
+          <set_value name="$stationsToProcess" exact="if $potentialStations.count lt $maxStationsToCheck then $potentialStations.count else $maxStationsToCheck"/>
+          
+          <do_if value="$stationsToProcess gt 0">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] DEBUG: Processing ' + $stationsToProcess + ' of ' + $potentialStations.count + ' stations (limited to closest ' + $maxStationsToCheck + ')'" chance="100"/>
+            </do_if>
+            
+            <do_all exact="$stationsToProcess" counter="$i">
+            <!-- CRITICAL DEBUG: Log loop iteration start -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] DEBUG: Loop iteration ' + $i + ', equipmentStation is null: ' + ($equipmentStation == null)" chance="100"/>
+            </do_if>
+            
+            <!-- CRITICAL: Extract station BEFORE any checks to ensure loop processes items -->
+            <set_value name="$station" exact="$potentialStations.{$i}"/>
+            
+            <!-- CRITICAL DEBUG: Verify station was extracted correctly -->
+            <do_if value="not $station?">
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] ERROR: Station at index ' + $i + ' is null!'" chance="100"/>
+              </do_if>
+              <continue/>
+            </do_if>
+            
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] ───────────────────────────────────────────────────────'" chance="100"/>
+              <debug_text text="'[GT-Maintenance] Station [' + $i + '/' + $potentialStations.count + ']: ' + $station.knownname" chance="100"/>
+              <debug_text text="'[GT-Maintenance]    Owner: ' + @$station.owner.knownname" chance="100"/>
+              <debug_text text="'[GT-Maintenance]    Sector: ' + @$station.sector.knownname" chance="100"/>
+              <debug_text text="'[GT-Maintenance]    Type: Wharf=' + $station.iswharf + ', Shipyard=' + $station.isshipyard + ', EquipmentDock=' + $station.isequipmentdock" chance="100"/>
+            </do_if>
+            
+            <!-- Determine blacklist group first (needed for pathfinding and blacklist checks) -->
+            <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroup">
+              <param name="ship" value="$ship"/>
+            </run_actions>
+            
+            <!-- SAFETY CHECK 1: Full reachability check (station known + basic path + blacklist-aware path) -->
+            <!-- Check ALL reachability requirements BEFORE evaluating stock -->
+            <run_actions ref="md.GT_Libraries_Pathfinding.GT_IsStationReachable" result="$reachabilityCheck">
+              <param name="ship" value="$ship"/>
+              <param name="station" value="$station"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+              <param name="returnDetails" value="true"/>
+            </run_actions>
+            
+            <do_if value="not $reachabilityCheck.$IsReachable">
+              <!-- Station is unreachable - skip it -->
+              <set_value name="$stationsSkippedDistance" operation="add"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]    SKIPPED - Not reachable (' + $reachabilityCheck.$FailureReason + ')'" chance="100"/>
+                <debug_text text="'[GT-Maintenance]      Station known: ' + $reachabilityCheck.$StationKnown + ', Basic path: ' + $reachabilityCheck.$BasicPathDistance + ', Blacklist-aware: ' + $reachabilityCheck.$BlacklistAwarePathDistance" chance="100"/>
+              </do_if>
+              <continue/>
+            </do_if>
+            
+            <!-- Extract distance from reachability check (use blacklist-aware distance) -->
+            <set_value name="$distance" exact="$reachabilityCheck.$BlacklistAwarePathDistance"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance]    Reachability check PASSED'" chance="100"/>
+              <debug_text text="'[GT-Maintenance]    Distance (blacklist-aware): ' + $distance + ' jumps (max allowed: ' + $maxJumpDistance + ')'" chance="100"/>
+            </do_if>
+            
+            <!-- SAFETY CHECK 2: Blacklist checks (station + sector) -->
+            <run_actions ref="md.GT_Libraries_Blacklist.GT_IsStationBlacklisted" result="$stationBlacklisted">
+              <param name="station" value="$station"/>
+              <param name="ship" value="$ship"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+            </run_actions>
+            <run_actions ref="md.GT_Libraries_Blacklist.GT_IsSectorBlacklisted" result="$sectorBlacklistDetails">
+              <param name="sector" value="$station.sector"/>
+              <param name="ship" value="$ship"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+              <param name="returnDetails" value="true"/>
+            </run_actions>
+            <set_value name="$sectorTravelBlacklisted" exact="$sectorBlacklistDetails.$TravelBlacklisted"/>
+            <set_value name="$sectorActivityBlacklisted" exact="$sectorBlacklistDetails.$ActivityBlacklisted"/>
+            
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance]    Blacklist: Station=' + $stationBlacklisted + ', SectorTravel=' + $sectorTravelBlacklisted + ', SectorActivity=' + $sectorActivityBlacklisted" chance="100"/>
+            </do_if>
+            
+            <do_if value="$stationBlacklisted or $sectorTravelBlacklisted or $sectorActivityBlacklisted">
+              <set_value name="$stationsSkippedBlacklist" operation="add"/>
+              <set_value name="$blacklistReason" exact="if $stationBlacklisted then 'station unsafe' else if $sectorTravelBlacklisted then 'sector travel blocked (threat system)' else 'sector activity restricted'"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]    SKIPPED - Blacklisted (' + $blacklistReason + ')'" chance="100"/>
+              </do_if>
+              <continue/>
+            </do_if>
+            
+            <!-- SAFETY CHECK 3: Skip if distance is too far -->
+            <do_if value="$distance gt $maxJumpDistance">
+              <set_value name="$stationsSkippedDistance" operation="add"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]    SKIPPED - Beyond max jump distance (' + $distance + ' > ' + $maxJumpDistance + ')'" chance="100"/>
+              </do_if>
+              <continue/>
+            </do_if>
+            
+            <do_if value="$distance ge 0 and $distance le $maxJumpDistance">
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]    Distance check PASSED - evaluating stock...'" chance="100"/>
+              </do_if>
+              <set_value name="$stationsChecked" operation="add"/>
+              
+              <!-- Recalculate what equipment is actually needed for stock check -->
+              <set_value name="$countermeasureCapacity" exact="$ship.ammostorage.countermeasure.capacity"/>
+              <set_value name="$currentCountermeasures" exact="$ship.ammostorage.countermeasure.count"/>
+              <set_value name="$countermeasurePercentage" exact="if $countermeasureCapacity gt 0 then ($currentCountermeasures * 100) / $countermeasureCapacity else 100"/>
+              
+              <set_value name="$deployableCapacity" exact="$ship.ammostorage.deployable.capacity"/>
+              <set_value name="$currentDeployables" exact="$ship.ammostorage.deployable.count"/>
+              <set_value name="$deployablePercentage" exact="if $deployableCapacity gt 0 then ($currentDeployables * 100) / $deployableCapacity else 100"/>
+              
+              <set_value name="$countermeasureThreshold" exact="@global.$GT_GlobalSettings.$DefensiveEquipment.$CountermeasureThreshold"/>
+              <set_value name="$unifiedThreshold" exact="@global.$GT_GlobalSettings.$DefensiveEquipment.$UnifiedThreshold"/>
+              
+              <!-- Recalculate needs inside loop (check units too!) -->
+              <set_value name="$unitsCapacity" exact="@$ship.units.maxcount"/>
+              <set_value name="$currentResourceProbes" exact="$ship.ammostorage.{deployablecategory.resourceprobe}.count"/>
+              
+              <set_value name="$needsCountermeasures" exact="$countermeasureCapacity gt 0 and $countermeasurePercentage lt $countermeasureThreshold"/>
+              <!-- Don't check deployables (mines/satellites) for trading ships -->
+              <set_value name="$needsDeployables" exact="false"/>
+              <set_value name="$needsResourceProbes" exact="$shipIsGalaxyMiner and $autoDeployResourceProbes and $currentResourceProbes lt 1"/>
+              <!-- For units, always check loadout (ship may have more than loadout wants) -->
+              <set_value name="$needsUnits" exact="$unitsCapacity gt 0"/>
+              
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]   Ship needs: CM=' + $needsCountermeasures + ', Units=' + $needsUnits + ', ResourceProbes=' + $needsResourceProbes + ' (will check loadout)'" chance="100"/>
+              </do_if>
+              
+              <!-- Capability and docking already validated earlier (lines 428-448) -->
+              <!-- Now we only need to check stock availability (like vanilla) -->
+              <set_value name="$canSupply" exact="false"/>
+              
+              <!-- Build evaluation tables like vanilla does to check stock -->
+              <set_value name="$evalammotable" exact="null"/>
+              <set_value name="$evalunittable" exact="null"/>
+              
+              <!-- Check countermeasures stock -->
+              <do_if value="$needsCountermeasures">
+                <set_value name="$availableCM" exact="@$station.buildequipment.countermeasures.list"/>
+                <do_if value="@$availableCM.count gt 0">
+                  <!-- Create evaluation table with quantity=1 for each ware (vanilla pattern) -->
+                  <set_value name="$evalammotable" exact="table[]"/>
+                  <do_all exact="$availableCM.count" counter="$j">
+                    <set_value name="$evalammotable.{$availableCM.{$j}}" exact="1"/>
+                  </do_all>
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Maintenance]   Eval ammo table has ' + @$evalammotable.keys.count + ' types'" chance="100"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+              
+              <!-- Miner probe restock check: require at least one resource probe when enabled -->
+              <do_if value="$needsResourceProbes">
+                <do_if value="not $evalammotable">
+                  <set_value name="$evalammotable" exact="table[]"/>
+                </do_if>
+                <set_value name="$evalammotable.{macro.eq_arg_resourceprobe_01_macro.ware}" exact="1"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance]   Added resource probe requirement to ammo eval table'" chance="100"/>
+                </do_if>
+              </do_if>
+              
+              <!-- NOTE: Deployables (mines/satellites) are NOT checked for trading ships -->
+              
+              <!-- Now check stock using vanilla's exact logic -->
+              <!-- Check each category we need, station passes if it has stock for ALL needed categories -->
+              <set_value name="$hasAmmoStock" exact="true"/>
+              <set_value name="$hasUnitDroneStock" exact="true"/>
+              
+              <do_if value="($needsCountermeasures or $needsResourceProbes) and $evalammotable">
+                <set_value name="$canBuildAmmo" exact="$station.canbuildequipment.{$evalammotable.keys.list}"/>
+                <set_value name="$hasAmmoResources" exact="$station.hasresourcesfor.{$evalammotable}"/>
+                <set_value name="$hasAmmoStock" exact="$canBuildAmmo and $hasAmmoResources"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance]   Ammo check: canBuild=' + $canBuildAmmo + ', hasResources=' + $hasAmmoResources + ', result=' + $hasAmmoStock" chance="100"/>
+                </do_if>
+              </do_if>
+              <do_elseif value="($needsCountermeasures or $needsResourceProbes) and not $evalammotable">
+                <!-- Need CM but no eval table - fail -->
+                <set_value name="$hasAmmoStock" exact="false"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance]   Ammo check: no eval table, result=false'" chance="100"/>
+                </do_if>
+              </do_elseif>
+              
+              <!-- Check for UNITS (defense drones, laser towers, etc.) -->
+              <!-- Note: We already validated cansupplyclass earlier, so station can supply this ship class -->
+              <do_if value="$needsUnits">
+                <!-- For units/drones, check if station can build units (shipyard/wharf) or is equipment dock that can supply -->
+                <!-- Vanilla resupply will handle the complex unit selection -->
+                <set_value name="$hasUnitDroneStock" exact="$station.isshipyard or $station.iswharf or $station.isequipmentdock"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance]   Units/Drones check: isShipyard=' + $station.isshipyard + ', isWharf=' + $station.iswharf + ', isEquipmentDock=' + $station.isequipmentdock + ', result=' + $hasUnitDroneStock" chance="100"/>
+                </do_if>
+              </do_if>
+              
+              <!-- Station passes if it has stock for ALL needed categories (all must be true) -->
+              <set_value name="$canSupply" exact="$hasAmmoStock and $hasUnitDroneStock"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]   Final: hasAmmoStock=' + $hasAmmoStock + ', hasUnitDroneStock=' + $hasUnitDroneStock + ', canSupply=' + $canSupply" chance="100"/>
+              </do_if>
+              
+              <do_if value="$canSupply">
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance]   Station has stock for required items'" chance="100"/>
+                </do_if>
+              </do_if>
+              <do_else>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance]    Station has no stock for any required items'" chance="100"/>
+                </do_if>
+              </do_else>
+              
+              <!-- If this station can supply, track nearest valid player/foreign candidate -->
+              <do_if value="$canSupply">
+                <do_if value="$station.owner == faction.player">
+                  <do_if value="$distance lt $nearestPlayerEquipmentDistance">
+                    <set_value name="$nearestPlayerEquipmentStation" exact="$station"/>
+                    <set_value name="$nearestPlayerEquipmentDistance" exact="$distance"/>
+                  </do_if>
+                </do_if>
+                <do_else>
+                  <do_if value="$distance lt $nearestForeignEquipmentDistance">
+                    <set_value name="$nearestForeignEquipmentStation" exact="$station"/>
+                    <set_value name="$nearestForeignEquipmentDistance" exact="$distance"/>
+                  </do_if>
+                </do_else>
+              </do_if>
+              <do_else>
+                <!-- Station cannot supply, try next one -->
+                <set_value name="$stationsWithNoStock" operation="add"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance]     SKIPPED - Cannot supply required items'" chance="100"/>
+                </do_if>
+              </do_else>
+            </do_if>
+          </do_all>
+          </do_if>
+          
+          <!-- Final equipment station selection with player-station preference -->
+          <do_if value="$nearestPlayerEquipmentStation and $nearestForeignEquipmentStation">
+            <do_if value="$nearestPlayerEquipmentDistance le ($nearestForeignEquipmentDistance + $playerStationJumpPreference)">
+              <set_value name="$equipmentStation" exact="$nearestPlayerEquipmentStation"/>
+            </do_if>
+            <do_else>
+              <set_value name="$equipmentStation" exact="$nearestForeignEquipmentStation"/>
+            </do_else>
+          </do_if>
+          <do_elseif value="$nearestPlayerEquipmentStation">
+            <set_value name="$equipmentStation" exact="$nearestPlayerEquipmentStation"/>
+          </do_elseif>
+          <do_elseif value="$nearestForeignEquipmentStation">
+            <set_value name="$equipmentStation" exact="$nearestForeignEquipmentStation"/>
+          </do_elseif>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $equipmentStation">
+            <debug_text text="'[GT-Maintenance] Equipment station preference: selected ' + $equipmentStation.knownname + ' (player dist=' + $nearestPlayerEquipmentDistance + ', foreign dist=' + $nearestForeignEquipmentDistance + ', threshold=' + $playerStationJumpPreference + ')'" chance="100"/>
+          </do_if>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] ═══════════════════════════════════════════════════════'" chance="100"/>
+            <debug_text text="'[GT-Maintenance] STATION SEARCH SUMMARY:'" chance="100"/>
+            <debug_text text="'[GT-Maintenance]    Total found: ' + $potentialStations.count + ' (checked: ' + (if $stationsToProcess? then $stationsToProcess else 0) + ')'" chance="100"/>
+            <debug_text text="'[GT-Maintenance]    Skipped (blacklisted): ' + $stationsSkippedBlacklist" chance="100"/>
+            <debug_text text="'[GT-Maintenance]    Skipped (distance): ' + $stationsSkippedDistance" chance="100"/>
+            <debug_text text="'[GT-Maintenance]    Skipped (no docking rights): ' + $stationsSkippedDocking" chance="100"/>
+            <debug_text text="'[GT-Maintenance]    Checked for stock: ' + $stationsChecked" chance="100"/>
+            <debug_text text="'[GT-Maintenance]    No stock available: ' + $stationsWithNoStock" chance="100"/>
+            <debug_text text="'[GT-Maintenance]    Selected station: ' + if $equipmentStation then $equipmentStation.knownname else 'NONE'" chance="100"/>
+            <debug_text text="'[GT-Maintenance] ═══════════════════════════════════════════════════════'" chance="100"/>
+          </do_if>
+          
+          <do_if value="$stationsChecked gt 0 and not $equipmentStation">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance]  WARNING: Checked ' + $stationsChecked + ' station(s), but NONE can supply equipment - will retry after next trade'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <do_if value="not $equipmentStation and $potentialStations.count == 0">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance]  WARNING: NO stations found in galaxy - check if player owns any wharfs/equipment docks/shipyards'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <do_if value="$equipmentStation and $equipmentStation.exists">
+            <!-- Final docking check BEFORE creating order (double-check even though already checked in loop) -->
+            <set_value name="$checkDocking" exact="not $ship.iscapitalship or ($equipmentStation.isclass.station)"/>
+            
+            <do_if value="$checkDocking">
+              <set_value name="$canDock" exact="$equipmentStation.dockingallowed.{$ship}"/>
+              
+              <do_if value="not $canDock">
+                <!-- Station is not dockable - log and continue trading -->
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance]   Equipment station ' + $equipmentStation.knownname + ' does not allow docking for ' + $ship.idcode + ' (trade restrictions, relation issues, or docking policy) - will continue with trading'" chance="100"/>
+                </do_if>
+                
+                <!-- Write logbook message when equipment station not dockable -->
+                <run_actions ref="md.GT_Libraries_General.GT_IsLogbookEnabled" result="$logbookEnabled">
+                  <param name="ship" value="$ship"/>
+                </run_actions>
+                <do_if value="$logbookEnabled">
+                  <!-- Only write logbook when debug is enabled -->
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <set_value name="$message" exact="{77000,3213}.[$equipmentStation.knownname,$ship.knownname]"/>
+                    <write_to_logbook 
+                      category="alerts" 
+                      title="'Auto-Resupply Unreachable: ' + $ship.knownname" 
+                      text="$message"
+                      interaction="showonmap" 
+                      object="$ship"
+                      highlighted="true"/>
+                  </do_if>
+                </do_if>
+                
+                <!-- Clear equipment station so we don't try to create order -->
+                <set_value name="$equipmentStation" exact="null"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <do_if value="$equipmentStation and $equipmentStation.exists">
+            <!-- Station found - build shopping list using vanilla's pattern -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] Building shopping list for ' + $ship.idcode + ' at ' + $equipmentStation.knownname" chance="100"/>
+            </do_if>
+            
+            <!-- Save current equipment levels to compare after resupply -->
+            <set_value name="$currentDeployables" exact="$ship.ammostorage.deployable.count"/>
+            <set_value name="$currentCM" exact="$ship.ammostorage.countermeasure.count"/>
+            <set_value name="$currentUnitsCount" exact="$ship.units.count"/>
+            
+            <!-- Get counts for each specific unit type BEFORE resupply -->
+            <!-- Note: Use macro directly, not macro.ware (vanilla pattern: units.{macro}.count) -->
+            <set_value name="$beforeDefenseDrones" exact="$ship.units.{macro.ship_gen_s_fightingdrone_01_a_macro}.count"/>
+            <set_value name="$beforeCargoDrones" exact="$ship.units.{macro.ship_gen_xs_cargodrone_empty_01_a_macro}.count"/>
+            <set_value name="$beforeLaserTowers" exact="$ship.units.{macro.ship_gen_xs_lasertower_01_a_macro}.count"/>
+            <set_value name="$beforeRepairDrones" exact="$ship.units.{macro.ship_gen_xs_repairdrone_01_a_macro}.count"/>
+            
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] EQUIPMENT COUNTS BEFORE RESUPPLY for ' + $ship.idcode + ':'" chance="100"/>
+              <debug_text text="'[GT-Maintenance]   Countermeasures: ' + $currentCM + '/' + $countermeasureCapacity" chance="100"/>
+              <debug_text text="'[GT-Maintenance]   Defense Drones: ' + $beforeDefenseDrones" chance="100"/>
+              <debug_text text="'[GT-Maintenance]   Cargo Drones: ' + $beforeCargoDrones" chance="100"/>
+              <debug_text text="'[GT-Maintenance]   Laser Towers: ' + $beforeLaserTowers" chance="100"/>
+              <debug_text text="'[GT-Maintenance]   Repair Drones: ' + $beforeRepairDrones" chance="100"/>
+              <debug_text text="'[GT-Maintenance]   Total Units: ' + $currentUnitsCount + '/' + $unitsCapacity" chance="100"/>
+            </do_if>
+            
+            <!-- Recalculate what ship needs (for shopping list) -->
+            <set_value name="$countermeasureCapacity" exact="$ship.ammostorage.countermeasure.capacity"/>
+            <set_value name="$currentCountermeasures" exact="$ship.ammostorage.countermeasure.count"/>
+            <set_value name="$countermeasurePercentage" exact="if $countermeasureCapacity gt 0 then ($currentCountermeasures * 100) / $countermeasureCapacity else 100"/>
+            
+            <set_value name="$deployableCapacity" exact="$ship.ammostorage.deployable.capacity"/>
+            <set_value name="$currentDeployablesPercentage" exact="$ship.ammostorage.deployable.count"/>
+            <set_value name="$deployablePercentage" exact="if $deployableCapacity gt 0 then ($currentDeployablesPercentage * 100) / $deployableCapacity else 100"/>
+            
+            <set_value name="$unitsCapacity" exact="$ship.units.maxcount"/>
+            <set_value name="$currentUnits" exact="$ship.units.count"/>
+            <set_value name="$unitsPercentage" exact="if $unitsCapacity gt 0 then ($currentUnits * 100) / $unitsCapacity else 100"/>
+            
+            <set_value name="$countermeasureThreshold" exact="@global.$GT_GlobalSettings.$DefensiveEquipment.$CountermeasureThreshold"/>
+            <set_value name="$unifiedThreshold" exact="@global.$GT_GlobalSettings.$DefensiveEquipment.$UnifiedThreshold"/>
+            <set_value name="$currentResourceProbes" exact="$ship.ammostorage.{deployablecategory.resourceprobe}.count"/>
+            
+            <!-- ========================================================================= -->
+            <!-- Always restock BOTH CM and Units when maintenance triggered -->
+            <!-- ========================================================================= -->
+            <!-- 
+              When maintenance is triggered (because EITHER CM or Units is low):
+              - Build shopping lists for BOTH CM AND Units (if ship has capacity AND below threshold)
+              - This ensures ONE trip gets everything
+              - After resupply, BOTH will be above threshold no immediate re-trigger
+              
+              Only restock CM if it's actually below threshold (not already full!)
+              Otherwise we try to buy 0 CM, which creates invalid build orders that get cancelled.
+            -->
+            <!-- Only restock CM if capacity exists AND percentage is below threshold -->
+            <set_value name="$needsCountermeasures" exact="$countermeasureCapacity gt 0 and $countermeasurePercentage lt $countermeasureThreshold"/>
+            <set_value name="$needsDeployables" exact="false"/>
+            <set_value name="$needsResourceProbes" exact="$shipIsGalaxyMiner and $autoDeployResourceProbes and $currentResourceProbes lt 1"/>
+            <!-- Only restock Units if capacity exists AND percentage is below threshold -->
+            <set_value name="$needsUnits" exact="$unitsCapacity gt 0 and $unitsPercentage lt $unifiedThreshold"/>
+            
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance]   Ship needs: CM=' + $needsCountermeasures + ' (' + $countermeasurePercentage + '%), Units=' + $needsUnits + ' (' + $unitsPercentage + '%), ResourceProbes=' + $needsResourceProbes + ' (current=' + $currentResourceProbes + ')'" chance="100"/>
+            </do_if>
+            
+            <!-- ALWAYS initialize to empty tables (not null) -->
+            <!-- If ammotable/unittable are null, add_build_to_modify_ship CLEARS all countermeasures/units! -->
+            <!-- Build ammo/unit tables like vanilla does -->
+            <set_value name="$ammotable" exact="table[]"/>
+            <set_value name="$unittable" exact="table[]"/>
+            
+            <!-- Get loadout level (determines what equipment to buy) -->
+            <set_value name="$loadoutlevel" exact="$ship.loadoutlevel"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance]   Loadout level: ' + $loadoutlevel" chance="100"/>
+            </do_if>
+            
+            <!-- Evaluate what UNITS ship needs (drones/towers) using Balance Profile -->
+            <!-- ALWAYS build unit list if ship has unit capacity - this ensures we restock EVERYTHING in one trip -->
+            <do_if value="$ship.units.maxcount gt 0">
+              <!-- Use Balance Profile to determine unit distribution -->
+              <set_value name="$balanceProfile" exact="@global.$GT_GlobalSettings.$DefensiveEquipment.$BalanceProfile"/>
+              <do_if value="not $balanceProfile?">
+                <set_value name="$balanceProfile" exact="2"/> <!-- Default: Trading-Focused -->
+              </do_if>
+              
+              <!-- Get distribution percentages from Balance Profile -->
+              <set_value name="$distribution" exact="table[
+                $DefenseDrones = 20,
+                $TradeDrones = 50,
+                $LaserTowers = 20,
+                $RepairDrones = 10
+              ]"/>
+              
+              <do_if value="$balanceProfile == 0">
+                <!-- Balanced -->
+                <set_value name="$distribution.$DefenseDrones" exact="35"/>
+                <set_value name="$distribution.$TradeDrones" exact="35"/>
+                <set_value name="$distribution.$LaserTowers" exact="20"/>
+                <set_value name="$distribution.$RepairDrones" exact="10"/>
+              </do_if>
+              <do_elseif value="$balanceProfile == 1">
+                <!-- Defensive -->
+                <set_value name="$distribution.$DefenseDrones" exact="50"/>
+                <set_value name="$distribution.$TradeDrones" exact="20"/>
+                <set_value name="$distribution.$LaserTowers" exact="20"/>
+                <set_value name="$distribution.$RepairDrones" exact="10"/>
+              </do_elseif>
+              <do_elseif value="$balanceProfile == 3">
+                <!-- Heavy Defense -->
+                <set_value name="$distribution.$DefenseDrones" exact="40"/>
+                <set_value name="$distribution.$TradeDrones" exact="30"/>
+                <set_value name="$distribution.$LaserTowers" exact="20"/>
+                <set_value name="$distribution.$RepairDrones" exact="10"/>
+              </do_elseif>
+              <do_elseif value="$balanceProfile == 4">
+                <!-- Tower Support -->
+                <set_value name="$distribution.$DefenseDrones" exact="30"/>
+                <set_value name="$distribution.$TradeDrones" exact="30"/>
+                <set_value name="$distribution.$LaserTowers" exact="30"/>
+                <set_value name="$distribution.$RepairDrones" exact="10"/>
+              </do_elseif>
+              <!-- Default is already set: Profile 2 = Trading-Focused -->
+              
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]   Balance Profile ' + $balanceProfile + ': Defense=' + $distribution.$DefenseDrones + '%, Trade=' + $distribution.$TradeDrones + '%, Towers=' + $distribution.$LaserTowers + '%, Repair=' + $distribution.$RepairDrones + '%'" chance="100"/>
+              </do_if>
+              
+              <!-- Calculate target quantities based on capacity and percentages -->
+              <set_value name="$totalCapacity" exact="$ship.units.maxcount"/>
+              <set_value name="$targetDefense" exact="(($totalCapacity * $distribution.$DefenseDrones) / 100)i"/>
+              <set_value name="$targetTrade" exact="(($totalCapacity * $distribution.$TradeDrones) / 100)i"/>
+              <set_value name="$targetTowers" exact="(($totalCapacity * $distribution.$LaserTowers) / 100)i"/>
+              <set_value name="$targetRepair" exact="(($totalCapacity * $distribution.$RepairDrones) / 100)i"/>
+              
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]   Targets (capacity=' + $totalCapacity + '): Defense=' + $targetDefense + ', Trade=' + $targetTrade + ', Towers=' + $targetTowers + ', Repair=' + $targetRepair" chance="100"/>
+              </do_if>
+              
+              <!-- Build unit shopping list using Balance Profile (like vanilla does in interrupt.restock line 603) -->
+              <!-- Initialize unittable BEFORE adding existing units (happens later) -->
+              <!-- We set TARGET amounts here, then add EXISTING amounts later to preserve them -->
+              <set_value name="$unittable" exact="table[]"/>
+              
+              <!-- Get current counts BEFORE setting targets (needed for later preservation logic) -->
+              <set_value name="$currentDefenseCount" exact="$ship.units.{macro.ship_gen_s_fightingdrone_01_a_macro}.count"/>
+              <set_value name="$currentCargoCount" exact="$ship.units.{macro.ship_gen_xs_cargodrone_empty_01_a_macro}.count"/>
+              <set_value name="$currentTowerCount" exact="$ship.units.{macro.ship_gen_xs_lasertower_01_a_macro}.count"/>
+              <set_value name="$currentRepairCount" exact="$ship.units.{macro.ship_gen_xs_repairdrone_01_a_macro}.count"/>
+              
+              <!-- Use hardcoded macro references (EXACTLY like vanilla) - macro.XXX.ware works at runtime! -->
+              <!-- Set TARGET amounts (will be adjusted by existing amounts later) -->
+              <do_if value="$targetDefense gt 0 and @global.$GT_GlobalSettings.$DefensiveEquipment.$RestockDefenseDrones">
+                <set_value name="$unittable.{macro.ship_gen_s_fightingdrone_01_a_macro.ware}" exact="$targetDefense"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance]   - Target Defense Drones: ' + $targetDefense + ' (current: ' + $currentDefenseCount + ')'" chance="100"/>
+                </do_if>
+              </do_if>
+              
+              <do_if value="$targetTrade gt 0 and @global.$GT_GlobalSettings.$DefensiveEquipment.$RestockTradeDrones">
+                <set_value name="$unittable.{macro.ship_gen_xs_cargodrone_empty_01_a_macro.ware}" exact="$targetTrade"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance]   - Target Trade Drones: ' + $targetTrade + ' (current: ' + $currentCargoCount + ')'" chance="100"/>
+                </do_if>
+              </do_if>
+              
+              <do_if value="$targetTowers gt 0 and @global.$GT_GlobalSettings.$DefensiveEquipment.$RestockLaserTowers">
+                <set_value name="$unittable.{macro.ship_gen_xs_lasertower_01_a_macro.ware}" exact="$targetTowers"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance]   - Target Laser Towers: ' + $targetTowers + ' (current: ' + $currentTowerCount + ')'" chance="100"/>
+                </do_if>
+              </do_if>
+              
+              <do_if value="$targetRepair gt 0 and @global.$GT_GlobalSettings.$DefensiveEquipment.$RestockRepairDrones">
+                <set_value name="$unittable.{macro.ship_gen_xs_repairdrone_01_a_macro.ware}" exact="$targetRepair"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance]   - Target Repair Drones: ' + $targetRepair + ' (current: ' + $currentRepairCount + ')'" chance="100"/>
+                </do_if>
+              </do_if>
+              
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]   Shopping list (targets) has ' + @$unittable.keys.count + ' unit types'" chance="100"/>
+              </do_if>
+            </do_if>
+            
+            <!-- NOTE: Deployables (mines, satellites) are NOT restocked for trading ships -->
+            <!-- Only combat ships with loadout configs defining deployables will get them via vanilla resupply -->
+            
+            <!-- NOTE: Countermeasure preservation happens AFTER this section (see lines ~1000+) -->
+            <!-- We preserve CM up to capacity there, so we don't need to build CM shopping list here -->
+            <!-- The preservation logic handles both "needed" and "not needed" cases -->
+            
+            <!-- add_build_to_modify_ship SETS inventory, doesn't ADD to it! -->
+            <!-- We MUST include CURRENT equipment in tables to preserve it -->
+            <!-- Pattern from vanilla interrupt.restock.xml lines 979-991 and 1009-1021 -->
+            
+            <!-- ALWAYS fill CM to MAX capacity -->
+            <!-- add_build_to_modify_ship SETS inventory - we must set CM to capacity to preserve it -->
+            <do_if value="$countermeasureCapacity gt 0">
+              <!-- Get available CM types from station -->
+              <set_value name="$availableCM" exact="@$equipmentStation.buildequipment.countermeasures.list"/>
+              <do_if value="@$availableCM.count gt 0">
+                <!-- Distribute MAX capacity across available CM types -->
+                <set_value name="$cmPerType" exact="($countermeasureCapacity / $availableCM.count)i"/>
+                <do_all exact="$availableCM.count" counter="$j">
+                  <set_value name="$cmMacro" exact="$availableCM.{$j}"/>
+                  <!-- Always set to MAX capacity -->
+                  <set_value name="$ammotable.{$cmMacro}" exact="$cmPerType"/>
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Maintenance]   - Setting CM to MAX: ' + $cmMacro + ' x' + $cmPerType + ' (capacity=' + $countermeasureCapacity + ')'" chance="100"/>
+                  </do_if>
+                </do_all>
+              </do_if>
+            </do_if>
+            
+            <!-- Miner probe restock: keep at least 1 resource probe loaded when enabled -->
+            <do_if value="$needsResourceProbes">
+              <set_value name="$resourceProbeTargetCount" exact="1"/>
+              <set_value name="$resourceProbeWare" exact="macro.eq_arg_resourceprobe_01_macro.ware"/>
+              <set_value name="$ammotable.{$resourceProbeWare}" exact="[$resourceProbeTargetCount, @$ammotable.{$resourceProbeWare}].max"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]   - Adding resource probe target: ' + $resourceProbeWare + ' x' + $resourceProbeTargetCount + ' (current=' + $currentResourceProbes + ')'" chance="100"/>
+              </do_if>
+            </do_if>
+            
+            <!-- Add CURRENT units to unit table (preserve existing units) -->
+            <!-- This happens AFTER setting targets, so we add existing to target = total desired -->
+            <!-- Note: Current counts already retrieved above (lines 904-907) if unit capacity exists -->
+            <!-- If unit capacity is 0, we need to get current counts here -->
+            <do_if value="$ship.units.maxcount == 0">
+              <!-- Ship has no unit capacity - skip unit preservation -->
+            </do_if>
+            <do_else>
+              <!-- Ship has unit capacity - preserve existing units -->
+              <set_value name="$defenseWare" exact="macro.ship_gen_s_fightingdrone_01_a_macro.ware"/>
+              <set_value name="$cargoWare" exact="macro.ship_gen_xs_cargodrone_empty_01_a_macro.ware"/>
+              <set_value name="$towerWare" exact="macro.ship_gen_xs_lasertower_01_a_macro.ware"/>
+              <set_value name="$repairWare" exact="macro.ship_gen_xs_repairdrone_01_a_macro.ware"/>
+              
+              <!-- Get current counts (if not already retrieved above) -->
+              <do_if value="not $currentDefenseCount?">
+                <set_value name="$currentDefenseCount" exact="$ship.units.{macro.ship_gen_s_fightingdrone_01_a_macro}.count"/>
+              </do_if>
+              <do_if value="not $currentCargoCount?">
+                <set_value name="$currentCargoCount" exact="$ship.units.{macro.ship_gen_xs_cargodrone_empty_01_a_macro}.count"/>
+              </do_if>
+              <do_if value="not $currentTowerCount?">
+                <set_value name="$currentTowerCount" exact="$ship.units.{macro.ship_gen_xs_lasertower_01_a_macro}.count"/>
+              </do_if>
+              <do_if value="not $currentRepairCount?">
+                <set_value name="$currentRepairCount" exact="$ship.units.{macro.ship_gen_xs_repairdrone_01_a_macro}.count"/>
+              </do_if>
+              
+              <!-- Add existing units to table (preserve them) - add to target = total desired -->
+              <!-- Always add existing, even if 0 (ensures we preserve what we have) -->
+              <set_value name="$unittable.{$defenseWare}" exact="@$unittable.{$defenseWare} + $currentDefenseCount"/>
+              <set_value name="$unittable.{$cargoWare}" exact="@$unittable.{$cargoWare} + $currentCargoCount"/>
+              <set_value name="$unittable.{$towerWare}" exact="@$unittable.{$towerWare} + $currentTowerCount"/>
+              <set_value name="$unittable.{$repairWare}" exact="@$unittable.{$repairWare} + $currentRepairCount"/>
+              
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]   - Preserving existing units: Defense=' + $currentDefenseCount + ', Cargo=' + $currentCargoCount + ', Towers=' + $currentTowerCount + ', Repair=' + $currentRepairCount" chance="100"/>
+              </do_if>
+            </do_else>
+            
+            <!-- Store shopping list for AI script -->
+            <!-- Ensure table exists before accessing (handles race condition) -->
+            <do_if value="not global.$GT_ResupplyOrders?">
+              <set_value name="global.$GT_ResupplyOrders" exact="table[]"/>
+            </do_if>
+            
+            <!-- Ensure currentCM is initialized (defensive check) -->
+            <set_value name="$storedCurrentCM" exact="if $currentCM? then $currentCM else $ship.ammostorage.countermeasure.count"/>
+            <set_value name="$storedCurrentUnits" exact="if $currentUnitsCount? then $currentUnitsCount else $ship.units.count"/>
+            <set_value name="$storedCurrentDeployables" exact="if $currentDeployables? then $currentDeployables else $ship.ammostorage.deployable.count"/>
+            
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] Storing resupply order tracking for ' + $ship.idcode + ': CM=' + $storedCurrentCM + ', Units=' + $storedCurrentUnits + ', Deployables=' + $storedCurrentDeployables" chance="100"/>
+              <debug_text text="'[GT-Maintenance] Final shopping list: Ammo types=' + @$ammotable.keys.count + ', Unit types=' + @$unittable.keys.count" chance="100"/>
+            </do_if>
+            
+            <set_value name="global.$GT_ResupplyOrders.{$ship}" exact="table[
+              $Station = $equipmentStation,
+              $AmmoTable = $ammotable,
+              $UnitTable = $unittable,
+              $DeployablesBefore = $storedCurrentDeployables,
+              $CountermeasuresBefore = $storedCurrentCM,
+              $UnitsBefore = $storedCurrentUnits,
+              $DefenseDronesBefore = $beforeDefenseDrones,
+              $CargoDronesBefore = $beforeCargoDrones,
+              $LaserTowersBefore = $beforeLaserTowers,
+              $RepairDronesBefore = $beforeRepairDrones
+            ]"/>
+            
+            <!-- PERFORMANCE OPTIMIZATION: Defer UI operations (ship renaming, logbook messages) -->
+            <do_if value="not global.$GT_DeferredUIUpdates?">
+              <set_value name="global.$GT_DeferredUIUpdates" exact="table[]"/>
+            </do_if>
+            <set_value name="$pilot" exact="$ship.pilot"/>
+            <set_value name="global.$GT_DeferredUIUpdates.{$ship}" exact="table[
+              $Type = 'equipment',
+              $Ship = $ship,
+              $Pilot = $pilot,
+              $LogbookMessage = '{77000,3207}.[' + $pilotLevel + ',' + $equipmentStation.knownname + ',' + $ship.knownname + ']',
+              $LogbookCategory = 'upkeep',
+              $LogbookTitle = 'Defensive Equipment Auto-Replenishment: ' + $ship.knownname,
+              $LogbookObject = $equipmentStation,
+              $LogbookInteraction = 'showonmap'
+            ]"/>
+            <signal_cue_instantly cue="md.GT_Maintenance.ProcessDeferredUIUpdates"/>
+            
+            <set_value name="$equipmentOrderCreated" exact="true"/>
+          </do_if>
+          <do_else>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] No equipment station found for ' + $ship.idcode" chance="100"/>
+            </do_if>
+            <!-- PERFORMANCE OPTIMIZATION: Defer UI operations (logbook messages) -->
+            <do_if value="not global.$GT_DeferredUIUpdates?">
+              <set_value name="global.$GT_DeferredUIUpdates" exact="table[]"/>
+            </do_if>
+            <set_value name="global.$GT_DeferredUIUpdates.{$ship}" exact="table[
+              $Type = 'equipment_failed',
+              $Ship = $ship,
+              $LogbookMessage = 'Level ' + $pilotLevel + ' ' + $ship.knownname + ' needs equipment but no suitable station found within ' + $maxJumpDistance + ' jumps.',
+              $LogbookCategory = 'upkeep',
+              $LogbookTitle = 'Defensive Equipment Auto-Replenishment Failed',
+              $LogbookObject = $ship,
+              $LogbookInteraction = 'showonmap'
+            ]"/>
+            <signal_cue_instantly cue="md.GT_Maintenance.ProcessDeferredUIUpdates"/>
+          </do_else>
+        </do_if>
+        
+        <!-- ========================================================================= -->
+        <!-- MONITOR COMPLETION                                                        -->
+        <!-- ========================================================================= -->
+        
+        <do_if value="$repairOrderCreated or $equipmentOrderCreated">
+          <!-- Track in global table for event-driven monitoring -->
+          <!-- Ensure table exists before accessing (handles race condition) -->
+          <do_if value="not global.$GT_MaintenanceOrders?">
+            <set_value name="global.$GT_MaintenanceOrders" exact="table[]"/>
+          </do_if>
+          
+          <!-- Don't overwrite existing maintenance order if one is already in progress -->
+          <!-- This prevents race condition where ship checks maintenance again before resupply completes -->
+          <set_value name="$existingOrder" exact="@global.$GT_MaintenanceOrders.{$ship}"/>
+          <set_value name="$hasExistingOrder" exact="$existingOrder?"/>
+          <set_value name="$existingWaitingForEquipment" exact="if $hasExistingOrder then @$existingOrder.$WaitingForEquipment else false"/>
+          <set_value name="$existingWaitingForRepair" exact="if $hasExistingOrder then @$existingOrder.$WaitingForRepair else false"/>
+          
+          <!-- Only consider order "in progress" if it has valid values (not null) -->
+          <!-- Stale orders with null values should be cleared, not preserved -->
+          <set_value name="$isValidExistingOrder" exact="$hasExistingOrder and ($existingWaitingForEquipment or $existingWaitingForRepair)"/>
+          
+          <do_if value="$isValidExistingOrder">
+            <!-- Maintenance order already in progress - don't overwrite it! -->
+            <set_value name="$existingNeededCM" exact="@$existingOrder.$NeededCM"/>
+            <set_value name="$existingNeededUnits" exact="@$existingOrder.$NeededUnits"/>
+            <set_value name="$existingBeforeCM" exact="@$existingOrder.$CountermeasuresBefore"/>
+            <set_value name="$existingBeforeUnits" exact="@$existingOrder.$UnitsBefore"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance]  Maintenance order already in progress for ' + $ship.idcode + ' - skipping new order creation (will wait for existing order to complete)'" chance="100"/>
+              <debug_text text="'[GT-Maintenance] Existing order details: NeededCM=' + $existingNeededCM + ', NeededUnits=' + $existingNeededUnits + ', BeforeCM=' + $existingBeforeCM + ', BeforeUnits=' + $existingBeforeUnits + ', WaitingForEquipment=' + $existingWaitingForEquipment" chance="100"/>
+              <debug_text text="'[GT-Maintenance] Current check would have set: NeededCM=' + $needsCountermeasures + ', NeededUnits=' + $needsUnits + ' (NOT overwriting!)'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- No existing order or existing order completed - create new tracking entry -->
+            <set_value name="global.$GT_MaintenanceOrders.{$ship}" exact="table[
+              $Ship = $ship,
+              $StartTime = player.age,
+              $WaitingForRepair = $repairOrderCreated,
+              $WaitingForEquipment = $equipmentOrderCreated,
+              $DeployablesBefore = @global.$GT_ResupplyOrders.{$ship}.$DeployablesBefore,
+              $CountermeasuresBefore = @global.$GT_ResupplyOrders.{$ship}.$CountermeasuresBefore,
+              $UnitsBefore = @global.$GT_ResupplyOrders.{$ship}.$UnitsBefore,
+              $NeededCM = $needsCountermeasures,
+              $NeededUnits = $needsUnits
+            ]"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] Created new maintenance order tracking: NeededCM=' + $needsCountermeasures + ', NeededUnits=' + $needsUnits + ', BeforeCM=' + (@global.$GT_ResupplyOrders.{$ship}.$CountermeasuresBefore) + ', BeforeUnits=' + (@global.$GT_ResupplyOrders.{$ship}.$UnitsBefore)" chance="100"/>
+            </do_if>
+          </do_else>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] ⏳ Tracking maintenance for ' + $ship.idcode + ' (Repair: ' + $repairOrderCreated + ', Equipment: ' + $equipmentOrderCreated + ')'" chance="100"/>
+          </do_if>
+          
+          <!-- CONCURRENCY CONTROL: Decrement counter when ExecuteMaintenance completes (orders created, will complete later via ProcessResupplyComplete/ProcessRepairComplete) -->
+          <!-- Note: Completion handlers will signal GT_Maintenance_Complete, but counter is decremented here when ExecuteMaintenance instance ends -->
+          <do_if value="global.$GT_MaintenanceQueue? and global.$GT_MaintenanceQueue.$ActiveInstances? and global.$GT_MaintenanceQueue.$ActiveInstances gt 0">
+            <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" operation="subtract"/>
+            <!-- Signal queue processor to process next item -->
+            <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <!-- No orders created - proceed to trading, will retry after next trade -->
+          <debug_text text="'[GT-Maintenance] No maintenance orders created for ' + $ship.idcode + ' (no stations with stock or no work needed), proceeding to trading'" chance="100"/>
+          
+          <!-- CONCURRENCY CONTROL: Decrement counter and process queue on completion -->
+          <do_if value="global.$GT_MaintenanceQueue? and global.$GT_MaintenanceQueue.$ActiveInstances? and global.$GT_MaintenanceQueue.$ActiveInstances gt 0">
+            <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" operation="subtract"/>
+            <!-- Signal queue processor to process next item -->
+            <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
+          </do_if>
+          
+          <signal_objects object="$ship" param="'GT_Maintenance_Complete'" delay="1ms"/>
+        </do_else>
+      </actions>
+    </cue>
+    
+    <!-- Process Resupply Completion (Event-Driven from diff patch) -->
+    <!-- Listen for signal instead of polling -->
+    <cue name="ProcessResupplyComplete" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_ResupplyComplete'"/>
+      </conditions>
+      <actions>
+        
+        <do_if value="global.$GT_ResupplyCompleteQueue? and global.$GT_ResupplyCompleteQueue.count gt 0">
+          <do_while value="global.$GT_ResupplyCompleteQueue.count gt 0">
+            <set_value name="$data" exact="global.$GT_ResupplyCompleteQueue.{1}"/>
+            <remove_from_list name="global.$GT_ResupplyCompleteQueue" exact="$data"/>
+            <set_value name="$ship" exact="$data.$Ship"/>
+            
+            <!-- Check if equipment order actually succeeded -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] Resupply completion signal received for ' + $ship.idcode" chance="100"/>
+            </do_if>
+            <do_if value="global.$GT_MaintenanceOrders? and global.$GT_MaintenanceOrders.{$ship}?">
+              <!-- Ship is actively tracked - process normally -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] Found maintenance order tracking for ' + $ship.idcode + ' - processing completion'" chance="100"/>
+              </do_if>
+              
+              <!-- Get stored values from maintenance order -->
+              <set_value name="$storedNeededCM" exact="@global.$GT_MaintenanceOrders.{$ship}.$NeededCM"/>
+              <set_value name="$storedNeededUnits" exact="@global.$GT_MaintenanceOrders.{$ship}.$NeededUnits"/>
+              <set_value name="$storedWaitingForEquipment" exact="@global.$GT_MaintenanceOrders.{$ship}.$WaitingForEquipment"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] Stored order values: NeededCM=' + $storedNeededCM + ', NeededUnits=' + $storedNeededUnits + ', WaitingForEquipment=' + $storedWaitingForEquipment" chance="100"/>
+              </do_if>
+              
+              <!-- Get current equipment levels -->
+              <!-- Log what we're reading to verify property access -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] Reading CURRENT equipment levels for ' + $ship.idcode + ' after resupply completion'" chance="100"/>
+                <debug_text text="'[GT-Maintenance]   Reading CM: ship.ammostorage.countermeasure.count = ' + $ship.ammostorage.countermeasure.count" chance="100"/>
+                <debug_text text="'[GT-Maintenance]   Reading CM capacity: ship.ammostorage.countermeasure.capacity = ' + $ship.ammostorage.countermeasure.capacity" chance="100"/>
+                <debug_text text="'[GT-Maintenance]   Reading Units: ship.units.count = ' + $ship.units.count" chance="100"/>
+              </do_if>
+              
+              <set_value name="$currentDeployables" exact="$ship.ammostorage.deployable.count"/>
+              <set_value name="$currentCM" exact="$ship.ammostorage.countermeasure.count"/>
+              <set_value name="$currentUnitsCount" exact="$ship.units.count"/>
+              <set_value name="$deployableCapacity" exact="$ship.ammostorage.deployable.capacity"/>
+              <set_value name="$cmCapacity" exact="$ship.ammostorage.countermeasure.capacity"/>
+              <set_value name="$unitsCapacity" exact="$ship.units.maxcount"/>
+              
+              <!-- Log what we read -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]   Read values: currentCM=' + $currentCM + ', cmCapacity=' + $cmCapacity + ', currentUnits=' + $currentUnitsCount + ', unitsCapacity=' + $unitsCapacity" chance="100"/>
+              </do_if>
+              
+              <!-- Get counts for each specific unit type AFTER resupply -->
+              <!-- Note: Use macro directly, not macro.ware (vanilla pattern: units.{macro}.count) -->
+              <set_value name="$afterDefenseDrones" exact="$ship.units.{macro.ship_gen_s_fightingdrone_01_a_macro}.count"/>
+              <set_value name="$afterCargoDrones" exact="$ship.units.{macro.ship_gen_xs_cargodrone_empty_01_a_macro}.count"/>
+              <set_value name="$afterLaserTowers" exact="$ship.units.{macro.ship_gen_xs_lasertower_01_a_macro}.count"/>
+              <set_value name="$afterRepairDrones" exact="$ship.units.{macro.ship_gen_xs_repairdrone_01_a_macro}.count"/>
+              
+              <!-- Get levels from before resupply -->
+              <set_value name="$beforeDeployables" exact="@global.$GT_MaintenanceOrders.{$ship}.$DeployablesBefore"/>
+              <set_value name="$beforeCM" exact="@global.$GT_MaintenanceOrders.{$ship}.$CountermeasuresBefore"/>
+              <set_value name="$beforeUnits" exact="@global.$GT_MaintenanceOrders.{$ship}.$UnitsBefore"/>
+              
+              <!-- Get unit type counts from before resupply (from resupply order tracking) -->
+              <set_value name="$beforeDefenseDrones" exact="@global.$GT_ResupplyOrders.{$ship}.$DefenseDronesBefore"/>
+              <set_value name="$beforeCargoDrones" exact="@global.$GT_ResupplyOrders.{$ship}.$CargoDronesBefore"/>
+              <set_value name="$beforeLaserTowers" exact="@global.$GT_ResupplyOrders.{$ship}.$LaserTowersBefore"/>
+              <set_value name="$beforeRepairDrones" exact="@global.$GT_ResupplyOrders.{$ship}.$RepairDronesBefore"/>
+              
+              <!-- Get what was ordered from resupply order tracking -->
+              <set_value name="$resupplyOrder" exact="@global.$GT_ResupplyOrders.{$ship}"/>
+              <set_value name="$orderedCMFromOrder" exact="0"/>
+              <set_value name="$orderedDefenseFromOrder" exact="0"/>
+              <set_value name="$orderedCargoFromOrder" exact="0"/>
+              <set_value name="$orderedTowersFromOrder" exact="0"/>
+              <set_value name="$orderedRepairFromOrder" exact="0"/>
+              <do_if value="$resupplyOrder?">
+                <!-- Initialize to safe defaults FIRST (memory pattern) -->
+                <set_value name="$ammoTableFromOrder" exact="@$resupplyOrder.$AmmoTable"/>
+                <set_value name="$unitTableFromOrder" exact="@$resupplyOrder.$UnitTable"/>
+                
+                <!-- Extract .keys with @, then extract .count with @, then check if count exists and > 0 -->
+                <set_value name="$ammoTableKeys" exact="@$ammoTableFromOrder.keys"/>
+                <set_value name="$ammoTableKeysCount" exact="@$ammoTableKeys.count"/>
+                <do_if value="$ammoTableKeysCount? and $ammoTableKeysCount gt 0">
+                  <!-- Sum up all countermeasures ordered -->
+                  <do_all exact="$ammoTableKeysCount" counter="$ammoKeyIdx">
+                    <set_value name="$ammoKey" exact="$ammoTableKeys.{$ammoKeyIdx}"/>
+                    <set_value name="$orderedCMFromOrder" exact="$orderedCMFromOrder + $ammoTableFromOrder.{$ammoKey}"/>
+                  </do_all>
+                </do_if>
+                
+                <!-- Extract .keys with @, then extract .count with @, then check if count exists and > 0 -->
+                <set_value name="$unitTableKeys" exact="@$unitTableFromOrder.keys"/>
+                <set_value name="$unitTableKeysCount" exact="@$unitTableKeys.count"/>
+                <do_if value="$unitTableKeysCount? and $unitTableKeysCount gt 0">
+                  <set_value name="$defenseWare" exact="macro.ship_gen_s_fightingdrone_01_a_macro.ware"/>
+                  <set_value name="$cargoWare" exact="macro.ship_gen_xs_cargodrone_empty_01_a_macro.ware"/>
+                  <set_value name="$towerWare" exact="macro.ship_gen_xs_lasertower_01_a_macro.ware"/>
+                  <set_value name="$repairWare" exact="macro.ship_gen_xs_repairdrone_01_a_macro.ware"/>
+                  <set_value name="$orderedDefenseFromOrder" exact="@$unitTableFromOrder.{$defenseWare}"/>
+                  <set_value name="$orderedCargoFromOrder" exact="@$unitTableFromOrder.{$cargoWare}"/>
+                  <set_value name="$orderedTowersFromOrder" exact="@$unitTableFromOrder.{$towerWare}"/>
+                  <set_value name="$orderedRepairFromOrder" exact="@$unitTableFromOrder.{$repairWare}"/>
+                </do_if>
+              </do_if>
+              
+              <!-- What was actually restocked when order finishes -->
+              <set_value name="$cmGained" exact="$currentCM - $beforeCM"/>
+              <set_value name="$defenseGained" exact="$afterDefenseDrones - $beforeDefenseDrones"/>
+              <set_value name="$cargoGained" exact="$afterCargoDrones - $beforeCargoDrones"/>
+              <set_value name="$towersGained" exact="$afterLaserTowers - $beforeLaserTowers"/>
+              <set_value name="$repairGained" exact="$afterRepairDrones - $beforeRepairDrones"/>
+              <set_value name="$totalUnitsGained" exact="$currentUnitsCount - $beforeUnits"/>
+              
+              <!-- Summary of what was restocked -->
+              <set_value name="$restockedItems" exact="[]"/>
+              <do_if value="$cmGained gt 0">
+                <append_to_list name="$restockedItems" exact="'CM +' + $cmGained"/>
+              </do_if>
+              <do_if value="$defenseGained gt 0">
+                <append_to_list name="$restockedItems" exact="'Defense Drones +' + $defenseGained"/>
+              </do_if>
+              <do_if value="$cargoGained gt 0">
+                <append_to_list name="$restockedItems" exact="'Cargo Drones +' + $cargoGained"/>
+              </do_if>
+              <do_if value="$towersGained gt 0">
+                <append_to_list name="$restockedItems" exact="'Laser Towers +' + $towersGained"/>
+              </do_if>
+              <do_if value="$repairGained gt 0">
+                <append_to_list name="$restockedItems" exact="'Repair Drones +' + $repairGained"/>
+              </do_if>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <set_value name="$restockedSummary" exact="if $restockedItems.count gt 0 then $restockedItems.{1} + (if $restockedItems.count gt 1 then ', ' + $restockedItems.{2} else '') + (if $restockedItems.count gt 2 then ', ' + $restockedItems.{3} else '') + (if $restockedItems.count gt 3 then ', ' + $restockedItems.{4} else '') + (if $restockedItems.count gt 4 then ', ' + $restockedItems.{5} else '') else 'NOTHING'"/>
+                <debug_text text="'[GT-Maintenance] RESUPPLY ORDER COMPLETED for ' + $ship.idcode + '  '" chance="100"/>
+                <debug_text text="'[GT-Maintenance] RESTOCKED: ' + $restockedSummary" chance="100"/>
+              </do_if>
+              
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] EQUIPMENT COUNTS AFTER RESUPPLY for ' + $ship.idcode + ':'" chance="100"/>
+                <debug_text text="'[GT-Maintenance]   Countermeasures: ' + $beforeCM + ' ' + $currentCM + ' (ordered: ' + $orderedCMFromOrder + ', gained: ' + $cmGained + ')'" chance="100"/>
+                <debug_text text="'[GT-Maintenance]   Defense Drones: ' + $beforeDefenseDrones + ' ' + $afterDefenseDrones + ' (ordered: ' + $orderedDefenseFromOrder + ', gained: ' + $defenseGained + ')'" chance="100"/>
+                <debug_text text="'[GT-Maintenance]   Cargo Drones: ' + $beforeCargoDrones + ' ' + $afterCargoDrones + ' (ordered: ' + $orderedCargoFromOrder + ', gained: ' + $cargoGained + ')'" chance="100"/>
+                <debug_text text="'[GT-Maintenance]   Laser Towers: ' + $beforeLaserTowers + ' ' + $afterLaserTowers + ' (ordered: ' + $orderedTowersFromOrder + ', gained: ' + $towersGained + ')'" chance="100"/>
+                <debug_text text="'[GT-Maintenance]   Repair Drones: ' + $beforeRepairDrones + ' ' + $afterRepairDrones + ' (ordered: ' + $orderedRepairFromOrder + ', gained: ' + $repairGained + ')'" chance="100"/>
+                <debug_text text="'[GT-Maintenance]   Total Units: ' + $beforeUnits + ' ' + $currentUnitsCount + ' (gained: ' + $totalUnitsGained + ')'" chance="100"/>
+              </do_if>
+              
+              <!-- Check if we actually got something meaningful -->
+              <!-- Accept partial restocking: if we got at least 2 of anything, that's good enough -->
+              <!-- This prevents ships from cruising the entire universe trying to get fully stocked -->
+              <!-- If station had limited stock, we take what we can and proceed with trading -->
+              <set_value name="$deployablesGained" exact="$currentDeployables - $beforeDeployables"/>
+              <set_value name="$cmGained" exact="$currentCM - $beforeCM"/>
+              <set_value name="$unitsGained" exact="$currentUnitsCount - $beforeUnits"/>
+              <set_value name="$minAcceptable" exact="2"/> <!-- Minimum items to consider resupply successful -->
+              
+              <set_value name="$gotEnoughDeployables" exact="$deployablesGained ge $minAcceptable"/>
+              <set_value name="$gotEnoughCM" exact="$cmGained ge $minAcceptable"/>
+              <set_value name="$gotEnoughUnits" exact="$unitsGained ge $minAcceptable"/>
+              <set_value name="$resupplySuccessful" exact="$gotEnoughDeployables or $gotEnoughCM or $gotEnoughUnits"/>
+              
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] Resupply result for ' + $ship.idcode + ': CM +' + $cmGained + ' (' + $beforeCM + '→' + $currentCM + '), Deployables +' + $deployablesGained + ' (' + $beforeDeployables + '→' + $currentDeployables + '), Units +' + $unitsGained + ' (' + $beforeUnits + '→' + $currentUnitsCount + ') - ' + if $resupplySuccessful then 'Acceptable' else 'Insufficient'" chance="100"/>
+              </do_if>
+              
+              <do_if value="$resupplySuccessful">
+                <!-- Resupply was successful - verify that CURRENT equipment is above threshold (not just what was originally needed) -->
+                <!-- Check CURRENT equipment levels against threshold, not just if originally-needed items are satisfied -->
+                <!-- This prevents loops when equipment drops below threshold after resupply (e.g., CM consumed during resupply) -->
+                <set_value name="$neededCM" exact="@global.$GT_MaintenanceOrders.{$ship}.$NeededCM"/>
+                <set_value name="$neededUnits" exact="@global.$GT_MaintenanceOrders.{$ship}.$NeededUnits"/>
+                
+                <!-- Get thresholds -->
+                <set_value name="$countermeasureThreshold" exact="@global.$GT_GlobalSettings.$DefensiveEquipment.$CountermeasureThreshold"/>
+                <set_value name="$unifiedThreshold" exact="@global.$GT_GlobalSettings.$DefensiveEquipment.$UnifiedThreshold"/>
+                
+                <!-- Check CURRENT equipment levels against threshold -->
+                <set_value name="$cmPercentage" exact="if $cmCapacity gt 0 then ($currentCM * 100) / $cmCapacity else 100"/>
+                <set_value name="$unitsPercentage" exact="if $unitsCapacity gt 0 then ($currentUnitsCount * 100) / $unitsCapacity else 100"/>
+                
+                <!-- Only check what was ORIGINALLY needed, not everything -->
+                <!-- If CM wasn't needed originally, don't check it. Same for units. -->
+                <!-- Use separate variables to avoid nested if-then-else (X4 doesn't support chained if-then-else) -->
+                <set_value name="$cmSatisfied" exact="if not $neededCM then true else false"/>
+                <set_value name="$unitsSatisfied" exact="if not $neededUnits then true else false"/>
+                
+                <!-- If needed, check if capacity is 0 or percentage is above threshold -->
+                <do_if value="$neededCM and not $cmSatisfied">
+                  <set_value name="$cmSatisfied" exact="if $cmCapacity == 0 then true else ($cmPercentage ge $countermeasureThreshold)"/>
+                </do_if>
+                <do_if value="$neededUnits and not $unitsSatisfied">
+                  <set_value name="$unitsSatisfied" exact="if $unitsCapacity == 0 then true else ($unitsPercentage ge $unifiedThreshold)"/>
+                </do_if>
+                
+                <!-- Track verification logic -->
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance] Resupply successful for ' + $ship.idcode + ' - Verification details:'" chance="100"/>
+                  <debug_text text="'[GT-Maintenance]   CM: Needed=' + $neededCM + ', Current=' + $currentCM + '/' + $cmCapacity + ' (' + $cmPercentage + '%), Threshold=' + $countermeasureThreshold + '%, Satisfied=' + $cmSatisfied + ' (not needed=' + (not $neededCM) + ' OR percentage>=threshold=' + ($cmPercentage ge $countermeasureThreshold) + ')'" chance="100"/>
+                  <debug_text text="'[GT-Maintenance]   Units: Needed=' + $neededUnits + ', Current=' + $currentUnitsCount + '/' + $unitsCapacity + ' (' + $unitsPercentage + '%), Threshold=' + $unifiedThreshold + '%, Satisfied=' + $unitsSatisfied + ' (not needed=' + (not $neededUnits) + ' OR percentage>=threshold=' + ($unitsPercentage ge $unifiedThreshold) + ')'" chance="100"/>
+                  <debug_text text="'[GT-Maintenance]   Final: Both satisfied=' + ($cmSatisfied and $unitsSatisfied) + ' (CM=' + $cmSatisfied + ', Units=' + $unitsSatisfied + ')'" chance="100"/>
+                </do_if>
+                <debug_text text="'[GT-Maintenance] Resupply successful for ' + $ship.idcode + ' - Needed: CM=' + $neededCM + ' (now ' + $cmPercentage + '% >= ' + $countermeasureThreshold + '%: ' + $cmSatisfied + '), Units=' + $neededUnits + ' (now ' + $unitsPercentage + '% >= ' + $unifiedThreshold + '%: ' + $unitsSatisfied + ')'" chance="100"/>
+                
+                <do_if value="$cmSatisfied and $unitsSatisfied">
+                  <!-- What we needed is satisfied - complete maintenance -->
+                  <set_value name="global.$GT_MaintenanceOrders.{$ship}.$WaitingForEquipment" exact="false"/>
+                  
+                  <!-- Check if all maintenance complete -->
+                  <set_value name="$waitingForRepair" exact="@global.$GT_MaintenanceOrders.{$ship}.$WaitingForRepair"/>
+                  <do_if value="not $waitingForRepair">
+                    <!-- All done! -->
+                    <remove_value name="global.$GT_MaintenanceOrders.{$ship}"/>
+                    
+                    <!-- Clear resupply order tracking -->
+                    <do_if value="global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{$ship}?">
+                      <remove_value name="global.$GT_ResupplyOrders.{$ship}"/>
+                    </do_if>
+                    
+                    <!-- Trigger ship rename to remove [RESUPPLY]/[MAINTENANCE] state -->
+                    <do_if value="@$ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}?">
+                      <set_value name="$pilot" exact="$ship.pilot"/>
+                      <run_actions ref="md.GT_Ship_Management.Update_Ship_Name">
+                        <param name="ship" value="$ship"/>
+                        <param name="pilot" value="$pilot"/>
+                        <param name="xp" value="global.$GT_Pilots.{$pilot}.$XP"/>
+                        <param name="level" value="global.$GT_Pilots.{$pilot}.$Level"/>
+                        <param name="rank" value="@global.$GT_Pilots.{$pilot}.$CurrentRank"/>
+                        <param name="nameType" value="'trader'"/>
+                      </run_actions>
+                    </do_if>
+                    
+                    <!-- CONCURRENCY CONTROL: Decrement counter and process queue on completion -->
+                    <do_if value="global.$GT_MaintenanceQueue? and global.$GT_MaintenanceQueue.$ActiveInstances? and global.$GT_MaintenanceQueue.$ActiveInstances gt 0">
+                      <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" operation="subtract"/>
+                      <!-- Signal queue processor to process next item -->
+                      <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
+                    </do_if>
+                    
+                    <signal_objects object="$ship" param="'GT_Maintenance_Complete'" delay="1ms"/>
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-Maintenance] All maintenance complete for ' + $ship.idcode" chance="100"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+                <do_else>
+                  <!-- Equipment below threshold after resupply - DO NOT signal completion, trigger another resupply immediately -->
+                  <debug_text text="'[GT-Maintenance]  Resupply completed but equipment below threshold for ' + $ship.idcode + ' - CM satisfied=' + $cmSatisfied + ' (' + $currentCM + '/' + $cmCapacity + ' = ' + $cmPercentage + '% >= ' + $countermeasureThreshold + '%), Units satisfied=' + $unitsSatisfied + ' (' + $currentUnitsCount + '/' + $unitsCapacity + ' = ' + $unitsPercentage + '% >= ' + $unifiedThreshold + '%) - triggering another resupply'" chance="100"/>
+                  
+                  <!-- Clear the maintenance order so DoMaintenance can create a new one -->
+                  <set_value name="global.$GT_MaintenanceOrders.{$ship}.$WaitingForEquipment" exact="false"/>
+                  <remove_value name="global.$GT_MaintenanceOrders.{$ship}"/>
+                  
+                  <!-- Clear resupply order tracking -->
+                  <do_if value="global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{$ship}?">
+                    <remove_value name="global.$GT_ResupplyOrders.{$ship}"/>
+                  </do_if>
+                  
+                  <!-- DO NOT signal completion - trigger another maintenance check immediately -->
+                  <!-- This will check equipment again and create a new resupply order if still below threshold -->
+                  <signal_objects object="player.galaxy" param="'GT_DoMaintenance'" param2="$ship"/>
+                </do_else>
+              </do_if>
+              <do_else>
+                <!-- Resupply failed (got less than minimum acceptable) - add cooldown to prevent immediate retry -->
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance]  Resupply insufficient for ' + $ship.idcode + ' - got less than ' + $minAcceptable + ' items, adding cooldown before retry'" chance="100"/>
+                </do_if>
+                
+                <!-- Add to failed resupply tracking with cooldown (prevents immediate retry) -->
+                
+                <!-- Set cooldown: 300 seconds (5 minutes) before allowing another resupply attempt -->
+                <set_value name="global.$GT_MaintenanceFailedResupply.{$ship}" exact="player.age + 300s"/>
+                <debug_text text="'[GT-Maintenance] 🕒 Cooldown set for ' + $ship.idcode + ' until ' + (player.age + 300s) + ' (5 minutes from now)'" chance="100"/>
+                
+                <!-- Clear the waiting flag and remove order so ship can proceed to trading -->
+                <set_value name="global.$GT_MaintenanceOrders.{$ship}.$WaitingForEquipment" exact="false"/>
+                <remove_value name="global.$GT_MaintenanceOrders.{$ship}"/>
+                
+                <!-- Signal ship to proceed -->
+                <signal_objects object="$ship" param="'GT_Maintenance_Complete'" delay="1ms"/>
+              </do_else>
+            </do_if>
+            <do_else>
+              <!-- Ship not actively tracked - this is a stale order from old save -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance]  Ignoring resupply completion for ' + $ship.idcode + ' - no active tracking (stale order from old save or order was aborted)'" chance="100"/>
+                
+                <!-- Log current equipment levels for debugging -->
+                <set_value name="$currentCM" exact="$ship.ammostorage.countermeasure.count"/>
+                <set_value name="$currentUnits" exact="$ship.units.count"/>
+                <set_value name="$cmCapacity" exact="$ship.ammostorage.countermeasure.capacity"/>
+                <set_value name="$unitsCapacity" exact="$ship.units.maxcount"/>
+                <set_value name="$cmPercentage" exact="if $cmCapacity gt 0 then ($currentCM * 100) / $cmCapacity else 100"/>
+                <set_value name="$unitsPercentage" exact="if $unitsCapacity gt 0 then ($currentUnits * 100) / $unitsCapacity else 100"/>
+                <debug_text text="'[GT-Maintenance] Current equipment levels (no tracking): CM=' + $currentCM + '/' + $cmCapacity + ' (' + $cmPercentage + '%), Units=' + $currentUnits + '/' + $unitsCapacity + ' (' + $unitsPercentage + '%)'" chance="100"/>
+              </do_if>
+              
+              <!-- Clear stale resupply order tracking -->
+              <do_if value="global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{$ship}?">
+                <remove_value name="global.$GT_ResupplyOrders.{$ship}"/>
+              </do_if>
+              
+              <!-- Trigger ship rename to remove [RESUPPLY] state -->
+              <do_if value="@$ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}?">
+                <set_value name="$pilot" exact="$ship.pilot"/>
+                <run_actions ref="md.GT_Ship_Management.Update_Ship_Name">
+                  <param name="ship" value="$ship"/>
+                  <param name="pilot" value="$pilot"/>
+                  <param name="xp" value="global.$GT_Pilots.{$pilot}.$XP"/>
+                  <param name="level" value="global.$GT_Pilots.{$pilot}.$Level"/>
+                  <param name="rank" value="@global.$GT_Pilots.{$pilot}.$CurrentRank"/>
+                  <param name="nameType" value="'trader'"/>
+                </run_actions>
+              </do_if>
+              
+              <!-- Still need to signal ship in case AI is waiting, but don't set cooldown -->
+              <!-- This allows the ship to proceed with normal operations -->
+              <signal_objects object="$ship" param="'GT_Maintenance_Complete'" delay="1ms"/>
+            </do_else>
+          </do_while>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Process Repair Completion (Event-Driven from diff patch) -->
+    <!-- Listen for signal instead of polling -->
+    <cue name="ProcessRepairComplete" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_RepairComplete'"/>
+      </conditions>
+      <actions>
+        
+        <do_if value="global.$GT_RepairCompleteQueue? and global.$GT_RepairCompleteQueue.count gt 0">
+          <do_while value="global.$GT_RepairCompleteQueue.count gt 0">
+            <set_value name="$data" exact="global.$GT_RepairCompleteQueue.{1}"/>
+            <remove_from_list name="global.$GT_RepairCompleteQueue" exact="$data"/>
+            <set_value name="$ship" exact="$data.$Ship"/>
+            
+            <!-- Mark repair order as complete in tracking -->
+            <do_if value="global.$GT_MaintenanceOrders? and global.$GT_MaintenanceOrders.{$ship}?">
+              <set_value name="global.$GT_MaintenanceOrders.{$ship}.$WaitingForRepair" exact="false"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] Repair complete for ' + $ship.idcode + ' (from diff patch signal)'" chance="100"/>
+              </do_if>
+              
+              <!-- Check if all maintenance complete -->
+              <set_value name="$waitingForEquipment" exact="@global.$GT_MaintenanceOrders.{$ship}.$WaitingForEquipment"/>
+              <do_if value="not $waitingForEquipment">
+                <!-- All done! -->
+                <remove_value name="global.$GT_MaintenanceOrders.{$ship}"/>
+                
+                <!-- Clear repair flag -->
+                <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$NeedsRepair?">
+                  <remove_value name="global.$GT_Ships.{$ship}.$NeedsRepair"/>
+                </do_if>
+                
+                <!-- Clear repair order tracking -->
+                <do_if value="global.$GT_RepairOrders? and global.$GT_RepairOrders.{$ship}?">
+                  <remove_value name="global.$GT_RepairOrders.{$ship}"/>
+                </do_if>
+                
+                <!-- Trigger ship rename to remove [REPAIR]/[MAINTENANCE] state -->
+                <do_if value="@$ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}?">
+                  <set_value name="$pilot" exact="$ship.pilot"/>
+                  <run_actions ref="md.GT_Ship_Management.Update_Ship_Name">
+                    <param name="ship" value="$ship"/>
+                    <param name="pilot" value="$pilot"/>
+                    <param name="xp" value="global.$GT_Pilots.{$pilot}.$XP"/>
+                    <param name="level" value="global.$GT_Pilots.{$pilot}.$Level"/>
+                    <param name="rank" value="@global.$GT_Pilots.{$pilot}.$CurrentRank"/>
+                    <param name="nameType" value="'trader'"/>
+                  </run_actions>
+                </do_if>
+                
+                <!-- CONCURRENCY CONTROL: Decrement counter and process queue on completion -->
+                <do_if value="global.$GT_MaintenanceQueue? and global.$GT_MaintenanceQueue.$ActiveInstances? and global.$GT_MaintenanceQueue.$ActiveInstances gt 0">
+                  <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" operation="subtract"/>
+                  <!-- Signal queue processor to process next item -->
+                  <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
+                </do_if>
+                
+                <signal_objects object="$ship" param="'GT_Maintenance_Complete'" delay="1ms"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Maintenance] All maintenance complete for ' + $ship.idcode" chance="100"/>
+                </do_if>
+              </do_if>
+            </do_if>
+            <do_elseif value="global.$GT_AutoRepair? and global.$GT_AutoRepair.{$ship}?">
+              <!-- Auto-repair path: Clear repair flag and update ship name -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] Auto-repair complete for ' + $ship.idcode + ' (from diff patch signal)'" chance="100"/>
+              </do_if>
+              
+              <!-- Clear repair flag -->
+              <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$NeedsRepair?">
+                <remove_value name="global.$GT_Ships.{$ship}.$NeedsRepair"/>
+              </do_if>
+              
+              <!-- Trigger ship rename to remove [REPAIR] state -->
+              <do_if value="@$ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}?">
+                <set_value name="$pilot" exact="$ship.pilot"/>
+                <run_actions ref="md.GT_Ship_Management.Update_Ship_Name">
+                  <param name="ship" value="$ship"/>
+                  <param name="pilot" value="$pilot"/>
+                  <param name="xp" value="global.$GT_Pilots.{$pilot}.$XP"/>
+                  <param name="level" value="global.$GT_Pilots.{$pilot}.$Level"/>
+                  <param name="rank" value="@global.$GT_Pilots.{$pilot}.$CurrentRank"/>
+                  <param name="nameType" value="'trader'"/>
+                </run_actions>
+              </do_if>
+              
+              <!-- Send repair completed signal to AI script -->
+              <signal_objects object="$ship" param="'GT_RepairCompleted'" delay="1ms"/>
+              
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] Auto-repair state cleared for ' + $ship.idcode" chance="100"/>
+              </do_if>
+            </do_elseif>
+          </do_while>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- ============================================================================= -->
+    <!-- LIBRARY: Find Nearest Repair Station                                         -->
+    <!-- ============================================================================= -->
+    <library name="FindNearestRepairStation" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship that needs repair"/>
+        <param name="maxJumpDistance" comment="Maximum jump distance to search for repair stations"/>
+      </params>
+      <actions>
+        <!-- PERFORMANCE OPTIMIZATION: Cache station search results (stations don't change often) -->
+        <!-- Cache key: 'repair_stations' (same for all ships, stations rarely change) -->
+        <!-- Cache age: 300 seconds (5 minutes) - stations can be destroyed/built, but rarely -->
+        <set_value name="$cacheKey" exact="'repair_stations'"/>
+        <set_value name="$cacheAge" exact="300s"/>
+        <set_value name="$useCache" exact="false"/>
+        
+        <!-- Check if cache exists and is fresh -->
+        <!-- CRITICAL: Use {'$' + $cacheKey} pattern for string keys in X4 tables -->
+        <set_value name="$cacheKeyWithDollar" exact="'$' + $cacheKey"/>
+        <do_if value="global.$GT_MaintenanceStationCache? and global.$GT_MaintenanceStationCache.{$cacheKeyWithDollar}?">
+          <set_value name="$cacheEntry" exact="global.$GT_MaintenanceStationCache.{$cacheKeyWithDollar}"/>
+          <set_value name="$cacheTime" exact="@$cacheEntry.$Timestamp"/>
+          <do_if value="(player.age - $cacheTime) lt $cacheAge">
+            <set_value name="$useCache" exact="true"/>
+            <set_value name="$potentialStations" exact="@$cacheEntry.$Stations"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Using cached repair station search (age: ' + (player.age - $cacheTime) + 's)'" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- Only search if cache miss or expired -->
+        <do_if value="not $useCache">
+          <!-- Use capability-based search instead of station type checks -->
+          <!-- Vanilla pattern: Stations can repair if they have shiptrader AND can build OR supply the ship's class -->
+          <!-- Source: interrupt.restock.xml:778, order.repair.xml:71-73 -->
+          <!-- Find stations with shiptrader (repair capability), then validate canbuildclass OR cansupplyclass manually -->
+          <!-- Note: find_station doesn't support OR logic for canbuildclass/cansupplyclass, so we search for shiptrader and validate capability -->
+          <find_station name="$potentialStations" 
+            space="player.galaxy" 
+            multiple="true" 
+            knownto="player.entity" 
+            checkoperational="true" 
+            sortbygatedistanceto="$ship"
+            hascontrolentity="controlpost.shiptrader">
+            <match class="class.station"/>
+            <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+          </find_station>
+          
+          <!-- Store in cache -->
+          <!-- CRITICAL: Ensure list is never null before storing in cache -->
+          <do_if value="not global.$GT_MaintenanceStationCache?">
+            <set_value name="global.$GT_MaintenanceStationCache" exact="table[]"/>
+          </do_if>
+          <!-- Ensure list is initialized (never null) -->
+          <set_value name="$stationsToCache" exact="if $potentialStations? then $potentialStations else []"/>
+          <set_value name="global.$GT_MaintenanceStationCache.{$cacheKeyWithDollar}" exact="table[
+            $Stations = $stationsToCache,
+            $Timestamp = player.age
+          ]"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Cached repair station search results (' + $potentialStations.count + ' stations)'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Found ' + $potentialStations.count + ' stations with shiptrader (sorted by distance)'" chance="100"/>
+        </do_if>
+        
+        <!-- Validate each station has repair capability AND docking capability -->
+        <!-- Vanilla check: station must be able to build OR supply this ship class (interrupt.restock.xml:778) -->
+        <set_value name="$validatedStations" exact="[]"/>
+        <set_value name="$preFilterRejectCapability" exact="0"/>
+        <set_value name="$preFilterRejectDocking" exact="0"/>
+        <do_all exact="$potentialStations.count" counter="$i">
+          <set_value name="$station" exact="$potentialStations.{$i}"/>
+          <set_value name="$isValid" exact="true"/>
+          
+          <!-- Verify repair capability: can build OR supply this ship class -->
+          <set_value name="$canBuild" exact="@$station.canbuildclass.{$ship.class}"/>
+          <set_value name="$canSupply" exact="@$station.cansupplyclass.{$ship.class}"/>
+          <do_if value="not $canBuild and not $canSupply">
+            <set_value name="$isValid" exact="false"/>
+            <set_value name="$preFilterRejectCapability" operation="add"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Pre-filter REJECT: ' + $station.knownname + ' - cannot build/supply class ' + $ship.class + ' (canBuild=' + $canBuild + ', canSupply=' + $canSupply + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <!-- Verify docking capability: station must have docking bay for this ship size -->
+          <do_if value="$isValid">
+            <find_dockingbay name="$testDock" object="$station" checkoperational="true" multiple="false">
+              <match_dock size="$ship.docksize" storage="false"/>
+            </find_dockingbay>
+            <do_if value="not $testDock">
+              <set_value name="$isValid" exact="false"/>
+              <set_value name="$preFilterRejectDocking" operation="add"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Pre-filter REJECT: ' + $station.knownname + ' - no docking bay for size ' + $ship.docksize" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <do_if value="$isValid">
+            <append_to_list name="$validatedStations" exact="$station"/>
+          </do_if>
+        </do_all>
+        
+        <set_value name="$potentialStations" exact="$validatedStations"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Pre-filter: ' + $potentialStations.count + ' passed, ' + $preFilterRejectCapability + ' rejected (capability), ' + $preFilterRejectDocking + ' rejected (docking) — ship class=' + $ship.class + ', docksize=' + $ship.docksize" chance="100"/>
+        </do_if>
+        
+        <!-- Prefer player-owned stations if they are within +2 jumps of nearest foreign station -->
+        <set_value name="$playerStationJumpPreference" exact="2"/>
+        <set_value name="$nearestStation" exact="null"/>
+        <set_value name="$nearestPlayerStation" exact="null"/>
+        <set_value name="$nearestPlayerDistance" exact="999999"/>
+        <set_value name="$nearestForeignStation" exact="null"/>
+        <set_value name="$nearestForeignDistance" exact="999999"/>
+        
+        <do_all exact="$potentialStations.count" counter="$i">
+          <set_value name="$station" exact="$potentialStations.{$i}"/>
+          <set_value name="$isValid" exact="true"/>
+          <set_value name="$rejectReason" exact="''"/>
+          <set_value name="$gateDistance" exact="-1"/>
+          
+          <!-- DIAGNOSTIC: Log each station being evaluated -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] Evaluating: ' + $station.knownname + ' (sector: ' + @$station.sector.knownname + ', owner: ' + @$station.owner.knownname + ')'" chance="100"/>
+          </do_if>
+          
+          <!-- SAFETY CHECK 1: Blacklist checks (station + sector) -->
+          <do_if value="$isValid">
+            <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroup">
+              <param name="ship" value="$ship"/>
+            </run_actions>
+            <run_actions ref="md.GT_Libraries_Blacklist.GT_IsStationBlacklisted" result="$stationBlacklisted">
+              <param name="station" value="$station"/>
+              <param name="ship" value="$ship"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+            </run_actions>
+            <run_actions ref="md.GT_Libraries_Blacklist.GT_IsSectorBlacklisted" result="$sectorBlacklistDetails">
+              <param name="sector" value="$station.sector"/>
+              <param name="ship" value="$ship"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+              <param name="returnDetails" value="true"/>
+            </run_actions>
+            <set_value name="$sectorTravelBlacklisted" exact="$sectorBlacklistDetails.$TravelBlacklisted"/>
+            <set_value name="$sectorActivityBlacklisted" exact="$sectorBlacklistDetails.$ActivityBlacklisted"/>
+            
+            <do_if value="$stationBlacklisted or $sectorTravelBlacklisted or $sectorActivityBlacklisted">
+              <set_value name="$isValid" exact="false"/>
+              <set_value name="$rejectReason" exact="if $stationBlacklisted then 'BLACKLIST(station)' else if $sectorTravelBlacklisted then 'BLACKLIST(sector-travel)' else 'BLACKLIST(sector-activity)'"/>
+            </do_if>
+          </do_if>
+          
+          <!-- SAFETY CHECK 2: Full reachability check (station known + basic path + blacklist-aware path) -->
+          <do_if value="$isValid">
+            <run_actions ref="md.GT_Libraries_Pathfinding.GT_IsStationReachable" result="$reachabilityCheck">
+              <param name="ship" value="$ship"/>
+              <param name="station" value="$station"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+              <param name="returnDetails" value="false"/>
+            </run_actions>
+            <do_if value="not $reachabilityCheck">
+              <set_value name="$isValid" exact="false"/>
+              <set_value name="$rejectReason" exact="'UNREACHABLE'"/>
+            </do_if>
+          </do_if>
+          
+          <!-- SAFETY CHECK 3: Get distance and check if station is within max jump distance -->
+          <do_if value="$isValid">
+            <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculatePathDistance" result="$gateDistance">
+              <param name="ship" value="$ship"/>
+              <param name="fromSector" value="$ship.sector"/>
+              <param name="toSector" value="$station.sector"/>
+              <param name="blacklistgroup" value="$blacklistgroup"/>
+              <param name="useEscapeMode" value="false"/>
+            </run_actions>
+            <do_if value="$gateDistance gt $maxJumpDistance">
+              <set_value name="$isValid" exact="false"/>
+              <set_value name="$rejectReason" exact="'DISTANCE(' + $gateDistance + '/' + $maxJumpDistance + ')'"/>
+            </do_if>
+          </do_if>
+          
+          <!-- SAFETY CHECK 4: Verify repair capability (double-check using vanilla pattern) -->
+          <do_if value="$isValid">
+            <do_if value="not $station.shiptrader?">
+              <set_value name="$isValid" exact="false"/>
+              <set_value name="$rejectReason" exact="'NO_SHIPTRADER'"/>
+            </do_if>
+            <do_else>
+              <set_value name="$canBuild" exact="@$station.canbuildclass.{$ship.class}"/>
+              <set_value name="$canSupply" exact="@$station.cansupplyclass.{$ship.class}"/>
+              <do_if value="not $canBuild and not $canSupply">
+                <set_value name="$isValid" exact="false"/>
+                <set_value name="$rejectReason" exact="'NO_BUILD_OR_SUPPLY(class=' + $ship.class + ')'"/>
+              </do_if>
+            </do_else>
+          </do_if>
+          
+          <!-- SAFETY CHECK 5: Check docking permission (same pattern as resupply) -->
+          <do_if value="$isValid">
+            <set_value name="$checkDocking" exact="not $ship.iscapitalship or ($station.isclass.station)"/>
+            
+            <do_if value="$checkDocking">
+              <set_value name="$canDock" exact="$station.dockingallowed.{$ship}"/>
+              <do_if value="not $canDock">
+                <set_value name="$isValid" exact="false"/>
+                <set_value name="$rejectReason" exact="'DOCKING_DENIED'"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <!-- SAFETY CHECK 6: Check if sector is excluded (from ship configuration) -->
+          <do_if value="$isValid and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$Config?">
+            <do_if value="global.$GT_Ships.{$ship}.$Config.$ExcludedSectors?">
+              <set_value name="$isSectorExcluded" exact="false"/>
+              <do_all exact="global.$GT_Ships.{$ship}.$Config.$ExcludedSectors.count" counter="$j">
+                <do_if value="global.$GT_Ships.{$ship}.$Config.$ExcludedSectors.{$j} == $station.sector">
+                  <set_value name="$isSectorExcluded" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+              
+              <do_if value="$isSectorExcluded">
+                <set_value name="$isValid" exact="false"/>
+                <set_value name="$rejectReason" exact="'SECTOR_EXCLUDED'"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          
+          <!-- DIAGNOSTIC: Always log the result for every station -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <do_if value="$isValid">
+              <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] -> ACCEPTED: ' + $station.knownname + ' (distance: ' + $gateDistance + ' jumps)'" chance="100"/>
+            </do_if>
+            <do_else>
+              <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') [' + $i + '/' + $potentialStations.count + '] -> REJECTED: ' + $station.knownname + ' | Reason: ' + $rejectReason" chance="100"/>
+            </do_else>
+          </do_if>
+          
+          <!-- Track nearest valid player and foreign stations -->
+          <do_if value="$isValid">
+            <do_if value="$station.owner == faction.player">
+              <do_if value="$gateDistance lt $nearestPlayerDistance">
+                <set_value name="$nearestPlayerStation" exact="$station"/>
+                <set_value name="$nearestPlayerDistance" exact="$gateDistance"/>
+              </do_if>
+            </do_if>
+            <do_else>
+              <do_if value="$gateDistance lt $nearestForeignDistance">
+                <set_value name="$nearestForeignStation" exact="$station"/>
+                <set_value name="$nearestForeignDistance" exact="$gateDistance"/>
+              </do_if>
+            </do_else>
+          </do_if>
+        </do_all>
+        
+        <!-- Final station selection with player-station preference -->
+        <do_if value="$nearestPlayerStation and $nearestForeignStation">
+          <do_if value="$nearestPlayerDistance le ($nearestForeignDistance + $playerStationJumpPreference)">
+            <set_value name="$nearestStation" exact="$nearestPlayerStation"/>
+          </do_if>
+          <do_else>
+            <set_value name="$nearestStation" exact="$nearestForeignStation"/>
+          </do_else>
+        </do_if>
+        <do_elseif value="$nearestPlayerStation">
+          <set_value name="$nearestStation" exact="$nearestPlayerStation"/>
+        </do_elseif>
+        <do_elseif value="$nearestForeignStation">
+          <set_value name="$nearestStation" exact="$nearestForeignStation"/>
+        </do_elseif>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $nearestStation">
+          <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Repair station preference: selected ' + $nearestStation.knownname + ' (player dist=' + $nearestPlayerDistance + ', foreign dist=' + $nearestForeignDistance + ', threshold=' + $playerStationJumpPreference + ')'" chance="100"/>
+        </do_if>
+        
+        <do_if value="not $nearestStation">
+          <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') No suitable repair station found after checking all ' + $potentialStations.count + ' discovered stations'" chance="100"/>
+        </do_if>
+        
+        <!-- Return nearest station (or null if none found) -->
+        <return value="$nearestStation"/>
+      </actions>
+    </library>
+    
+    <!-- ============================================================================= -->
+    <!-- PERFORMANCE OPTIMIZATION: Process Deferred UI Updates                       -->
+    <!-- Deferred operations: Ship renaming, logbook messages                        -->
+    <!-- These operations don't affect gameplay and are processed after critical path -->
+    <!-- ============================================================================= -->
+    <cue name="ProcessDeferredUIUpdates" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="100ms"/> <!-- Process after a small delay to allow ExecuteMaintenance to complete -->
+      <actions>
+        <!-- Process all deferred UI updates -->
+        <do_if value="global.$GT_DeferredUIUpdates?">
+          <set_value name="$updateKeys" exact="@global.$GT_DeferredUIUpdates.keys"/>
+          <do_if value="$updateKeys?">
+            <set_value name="$updateKeysCount" exact="@$updateKeys.count"/>
+            <do_if value="$updateKeysCount? and $updateKeysCount gt 0">
+              <do_all exact="$updateKeysCount" counter="$i">
+                <set_value name="$ship" exact="$updateKeys.{$i}"/>
+                <set_value name="$update" exact="global.$GT_DeferredUIUpdates.{$ship}"/>
+                
+                <!-- Ship rename (for repair and equipment orders) -->
+                <do_if value="($update.$Type == 'repair' or $update.$Type == 'equipment') and $update.$Pilot? and global.$GT_Pilots? and global.$GT_Pilots.{$update.$Pilot}?">
+                  <run_actions ref="md.GT_Ship_Management.Update_Ship_Name">
+                    <param name="ship" value="$update.$Ship"/>
+                    <param name="pilot" value="$update.$Pilot"/>
+                    <param name="xp" value="global.$GT_Pilots.{$update.$Pilot}.$XP"/>
+                    <param name="level" value="global.$GT_Pilots.{$update.$Pilot}.$Level"/>
+                    <param name="rank" value="@global.$GT_Pilots.{$update.$Pilot}.$CurrentRank"/>
+                    <param name="nameType" value="'trader'"/>
+                  </run_actions>
+                </do_if>
+                
+                <!-- Logbook message -->
+                <do_if value="$update.$LogbookMessage?">
+                  <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+                    <param name="Message" value="$update.$LogbookMessage"/>
+                    <param name="Category" value="$update.$LogbookCategory"/>
+                    <param name="Title" value="$update.$LogbookTitle"/>
+                    <param name="Object" value="$update.$LogbookObject"/>
+                    <param name="Interaction" value="$update.$LogbookInteraction"/>
+                    <param name="CheckGlobalSettings" value="false"/>
+                  </run_actions>
+                </do_if>
+                
+                <!-- Clean up -->
+                <remove_value name="global.$GT_DeferredUIUpdates.{$ship}"/>
+              </do_all>
+            </do_if>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+    
+  </cues>
+</mdscript>

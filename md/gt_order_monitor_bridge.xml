@@ -1,0 +1,533 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_Order_Monitor_Bridge" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4 Foundations/libraries/md.xsd">
+  <!--
+    Bridge between Lua order monitor and MD cleanup system
+    Provides batched order change detection as fallback when event_object_order_cancelled doesn't fire
+  -->
+  
+  <cues>
+    <!-- Ensure authoritative idcode->ship map exists on startup/load -->
+    <cue name="BootstrapShipIdCodeMap" instantiate="true">
+      <conditions>
+        <event_cue_signalled cue="md.Setup.Start"/>
+        <check_value value="global.$GT_Ships?"/>
+      </conditions>
+      <actions>
+        <signal_cue_instantly cue="md.GT_Order_Monitor_Bridge.RebuildShipIdCodeMap"/>
+      </actions>
+    </cue>
+
+    <!-- Rebuild authoritative idcode->ship map from GT registry -->
+    <cue name="RebuildShipIdCodeMap" instantiate="true">
+      <conditions>
+        <event_cue_signalled cue="md.GT_Order_Monitor_Bridge.RebuildShipIdCodeMap"/>
+      </conditions>
+      <actions>
+        <do_if value="not global.$GT_ShipIDCodeMap?">
+          <set_value name="global.$GT_ShipIDCodeMap" exact="table[]"/>
+        </do_if>
+        <do_all exact="global.$GT_Ships.keys.count" counter="$i">
+          <set_value name="$ship" exact="global.$GT_Ships.keys.{$i}"/>
+          <do_if value="$ship.exists and $ship.idcode? and $ship.idcode != null and $ship.idcode != ''">
+            <set_value name="global.$GT_ShipIDCodeMap.{'$' + $ship.idcode}" exact="$ship"/>
+          </do_if>
+        </do_all>
+      </actions>
+    </cue>
+    
+    <!-- Send ship list to Lua monitor when it's ready -->
+    <cue name="InitializeMonitor" instantiate="true">
+      <conditions>
+        <event_ui_triggered screen="'GT_OrderMonitor'" control="'Ready'"/>
+        <check_value value="global.$GT_Ships?"/>
+      </conditions>
+      <actions>
+        <!-- Build ship list from GT registry -->
+        <!-- Store both UniverseID (for Lua) and idcode (for MD tracking) -->
+        <!-- OPTIMIZATION: Maintain reverse lookup table (idcode -> ship object) for O(1) lookups -->
+        <!-- Pattern from vanilla: factionlogic_staticdefense.xml uses {'$' + $Ship.idcode} for string keys -->
+        <set_value name="$shipList" exact="[]"/>
+        <set_value name="$shipListString" exact="''"/>
+        <!-- Initialize reverse lookup table if needed -->
+        <do_if value="not global.$GT_ShipIDCodeMap?">
+          <set_value name="global.$GT_ShipIDCodeMap" exact="table[]"/>
+        </do_if>
+        <do_all exact="global.$GT_Ships.keys.count" counter="$i">
+          <set_value name="$ship" exact="global.$GT_Ships.keys.{$i}"/>
+          <do_if value="$ship.exists">
+            <!-- Store idcode for MD tracking -->
+            <append_to_list name="$shipList" exact="$ship.idcode"/>
+            <!-- Update reverse lookup table using vanilla pattern: {'$' + idcode} -->
+            <do_if value="$ship.idcode? and $ship.idcode != null and $ship.idcode != ''">
+              <set_value name="global.$GT_ShipIDCodeMap.{'$' + $ship.idcode}" exact="$ship"/>
+            </do_if>
+            <!-- Build comma-separated string of "UniverseID:IDCode" pairs for Lua -->
+            <do_if value="$shipListString != ''">
+              <set_value name="$shipListString" exact="$shipListString + ','"/>
+            </do_if>
+            <!-- Format: "UniverseID:IDCode" so Lua can show ID code on conversion failure -->
+            <set_value name="$shipListString" exact="$shipListString + $ship + ':' + $ship.idcode"/>
+          </do_if>
+        </do_all>
+        
+        <!-- Send to Lua as comma-separated string -->
+        <raise_lua_event name="'GT_OrderMonitor.UpdateShipList'" param="$shipListString"/>
+        
+        <!-- Start monitoring -->
+        <raise_lua_event name="'GT_OrderMonitor.Start'"/>
+      </actions>
+    </cue>
+    
+    <!-- Handle GT order removal detected by Lua - triggers cleanup directly -->
+    <cue name="HandleGTOrderRemoved" instantiate="true">
+      <conditions>
+        <event_ui_triggered screen="'GT_OrderMonitor'" control="'GTOrderRemoved'"/>
+      </conditions>
+      <actions>
+        <set_value name="$shipID" exact="event.param3.$ship"/>
+        <set_value name="$oldOrder" exact="event.param3.$oldOrder"/>
+        <set_value name="$newOrder" exact="event.param3.$newOrder"/>
+        
+        <!-- Find ship object by ID using reverse lookup table (O(1) instead of O(n)) -->
+        <!-- Pattern from vanilla: factionlogic_staticdefense.xml uses {'$' + idcode} for string keys -->
+        <set_value name="$ship" exact="null"/>
+        <do_if value="global.$GT_ShipIDCodeMap? and global.$GT_ShipIDCodeMap.{'$' + $shipID}?">
+          <set_value name="$ship" exact="global.$GT_ShipIDCodeMap.{'$' + $shipID}"/>
+        </do_if>
+        <do_else>
+          <!-- Fallback: iterate if lookup table missing (shouldn't happen, but safe) -->
+          <do_if value="global.$GT_Ships?">
+            <do_all exact="global.$GT_Ships.keys.count" counter="$i">
+              <set_value name="$candidateShip" exact="global.$GT_Ships.keys.{$i}"/>
+              <do_if value="$candidateShip.idcode == $shipID">
+                <set_value name="$ship" exact="$candidateShip"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_else>
+        
+        <do_if value="$ship and $ship.exists">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Cleanup] Cleaning up ship (GT order removed): ' + $ship.knownname + ' (ID: ' + $shipID + ')'" chance="100"/>
+          </do_if>
+          
+          <!-- Get original name from registry -->
+          <set_value name="$originalName" exact="null"/>
+          <do_if value="global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$OriginalShipName?">
+            <set_value name="$originalName" exact="global.$GT_Ships.{$ship}.$OriginalShipName"/>
+          </do_if>
+          <do_elseif value="$ship.pilot? and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$OriginalShipName?">
+            <set_value name="$originalName" exact="global.$GT_Pilots.{$ship.pilot}.$OriginalShipName"/>
+          </do_elseif>
+          <do_elseif value="$ship.macro?">
+            <set_value name="$originalName" exact="@$ship.macro.name"/>
+          </do_elseif>
+          
+          <!-- SAFETY: Lua order monitor can briefly report GT order removal during fleet commander promotion.
+               Defer cleanup and verify after a short delay to avoid purging GT registry during transient states. -->
+          <set_value name="$deferCleanup" exact="false"/>
+          <set_value name="$hasDirectGT" exact="false"/>
+          <set_value name="$hasGTCommander" exact="false"/>
+          <set_value name="$commanderDefaultOrderNull" exact="false"/>
+          
+          <!-- Direct GT order still present? -->
+          <do_if value="$ship.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.defaultorder.id})">
+            <set_value name="$hasDirectGT" exact="true"/>
+          </do_if>
+          
+          <!-- GT via commander still present? -->
+          <do_if value="$ship.commander? and $ship.commander.exists and $ship.commander != $ship">
+            <do_if value="$ship.commander.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.commander.defaultorder.id})">
+              <set_value name="$hasGTCommander" exact="true"/>
+            </do_if>
+            <do_elseif value="(not @$ship.commander.defaultorder) or (@$ship.commander.defaultorder == null)">
+              <set_value name="$commanderDefaultOrderNull" exact="true"/>
+            </do_elseif>
+          </do_if>
+          
+          <!-- Defer if this looks like a transient/null-order transition (promotion), or if GT is still present. -->
+          <do_if value="$hasDirectGT or $hasGTCommander or $commanderDefaultOrderNull or ((global.$GT_ProtectedOrderIDs? and $oldOrder? and global.$GT_ProtectedOrderIDs.indexof.{$oldOrder}) and ((not $newOrder?) or $newOrder == null or $newOrder == ''))">
+            <set_value name="$deferCleanup" exact="true"/>
+          </do_if>
+          
+          <do_if value="$deferCleanup">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Cleanup] Deferring GTOrderRemoved cleanup for ' + $shipID + ' (old=' + (if $oldOrder? then $oldOrder else 'null') + ', new=' + (if $newOrder? then $newOrder else 'null') + ', directGT=' + $hasDirectGT + ', viaCommander=' + $hasGTCommander + ', commanderDefaultNull=' + $commanderDefaultOrderNull + ')'" chance="100"/>
+            </do_if>
+            <signal_cue_instantly cue="md.GT_Order_Monitor_Bridge.VerifyGTOrderRemoved" param="table[
+              $ShipID = $shipID,
+              $OldOrder = $oldOrder,
+              $NewOrder = $newOrder,
+              $OriginalName = $originalName
+            ]"/>
+          </do_if>
+          
+          <!-- Trigger cleanup only if not deferred -->
+          <do_if value="not $deferCleanup">
+            <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+              $Ship = $ship,
+              $Pilot = $ship.pilot,
+              $Reason = 'GT order removed (Lua detection)',
+              $OriginalName = $originalName
+            ]"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- Verify a GT order removal after a short delay (guards against transient null default orders during promotion) -->
+    <cue name="VerifyGTOrderRemoved" instantiate="true">
+      <conditions>
+        <event_cue_signalled cue="md.GT_Order_Monitor_Bridge.VerifyGTOrderRemoved"/>
+      </conditions>
+      <delay exact="3s"/>
+      <actions>
+        <set_value name="$p" exact="event.param"/>
+        <set_value name="$shipID" exact="$p.$ShipID"/>
+        <set_value name="$oldOrder" exact="$p.$OldOrder"/>
+        <set_value name="$newOrder" exact="$p.$NewOrder"/>
+        <set_value name="$originalName" exact="$p.$OriginalName"/>
+        
+        <!-- Resolve ship by ID again (it may have changed or been promoted) -->
+        <set_value name="$ship" exact="null"/>
+        <do_if value="global.$GT_ShipIDCodeMap? and global.$GT_ShipIDCodeMap.{'$' + $shipID}?">
+          <set_value name="$ship" exact="global.$GT_ShipIDCodeMap.{'$' + $shipID}"/>
+        </do_if>
+        <do_else>
+          <do_if value="global.$GT_Ships?">
+            <do_all exact="global.$GT_Ships.keys.count" counter="$i">
+              <set_value name="$candidateShip" exact="global.$GT_Ships.keys.{$i}"/>
+              <do_if value="$candidateShip.idcode == $shipID">
+                <set_value name="$ship" exact="$candidateShip"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_else>
+        
+        <do_if value="$ship and $ship.exists">
+          <set_value name="$hasDirectGT" exact="false"/>
+          <set_value name="$hasGTCommander" exact="false"/>
+          <set_value name="$commanderDefaultOrderNull" exact="false"/>
+          
+          <do_if value="$ship.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.defaultorder.id})">
+            <set_value name="$hasDirectGT" exact="true"/>
+          </do_if>
+          <do_if value="$ship.commander? and $ship.commander.exists and $ship.commander != $ship">
+            <do_if value="$ship.commander.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.commander.defaultorder.id})">
+              <set_value name="$hasGTCommander" exact="true"/>
+            </do_if>
+            <do_elseif value="(not @$ship.commander.defaultorder) or (@$ship.commander.defaultorder == null)">
+              <set_value name="$commanderDefaultOrderNull" exact="true"/>
+            </do_elseif>
+          </do_if>
+          
+          <do_if value="$hasDirectGT or $hasGTCommander or $commanderDefaultOrderNull">
+            <!-- False positive / still transitioning: do nothing -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Cleanup] Verified GTOrderRemoved was transient for ' + $shipID + ' (directGT=' + $hasDirectGT + ', viaCommander=' + $hasGTCommander + ', commanderDefaultNull=' + $commanderDefaultOrderNull + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- Still removed: proceed with cleanup -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Cleanup] Verified GTOrderRemoved - cleaning up ' + $shipID + ' (old=' + (if $oldOrder? then $oldOrder else 'null') + ', new=' + (if $newOrder? then $newOrder else 'null') + ')'" chance="100"/>
+            </do_if>
+            <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+              $Ship = $ship,
+              $Pilot = $ship.pilot,
+              $Reason = 'GT order removed (Lua detection, verified)',
+              $OriginalName = $originalName
+            ]"/>
+          </do_else>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Handle missing pilot detection from Lua -->
+    <cue name="HandleMissingPilot" instantiate="true">
+      <conditions>
+        <event_ui_triggered screen="'GT_OrderMonitor'" control="'MissingPilot'"/>
+      </conditions>
+      <actions>
+        <set_value name="$shipID" exact="event.param3.$ship"/>
+        
+        <!-- Find ship object by ID using reverse lookup table (O(1) instead of O(n)) -->
+        <!-- Pattern from vanilla: factionlogic_staticdefense.xml uses {'$' + idcode} for string keys -->
+        <set_value name="$ship" exact="null"/>
+        <do_if value="global.$GT_ShipIDCodeMap? and global.$GT_ShipIDCodeMap.{'$' + $shipID}?">
+          <set_value name="$ship" exact="global.$GT_ShipIDCodeMap.{'$' + $shipID}"/>
+        </do_if>
+        <do_else>
+          <!-- Fallback: iterate if lookup table missing (shouldn't happen, but safe) -->
+          <do_if value="global.$GT_Ships?">
+            <do_all exact="global.$GT_Ships.keys.count" counter="$i">
+              <set_value name="$candidateShip" exact="global.$GT_Ships.keys.{$i}"/>
+              <do_if value="$candidateShip.idcode == $shipID">
+                <set_value name="$ship" exact="$candidateShip"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_else>
+        
+        <do_if value="$ship and $ship.exists">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Cleanup] Cleaning up ship (missing pilot): ' + $ship.knownname + ' (ID: ' + $shipID + ')'" chance="100"/>
+          </do_if>
+          <!-- Get original name from registry -->
+          <set_value name="$originalName" exact="null"/>
+          <do_if value="global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$OriginalShipName?">
+            <set_value name="$originalName" exact="global.$GT_Ships.{$ship}.$OriginalShipName"/>
+          </do_if>
+          <do_elseif value="$ship.pilot? and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$OriginalShipName?">
+            <set_value name="$originalName" exact="global.$GT_Pilots.{$ship.pilot}.$OriginalShipName"/>
+          </do_elseif>
+          <do_elseif value="$ship.macro?">
+            <set_value name="$originalName" exact="@$ship.macro.name"/>
+          </do_elseif>
+          
+          <!-- Trigger cleanup directly - HandleShipOrderAborted will handle all order cancellation -->
+          <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+            $Ship = $ship,
+            $Pilot = null,
+            $Reason = 'Missing pilot (Lua detection)',
+            $OriginalName = $originalName
+          ]"/>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Handle commander lost GT order from Lua -->
+    <cue name="HandleCommanderLostGT" instantiate="true">
+      <conditions>
+        <event_ui_triggered screen="'GT_OrderMonitor'" control="'CommanderLostGT'"/>
+      </conditions>
+      <actions>
+        <set_value name="$shipID" exact="event.param3.$ship"/>
+        
+        <!-- Find ship object by ID using reverse lookup table (O(1) instead of O(n)) -->
+        <!-- Pattern from vanilla: factionlogic_staticdefense.xml uses {'$' + idcode} for string keys -->
+        <set_value name="$ship" exact="null"/>
+        <do_if value="global.$GT_ShipIDCodeMap? and global.$GT_ShipIDCodeMap.{'$' + $shipID}?">
+          <set_value name="$ship" exact="global.$GT_ShipIDCodeMap.{'$' + $shipID}"/>
+        </do_if>
+        <do_else>
+          <!-- Fallback: iterate if lookup table missing (shouldn't happen, but safe) -->
+          <do_if value="global.$GT_Ships?">
+            <do_all exact="global.$GT_Ships.keys.count" counter="$i">
+              <set_value name="$candidateShip" exact="global.$GT_Ships.keys.{$i}"/>
+              <do_if value="$candidateShip.idcode == $shipID">
+                <set_value name="$ship" exact="$candidateShip"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_else>
+        
+        <do_if value="$ship and $ship.exists">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Cleanup] Cleaning up ship (commander lost GT): ' + $ship.knownname + ' (ID: ' + $shipID + ')'" chance="100"/>
+          </do_if>
+          <!-- Get original name from registry -->
+          <set_value name="$originalName" exact="null"/>
+          <do_if value="global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$OriginalShipName?">
+            <set_value name="$originalName" exact="global.$GT_Ships.{$ship}.$OriginalShipName"/>
+          </do_if>
+          <do_elseif value="$ship.pilot? and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$OriginalShipName?">
+            <set_value name="$originalName" exact="global.$GT_Pilots.{$ship.pilot}.$OriginalShipName"/>
+          </do_elseif>
+          <do_elseif value="$ship.macro?">
+            <set_value name="$originalName" exact="@$ship.macro.name"/>
+          </do_elseif>
+          
+          <!-- Trigger cleanup directly -->
+          <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+            $Ship = $ship,
+            $Pilot = $ship.pilot,
+            $Reason = 'Commander lost GT order (Lua detection)',
+            $OriginalName = $originalName
+          ]"/>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Handle commander removed from Lua -->
+    <cue name="HandleCommanderRemoved" instantiate="true">
+      <conditions>
+        <event_ui_triggered screen="'GT_OrderMonitor'" control="'CommanderRemoved'"/>
+      </conditions>
+      <actions>
+        <set_value name="$shipID" exact="event.param3.$ship"/>
+        
+        <!-- Find ship object by ID using reverse lookup table (O(1) instead of O(n)) -->
+        <!-- Pattern from vanilla: factionlogic_staticdefense.xml uses {'$' + idcode} for string keys -->
+        <set_value name="$ship" exact="null"/>
+        <do_if value="global.$GT_ShipIDCodeMap? and global.$GT_ShipIDCodeMap.{'$' + $shipID}?">
+          <set_value name="$ship" exact="global.$GT_ShipIDCodeMap.{'$' + $shipID}"/>
+        </do_if>
+        <do_else>
+          <!-- Fallback: iterate if lookup table missing (shouldn't happen, but safe) -->
+          <do_if value="global.$GT_Ships?">
+            <do_all exact="global.$GT_Ships.keys.count" counter="$i">
+              <set_value name="$candidateShip" exact="global.$GT_Ships.keys.{$i}"/>
+              <do_if value="$candidateShip.idcode == $shipID">
+                <set_value name="$ship" exact="$candidateShip"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_else>
+        
+        <do_if value="$ship and $ship.exists">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Cleanup] Cleaning up ship (commander removed): ' + $ship.knownname + ' (ID: ' + $shipID + ')'" chance="100"/>
+          </do_if>
+          <!-- Get original name from registry -->
+          <set_value name="$originalName" exact="null"/>
+          <do_if value="global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$OriginalShipName?">
+            <set_value name="$originalName" exact="global.$GT_Ships.{$ship}.$OriginalShipName"/>
+          </do_if>
+          <do_elseif value="$ship.pilot? and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$OriginalShipName?">
+            <set_value name="$originalName" exact="global.$GT_Pilots.{$ship.pilot}.$OriginalShipName"/>
+          </do_elseif>
+          <do_elseif value="$ship.macro?">
+            <set_value name="$originalName" exact="@$ship.macro.name"/>
+          </do_elseif>
+          
+          <!-- Trigger cleanup directly -->
+          <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+            $Ship = $ship,
+            $Pilot = $ship.pilot,
+            $Reason = 'Commander removed (Lua detection)',
+            $OriginalName = $originalName
+          ]"/>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Update ship list when ships are removed from GT registry -->
+    <!-- Using instantiate="false" to prevent multiple instances for same signal -->
+    <cue name="UpdateShipList" instantiate="false">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_Ship_Order_Aborted'"/>
+        <check_value value="global.$GT_Ships?"/>
+      </conditions>
+      <delay exact="500ms"/>
+      <actions>
+        <!-- Get ship info from signal -->
+        <set_value name="$removedShip" exact="null"/>
+        <set_value name="$removedShipID" exact="'UNKNOWN'"/>
+        <set_value name="$removedShipName" exact="'UNKNOWN'"/>
+        <do_if value="event.param2? and event.param2.$Ship? and event.param2.$Ship != null">
+          <set_value name="$removedShip" exact="event.param2.$Ship"/>
+          <do_if value="$removedShip.exists">
+            <set_value name="$removedShipID" exact="$removedShip.idcode"/>
+            <set_value name="$removedShipName" exact="$removedShip.knownname"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Check if ship is still in registry (deduplication - avoid updating if already removed) -->
+        <set_value name="$shipStillInRegistry" exact="false"/>
+        <do_if value="$removedShipID != 'UNKNOWN' and global.$GT_Ships.{$removedShip}?">
+          <set_value name="$shipStillInRegistry" exact="true"/>
+        </do_if>
+        
+        <!-- Only update if ship was actually removed from registry -->
+        <do_if value="not $shipStillInRegistry">
+          <!-- Remove from reverse lookup table -->
+          <do_if value="global.$GT_ShipIDCodeMap? and global.$GT_ShipIDCodeMap.{'$' + $removedShipID}?">
+            <remove_value name="global.$GT_ShipIDCodeMap.{'$' + $removedShipID}"/>
+          </do_if>
+          
+          <!-- Rebuild and send updated list -->
+          <set_value name="$shipList" exact="[]"/>
+          <set_value name="$shipListString" exact="''"/>
+          <do_all exact="global.$GT_Ships.keys.count" counter="$i">
+            <set_value name="$ship" exact="global.$GT_Ships.keys.{$i}"/>
+            <do_if value="$ship.exists">
+              <!-- Store idcode for MD tracking -->
+              <append_to_list name="$shipList" exact="$ship.idcode"/>
+              <!-- Build comma-separated string of "UniverseID:IDCode" pairs for Lua -->
+              <do_if value="$shipListString != ''">
+                <set_value name="$shipListString" exact="$shipListString + ','"/>
+              </do_if>
+              <!-- Format: "UniverseID:IDCode" so Lua can show ID code on conversion failure -->
+              <set_value name="$shipListString" exact="$shipListString + $ship + ':' + $ship.idcode"/>
+            </do_if>
+          </do_all>
+          
+          <!-- Send to Lua as comma-separated string -->
+          <raise_lua_event name="'GT_OrderMonitor.UpdateShipList'" param="$shipListString"/>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Event-driven ship list update: On ship state updates -->
+    <cue name="UpdateShipList_OnStateUpdate" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_Ship_State_Update'"/>
+        <check_value value="global.$GT_Ships?"/>
+      </conditions>
+      <delay exact="250ms"/>
+      <actions>
+        <set_value name="$shipList" exact="[]"/>
+        <set_value name="$shipListString" exact="''"/>
+        <!-- Initialize reverse lookup table if needed -->
+        <do_if value="not global.$GT_ShipIDCodeMap?">
+          <set_value name="global.$GT_ShipIDCodeMap" exact="table[]"/>
+        </do_if>
+        <do_all exact="global.$GT_Ships.keys.count" counter="$i">
+          <set_value name="$ship" exact="global.$GT_Ships.keys.{$i}"/>
+            <do_if value="$ship.exists">
+              <append_to_list name="$shipList" exact="$ship.idcode"/>
+              <!-- Update reverse lookup table using vanilla pattern: {'$' + idcode} -->
+              <do_if value="$ship.idcode? and $ship.idcode != null and $ship.idcode != ''">
+                <set_value name="global.$GT_ShipIDCodeMap.{'$' + $ship.idcode}" exact="$ship"/>
+              </do_if>
+              <do_if value="$shipListString != ''">
+              <set_value name="$shipListString" exact="$shipListString + ','"/>
+            </do_if>
+            <set_value name="$shipListString" exact="$shipListString + $ship + ':' + $ship.idcode"/>
+          </do_if>
+        </do_all>
+        <raise_lua_event name="'GT_OrderMonitor.UpdateShipList'" param="$shipListString"/>
+      </actions>
+    </cue>
+    
+    <!-- Event-driven ship list update: On AI start (new/returned ships) -->
+    <cue name="UpdateShipList_OnAIStarted" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_AI_Started'"/>
+        <check_value value="global.$GT_Ships?"/>
+      </conditions>
+      <delay exact="250ms"/>
+      <actions>
+        <set_value name="$shipList" exact="[]"/>
+        <set_value name="$shipListString" exact="''"/>
+        <!-- Initialize reverse lookup table if needed -->
+        <do_if value="not global.$GT_ShipIDCodeMap?">
+          <set_value name="global.$GT_ShipIDCodeMap" exact="table[]"/>
+        </do_if>
+        <do_all exact="global.$GT_Ships.keys.count" counter="$i">
+          <set_value name="$ship" exact="global.$GT_Ships.keys.{$i}"/>
+            <do_if value="$ship.exists">
+              <append_to_list name="$shipList" exact="$ship.idcode"/>
+              <!-- Update reverse lookup table using vanilla pattern: {'$' + idcode} -->
+              <do_if value="$ship.idcode? and $ship.idcode != null and $ship.idcode != ''">
+                <set_value name="global.$GT_ShipIDCodeMap.{'$' + $ship.idcode}" exact="$ship"/>
+              </do_if>
+              <do_if value="$shipListString != ''">
+              <set_value name="$shipListString" exact="$shipListString + ','"/>
+            </do_if>
+            <set_value name="$shipListString" exact="$shipListString + $ship + ':' + $ship.idcode"/>
+          </do_if>
+        </do_all>
+        <raise_lua_event name="'GT_OrderMonitor.UpdateShipList'" param="$shipListString"/>
+      </actions>
+    </cue>
+    
+  </cues>
+  
+</mdscript>

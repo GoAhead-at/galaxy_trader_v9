@@ -1,0 +1,310 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  GalaxyTrader MK1 — Station Trader Library Functions
+  
+  Provides reusable library cues for the MK1 Station Trader order:
+  - GT_BuildStationWareBasket: Derive effective ware list from station
+  - GT_FindBestStationSale: Find best NPC buyer for station wares
+  - GT_ValidateStationAssignment: Validate station is valid for MK1
+  
+  These are called via run_actions from the MK1 AI script.
+-->
+<mdscript name="GT_Libraries_StationTrader" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4 Foundations/libraries/md.xsd">
+  <cues>
+
+    <!-- ================================================================ -->
+    <!-- GT_ValidateStationAssignment                                     -->
+    <!-- Validates that a station is a valid MK1 home station             -->
+    <!-- Returns: $valid (bool), $reason (string)                         -->
+    <!-- ================================================================ -->
+    <library name="GT_ValidateStationAssignment" purpose="run_actions">
+      <params>
+        <param name="ship" comment="The trading ship"/>
+        <param name="homeStation" comment="The station to validate"/>
+      </params>
+      <actions>
+        <set_value name="$valid" exact="false"/>
+        <set_value name="$reason" exact="''"/>
+
+        <do_if value="not $homeStation? or not $homeStation.exists">
+          <set_value name="$reason" exact="'Station does not exist'"/>
+          <return/>
+        </do_if>
+
+        <do_if value="not $homeStation.isclass.station">
+          <set_value name="$reason" exact="'Object is not a station'"/>
+          <return/>
+        </do_if>
+
+        <do_if value="not $homeStation.isplayerowned">
+          <set_value name="$reason" exact="'Station is not player-owned'"/>
+          <return/>
+        </do_if>
+
+        <do_if value="not $homeStation.isoperational">
+          <set_value name="$reason" exact="'Station is not operational'"/>
+          <return/>
+        </do_if>
+
+        <set_value name="$valid" exact="true"/>
+      </actions>
+    </library>
+
+    <!-- ================================================================ -->
+    <!-- GT_BuildStationWareBasket                                        -->
+    <!-- Builds the effective ware list from station products/tradewares  -->
+    <!-- Excludes resources, processed wares, and cargo-incompatible      -->
+    <!-- Returns: $effectiveWares (list)                                  -->
+    <!-- ================================================================ -->
+    <library name="GT_BuildStationWareBasket" purpose="run_actions">
+      <params>
+        <param name="station" comment="Home station"/>
+        <param name="ship" comment="Trading ship (for cargo filtering)"/>
+        <param name="warebasket" comment="User-specified ware filter (empty = auto-derive)"/>
+        <param name="allowillegal" comment="Allow illegal wares"/>
+      </params>
+      <actions>
+        <create_list name="$effectiveWares"/>
+        <create_list name="$candidateWares"/>
+
+        <!-- Step 1: Build candidate list from station -->
+        <do_if value="$warebasket? and $warebasket.count gt 0">
+          <!-- Manual filter: use only user-specified wares -->
+          <do_all exact="$warebasket.count" counter="$i">
+            <append_to_list name="$candidateWares" exact="$warebasket.{$i}"/>
+          </do_all>
+        </do_if>
+        <do_else>
+          <!-- Auto-derive: station products + tradewares, exclude resources -->
+          <set_value name="$products" exact="$station.products.list"/>
+          <set_value name="$tradewares" exact="$station.tradewares.list"/>
+
+          <do_all exact="$products.count" counter="$i">
+            <set_value name="$ware" exact="$products.{$i}"/>
+            <!-- Avoid duplicates -->
+            <set_value name="$alreadyAdded" exact="false"/>
+            <do_all exact="$candidateWares.count" counter="$j">
+              <do_if value="$candidateWares.{$j} == $ware">
+                <set_value name="$alreadyAdded" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+            <do_if value="not $alreadyAdded">
+              <append_to_list name="$candidateWares" exact="$ware"/>
+            </do_if>
+          </do_all>
+
+          <do_all exact="$tradewares.count" counter="$i">
+            <set_value name="$ware" exact="$tradewares.{$i}"/>
+            <set_value name="$alreadyAdded" exact="false"/>
+            <do_all exact="$candidateWares.count" counter="$j">
+              <do_if value="$candidateWares.{$j} == $ware">
+                <set_value name="$alreadyAdded" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+            <do_if value="not $alreadyAdded">
+              <append_to_list name="$candidateWares" exact="$ware"/>
+            </do_if>
+          </do_all>
+        </do_else>
+
+        <!-- Step 2: Filter candidates -->
+        <do_all exact="$candidateWares.count" counter="$i">
+          <set_value name="$ware" exact="$candidateWares.{$i}"/>
+
+          <!-- Skip if ship can't carry this ware -->
+          <do_if value="$ship.cargo.{$ware}.max le 0">
+            <continue/>
+          </do_if>
+
+          <!-- Skip processed wares -->
+          <do_if value="$ware.isprocessed">
+            <continue/>
+          </do_if>
+
+          <!-- Skip illegal wares unless allowed -->
+          <do_if value="not $allowillegal and $ware.illegal">
+            <continue/>
+          </do_if>
+
+          <append_to_list name="$effectiveWares" exact="$ware"/>
+        </do_all>
+      </actions>
+    </library>
+
+    <!-- ================================================================ -->
+    <!-- GT_FindBestStationSale                                           -->
+    <!-- Finds the best NPC buyer(s) for station wares                    -->
+    <!-- Returns: $bestTrade (table or null), $allTrades (list)           -->
+    <!--                                                                  -->
+    <!-- Trade table structure:                                           -->
+    <!--   $Ware, $SellOffer, $BuyOffer, $Amount, $Score,                 -->
+    <!--   $BuyStation, $BuySector, $Distance, $UnitProfit                -->
+    <!-- ================================================================ -->
+    <library name="GT_FindBestStationSale" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Trading ship"/>
+        <param name="station" comment="Home station (sell source)"/>
+        <param name="effectiveWares" comment="List of wares to sell"/>
+        <param name="maxsell" comment="Max gate distance for buyers"/>
+        <param name="ignoretraderules" comment="Bypass station trade rules"/>
+        <param name="fleetcoordination" comment="Check fleet reservations"/>
+      </params>
+      <actions>
+        <set_value name="$bestTrade" exact="null"/>
+        <create_list name="$allTrades"/>
+        <set_value name="$bestScore" exact="0"/>
+
+        <!-- Build list of sectors within maxsell range -->
+        <create_list name="$searchSectors"/>
+        <append_to_list name="$searchSectors" exact="$station.sector"/>
+        <do_if value="$maxsell gt 0">
+          <find_sector name="$nearbySectors" space="player.galaxy" multiple="true">
+            <match_gate_distance object="$station.sector" min="0" max="$maxsell"/>
+          </find_sector>
+          <do_if value="$nearbySectors? and $nearbySectors.count gt 0">
+            <do_all exact="$nearbySectors.count" counter="$si">
+              <do_if value="$nearbySectors.{$si} != $station.sector">
+                <append_to_list name="$searchSectors" exact="$nearbySectors.{$si}"/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_if>
+
+        <!-- For each ware, find sell offer from station and matching buy offers -->
+        <do_all exact="$effectiveWares.count" counter="$wi">
+          <set_value name="$ware" exact="$effectiveWares.{$wi}"/>
+
+          <!-- Get sell offer from home station for this ware -->
+          <!-- Station sells -> ship buys from station -->
+          <find_sell_offer seller="$station" wares="$ware" result="$stationSellOffer"/>
+          <do_if value="not $stationSellOffer.available">
+            <continue/>
+          </do_if>
+          <do_if value="$stationSellOffer.amount le 0">
+            <continue/>
+          </do_if>
+
+          <!-- Find NPC buyers in each sector within range -->
+          <create_list name="$buyOffers"/>
+          <do_all exact="$searchSectors.count" counter="$si">
+            <set_value name="$searchSec" exact="$searchSectors.{$si}"/>
+            <do_if value="$ignoretraderules">
+              <!-- Bypass trade rules: find any friendly NPC buyer -->
+              <find_buy_offer wares="$ware" space="$searchSec" result="$secBuyOffers" multiple="true">
+                <match_buyer tradesknownto="$ship.owner" owner="faction.player" negateownerfilter="true">
+                  <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+                </match_buyer>
+                <amount min="1"/>
+              </find_buy_offer>
+            </do_if>
+            <do_else>
+              <!-- Respect trade rules: use tradepartner for restriction filtering -->
+              <find_buy_offer wares="$ware" tradepartner="$ship" space="$searchSec" result="$secBuyOffers" multiple="true">
+                <match_buyer tradesknownto="$ship.owner" owner="faction.player" negateownerfilter="true">
+                  <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+                </match_buyer>
+                <amount min="1"/>
+              </find_buy_offer>
+            </do_else>
+            <do_if value="$secBuyOffers? and $secBuyOffers.count gt 0">
+              <do_all exact="$secBuyOffers.count" counter="$boi">
+                <append_to_list name="$buyOffers" exact="$secBuyOffers.{$boi}"/>
+              </do_all>
+            </do_if>
+          </do_all>
+
+          <do_if value="$buyOffers.count == 0">
+            <continue/>
+          </do_if>
+
+          <!-- Evaluate each buyer -->
+          <do_all exact="$buyOffers.count" counter="$bi">
+            <set_value name="$buyOffer" exact="$buyOffers.{$bi}"/>
+
+            <!-- Skip if buyer has no demand -->
+            <do_if value="$buyOffer.amount le 0">
+              <continue/>
+            </do_if>
+
+            <!-- Calculate tradeable amount -->
+            <set_value name="$tradeAmount" exact="[$stationSellOffer.amount, $buyOffer.amount, $ship.cargo.{$ware}.free].min"/>
+            <do_if value="$tradeAmount le 0">
+              <continue/>
+            </do_if>
+
+            <!-- Calculate profit -->
+            <set_value name="$unitProfit" exact="$buyOffer.unitprice - $stationSellOffer.unitprice"/>
+            <do_if value="$unitProfit le 0">
+              <continue/>
+            </do_if>
+
+            <!-- Get buyer station and distance -->
+            <set_value name="$buyStation" exact="$buyOffer.owner"/>
+            <set_value name="$buySector" exact="$buyStation.sector"/>
+            <set_value name="$distance" exact="$station.gatedistance.{$buyStation}"/>
+            <do_if value="$distance lt 0">
+              <!-- Unreachable -->
+              <continue/>
+            </do_if>
+
+            <!-- Check fleet reservation (if enabled) -->
+            <do_if value="$fleetcoordination and global.$GT_TradeReservations?">
+              <set_value name="$tradeKey" exact="'' + $ware + '_' + $buyStation"/>
+              <set_value name="$isReserved" exact="false"/>
+              <do_if value="global.$GT_TradeReservations.{$tradeKey}? and global.$GT_TradeReservations.{$tradeKey} != $ship">
+                <set_value name="$isReserved" exact="true"/>
+              </do_if>
+              <do_if value="$isReserved">
+                <continue/>
+              </do_if>
+            </do_if>
+
+            <!-- Check blacklist -->
+            <do_if value="global.$GT_ThreatIntelligence? and global.$GT_ThreatIntelligence.$BlacklistedSectors?">
+              <set_value name="$sectorBlacklisted" exact="false"/>
+              <do_all exact="global.$GT_ThreatIntelligence.$BlacklistedSectors.count" counter="$bli">
+                <do_if value="global.$GT_ThreatIntelligence.$BlacklistedSectors.{$bli} == $buySector">
+                  <set_value name="$sectorBlacklisted" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+              <do_if value="$sectorBlacklisted">
+                <continue/>
+              </do_if>
+            </do_if>
+
+            <!-- Score: (unitProfit * amount) / distancePenalty -->
+            <set_value name="$distancePenalty" exact="1.0 + ($distance * 0.1)"/>
+            <set_value name="$score" exact="($unitProfit * $tradeAmount) / $distancePenalty"/>
+
+            <!-- Build trade entry -->
+            <set_value name="$trade" exact="table[
+              $Ware = $ware,
+              $SellOffer = $stationSellOffer,
+              $BuyOffer = $buyOffer,
+              $Amount = $tradeAmount,
+              $Score = $score,
+              $BuyStation = $buyStation,
+              $BuySector = $buySector,
+              $Distance = $distance,
+              $UnitProfit = $unitProfit
+            ]"/>
+
+            <append_to_list name="$allTrades" exact="$trade"/>
+
+            <!-- Track best -->
+            <do_if value="$score gt $bestScore">
+              <set_value name="$bestScore" exact="$score"/>
+              <set_value name="$bestTrade" exact="$trade"/>
+            </do_if>
+          </do_all>
+        </do_all>
+      </actions>
+    </library>
+
+  </cues>
+</mdscript>

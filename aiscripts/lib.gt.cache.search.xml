@@ -1,0 +1,291 @@
+<?xml version="1.0" encoding="utf-8"?>
+<aiscript name="lib.gt.cache.search" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <params>
+    <param name="ship" default="this.ship"/>
+    <param name="searchMode" default="'buy_and_sell'"/>
+    <param name="homeSector" default="this.ship.sector"/>
+    <param name="maxDistance" default="0"/>
+    <param name="wareBasket" default="[]"/>
+    <param name="minROI" default="0"/>
+    <param name="minAbsoluteProfit" default="0"/>
+    <param name="ignoreBuildStorage" default="false"/>
+    <param name="ignoreCarrierAux" default="false"/>
+    <param name="maxEntries" default="100"/>
+    <param name="cacheMaxAge" default="300s"/> <!-- Matches $Fleet.$CacheTTL default -->
+    <param name="cacheDropoffTolerance" default="15"/> <!-- Max % profit drop from cached value before rejection (0 = disabled) -->
+    <param name="minCargoUtilPercent" default="10"/> <!-- Hard minimum cargo utilization threshold (10-100) -->
+    <param name="enableMinCargoUtil" default="true"/>
+    <!-- MK4 compatibility params (accepted for call-site compatibility; current cache filter logic is generic) -->
+    <param name="mk4AllowResources" default="true"/>
+    <param name="mk4AllowIntermediates" default="true"/>
+    <param name="mk4AllowTradewares" default="true"/>
+    <param name="mk4DedicatedServe" default="false"/>
+    <param name="mk4AnchorHome" default="null"/>
+    <param name="maxDistanceBuy" default="0"/>
+    <param name="maxDistanceSell" default="0"/>
+    <param name="requirePlayerDeliveryStation" default="false"/>
+    <param name="requirePlayerSupplierStation" default="false"/>
+    <param name="requireNonPlayerSupplierStation" default="false"/>
+    <param name="debugchance" default="0"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <create_list name="$tradeList"/>
+      <set_value name="$bestTrade" exact="null"/>
+      <set_value name="$bestScore" exact="0"/>
+
+      <!-- Read AI yield interval from global settings (persisted to instance var to survive waits) -->
+      <set_value name="this.$gt_yieldMs" exact="1"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$AIYieldInterval?">
+        <set_value name="this.$gt_yieldMs" exact="[1, @global.$GT_GlobalSettings.$Performance.$AIYieldInterval].max"/>
+      </do_if>
+
+      <set_value name="$homeCache" exact="@global.$GT_TradeCache.{$homeSector}"/>
+      <set_value name="$homeCacheCount" exact="0"/>
+      <do_if value="$homeCache?">
+        <set_value name="$homeCacheCount" exact="@$homeCache.count"/>
+      </do_if>
+      <do_if value="$homeCacheCount == 0">
+        <return value="table[
+          $Found = false,
+          $BestTrade = null,
+          $BestScore = 0,
+          $TradeList = $tradeList
+        ]"/>
+      </do_if>
+
+      <set_value name="$now" exact="player.age"/>
+      <set_value name="$foundCount" exact="0"/>
+      <set_value name="$isSellOnlySearch" exact="$searchMode == 'sell_only'"/>
+      <set_value name="$wareBasketCount" exact="if $wareBasket? and typeof $wareBasket == datatype.list then $wareBasket.count else 0"/>
+      <set_value name="$isIsolatedMode" exact="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?"/>
+      <set_value name="$cargoUtilThresholdPct" exact="[10,[$minCargoUtilPercent,100].min].max"/>
+      <!-- Iterate start-to-end (cache is sorted by Score descending via lib.gt.cache.write).
+           Best trades are at the front — first $maxEntries that pass filters are the best available.
+           Stop when we've found $maxEntries valid trades OR exhausted all entries. -->
+      <!-- NOTE: $homeCacheCount is a snapshot; the list can shrink mid-loop (MD purge/cleanup
+           runs while this AI script yields). Guard with bounds check before access. -->
+      <do_all exact="$homeCacheCount" counter="$i">
+        <!-- Bounds guard: list may have shrunk since $homeCacheCount was captured -->
+        <do_if value="$i gt $homeCache.count">
+          <break/>
+        </do_if>
+        <set_value name="$entry" exact="@$homeCache.{$i}"/>
+        <!-- Initialize per-entry offer capacities to avoid undefined-variable lookups -->
+        <set_value name="$preCheckBuyAmt" exact="0"/>
+        <set_value name="$preCheckSellAmt" exact="0"/>
+
+        <!-- Basic validity -->
+        <do_if value="not $entry? or not $entry.$Score? or $entry.$Score le 0">
+          <continue/>
+        </do_if>
+
+        <!-- Search-mode guard:
+             - sell_only: only sell-only entries for wares this ship is currently carrying
+             - buy_and_sell: never pick sell-only disposal entries -->
+        <do_if value="$isSellOnlySearch">
+          <do_if value="not $entry.$IsSellOnly? or not $entry.$IsSellOnly">
+            <continue/>
+          </do_if>
+          <do_if value="not $entry.$Ware? or $ship.cargo.{$entry.$Ware}.count le 0">
+            <continue/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <do_if value="$entry.$IsSellOnly? and $entry.$IsSellOnly">
+            <continue/>
+          </do_if>
+        </do_else>
+
+        <!-- Ware basket filter (applies to all cache search modes when basket is non-empty). -->
+        <do_if value="$wareBasketCount gt 0">
+          <set_value name="$entryWare" exact="if $entry.$Ware? then $entry.$Ware else null"/>
+          <do_if value="$entryWare == null and $entry.$BuyOffer? and @$entry.$BuyOffer.exists and @$entry.$BuyOffer.ware != null">
+            <set_value name="$entryWare" exact="@$entry.$BuyOffer.ware"/>
+          </do_if>
+          <do_if value="$entryWare == null and $entry.$SellOffer? and @$entry.$SellOffer.exists and @$entry.$SellOffer.ware != null">
+            <set_value name="$entryWare" exact="@$entry.$SellOffer.ware"/>
+          </do_if>
+          <set_value name="$wareAllowed" exact="false"/>
+          <do_all exact="$wareBasketCount" counter="$wbIdx">
+            <do_if value="$wareBasket.{$wbIdx} == $entryWare">
+              <set_value name="$wareAllowed" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+          <do_if value="not $wareAllowed">
+            <continue/>
+          </do_if>
+        </do_if>
+
+        <!-- TTL / age check -->
+        <do_if value="$entry.$CachedAt? and ($now - $entry.$CachedAt) gt $cacheMaxAge">
+          <continue/>
+        </do_if>
+
+        <!-- Distance check (both buy and sell station) -->
+        <do_if value="$maxDistance gt 0">
+          <set_value name="$entryBuyStation" exact="@$entry.$BuyStation"/>
+          <set_value name="$entrySellStation" exact="@$entry.$SellStation"/>
+          <do_if value="$entryBuyStation?">
+            <set_value name="$distBuy" exact="$homeSector.gatedistance.{$entryBuyStation}"/>
+            <do_if value="$distBuy lt 0 or $distBuy gt $maxDistance">
+              <continue/>
+            </do_if>
+          </do_if>
+          <do_if value="$entrySellStation?">
+            <set_value name="$distSell" exact="$homeSector.gatedistance.{$entrySellStation}"/>
+            <do_if value="$distSell lt 0 or $distSell gt $maxDistance">
+              <continue/>
+            </do_if>
+          </do_if>
+        </do_if>
+
+        <!-- ROI / absolute profit check (sell-mode trades only) -->
+        <do_if value="not $entry.$IsSellOnly?">
+          <do_if value="$minAbsoluteProfit gt 0 and $entry.$Profit? and $entry.$Profit lt $minAbsoluteProfit">
+            <continue/>
+          </do_if>
+          <do_if value="$minROI gt 0 and $entry.$BuyPrice? and $entry.$BuyPrice gt 0">
+            <set_value name="$entryROI" exact="($entry.$UnitProfit * 100) / $entry.$BuyPrice"/>
+            <do_if value="$entryROI lt $minROI">
+              <continue/>
+            </do_if>
+          </do_if>
+        </do_if>
+
+        <!-- Cache Dropoff Tolerance: reject if profit dropped too much since caching -->
+        <do_if value="$cacheDropoffTolerance gt 0 and not $entry.$IsSellOnly? and $entry.$UnitProfit? and $entry.$UnitProfit gt 0 and $entry.$BuyOffer? and $entry.$SellOffer?">
+          <!-- Only check if both offers still exist (otherwise station-existence check will catch it) -->
+          <do_if value="@$entry.$BuyOffer.exists and @$entry.$SellOffer.exists">
+            <set_value name="$currentBuyPrice" exact="@$entry.$BuyOffer.unitprice"/>
+            <set_value name="$currentSellPrice" exact="@$entry.$SellOffer.unitprice"/>
+            <do_if value="$currentBuyPrice? and $currentSellPrice? and $currentBuyPrice gt 0">
+              <set_value name="$currentUnitProfit" exact="$currentSellPrice - $currentBuyPrice"/>
+              <!-- Calculate how much profit has dropped as % of original -->
+              <do_if value="$currentUnitProfit le 0">
+                <!-- Profit went negative — always reject -->
+                <continue/>
+              </do_if>
+              <set_value name="$profitDropPct" exact="(($entry.$UnitProfit - $currentUnitProfit) * 100) / $entry.$UnitProfit"/>
+              <do_if value="$profitDropPct gt $cacheDropoffTolerance">
+                <continue/>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_if>
+
+        <!-- Build storage exclusion -->
+        <do_if value="$ignoreBuildStorage">
+          <do_if value="@$entry.$BuyStation.isbuildstorage or @$entry.$SellStation.isbuildstorage">
+            <continue/>
+          </do_if>
+        </do_if>
+
+        <!-- Carrier / auxiliary exclusion (stations are never carriers/auxiliaries, only ships can be) -->
+        <do_if value="$ignoreCarrierAux">
+          <do_if value="(@$entry.$BuyStation.isclass.ship and (@$entry.$BuyStation.type == shiptype.carrier or @$entry.$BuyStation.type == shiptype.resupplier)) or (@$entry.$SellStation.isclass.ship and (@$entry.$SellStation.type == shiptype.carrier or @$entry.$SellStation.type == shiptype.resupplier))">
+            <continue/>
+          </do_if>
+        </do_if>
+
+        <!-- Station existence check -->
+        <do_if value="$entry.$BuyStation? and not @$entry.$BuyStation.exists">
+          <continue/>
+        </do_if>
+        <do_if value="$entry.$SellStation? and not @$entry.$SellStation.exists">
+          <continue/>
+        </do_if>
+
+        <!-- Offer availability pre-filter (CHEAP: universal, no per-ship computation).
+             Matches the MD-era cache validation pattern (offer.available + offer.amount).
+             This catches universally dead offers before the expensive offeramount.{ship} check. -->
+        <do_if value="not $entry.$IsSellOnly?">
+          <do_if value="$entry.$BuyOffer? and @$entry.$BuyOffer.exists">
+            <do_if value="not @$entry.$BuyOffer.available or @$entry.$BuyOffer.amount le 0">
+              <continue/>
+            </do_if>
+          </do_if>
+        </do_if>
+        <do_if value="$entry.$SellOffer? and @$entry.$SellOffer.exists">
+          <do_if value="not @$entry.$SellOffer.available or @$entry.$SellOffer.amount le 0">
+            <continue/>
+          </do_if>
+        </do_if>
+
+        <!-- Offer capacity check (EXPENSIVE: per-ship, considers pending trade reservations).
+             Skip entries where offeramount.{ship} is 0 — station capacity is fully reserved
+             by other ships' pending trades. Without this check, the scanner would return 50
+             entries all pointing to saturated stations while valid entries deeper in the cache
+             go unseen. This replaces the old per-ware limit's natural diversification effect. -->
+        <do_if value="not $entry.$IsSellOnly?">
+          <do_if value="$entry.$BuyOffer? and @$entry.$BuyOffer.exists">
+            <set_value name="$preCheckBuyAmt" exact="@$entry.$BuyOffer.offeramount.{$ship}"/>
+            <do_if value="not $preCheckBuyAmt? or $preCheckBuyAmt le 0">
+              <continue/>
+            </do_if>
+          </do_if>
+        </do_if>
+        <do_if value="$entry.$SellOffer? and @$entry.$SellOffer.exists">
+          <set_value name="$preCheckSellAmt" exact="@$entry.$SellOffer.offeramount.{$ship}"/>
+          <do_if value="not $preCheckSellAmt? or $preCheckSellAmt le 0">
+            <continue/>
+          </do_if>
+        </do_if>
+
+        <!-- Hard minimum cargo utilization pre-filter (cache path only, excluded in isolated mode).
+             Uses available reserved-aware offer amounts to estimate max feasible load. -->
+        <do_if value="$enableMinCargoUtil and not $isIsolatedMode and not $entry.$IsSellOnly?">
+          <set_value name="$minUtilVolumePerUnit" exact="1"/>
+          <do_if value="$entry.$Ware? and $entry.$Ware.volume?">
+            <set_value name="$minUtilVolumePerUnit" exact="$entry.$Ware.volume"/>
+          </do_if>
+          <set_value name="$minUtilAmountLimit" exact="$preCheckSellAmt"/>
+          <do_if value="$preCheckBuyAmt? and $preCheckBuyAmt lt $minUtilAmountLimit">
+            <set_value name="$minUtilAmountLimit" exact="$preCheckBuyAmt"/>
+          </do_if>
+          <set_value name="$minUtilTradeVolume" exact="$minUtilAmountLimit * $minUtilVolumePerUnit"/>
+          <set_value name="$minUtilRequiredVolume" exact="($ship.cargo.capacity.all * $cargoUtilThresholdPct) / 100.0"/>
+          <do_if value="$minUtilTradeVolume lt $minUtilRequiredVolume">
+            <continue/>
+          </do_if>
+        </do_if>
+
+        <!-- Reservation check: skip trades reserved by other ships (same rule as MD reservations).
+             Uses SellOffer object as key (Method B from GT_GenerateTradeKey — most reliable, offer.id often unavailable). -->
+        <do_if value="global.$GT_Reservations? and $entry.$SellOffer?">
+          <set_value name="$resKey" exact="$entry.$SellOffer"/>
+          <do_if value="global.$GT_Reservations.{$resKey}?">
+            <set_value name="$resData" exact="global.$GT_Reservations.{$resKey}"/>
+            <!-- Only skip if reservation is unexpired AND belongs to a different ship -->
+            <do_if value="$resData.$Until? and player.age lt @$resData.$Until and $resData.$Ship? and @$resData.$Ship != $ship">
+              <continue/>
+            </do_if>
+          </do_if>
+        </do_if>
+
+        <!-- Entry passed all filters -->
+        <append_to_list name="$tradeList" exact="$entry"/>
+        <set_value name="$foundCount" operation="add"/>
+        <do_if value="$entry.$Score gt $bestScore">
+          <set_value name="$bestScore" exact="$entry.$Score"/>
+          <set_value name="$bestTrade" exact="$entry"/>
+        </do_if>
+        <!-- Stop once we have enough valid trades -->
+        <do_if value="$foundCount ge $maxEntries">
+          <break/>
+        </do_if>
+        <do_if value="($i % 10) == 0">
+          <wait exact="this.$gt_yieldMs * 1ms" comment="Yield cache scan loop"/>
+        </do_if>
+      </do_all>
+
+      <return value="table[
+        $Found = ($bestTrade != null),
+        $BestTrade = $bestTrade,
+        $BestScore = $bestScore,
+        $TradeList = $tradeList
+      ]"/>
+    </actions>
+  </attention>
+</aiscript>

@@ -1,0 +1,497 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_Ship_State_Utilities" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4 Foundations/libraries/md.xsd">
+  <cues>
+    <!-- ========================================= -->
+    <!-- SHIP STATE UTILITIES -->
+    <!-- ========================================= -->
+    
+    <!-- Check Commander Status -->
+    <!-- Returns table with HasCommander, CommanderHasGT, Commander -->
+    <library name="GT_CheckCommanderStatus" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to check commander for"/>
+      </params>
+      <actions>
+        <set_value name="$result" exact="table[]"/>
+        <set_value name="$result.$HasCommander" exact="false"/>
+        <set_value name="$result.$CommanderHasGT" exact="false"/>
+        <set_value name="$result.$Commander" exact="null"/>
+        
+        <do_if value="$ship.commander? and $ship.commander.exists and $ship.commander != $ship">
+          <set_value name="$result.$HasCommander" exact="true"/>
+          <set_value name="$result.$Commander" exact="$ship.commander"/>
+          <do_if value="$ship.commander.defaultorder? and (@$ship.commander.defaultorder.id == 'GalaxyTraderMK4Supply' or @$ship.commander.defaultorder.id == 'GalaxyTraderMK3' or (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.commander.defaultorder.id}))">
+            <set_value name="$result.$CommanderHasGT" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <return value="$result"/>
+      </actions>
+    </library>
+    
+    <!-- Is Subordinate of GT Commander -->
+    <!-- Quick check if ship is subordinate to a GT commander -->
+    <library name="GT_IsSubordinateOfGTCommander" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to check"/>
+      </params>
+      <actions>
+        <run_actions ref="md.GT_Ship_State_Utilities.GT_CheckCommanderStatus" result="$commanderStatus">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        <return value="$commanderStatus.$HasCommander and $commanderStatus.$CommanderHasGT"/>
+      </actions>
+    </library>
+    
+    <!-- Get Ship State -->
+    <!-- Returns ship state with safe property access -->
+    <library name="GT_GetShipState" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to get state for"/>
+      </params>
+      <actions>
+        <set_value name="$state" exact="null"/>
+        <do_if value="global.$GT_Ship_State? and global.$GT_Ship_State.{$ship}?">
+          <set_value name="$state" exact="global.$GT_Ship_State.{$ship}"/>
+        </do_if>
+        
+        <set_value name="$result" exact="table[]"/>
+        <set_value name="$result.$State" exact="$state"/>
+        <set_value name="$result.$HasGTOrder" exact="false"/>
+        <set_value name="$result.$OperationalState" exact="'unknown'"/>
+        <set_value name="$result.$SubordinateState" exact="'unknown'"/>
+        <set_value name="$result.$CommanderHasGT" exact="false"/>
+        <set_value name="$result.$OriginalShipName" exact="null"/>
+        
+        <do_if value="$state?">
+          <do_if value="$state.$HasGTOrder? and $state.$HasGTOrder">
+            <set_value name="$result.$HasGTOrder" exact="true"/>
+          </do_if>
+          <do_if value="$state.$OperationalState?">
+            <set_value name="$result.$OperationalState" exact="$state.$OperationalState"/>
+          </do_if>
+          <do_if value="$state.$SubordinateState?">
+            <set_value name="$result.$SubordinateState" exact="$state.$SubordinateState"/>
+          </do_if>
+          <do_if value="$state.$CommanderHasGT? and $state.$CommanderHasGT">
+            <set_value name="$result.$CommanderHasGT" exact="true"/>
+          </do_if>
+          <do_if value="$state.$OriginalShipName?">
+            <set_value name="$result.$OriginalShipName" exact="$state.$OriginalShipName"/>
+          </do_if>
+        </do_if>
+        
+        <return value="$result"/>
+      </actions>
+    </library>
+    
+    <!-- Unified wrapper for deferred ship-name refresh requests. -->
+    <library name="GT_RequestShipNameRefresh" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to refresh name for"/>
+        <param name="pilot" default="null" comment="Pilot entity (optional, derived from ship if missing)"/>
+        <param name="reason" default="''" comment="Optional reason tag for debug tracing"/>
+      </params>
+      <actions>
+        <do_if value="not $ship? or not $ship.exists">
+          <return value="false"/>
+        </do_if>
+        
+        <do_if value="not $pilot? or not $pilot.exists">
+          <set_value name="$pilot" exact="if $ship.pilot? and $ship.pilot.exists then $ship.pilot else null"/>
+        </do_if>
+        <do_if value="not $pilot? or not $pilot.exists">
+          <return value="false"/>
+        </do_if>
+        
+        <signal_cue_instantly cue="md.GT_CoreSystem.DeferredShipNameUpdate" param="table[
+          $Ship = $ship,
+          $pilot = $pilot
+        ]"/>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $reason != ''">
+          <debug_text text="'[GT-StateUtils] Requested DeferredShipNameUpdate for ' + $ship.idcode + ' reason=' + $reason" chance="100"/>
+        </do_if>
+        <return value="true"/>
+      </actions>
+    </library>
+    
+    <!-- Restore Ship Name -->
+    <!-- Handles name restoration logic with subordinate checking -->
+    <library name="GT_RestoreShipName" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to restore name for"/>
+        <param name="reason" comment="Reason for name restoration"/>
+        <param name="checkSubordinate" default="true" comment="Check if subordinate to GT commander"/>
+        <param name="state" default="null" comment="Ship state (optional, for state-based name lookup)"/>
+        <param name="checkDirectGTOrder" default="true" comment="Check if ship has direct GT order"/>
+      </params>
+      <actions>
+        <!-- Check if ship has direct GT order -->
+        <set_value name="$hasDirectGTOrder" exact="false"/>
+        <do_if value="$checkDirectGTOrder">
+          <do_if value="$ship.defaultorder? and (@$ship.defaultorder.id == 'GalaxyTraderMK4Supply' or @$ship.defaultorder.id == 'GalaxyTraderMK3' or (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.defaultorder.id}))">
+            <set_value name="$hasDirectGTOrder" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- If ship has direct GT order, don't restore name -->
+        <do_if value="$hasDirectGTOrder">
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Check if ship is subordinate to GT commander -->
+        <set_value name="$isSubordinateOfGTCommander" exact="false"/>
+        <do_if value="$checkSubordinate">
+          <run_actions ref="md.GT_Ship_State_Utilities.GT_IsSubordinateOfGTCommander" result="$isSubordinate">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          <set_value name="$isSubordinateOfGTCommander" exact="$isSubordinate"/>
+        </do_if>
+        
+        <!-- Restore name if ship is not GT-controlled -->
+        <set_value name="$shouldRestore" exact="false"/>
+        <do_if value="not $isSubordinateOfGTCommander and $ship.pilot?">
+          <set_value name="$shouldRestore" exact="true"/>
+        </do_if>
+        
+        <do_if value="$shouldRestore">
+          <set_value name="$originalName" exact="null"/>
+          
+          <!-- Try to get original name from pilot registry -->
+          <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$OriginalShipName?">
+            <set_value name="$originalName" exact="global.$GT_Pilots.{$ship.pilot}.$OriginalShipName"/>
+          </do_if>
+          <!-- Fallback to state if available -->
+          <do_elseif value="$state? and $state.$OriginalShipName?">
+            <set_value name="$originalName" exact="$state.$OriginalShipName"/>
+          </do_elseif>
+          
+          <do_if value="$originalName">
+            <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+              $Ship = $ship,
+              $Pilot = $ship.pilot,
+              $Reason = $reason,
+              $OriginalName = $originalName
+            ]"/>
+            <return value="true"/>
+          </do_if>
+        </do_if>
+        <return value="false"/>
+      </actions>
+    </library>
+    
+    <!-- Check GT Order Status (COMPREHENSIVE) -->
+    <!-- Unified function that checks ALL conditions for GT order detection -->
+    <!-- Consolidates logic from: order.wait.xml, order.trade.galaxytrader.xml, order.assist.xml, etc. -->
+    <!-- Returns comprehensive status table for cleanup detection -->
+    <library name="GT_CheckGTOrderStatus" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to check GT order status for"/>
+        <param name="checkRegistry" default="true" comment="Check if ship is in GT_Ships registry"/>
+        <param name="checkState" default="true" comment="Check state registry for historical data"/>
+      </params>
+      <actions>
+        <set_value name="$result" exact="table[]"/>
+        
+        <!-- Initialize all result fields -->
+        <set_value name="$result.$HasDirectGTOrder" exact="false"/>
+        <set_value name="$result.$HasGTCommander" exact="false"/>
+        <set_value name="$result.$IsGTControlled" exact="false"/>
+        <set_value name="$result.$IsSubordinate" exact="false"/>
+        <set_value name="$result.$DefaultOrder" exact="null"/>
+        <set_value name="$result.$Commander" exact="null"/>
+        <set_value name="$result.$CommanderExists" exact="false"/>
+        <set_value name="$result.$InRegistry" exact="false"/>
+        <set_value name="$result.$WasSubordinate" exact="false"/>
+        <set_value name="$result.$StateSaysHasGTOrder" exact="false"/>
+        <set_value name="$result.$PilotRegistryLinked" exact="false"/>
+        <set_value name="$result.$ShouldCleanup" exact="false"/>
+        <set_value name="$result.$ShouldRestoreName" exact="false"/>
+        <set_value name="$result.$IsPermanentRemoval" exact="false"/>
+        
+        <!-- Get current default order -->
+        <set_value name="$currentDefaultOrder" exact="@$ship.defaultorder.id"/>
+        <set_value name="$result.$DefaultOrder" exact="$currentDefaultOrder"/>
+        
+        <!-- CHECK 1: Direct GT Order -->
+        <do_if value="$currentDefaultOrder? and ($currentDefaultOrder == 'GalaxyTraderMK4Supply' or $currentDefaultOrder == 'GalaxyTraderMK3' or (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{$currentDefaultOrder}))">
+          <set_value name="$result.$HasDirectGTOrder" exact="true"/>
+          <set_value name="$result.$IsGTControlled" exact="true"/>
+        </do_if>
+        
+        <!-- CHECK 2: Commander Status (if not direct GT) -->
+        <do_if value="not $result.$HasDirectGTOrder">
+          <run_actions ref="md.GT_Ship_State_Utilities.GT_CheckCommanderStatus" result="$commanderStatus">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          
+          <set_value name="$result.$CommanderExists" exact="$commanderStatus.$HasCommander"/>
+          <set_value name="$result.$Commander" exact="$commanderStatus.$Commander"/>
+          <set_value name="$result.$HasGTCommander" exact="$commanderStatus.$CommanderHasGT"/>
+          
+          <!-- CHECK 3: Subordinate with Assist order AND GT commander -->
+          <do_if value="$currentDefaultOrder == 'Assist' and $result.$HasGTCommander">
+            <set_value name="$result.$IsSubordinate" exact="true"/>
+            <set_value name="$result.$IsGTControlled" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- CHECK 4: Registry Status -->
+        <do_if value="$checkRegistry">
+          <set_value name="$result.$InRegistry" exact="global.$GT_Ships? and global.$GT_Ships.{$ship}?"/>
+        </do_if>
+        
+        <!-- CHECK 5: State Registry (Historical Data) -->
+        <set_value name="$state" exact="null"/>
+        <do_if value="$checkState and global.$GT_Ship_State? and global.$GT_Ship_State.{$ship}?">
+          <set_value name="$state" exact="global.$GT_Ship_State.{$ship}"/>
+          
+          <!-- State says ship had GT order -->
+          <do_if value="$state.$HasGTOrder? and $state.$HasGTOrder">
+            <set_value name="$result.$StateSaysHasGTOrder" exact="true"/>
+          </do_if>
+          
+          <!-- State says ship was subordinate -->
+          <do_if value="$state.$SubordinateState? and $state.$SubordinateState == 'subordinate'">
+            <set_value name="$result.$WasSubordinate" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- CHECK 5b: Pilot registry link (survives detach races better than GT_Ships/state alone) -->
+        <do_if value="$ship.pilot? and global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$OriginalShipName?">
+          <set_value name="$pilotData" exact="global.$GT_Pilots.{$ship.pilot}"/>
+          <do_if value="$pilotData.$Ship? and $pilotData.$Ship == $ship">
+            <set_value name="$result.$PilotRegistryLinked" exact="true"/>
+          </do_if>
+          <do_elseif value="$pilotData.$AssociatedShip? and $pilotData.$AssociatedShip == $ship">
+            <set_value name="$result.$PilotRegistryLinked" exact="true"/>
+          </do_elseif>
+          <do_elseif value="$pilotData.$ShipID? and $pilotData.$ShipID == $ship.idcode">
+            <set_value name="$result.$PilotRegistryLinked" exact="true"/>
+          </do_elseif>
+        </do_if>
+        
+        <!-- CHECK 6: Cleanup Decision Logic -->
+        <!-- Should cleanup if: ship was GT-controlled but no longer is -->
+        <set_value name="$wasGTControlled" exact="false"/>
+        <do_if value="$result.$InRegistry or $result.$StateSaysHasGTOrder or $result.$WasSubordinate or $result.$PilotRegistryLinked">
+          <set_value name="$wasGTControlled" exact="true"/>
+        </do_if>
+        
+        <!-- Cleanup needed if: was GT-controlled but now is NOT -->
+        <do_if value="$wasGTControlled and not $result.$IsGTControlled">
+          <set_value name="$result.$ShouldCleanup" exact="true"/>
+          
+          <!-- Permanent removal if: no direct GT AND no GT commander -->
+          <do_if value="not $result.$HasDirectGTOrder and not $result.$HasGTCommander">
+            <set_value name="$result.$IsPermanentRemoval" exact="true"/>
+          </do_if>
+          
+          <!-- Should restore name if: not subordinate to GT commander -->
+          <do_if value="not $result.$IsSubordinate and $ship.pilot?">
+            <set_value name="$result.$ShouldRestoreName" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- SPECIAL CASE: Subordinate with Assist order but commander check might fail due to timing -->
+        <!-- If ship has Assist order, treat as active subordinate (even if commander check fails temporarily) -->
+        <do_if value="$currentDefaultOrder == 'Assist' and $result.$CommanderExists">
+          <!-- Commander exists - check if it has GT order -->
+          <do_if value="$result.$HasGTCommander">
+            <set_value name="$result.$IsSubordinate" exact="true"/>
+            <set_value name="$result.$IsGTControlled" exact="true"/>
+            <set_value name="$result.$ShouldCleanup" exact="false"/>
+            <set_value name="$result.$ShouldRestoreName" exact="false"/>
+          </do_if>
+        </do_if>
+        
+        <return value="$result"/>
+      </actions>
+    </library>
+    
+    <!-- Check pilot-exchange lifecycle status (authoritative state only, no time grace). -->
+    <library name="GT_CheckPilotExchangeStatus" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to check pilot-exchange status for"/>
+      </params>
+      <actions>
+        <set_value name="$result" exact="table[]"/>
+        <set_value name="$result.$FlagSet" exact="false"/>
+        <set_value name="$result.$IsOrderActive" exact="false"/>
+        <set_value name="$result.$HasQueuedExchangeOrder" exact="false"/>
+        <set_value name="$result.$HasPendingDock" exact="false"/>
+        <set_value name="$result.$ShouldKeepPE" exact="false"/>
+        <set_value name="$result.$ShouldClearPE" exact="false"/>
+        <set_value name="$result.$CurrentOrder" exact="'NONE'"/>
+        <set_value name="$result.$CurrentCallerOrder" exact="'NONE'"/>
+        
+        <do_if value="$ship? and $ship.exists">
+          <do_if value="$ship.order? and $ship.order.id?">
+            <set_value name="$result.$CurrentOrder" exact="@$ship.order.id"/>
+          </do_if>
+          <do_if value="$ship.order? and $ship.order.$callerid? and $ship.order.$callerid.id?">
+            <set_value name="$result.$CurrentCallerOrder" exact="@$ship.order.$callerid.id"/>
+          </do_if>
+          
+          <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$PilotExchange? and global.$GT_Ships.{$ship}.$PilotExchange">
+            <set_value name="$result.$FlagSet" exact="true"/>
+          </do_if>
+          
+          <do_if value="$result.$CurrentOrder == 'DockAndPilotExchange'">
+            <set_value name="$result.$IsOrderActive" exact="true"/>
+          </do_if>
+          <do_elseif value="$result.$CurrentOrder == 'DockAndWait' and $result.$CurrentCallerOrder == 'DockAndPilotExchange'">
+            <set_value name="$result.$IsOrderActive" exact="true"/>
+          </do_elseif>
+          
+          <do_if value="$ship.orders? and $ship.orders.count gt 0">
+            <do_all exact="$ship.orders.count" counter="$i">
+              <set_value name="$orderId" exact="@$ship.orders.{$i}.id"/>
+              <set_value name="$callerId" exact="''"/>
+              <do_if value="$ship.orders.{$i}.$callerid? and $ship.orders.{$i}.$callerid.id?">
+                <set_value name="$callerId" exact="@$ship.orders.{$i}.$callerid.id"/>
+              </do_if>
+              <do_if value="$orderId == 'DockAndPilotExchange' or ($orderId == 'DockAndWait' and $callerId == 'DockAndPilotExchange')">
+                <set_value name="$result.$HasQueuedExchangeOrder" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+          
+          <do_if value="global.$GT_RedistributePendingDockByShip? and $ship.idcode? and global.$GT_RedistributePendingDockByShip.{'$' + $ship.idcode}?">
+            <set_value name="$result.$HasPendingDock" exact="true"/>
+          </do_if>
+          
+          <!-- Keep PE only while exchange order is active or queued.
+               Pending-dock markers alone are transitional and must not pin PE forever. -->
+          <do_if value="$result.$IsOrderActive or $result.$HasQueuedExchangeOrder">
+            <set_value name="$result.$ShouldKeepPE" exact="true"/>
+          </do_if>
+          
+          <do_if value="$result.$FlagSet and not $result.$ShouldKeepPE">
+            <set_value name="$result.$ShouldClearPE" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <return value="$result"/>
+      </actions>
+    </library>
+    
+    <!-- Reconcile PE flag against authoritative ship/order state and clear stale markers. -->
+    <library name="GT_ReconcilePilotExchangeState" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to reconcile PE state for"/>
+        <param name="reason" default="''" comment="Optional reason tag for debug tracing"/>
+      </params>
+      <actions>
+        <do_if value="not $ship? or not $ship.exists">
+          <return value="false"/>
+        </do_if>
+        
+        <run_actions ref="md.GT_Ship_State_Utilities.GT_CheckPilotExchangeStatus" result="$peStatus">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        
+        <set_value name="$hadChanges" exact="false"/>
+        <do_if value="$peStatus.$HasPendingDock and not ($peStatus.$IsOrderActive or $peStatus.$HasQueuedExchangeOrder)">
+          <do_if value="global.$GT_RedistributePendingDockByShip? and $ship.idcode?">
+            <remove_value name="global.$GT_RedistributePendingDockByShip.{'$' + $ship.idcode}"/>
+          </do_if>
+          <do_if value="global.$GT_RedistributePendingDockSinceByShip? and $ship.idcode?">
+            <remove_value name="global.$GT_RedistributePendingDockSinceByShip.{'$' + $ship.idcode}"/>
+          </do_if>
+          <set_value name="$hadChanges" exact="true"/>
+        </do_if>
+        
+        <do_if value="$peStatus.$ShouldClearPE">
+          <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
+            <set_value name="global.$GT_Ships.{$ship}.$PilotExchange" exact="false"/>
+          </do_if>
+          <do_if value="$ship.pilot?">
+            <run_actions ref="md.GT_Ship_State_Utilities.GT_RequestShipNameRefresh">
+              <param name="ship" value="$ship"/>
+              <param name="pilot" value="$ship.pilot"/>
+              <param name="reason" value="'pe_reconcile_clear:' + $reason"/>
+            </run_actions>
+          </do_if>
+          <set_value name="$hadChanges" exact="true"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-StateUtils] Reconciled stale PE on ' + $ship.idcode + ' reason=' + (if $reason != '' then $reason else 'none') + ' current=' + $peStatus.$CurrentOrder + ' caller=' + $peStatus.$CurrentCallerOrder + ' queued=' + $peStatus.$HasQueuedExchangeOrder + ' hadPending=' + $peStatus.$HasPendingDock" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <return value="$hadChanges"/>
+      </actions>
+    </library>
+    
+    <!-- Check if Ship Should Trigger Cleanup -->
+    <!-- Simplified wrapper that returns boolean for cleanup decision -->
+    <library name="GT_ShouldTriggerCleanup" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to check"/>
+        <param name="checkRegistry" default="true" comment="Check registry"/>
+        <param name="checkState" default="true" comment="Check state"/>
+      </params>
+      <actions>
+        <run_actions ref="md.GT_Ship_State_Utilities.GT_CheckGTOrderStatus" result="$status">
+          <param name="ship" value="$ship"/>
+          <param name="checkRegistry" value="$checkRegistry"/>
+          <param name="checkState" value="$checkState"/>
+        </run_actions>
+        <return value="$status.$ShouldCleanup"/>
+      </actions>
+    </library>
+    
+    <!-- Check if Ship is GT-Controlled (Quick Check) -->
+    <!-- Simplified wrapper for quick GT-controlled check -->
+    <library name="GT_IsGTControlled" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to check"/>
+      </params>
+      <actions>
+        <run_actions ref="md.GT_Ship_State_Utilities.GT_CheckGTOrderStatus" result="$status">
+          <param name="ship" value="$ship"/>
+          <param name="checkRegistry" value="false"/>
+          <param name="checkState" value="false"/>
+        </run_actions>
+        <return value="$status.$IsGTControlled"/>
+      </actions>
+    </library>
+    
+    <!-- Check if Ship is in Maintenance (Repair/Resupply) -->
+    <!-- Unified maintenance check used by batch processor and cleanup logic -->
+    <library name="GT_IsShipInMaintenance" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to check"/>
+      </params>
+      <actions>
+        <set_value name="$isInMaintenance" exact="false"/>
+        
+        <!-- Check for active repair order -->
+        <do_if value="global.$GT_RepairOrders? and global.$GT_RepairOrders.{$ship}?">
+          <set_value name="$isInMaintenance" exact="true"/>
+        </do_if>
+        
+        <!-- Check for active resupply order -->
+        <do_if value="not $isInMaintenance and global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{$ship}?">
+          <set_value name="$isInMaintenance" exact="true"/>
+        </do_if>
+        
+        <!-- Check for active repair/resupply orders on ship -->
+        <do_if value="not $isInMaintenance and $ship.orders? and $ship.orders.count gt 0">
+          <do_all exact="$ship.orders.count" counter="$i">
+            <set_value name="$orderId" exact="@$ship.orders.{$i}.id"/>
+            <do_if value="$orderId == 'Repair' or $orderId == 'Resupply'">
+              <set_value name="$isInMaintenance" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+        </do_if>
+        
+        <return value="$isInMaintenance"/>
+      </actions>
+    </library>
+    
+  </cues>
+</mdscript>

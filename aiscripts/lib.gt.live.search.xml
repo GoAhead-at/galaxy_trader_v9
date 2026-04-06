@@ -1,0 +1,526 @@
+<?xml version="1.0" encoding="utf-8"?>
+<aiscript name="lib.gt.live.search" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <params>
+    <param name="ship" default="this.ship"/>
+    <param name="searchMode" default="'buy_and_sell'"/>
+    <param name="buySpaces" default="[]"/>
+    <param name="sellSpaces" default="[]"/>
+    <param name="homeSector" default="this.ship.sector"/>
+    <param name="maxDistance" default="0"/>
+    <param name="wareBasket" default="[]"/>
+    <param name="allowIllegal" default="false"/>
+    <param name="ownerFilter" default="'any'"/>
+    <param name="ignoreMK1Supply" default="false"/>
+    <param name="ignoreTradeRules" default="false"/>
+    <param name="maxOffersPerWare" default="20"/>
+    <param name="maxOffersPerSearch" default="200"/> <!-- Legacy / unused — kept for call-site compat, per-ware cap is used instead -->
+    <param name="sellPriceMax" default="1.0" comment="Max relative price for sell offers (ship buys from station). Range: -1.0 to 1.0. Default 1.0 = no filter"/>
+    <param name="buyPriceMin" default="-1.0" comment="Min relative price for buy offers (ship sells to station). Range: -1.0 to 1.0. Default -1.0 = no filter"/>
+    <!-- MK4 compatibility params (accepted for call-site compatibility) -->
+    <param name="ignoreTradeRulesPlayerBuyOffersRequireCargoNeed" default="false"/>
+    <param name="includePlayerBuyOffers" default="true"/>
+    <param name="includePlayerSellOffers" default="true"/>
+    <param name="priorityWares" default="[]" comment="Optional: MK3 priority wares to explicitly search for (ensures they enter the tradeable set for scoring)"/>
+    <param name="debugchance" default="0"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <create_list name="$sellOffers"/>
+      <create_list name="$buyOffers"/>
+
+      <!-- Per-ware offer tracking: ensures EVERY tradeable ware gets representation.
+           Without this, the first few busy sectors would fill a blind cap with the same
+           10-15 high-volume wares, starving niche wares and distant sectors.
+           Old version used MaxOffersPerWare=200 (collection) + MaxOffersPerWareForMatching=20. -->
+      <set_value name="$sellOffersPerWare" exact="table[]"/>
+      <set_value name="$buyOffersPerWare" exact="table[]"/>
+
+      <!-- Read AI yield interval from global settings (persisted to instance var to survive waits) -->
+      <set_value name="this.$gt_yieldMs" exact="1"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$AIYieldInterval?">
+        <set_value name="this.$gt_yieldMs" exact="[1, @global.$GT_GlobalSettings.$Performance.$AIYieldInterval].max"/>
+      </do_if>
+
+      <!-- Persist params to instance vars so loop yields (<wait>) cannot lose them. -->
+      <set_value name="this.$gtls_ship" exact="$ship"/>
+      <set_value name="this.$gtls_searchMode" exact="$searchMode"/>
+      <set_value name="this.$gtls_buySpaces" exact="$buySpaces"/>
+      <set_value name="this.$gtls_sellSpaces" exact="$sellSpaces"/>
+      <set_value name="this.$gtls_homeSector" exact="$homeSector"/>
+      <set_value name="this.$gtls_maxDistance" exact="$maxDistance"/>
+      <set_value name="this.$gtls_wareBasket" exact="$wareBasket"/>
+      <set_value name="this.$gtls_allowIllegal" exact="$allowIllegal"/>
+      <set_value name="this.$gtls_ownerFilter" exact="$ownerFilter"/>
+      <set_value name="this.$gtls_ignoreMK1Supply" exact="$ignoreMK1Supply"/>
+      <set_value name="this.$gtls_ignoreTradeRules" exact="$ignoreTradeRules"/>
+      <set_value name="this.$gtls_maxOffersPerWare" exact="$maxOffersPerWare"/>
+      <set_value name="this.$gtls_maxOffersPerSearch" exact="$maxOffersPerSearch"/>
+      <set_value name="this.$gtls_sellPriceMax" exact="$sellPriceMax"/>
+      <set_value name="this.$gtls_buyPriceMin" exact="$buyPriceMin"/>
+      <set_value name="this.$gtls_includePlayerBuyOffers" exact="$includePlayerBuyOffers"/>
+      <set_value name="this.$gtls_includePlayerSellOffers" exact="$includePlayerSellOffers"/>
+      <set_value name="this.$gtls_ignoreTradeRulesPlayerBuyOffersRequireCargoNeed" exact="$ignoreTradeRulesPlayerBuyOffersRequireCargoNeed"/>
+      <set_value name="this.$gtls_priorityWares" exact="if $priorityWares? then $priorityWares else []"/>
+      <set_value name="this.$gtls_debugchance" exact="$debugchance"/>
+
+      <set_value name="this.$gtls_useAllWares" exact="(not this.$gtls_wareBasket? or this.$gtls_wareBasket.count == 0)"/>
+
+      <debug_text text="'[GT-LiveSearch] ' + this.$gtls_ship.idcode + ': params: sellPriceMax=' + this.$gtls_sellPriceMax + ' buyPriceMin=' + this.$gtls_buyPriceMin + ' mode=' + this.$gtls_searchMode + ' buySpaces=' + this.$gtls_buySpaces.count + ' sellSpaces=' + this.$gtls_sellSpaces.count" chance="this.$gtls_debugchance"/>
+
+      <!-- ══════════════════════════════════════════════════════════════════
+           Collect seller offers (ship buys from seller)
+           Per-ware cap applied: each ware gets up to $maxOffersPerWare offers.
+           ══════════════════════════════════════════════════════════════════ -->
+      <do_if value="this.$gtls_searchMode != 'sell_only' and this.$gtls_buySpaces? and this.$gtls_buySpaces.count gt 0">
+        <do_all exact="this.$gtls_buySpaces.count" counter="$si">
+          <set_value name="$space" exact="this.$gtls_buySpaces.{$si}"/>
+          <do_if value="this.$gtls_useAllWares">
+            <find_sell_offer tradepartner="this.$gtls_ship" space="$space" result="$foundSellOffers" multiple="true">
+              <match_seller tradesknownto="this.$gtls_ship.owner" owner="faction.player" negateownerfilter="true">
+                <match_relation_to object="this.$gtls_ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="this.$gtls_ship.owner" relation="enemy" comparison="not"/>
+              </match_seller>
+              <amount min="1"/>
+              <relativeprice max="this.$gtls_sellPriceMax" tradepartner="if this.$gtls_ship.isplayerowned then this.$gtls_ship else null"/>
+            </find_sell_offer>
+
+            <do_if value="$foundSellOffers? and $foundSellOffers.count gt 0">
+              <do_all exact="$foundSellOffers.count" counter="$oi">
+                <set_value name="$offer" exact="$foundSellOffers.{$oi}"/>
+                <do_if value="not this.$gtls_allowIllegal and $offer.ware? and @$offer.ware.illegal">
+                  <continue/>
+                </do_if>
+                <do_if value="this.$gtls_ownerFilter == 'npc_only' and $offer.owner.isplayerowned">
+                  <continue/>
+                </do_if>
+                <do_if value="this.$gtls_ownerFilter == 'player_only' and not $offer.owner.isplayerowned">
+                  <continue/>
+                </do_if>
+                <!-- Per-ware cap: ensure ware diversity -->
+                <set_value name="$offerWare" exact="@$offer.ware"/>
+                <do_if value="$offerWare?">
+                  <do_if value="not $sellOffersPerWare.{$offerWare}?">
+                    <set_value name="$sellOffersPerWare.{$offerWare}" exact="0"/>
+                  </do_if>
+                  <do_if value="$sellOffersPerWare.{$offerWare} ge this.$gtls_maxOffersPerWare">
+                    <continue/>
+                  </do_if>
+                  <set_value name="$sellOffersPerWare.{$offerWare}" operation="add"/>
+                </do_if>
+                <append_to_list name="$sellOffers" exact="$offer"/>
+              </do_all>
+            </do_if>
+          </do_if>
+          <do_else>
+          <do_all exact="this.$gtls_wareBasket.count" counter="$wi">
+            <set_value name="$ware" exact="this.$gtls_wareBasket.{$wi}"/>
+            <!-- Skip this ware entirely if we already have enough sell offers for it -->
+            <do_if value="$sellOffersPerWare.{$ware}? and $sellOffersPerWare.{$ware} ge this.$gtls_maxOffersPerWare">
+              <continue/>
+            </do_if>
+
+            <find_sell_offer wares="$ware" tradepartner="this.$gtls_ship" space="$space" result="$foundSellOffers" multiple="true">
+              <match_seller tradesknownto="this.$gtls_ship.owner" owner="faction.player" negateownerfilter="true">
+                <match_relation_to object="this.$gtls_ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="this.$gtls_ship.owner" relation="enemy" comparison="not"/>
+              </match_seller>
+              <amount min="1"/>
+              <relativeprice max="this.$gtls_sellPriceMax" tradepartner="if this.$gtls_ship.isplayerowned then this.$gtls_ship else null"/>
+            </find_sell_offer>
+
+            <do_if value="$foundSellOffers? and $foundSellOffers.count gt 0">
+              <do_if value="not $sellOffersPerWare.{$ware}?">
+                <set_value name="$sellOffersPerWare.{$ware}" exact="0"/>
+              </do_if>
+              <do_all exact="$foundSellOffers.count" counter="$oi">
+                <do_if value="$sellOffersPerWare.{$ware} ge this.$gtls_maxOffersPerWare">
+                  <break/>
+                </do_if>
+                <set_value name="$offer" exact="$foundSellOffers.{$oi}"/>
+
+                <do_if value="this.$gtls_ownerFilter == 'npc_only' and $offer.owner.isplayerowned">
+                  <continue/>
+                </do_if>
+                <do_if value="this.$gtls_ownerFilter == 'player_only' and not $offer.owner.isplayerowned">
+                  <continue/>
+                </do_if>
+
+                <append_to_list name="$sellOffers" exact="$offer"/>
+                <set_value name="$sellOffersPerWare.{$ware}" operation="add"/>
+              </do_all>
+            </do_if>
+          </do_all>
+          </do_else>
+          <wait exact="this.$gt_yieldMs * 1ms" comment="Yield after sell-offer sector"/>
+        </do_all>
+      </do_if>
+
+      <debug_text text="'[GT-LiveSearch] ' + this.$gtls_ship.idcode + ': sell-offers collected=' + $sellOffers.count + ' (sellPriceMax=' + this.$gtls_sellPriceMax + ')'" chance="this.$gtls_debugchance"/>
+
+      <!-- ══════════════════════════════════════════════════════════════════
+           Collect buyer offers (ship sells to buyer)
+           Per-ware cap applied: each ware gets up to $maxOffersPerWare offers.
+           ══════════════════════════════════════════════════════════════════ -->
+      <do_if value="this.$gtls_searchMode != 'buy_only' and this.$gtls_sellSpaces? and this.$gtls_sellSpaces.count gt 0">
+        <do_all exact="this.$gtls_sellSpaces.count" counter="$si">
+          <set_value name="$space" exact="this.$gtls_sellSpaces.{$si}"/>
+          <do_if value="this.$gtls_useAllWares">
+            <!-- Always start with partner-filtered offers so normal execution constraints stay intact. -->
+            <find_buy_offer tradepartner="this.$gtls_ship" space="$space" result="$foundBuyOffers" multiple="true">
+              <match_buyer tradesknownto="this.$gtls_ship.owner">
+                <match_relation_to object="this.$gtls_ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="this.$gtls_ship.owner" relation="enemy" comparison="not"/>
+              </match_buyer>
+              <offeramount min="1" tradepartner="this.$gtls_ship"/>
+              <relativeprice min="this.$gtls_buyPriceMin" tradepartner="if this.$gtls_ship.isplayerowned then this.$gtls_ship else null"/>
+            </find_buy_offer>
+            <do_if value="this.$gtls_ignoreTradeRules">
+              <!-- ignoreTradeRules scope: only bypass player-station trade rules.
+                   Do not broaden to non-player stations or bypass other partner checks. -->
+              <find_buy_offer space="$space" result="$ignoreRulesBuyOffers" multiple="true">
+                <match_buyer tradesknownto="this.$gtls_ship.owner" owner="faction.player">
+                  <match_relation_to object="this.$gtls_ship" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="this.$gtls_ship.owner" relation="enemy" comparison="not"/>
+                </match_buyer>
+                <offeramount min="1" tradepartner="this.$gtls_ship"/>
+              </find_buy_offer>
+              <do_if value="not $foundBuyOffers?">
+                <create_list name="$foundBuyOffers"/>
+              </do_if>
+              <do_if value="$ignoreRulesBuyOffers? and $ignoreRulesBuyOffers.count gt 0">
+                <do_all exact="$ignoreRulesBuyOffers.count" counter="$iri">
+                  <append_to_list name="$foundBuyOffers" exact="$ignoreRulesBuyOffers.{$iri}"/>
+                </do_all>
+              </do_if>
+            </do_if>
+
+            <do_if value="$foundBuyOffers? and $foundBuyOffers.count gt 0">
+              <do_all exact="$foundBuyOffers.count" counter="$oi">
+                <set_value name="$offer" exact="$foundBuyOffers.{$oi}"/>
+                <do_if value="not this.$gtls_allowIllegal and $offer.ware? and @$offer.ware.illegal">
+                  <continue/>
+                </do_if>
+                <do_if value="this.$gtls_ownerFilter == 'npc_only' and $offer.owner.isplayerowned">
+                  <continue/>
+                </do_if>
+                <do_if value="this.$gtls_ownerFilter == 'player_only' and not $offer.owner.isplayerowned">
+                  <continue/>
+                </do_if>
+                <do_if value="this.$gtls_ignoreMK1Supply and global.$GT_MK1SuppliedStations? and global.$GT_MK1SuppliedStations.{$offer.owner}?">
+                  <continue/>
+                </do_if>
+                <!-- Per-ware cap: ensure ware diversity -->
+                <set_value name="$offerWare" exact="@$offer.ware"/>
+                <do_if value="$offerWare?">
+                  <do_if value="not $buyOffersPerWare.{$offerWare}?">
+                    <set_value name="$buyOffersPerWare.{$offerWare}" exact="0"/>
+                  </do_if>
+                  <do_if value="$buyOffersPerWare.{$offerWare} ge this.$gtls_maxOffersPerWare">
+                    <continue/>
+                  </do_if>
+                  <set_value name="$buyOffersPerWare.{$offerWare}" operation="add"/>
+                </do_if>
+                <append_to_list name="$buyOffers" exact="$offer"/>
+              </do_all>
+            </do_if>
+          </do_if>
+          <do_else>
+          <do_all exact="this.$gtls_wareBasket.count" counter="$wi">
+            <set_value name="$ware" exact="this.$gtls_wareBasket.{$wi}"/>
+            <!-- Skip this ware entirely if we already have enough buy offers for it -->
+            <do_if value="$buyOffersPerWare.{$ware}? and $buyOffersPerWare.{$ware} ge this.$gtls_maxOffersPerWare">
+              <continue/>
+            </do_if>
+
+            <!-- Always start with partner-filtered offers so normal execution constraints stay intact. -->
+            <find_buy_offer wares="$ware" tradepartner="this.$gtls_ship" space="$space" result="$foundBuyOffers" multiple="true">
+              <match_buyer tradesknownto="this.$gtls_ship.owner">
+                <match_relation_to object="this.$gtls_ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="this.$gtls_ship.owner" relation="enemy" comparison="not"/>
+              </match_buyer>
+              <offeramount min="1" tradepartner="this.$gtls_ship"/>
+              <relativeprice min="this.$gtls_buyPriceMin" tradepartner="if this.$gtls_ship.isplayerowned then this.$gtls_ship else null"/>
+            </find_buy_offer>
+            <do_if value="this.$gtls_ignoreTradeRules">
+              <!-- ignoreTradeRules scope: only bypass player-station trade rules.
+                   Do not broaden to non-player stations or bypass other partner checks. -->
+              <find_buy_offer wares="$ware" space="$space" result="$ignoreRulesBuyOffers" multiple="true">
+                <match_buyer tradesknownto="this.$gtls_ship.owner" owner="faction.player">
+                  <match_relation_to object="this.$gtls_ship" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="this.$gtls_ship.owner" relation="enemy" comparison="not"/>
+                </match_buyer>
+                <offeramount min="1" tradepartner="this.$gtls_ship"/>
+              </find_buy_offer>
+              <do_if value="not $foundBuyOffers?">
+                <create_list name="$foundBuyOffers"/>
+              </do_if>
+              <do_if value="$ignoreRulesBuyOffers? and $ignoreRulesBuyOffers.count gt 0">
+                <do_all exact="$ignoreRulesBuyOffers.count" counter="$iri">
+                  <append_to_list name="$foundBuyOffers" exact="$ignoreRulesBuyOffers.{$iri}"/>
+                </do_all>
+              </do_if>
+            </do_if>
+
+            <do_if value="$foundBuyOffers? and $foundBuyOffers.count gt 0">
+              <do_if value="not $buyOffersPerWare.{$ware}?">
+                <set_value name="$buyOffersPerWare.{$ware}" exact="0"/>
+              </do_if>
+              <do_all exact="$foundBuyOffers.count" counter="$oi">
+                <do_if value="$buyOffersPerWare.{$ware} ge this.$gtls_maxOffersPerWare">
+                  <break/>
+                </do_if>
+                <set_value name="$offer" exact="$foundBuyOffers.{$oi}"/>
+
+                <do_if value="this.$gtls_ownerFilter == 'npc_only' and $offer.owner.isplayerowned">
+                  <continue/>
+                </do_if>
+                <do_if value="this.$gtls_ownerFilter == 'player_only' and not $offer.owner.isplayerowned">
+                  <continue/>
+                </do_if>
+                <do_if value="this.$gtls_ignoreMK1Supply and global.$GT_MK1SuppliedStations? and global.$GT_MK1SuppliedStations.{$offer.owner}?">
+                  <continue/>
+                </do_if>
+
+                <append_to_list name="$buyOffers" exact="$offer"/>
+                <set_value name="$buyOffersPerWare.{$ware}" operation="add"/>
+              </do_all>
+            </do_if>
+          </do_all>
+          </do_else>
+          <wait exact="this.$gt_yieldMs * 1ms" comment="Yield after buy-offer sector"/>
+        </do_all>
+      </do_if>
+
+      <!-- MK4 compatibility:
+           include player buy offers even when tradepartner-filtered query returns none.
+           This is intentionally scoped to player-owned buyers and still respects ware caps;
+           downstream AI validation re-checks tradepartner constraints before order creation. -->
+      <do_if value="this.$gtls_includePlayerBuyOffers and this.$gtls_ownerFilter != 'npc_only' and (this.$gtls_ignoreTradeRules or this.$gtls_ignoreTradeRulesPlayerBuyOffersRequireCargoNeed) and this.$gtls_searchMode != 'buy_only' and this.$gtls_sellSpaces? and this.$gtls_sellSpaces.count gt 0">
+        <set_value name="$playerBuyOffersAdded" exact="0"/>
+        <set_value name="$suppHasWareBasket" exact="this.$gtls_wareBasket? and this.$gtls_wareBasket.count gt 0"/>
+        <do_all exact="this.$gtls_sellSpaces.count" counter="$si">
+          <set_value name="$space" exact="this.$gtls_sellSpaces.{$si}"/>
+          <do_if value="this.$gtls_useAllWares">
+            <find_buy_offer space="$space" result="$playerBuyOffers" multiple="true">
+              <match_buyer tradesknownto="this.$gtls_ship.owner" owner="faction.player">
+                <match_relation_to object="this.$gtls_ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="this.$gtls_ship.owner" relation="enemy" comparison="not"/>
+              </match_buyer>
+              <offeramount min="1"/>
+            </find_buy_offer>
+            <do_if value="$playerBuyOffers? and $playerBuyOffers.count gt 0">
+              <do_all exact="$playerBuyOffers.count" counter="$oi">
+                <set_value name="$offer" exact="$playerBuyOffers.{$oi}"/>
+                <do_if value="not this.$gtls_allowIllegal and $offer.ware? and @$offer.ware.illegal">
+                  <continue/>
+                </do_if>
+                <!-- Honor manual ware basket even in supplemental player-buy scan. -->
+                <do_if value="$suppHasWareBasket">
+                  <set_value name="$offerWareInBasket" exact="false"/>
+                  <set_value name="$offerWare" exact="if $offer.ware? then @$offer.ware else null"/>
+                  <do_if value="$offerWare?">
+                    <do_all exact="this.$gtls_wareBasket.count" counter="$wbi">
+                      <do_if value="this.$gtls_wareBasket.{$wbi} == $offerWare">
+                        <set_value name="$offerWareInBasket" exact="true"/>
+                        <break/>
+                      </do_if>
+                    </do_all>
+                  </do_if>
+                  <do_if value="not $offerWareInBasket">
+                    <continue/>
+                  </do_if>
+                </do_if>
+                <do_if value="this.$gtls_ignoreMK1Supply and global.$GT_MK1SuppliedStations? and global.$GT_MK1SuppliedStations.{$offer.owner}?">
+                  <continue/>
+                </do_if>
+                <set_value name="$offerWare" exact="@$offer.ware"/>
+                <do_if value="$offerWare?">
+                  <do_if value="not $buyOffersPerWare.{$offerWare}?">
+                    <set_value name="$buyOffersPerWare.{$offerWare}" exact="0"/>
+                  </do_if>
+                  <do_if value="$buyOffersPerWare.{$offerWare} ge this.$gtls_maxOffersPerWare">
+                    <continue/>
+                  </do_if>
+                  <set_value name="$buyOffersPerWare.{$offerWare}" operation="add"/>
+                </do_if>
+                <append_to_list name="$buyOffers" exact="$offer"/>
+                <set_value name="$playerBuyOffersAdded" operation="add"/>
+              </do_all>
+            </do_if>
+          </do_if>
+          <do_else>
+            <do_all exact="this.$gtls_wareBasket.count" counter="$wi">
+              <set_value name="$ware" exact="this.$gtls_wareBasket.{$wi}"/>
+              <do_if value="$buyOffersPerWare.{$ware}? and $buyOffersPerWare.{$ware} ge this.$gtls_maxOffersPerWare">
+                <continue/>
+              </do_if>
+              <find_buy_offer wares="$ware" space="$space" result="$playerBuyOffers" multiple="true">
+                <match_buyer tradesknownto="this.$gtls_ship.owner" owner="faction.player">
+                  <match_relation_to object="this.$gtls_ship" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="this.$gtls_ship.owner" relation="enemy" comparison="not"/>
+                </match_buyer>
+                <offeramount min="1"/>
+              </find_buy_offer>
+              <do_if value="$playerBuyOffers? and $playerBuyOffers.count gt 0">
+                <do_if value="not $buyOffersPerWare.{$ware}?">
+                  <set_value name="$buyOffersPerWare.{$ware}" exact="0"/>
+                </do_if>
+                <do_all exact="$playerBuyOffers.count" counter="$oi">
+                  <do_if value="$buyOffersPerWare.{$ware} ge this.$gtls_maxOffersPerWare">
+                    <break/>
+                  </do_if>
+                  <set_value name="$offer" exact="$playerBuyOffers.{$oi}"/>
+                  <do_if value="this.$gtls_ignoreMK1Supply and global.$GT_MK1SuppliedStations? and global.$GT_MK1SuppliedStations.{$offer.owner}?">
+                    <continue/>
+                  </do_if>
+                  <append_to_list name="$buyOffers" exact="$offer"/>
+                  <set_value name="$buyOffersPerWare.{$ware}" operation="add"/>
+                  <set_value name="$playerBuyOffersAdded" operation="add"/>
+                </do_all>
+              </do_if>
+            </do_all>
+          </do_else>
+          <wait exact="this.$gt_yieldMs * 1ms" comment="Yield after player buy-offer supplement"/>
+        </do_all>
+        <debug_text text="'[GT-LiveSearch] ' + this.$gtls_ship.idcode + ': player buy-offer supplement added=' + $playerBuyOffersAdded + ' (ignoreTradeRules=' + this.$gtls_ignoreTradeRules + ', ignoreCargoNeed=' + this.$gtls_ignoreTradeRulesPlayerBuyOffersRequireCargoNeed + ')'" chance="this.$gtls_debugchance"/>
+      </do_if>
+
+      <debug_text text="'[GT-LiveSearch] ' + this.$gtls_ship.idcode + ': buy-offers collected=' + $buyOffers.count + ' (buyPriceMin=' + this.$gtls_buyPriceMin + ')'" chance="this.$gtls_debugchance"/>
+
+      <!-- Normalize priority wares before first use to avoid null .count lookups
+           on resumed/search-resume contexts. -->
+      <do_if value="not this.$gtls_priorityWares? or this.$gtls_priorityWares == null">
+        <set_value name="this.$gtls_priorityWares" exact="[]"/>
+      </do_if>
+      <set_value name="$priorityWaresCount" exact="this.$gtls_priorityWares.count"/>
+
+      <!-- ══════════════════════════════════════════════════════════════════
+           Explicit priority-ware pass: ensures MK3 priority wares enter the
+           tradeable set even if they were omitted from the main search results
+           (e.g. engine limits, rare wares). If no offers found, ship still
+           trades other wares; scoring will pick the best available.
+           ══════════════════════════════════════════════════════════════════ -->
+      <do_if value="$priorityWaresCount gt 0 and this.$gtls_searchMode == 'buy_and_sell'">
+        <set_value name="$pwSellBefore" exact="$sellOffers.count"/>
+        <set_value name="$pwBuyBefore" exact="$buyOffers.count"/>
+        <set_value name="$pwNames" exact="''"/>
+        <do_all exact="$priorityWaresCount" counter="$pn">
+          <set_value name="$pnw" exact="this.$gtls_priorityWares.{$pn}"/>
+          <set_value name="$pwNames" exact="$pwNames + (if $pn gt 1 then ', ' else '') + (if $pnw? and $pnw != null then @$pnw.name else '?')"/>
+        </do_all>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-LiveSearch] ' + this.$gtls_ship.idcode + ': priority-ware pass: searching ' + $priorityWaresCount + ' wares: [' + $pwNames + '] allowIllegal=' + this.$gtls_allowIllegal" chance="100"/>
+        </do_if>
+        <do_all exact="$priorityWaresCount" counter="$pwi">
+          <set_value name="$pw" exact="this.$gtls_priorityWares.{$pwi}"/>
+          <do_if value="not $pw? or $pw == null">
+            <continue/>
+          </do_if>
+          <do_if value="not this.$gtls_allowIllegal and $pw.illegal">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-LiveSearch] ' + this.$gtls_ship.idcode + ': priority ware ' + (if $pw? and $pw != null then @$pw.name else '?') + ' SKIPPED (illegal, allowIllegal=false)'" chance="100"/>
+            </do_if>
+            <continue/>
+          </do_if>
+          <!-- Sell offers for this priority ware (ship buys) -->
+          <do_if value="this.$gtls_buySpaces? and this.$gtls_buySpaces.count gt 0">
+            <do_if value="not $sellOffersPerWare.{$pw}? or $sellOffersPerWare.{$pw} lt this.$gtls_maxOffersPerWare">
+              <do_all exact="this.$gtls_buySpaces.count" counter="$psi">
+                <set_value name="$space" exact="this.$gtls_buySpaces.{$psi}"/>
+                <find_sell_offer wares="$pw" tradepartner="this.$gtls_ship" space="$space" result="$foundSellOffers" multiple="true">
+                  <match_seller tradesknownto="this.$gtls_ship.owner" owner="faction.player" negateownerfilter="true">
+                    <match_relation_to object="this.$gtls_ship" relation="dock" comparison="ge"/>
+                    <match_relation_to faction="this.$gtls_ship.owner" relation="enemy" comparison="not"/>
+                  </match_seller>
+                  <amount min="1"/>
+                  <relativeprice max="this.$gtls_sellPriceMax" tradepartner="if this.$gtls_ship.isplayerowned then this.$gtls_ship else null"/>
+                </find_sell_offer>
+                <do_if value="$foundSellOffers? and $foundSellOffers.count gt 0">
+                  <do_if value="not $sellOffersPerWare.{$pw}?">
+                    <set_value name="$sellOffersPerWare.{$pw}" exact="0"/>
+                  </do_if>
+                  <do_all exact="$foundSellOffers.count" counter="$oi">
+                    <do_if value="$sellOffersPerWare.{$pw} ge this.$gtls_maxOffersPerWare">
+                      <break/>
+                    </do_if>
+                    <set_value name="$offer" exact="$foundSellOffers.{$oi}"/>
+                    <do_if value="this.$gtls_ownerFilter == 'npc_only' and $offer.owner.isplayerowned">
+                      <continue/>
+                    </do_if>
+                    <do_if value="this.$gtls_ownerFilter == 'player_only' and not $offer.owner.isplayerowned">
+                      <continue/>
+                    </do_if>
+                    <append_to_list name="$sellOffers" exact="$offer"/>
+                    <set_value name="$sellOffersPerWare.{$pw}" operation="add"/>
+                  </do_all>
+                </do_if>
+                <wait exact="this.$gt_yieldMs * 1ms" comment="Yield priority-ware sell sector"/>
+              </do_all>
+            </do_if>
+          </do_if>
+          <!-- Buy offers for this priority ware (ship sells) -->
+          <do_if value="this.$gtls_sellSpaces? and this.$gtls_sellSpaces.count gt 0">
+            <do_if value="not $buyOffersPerWare.{$pw}? or $buyOffersPerWare.{$pw} lt this.$gtls_maxOffersPerWare">
+              <do_all exact="this.$gtls_sellSpaces.count" counter="$psi">
+                <set_value name="$space" exact="this.$gtls_sellSpaces.{$psi}"/>
+                <find_buy_offer wares="$pw" tradepartner="this.$gtls_ship" space="$space" result="$foundBuyOffers" multiple="true">
+                  <match_buyer tradesknownto="this.$gtls_ship.owner">
+                    <match_relation_to object="this.$gtls_ship" relation="dock" comparison="ge"/>
+                    <match_relation_to faction="this.$gtls_ship.owner" relation="enemy" comparison="not"/>
+                  </match_buyer>
+                  <offeramount min="1" tradepartner="this.$gtls_ship"/>
+                  <relativeprice min="this.$gtls_buyPriceMin" tradepartner="if this.$gtls_ship.isplayerowned then this.$gtls_ship else null"/>
+                </find_buy_offer>
+                <do_if value="$foundBuyOffers? and $foundBuyOffers.count gt 0">
+                  <do_if value="not $buyOffersPerWare.{$pw}?">
+                    <set_value name="$buyOffersPerWare.{$pw}" exact="0"/>
+                  </do_if>
+                  <do_all exact="$foundBuyOffers.count" counter="$oi">
+                    <do_if value="$buyOffersPerWare.{$pw} ge this.$gtls_maxOffersPerWare">
+                      <break/>
+                    </do_if>
+                    <set_value name="$offer" exact="$foundBuyOffers.{$oi}"/>
+                    <do_if value="this.$gtls_ownerFilter == 'npc_only' and $offer.owner.isplayerowned">
+                      <continue/>
+                    </do_if>
+                    <do_if value="this.$gtls_ownerFilter == 'player_only' and not $offer.owner.isplayerowned">
+                      <continue/>
+                    </do_if>
+                    <do_if value="this.$gtls_ignoreMK1Supply and global.$GT_MK1SuppliedStations? and global.$GT_MK1SuppliedStations.{$offer.owner}?">
+                      <continue/>
+                    </do_if>
+                    <append_to_list name="$buyOffers" exact="$offer"/>
+                    <set_value name="$buyOffersPerWare.{$pw}" operation="add"/>
+                  </do_all>
+                </do_if>
+                <wait exact="this.$gt_yieldMs * 1ms" comment="Yield priority-ware buy sector"/>
+              </do_all>
+            </do_if>
+          </do_if>
+          <set_value name="$pwSellCount" exact="if $sellOffersPerWare.{$pw}? then $sellOffersPerWare.{$pw} else 0"/>
+          <set_value name="$pwBuyCount" exact="if $buyOffersPerWare.{$pw}? then $buyOffersPerWare.{$pw} else 0"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-LiveSearch] ' + this.$gtls_ship.idcode + ': priority ware ' + (if $pw? and $pw != null then @$pw.name else '?') + ': sellOffers=' + $pwSellCount + ' buyOffers=' + $pwBuyCount" chance="100"/>
+          </do_if>
+          <wait exact="this.$gt_yieldMs * 1ms" comment="Yield priority-ware"/>
+        </do_all>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-LiveSearch] ' + this.$gtls_ship.idcode + ': priority-ware pass complete: added sellOffers=' + ($sellOffers.count - $pwSellBefore) + ' buyOffers=' + ($buyOffers.count - $pwBuyBefore) + ' (total sell=' + $sellOffers.count + ' buy=' + $buyOffers.count + ')'" chance="100"/>
+        </do_if>
+      </do_if>
+
+      <!-- No blind total cap — per-ware limits above ensure manageable totals.
+           With ~50 wares x 20 offers/ware = ~1000 offers max per side.
+           The matching step (lib.gt.tradematch) handles O(sell*buy) by ware-skipping. -->
+
+      <return value="table[
+        $SellOffers = $sellOffers,
+        $BuyOffers = $buyOffers,
+        $SellOfferCount = $sellOffers.count,
+        $BuyOfferCount = $buyOffers.count,
+        $SellWaresFound = $sellOffersPerWare.keys.count,
+        $BuyWaresFound = $buyOffersPerWare.keys.count
+      ]"/>
+    </actions>
+  </attention>
+</aiscript>

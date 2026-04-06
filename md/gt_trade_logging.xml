@@ -1,0 +1,884 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_TradeLogging" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4 Foundations/libraries/md.xsd">
+  <cues>
+    
+    <!-- Initialize Trade Logging System -->
+    <cue name="SystemInit" instantiate="true">
+      <conditions>
+        <event_cue_signalled cue="md.GT_CoreSystem.SystemInit"/>
+      </conditions>
+      <actions>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GalaxyTrader MK3] Trade logging system initializing...'" chance="100"/>
+        </do_if>
+        
+        <!-- Initialize logbook settings -->
+        <set_value name="global.$GT_TradeLogging" exact="table[]"/>
+        <set_value name="global.$GT_TradeLogging.$Enabled" exact="true"/>
+        <set_value name="global.$GT_TradeLogging.$TrainingMessages" exact="true"/>
+        <set_value name="global.$GT_TradeLogging.$LifetimeProfit" exact="table[]"/>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GalaxyTrader MK3] Trade logging system initialized'" chance="100"/>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Per-Trade Logbook Entry (TaterTrader Style) -->
+    <cue name="LogTradeOrder" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_TradeLogging_LogTradeOrder'"/>
+      </conditions>
+      <actions>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-TradeLogging] LogTradeOrder cue triggered'" chance="100"/>
+        </do_if>
+        
+        <!-- Extract trade data from signal -->
+        <set_value name="$ship" exact="event.param2.$Ship"/>
+        <set_value name="$sellOffer" exact="event.param2.$SellOffer"/>
+        <set_value name="$buyOffer" exact="event.param2.$BuyOffer"/>
+        <set_value name="$amount" exact="event.param2.$Amount"/>
+        <set_value name="$profit" exact="event.param2.$Profit"/>
+        <set_value name="$sellPrice" exact="event.param2.$SellPrice"/>
+        <set_value name="$buyPrice" exact="event.param2.$BuyPrice"/>
+        <set_value name="$buyPriceRaw" exact="if event.param2.$BuyPriceRaw? then event.param2.$BuyPriceRaw else $buyPrice * 100"/>
+        <set_value name="$sellPriceRaw" exact="if event.param2.$SellPriceRaw? then event.param2.$SellPriceRaw else $sellPrice * 100"/>
+        <set_value name="$buyPrice" exact="$buyPriceRaw / 100"/>
+        <set_value name="$sellPrice" exact="$sellPriceRaw / 100"/>
+
+        <!-- GT due override source of truth: mirror queued logbook semantics exactly. -->
+        <!-- Use exact money snapshot from AI when available to avoid conversion drift. -->
+        <set_value name="$moneyRawForDue" exact="if event.param2.$MoneyRaw? then event.param2.$MoneyRaw else -$amount * $buyPriceRaw"/>
+        <!-- Match vanilla due semantics: reserved money only (no bonus/profit component). -->
+        <set_value name="$projectedRawForDue" exact="abs($moneyRawForDue)"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-MD-UI-DUE] ' + $ship.idcode +
+            '\n  Signal amount: ' + $amount +
+            '\n  Signal buyPrice (RAW): ' + $buyPriceRaw + ' (' + ($buyPriceRaw / 100) + ' Cr)' +
+            '\n  Signal sellPrice (RAW): ' + $sellPriceRaw + ' (' + ($sellPriceRaw / 100) + ' Cr)' +
+            '\n  Signal profit (RAW): ' + (if $profit? then $profit else 0) + ' (' + ((if $profit? then $profit else 0)/100) + ' Cr)' +
+            '\n  Computed moneyRawForDue: ' + $moneyRawForDue + ' (' + ($moneyRawForDue/100) + ' Cr)' +
+            '\n  Computed projectedRawForDue (money only): ' + $projectedRawForDue + ' (' + ($projectedRawForDue/100) + ' Cr)'" chance="100"/>
+        </do_if>
+        <run_actions ref="md.GT_Libraries_General.GT_SetUICreditsDueForShip">
+          <param name="ship" value="$ship"/>
+          <param name="projectedRaw" value="$projectedRawForDue"/>
+        </run_actions>
+
+        <!-- FIX: Check if this is a sell-only trade -->
+        <set_value name="$isSellOnly" exact="false"/>
+        <do_if value="event.param2.$IsSellOnly?">
+          <set_value name="$isSellOnly" exact="event.param2.$IsSellOnly"/>
+        </do_if>
+        
+        <!-- Extract search pipeline type (normal / fallback / isolated) -->
+        <set_value name="$searchPipeline" exact="'normal'"/>
+        <do_if value="event.param2.$SearchPipeline?">
+          <set_value name="$searchPipeline" exact="event.param2.$SearchPipeline"/>
+        </do_if>
+        
+        <!-- Validate trade offers before accessing properties (they may be invalid/expired) -->
+        <set_value name="$buyOfferValid" exact="$buyOffer.exists"/>
+        <set_value name="$sellOfferValid" exact="$sellOffer.exists"/>
+        
+        <!-- Build debug message with safe property access (only when debug is enabled) -->
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <set_value name="$debugMsg" exact="'[GT-TradeLogging] ========== RAW DATA RECEIVED ==========\nShip: ' + $ship.knownname + ' (' + $ship.idcode + ')'"/>
+          
+          <!-- FIX: Show "N/A (sell-only)" instead of "[INVALID/EXPIRED]" for sell-only trades -->
+          <do_if value="$isSellOnly">
+            <set_value name="$debugMsg" exact="$debugMsg + '\nBuyOffer: N/A (sell-only)'"/>
+          </do_if>
+          <do_elseif value="$buyOfferValid">
+            <set_value name="$debugMsg" exact="$debugMsg + '\nBuyOffer: ' + $buyOffer.owner.knownname + ', Ware: ' + $buyOffer.ware.name + ', UnitPrice: ' + ($buyOffer.unitprice/100) + ' Cr'"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$debugMsg" exact="$debugMsg + '\nBuyOffer: [INVALID/EXPIRED]'"/>
+          </do_else>
+          
+          <do_if value="$sellOfferValid">
+            <set_value name="$debugMsg" exact="$debugMsg + '\nSellOffer: ' + $sellOffer.owner.knownname + ', Ware: ' + $sellOffer.ware.name + ', UnitPrice: ' + ($sellOffer.unitprice/100) + ' Cr'"/>
+          </do_if>
+          <do_else>
+            <set_value name="$debugMsg" exact="$debugMsg + '\nSellOffer: [INVALID/EXPIRED]'"/>
+          </do_else>
+          
+          <set_value name="$debugMsg" exact="$debugMsg + '\nAmount: ' + $amount + '\nProfit: ' + ($profit/100) + ' Cr (RAW: ' + $profit + ')' + '\nBuyPrice snapshot: ' + $buyPrice + ' Cr (RAW: ' + $buyPriceRaw + ')' + '\nSellPrice snapshot: ' + $sellPrice + ' Cr (RAW: ' + $sellPriceRaw + ')' + '\nCalculated profit check: (' + $sellPrice + ' - ' + $buyPrice + ') * ' + $amount + ' = ' + (($sellPrice - $buyPrice) * $amount) + ' Cr'"/>
+          <debug_text text="$debugMsg" chance="100"/>
+        </do_if>
+        
+        <!-- SIMPLIFIED: Initialization guarantees global.$GT_TradeLogging exists -->
+        <!-- Initialize logging system if not already done -->
+        <do_if value="not global.$GT_TradeLogging.$Enabled?">
+          <set_value name="global.$GT_TradeLogging.$Enabled" exact="true"/>
+          <set_value name="global.$GT_TradeLogging.$TrainingMessages" exact="true"/>
+          <set_value name="global.$GT_TradeLogging.$LifetimeProfit" exact="table[]"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GalaxyTrader MK3] Trade logging system auto-initialized'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Only log if enabled -->
+        <do_if value="global.$GT_TradeLogging.$Enabled">
+          
+          <!-- Validate we have enough data to log (need at least one valid offer for ware info) -->
+          <do_if value="$buyOfferValid or $sellOfferValid">
+            
+            <!-- Get ware info from valid offer (prefer buy offer) -->
+            <set_value name="$wareInfo" exact="null"/>
+            <do_if value="$buyOfferValid">
+              <set_value name="$wareInfo" exact="$buyOffer.ware"/>
+            </do_if>
+            <do_elseif value="$sellOfferValid">
+              <set_value name="$wareInfo" exact="$sellOffer.ware"/>
+            </do_elseif>
+            
+            <!-- Build queued trade message from snapshot prices: 3100 for cargo sale, 3101 for normal trade. -->
+            <set_value name="$logbookMessage" exact="null"/>
+            <do_if value="not $buyOfferValid">
+              <!-- Selling from cargo (no buy offer) - use translation ID 3100 -->
+              <!-- Format profit with thousand separators and M suffix according to global settings -->
+              <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$formattedProfit">
+                <param name="number" value="$profit/100"/>
+                <param name="suffix" value="' Cr'"/>
+              </run_actions>
+              <set_value name="$logbookMessage" exact="{77000,3100}.[$amount,$wareInfo,$sellPrice,$formattedProfit]"/>
+            </do_if>
+            <do_else>
+              <!-- Normal trade (buy then sell) - use translation ID 3101 -->
+              <!-- $buyPrice/$sellPrice are derived from RAW snapshot values for this created trade. -->
+              <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$formattedProfit">
+                <param name="number" value="$profit/100"/>
+                <param name="suffix" value="' Cr'"/>
+              </run_actions>
+              <set_value name="$logbookMessage" exact="{77000,3101}.[$amount,$wareInfo,$buyPrice,$sellPrice,$formattedProfit]"/>
+            </do_else>
+            
+            <set_value name="$msgType" exact="'3101 (normal trade)'"/>
+            <do_if value="not $buyOfferValid">
+              <set_value name="$msgType" exact="'3100 (cargo sale)'"/>
+            </do_if>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <!-- Format numbers for debug output -->
+              <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$debugProfit">
+                <param name="number" value="$profit/100"/>
+                <param name="suffix" value="' Cr'"/>
+              </run_actions>
+              <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$debugMoney">
+                <param name="number" value="$amount * $buyPrice"/>
+                <param name="suffix" value="' Cr'"/>
+              </run_actions>
+              
+              <!-- PROFIT DEBUG: Enhanced logging for profit calculation investigation -->
+              <set_value name="$buyStationName" exact="if $buyOfferValid and $buyOffer.owner? then @$buyOffer.owner.knownname else 'NULL'"/>
+              <set_value name="$sellStationName" exact="if $sellOfferValid and $sellOffer.owner? then @$sellOffer.owner.knownname else 'NULL'"/>
+              <set_value name="$calculatedProfitCheck" exact="(($sellPrice - $buyPrice) * $amount)"/>
+              <debug_text text="'[GT-TradeLogging-PROFIT] ========== LOGBOOK DATA BEING WRITTEN ==========' + 
+                '\nMessage type: ' + $msgType + 
+                '\nWare: ' + (if $wareInfo? then @$wareInfo.name else 'NULL') +
+                '\nBuy Station: ' + $buyStationName + ' @ ' + $buyPrice + ' Cr (from snapshot)' +
+                '\nSell Station: ' + $sellStationName + ' @ ' + $sellPrice + ' Cr (from snapshot)' +
+                '\nAmount: ' + $amount + ' units (from param)' +
+                '\nProfit (RAW from param): ' + $profit + ' = ' + ($profit/100) + ' Cr' +
+                '\nProfit (formatted for display): ' + $debugProfit +
+                '\nVerification calculation: (' + $sellPrice + ' - ' + $buyPrice + ') * ' + $amount + ' = ' + $calculatedProfitCheck + ' Cr' +
+                '\nProfit matches verification: ' + (if abs(($profit/100) - $calculatedProfitCheck) lt 0.01 then 'YES' else 'NO (DIFF: ' + abs(($profit/100) - $calculatedProfitCheck) + ' Cr)') +
+                '\nMoney field: -' + $debugMoney + 
+                '\nBonus field: ' + $debugProfit + 
+                '\nFinal message text: ' + $logbookMessage" chance="100"/>
+            </do_if>
+            
+            <!-- Write to ship logbook (TaterTrader style) -->
+            <!-- Build logbook title: add [FALLBACK] or [ISOLATED] prefix for non-normal pipelines -->
+            <set_value name="$logbookOrderName" exact="'GalaxyTrader MK3'"/>
+            <do_if value="$ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK1'">
+              <set_value name="$logbookOrderName" exact="'GalaxyTrader MK1'"/>
+            </do_if>
+            <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK2'">
+              <set_value name="$logbookOrderName" exact="'GalaxyTrader MK2'"/>
+            </do_elseif>
+            <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK3'">
+              <set_value name="$logbookOrderName" exact="'GalaxyTrader MK3'"/>
+            </do_elseif>
+            <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK4Supply'">
+              <set_value name="$logbookOrderName" exact="'GalaxyTrader MK4 Supply'"/>
+            </do_elseif>
+            <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.defaultorder? and @$ship.commander.defaultorder.id == 'GalaxyTraderMK1'">
+              <set_value name="$logbookOrderName" exact="'GalaxyTrader MK1'"/>
+            </do_elseif>
+            <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.defaultorder? and @$ship.commander.defaultorder.id == 'GalaxyTraderMK2'">
+              <set_value name="$logbookOrderName" exact="'GalaxyTrader MK2'"/>
+            </do_elseif>
+            <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.defaultorder? and @$ship.commander.defaultorder.id == 'GalaxyTraderMK3'">
+              <set_value name="$logbookOrderName" exact="'GalaxyTrader MK3'"/>
+            </do_elseif>
+            <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.defaultorder? and @$ship.commander.defaultorder.id == 'GalaxyTraderMK4Supply'">
+              <set_value name="$logbookOrderName" exact="'GalaxyTrader MK4 Supply'"/>
+            </do_elseif>
+            <set_value name="$logbookTitle" exact="$logbookOrderName + ': ' + $ship.knownname + ' (' + $ship.idcode + ')'"/>
+            <do_if value="$searchPipeline == 'fallback'">
+              <set_value name="$logbookTitle" exact="'[FALLBACK] ' + $logbookTitle"/>
+            </do_if>
+            <do_elseif value="$searchPipeline == 'isolated'">
+              <set_value name="$logbookTitle" exact="'[ISOLATED] ' + $logbookTitle"/>
+            </do_elseif>
+            
+            <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+              <param name="Message" value="$logbookMessage"/>
+              <param name="Category" value="'tips'"/>
+              <param name="Title" value="$logbookTitle"/>
+              <param name="Object" value="$ship"/>
+              <param name="Interaction" value="'showonmap'"/>
+              <!-- Keep money consistent with queued trade snapshot. -->
+              <param name="Money" value="$moneyRawForDue"/>
+              <param name="Bonus" value="$profit"/>
+              <param name="CheckGlobalSettings" value="false"/>
+            </run_actions>
+            
+            <!-- DEBUG MODE: Only log when debug is enabled -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <!-- Format profit for debug output -->
+              <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$debugProfit">
+                <param name="number" value="$profit/100"/>
+                <param name="suffix" value="' Cr'"/>
+              </run_actions>
+              <debug_text text="'[GalaxyTrader MK3] Trade logged for ' + $ship.knownname + ' (' + $ship.idcode + '): ' + $amount + ' ' + $wareInfo.name + ' (Profit: ' + $debugProfit + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- DEBUG MODE: Only log when debug is enabled -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GalaxyTrader MK3] WARNING: Cannot log trade - both buy and sell offers are invalid for ' + $ship.knownname" chance="100"/>
+            </do_if>
+          </do_else>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Miner foreign-station cargo sale logbook entry -->
+    <cue name="LogMinerCargoSale" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_TradeLogging_LogMinerCargoSale'"/>
+      </conditions>
+      <actions>
+        <set_value name="$ship" exact="event.param2.$Ship"/>
+        <set_value name="$station" exact="event.param2.$station"/>
+        <set_value name="$ware" exact="event.param2.$ware"/>
+        <set_value name="$amount" exact="event.param2.$transferredAmount"/>
+        <set_value name="$saleValueRaw" exact="if event.param2.$saleValueRaw? then event.param2.$saleValueRaw else 0"/>
+
+        <do_if value="$ship? and $ship.exists and $station? and $station.exists and $ware? and $amount? and $amount gt 0">
+          <set_value name="$isForeignSale" exact="$station.owner != $ship.owner"/>
+          <set_value name="$logbookMessage" exact="null"/>
+
+          <do_if value="$isForeignSale">
+            <!-- Prefer live station buy offer unit price; fallback to ware average price when no offer is available. -->
+            <do_if value="$saleValueRaw le 0">
+              <set_value name="$unitPriceRaw" exact="0"/>
+              <find_buy_offer buyer="$station" tradepartner="$ship" result="$stationBuyOffers" multiple="true"/>
+              <do_all exact="$stationBuyOffers.count" counter="$boi">
+                <set_value name="$offer" exact="$stationBuyOffers.{$boi}"/>
+                <do_if value="$offer.ware == $ware and $offer.unitprice gt $unitPriceRaw">
+                  <set_value name="$unitPriceRaw" exact="$offer.unitprice"/>
+                </do_if>
+              </do_all>
+              <do_if value="$unitPriceRaw le 0">
+                <set_value name="$unitPriceRaw" exact="$ware.averageprice * 100"/>
+              </do_if>
+              <set_value name="$saleValueRaw" exact="$amount * $unitPriceRaw"/>
+            </do_if>
+
+            <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$formattedSaleValue">
+              <param name="number" value="$saleValueRaw/100"/>
+              <param name="suffix" value="' Cr'"/>
+            </run_actions>
+            <set_value name="$logbookMessage" exact="'Queued sale: ' + $amount + ' ' + $ware.name + ' to ' + $station.knownname + '. Expected value: ' + $formattedSaleValue + '.'"/>
+          </do_if>
+          <do_else>
+            <!-- Player-owned station supply: queue-time informational entry only (no money/profit). -->
+            <set_value name="$logbookMessage" exact="'Queued delivery: ' + $amount + ' ' + $ware.name + ' to ' + $station.knownname + '.'"/>
+          </do_else>
+
+          <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+            <param name="Message" value="$logbookMessage"/>
+            <param name="Category" value="'tips'"/>
+            <param name="Title" value="{77000,31002} + ': ' + $ship.knownname + ' (' + $ship.idcode + ')'"/>
+            <param name="Object" value="$ship"/>
+            <param name="Interaction" value="'showonmap'"/>
+            <param name="Bonus" value="if $isForeignSale then $saleValueRaw else 0"/>
+            <param name="CheckGlobalSettings" value="false"/>
+          </run_actions>
+
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <do_if value="$isForeignSale">
+              <debug_text text="'[GT-TradeLogging] Miner foreign cargo sale logged for ' + $ship.idcode + ': ' + $amount + ' ' + $ware.name + ' at ' + $station.knownname + ' (Value: ' + ($saleValueRaw / 100) + ' Cr)'" chance="100"/>
+            </do_if>
+            <do_else>
+              <debug_text text="'[GT-TradeLogging] Miner player-station supply logged for ' + $ship.idcode + ': ' + $amount + ' ' + $ware.name + ' to ' + $station.knownname" chance="100"/>
+            </do_else>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- Trade Completion Logbook Entry -->
+    <cue name="LogTradeCompletion" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_TradeLogging_LogTradeCompletion'"/>
+      </conditions>
+      <actions>
+        <!-- Extract completion data -->
+        <set_value name="$ship" exact="event.param2.$Ship"/>
+        <set_value name="$ware" exact="event.param2.$Ware"/>
+        <set_value name="$amount" exact="event.param2.$Amount"/>
+        <set_value name="$totalProfit" exact="event.param2.$TotalProfit"/>
+        
+        <!-- SIMPLIFIED: Initialization guarantees global.$GT_TradeLogging exists -->
+        <!-- Initialize logging system if not already done -->
+        <do_if value="not global.$GT_TradeLogging.$Enabled?">
+          <set_value name="global.$GT_TradeLogging.$Enabled" exact="true"/>
+          <set_value name="global.$GT_TradeLogging.$TrainingMessages" exact="true"/>
+          <set_value name="global.$GT_TradeLogging.$LifetimeProfit" exact="table[]"/>
+        </do_if>
+        
+        <!-- Only log if enabled -->
+        <do_if value="global.$GT_TradeLogging.$Enabled">
+          
+          <!-- Write completion entry -->
+          <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
+          <!-- Format profit with thousand separators and M suffix according to global settings -->
+          <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$formattedProfit">
+            <param name="number" value="$totalProfit/100"/>
+            <param name="suffix" value="' Cr'"/>
+          </run_actions>
+          <set_value name="$logbookMessage" exact="{77000,3104}.[$amount,$ware,$formattedProfit]"/>
+          
+          <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+            <param name="Message" value="$logbookMessage"/>
+            <param name="Category" value="'tips'"/>
+            <param name="Title" value="(if ($ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK4Supply') or ($ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.defaultorder? and @$ship.commander.defaultorder.id == 'GalaxyTraderMK4Supply') then 'GalaxyTrader MK4 Supply' else 'GalaxyTrader MK3') + ': ' + $ship.knownname + ' (' + $ship.idcode + ')'"/>
+            <param name="Object" value="$ship"/>
+            <param name="Interaction" value="'showonmap'"/>
+            <param name="Bonus" value="$totalProfit"/>
+            <param name="CheckGlobalSettings" value="false"/>
+          </run_actions>
+          
+          <!-- DEBUG MODE: Only log when debug is enabled -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <!-- Format profit for debug output -->
+            <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$debugProfit">
+              <param name="number" value="$totalProfit/100"/>
+              <param name="suffix" value="' Cr'"/>
+            </run_actions>
+            <debug_text text="'[GalaxyTrader MK3] Trade completion logged for ' + $ship.knownname + ': ' + $debugProfit + ' total profit'" chance="100"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Cached Trade Route Logbook Entry -->
+    <cue name="LogCachedTrade" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_TradeLogging_LogCachedTrade'"/>
+      </conditions>
+      <actions>
+        <!-- Extract cached trade data -->
+        <set_value name="$ship" exact="event.param2.$Ship"/>
+        <set_value name="$trade" exact="event.param2.$Trade"/>
+        
+        <!-- SIMPLIFIED: Initialization guarantees global.$GT_TradeLogging exists -->
+        <!-- Initialize logging system if not already done -->
+        <do_if value="not global.$GT_TradeLogging.$Enabled?">
+          <set_value name="global.$GT_TradeLogging.$Enabled" exact="true"/>
+          <set_value name="global.$GT_TradeLogging.$TrainingMessages" exact="true"/>
+          <set_value name="global.$GT_TradeLogging.$LifetimeProfit" exact="table[]"/>
+        </do_if>
+        
+        <!-- Only log if enabled -->
+        <do_if value="global.$GT_TradeLogging.$Enabled">
+          
+          <!-- SAFETY: Validate station owners exist before logging (prevents "nil" display) -->
+          <set_value name="$buyStationName" exact="'Unknown Station'"/>
+          <set_value name="$sellStationName" exact="'Unknown Station'"/>
+          
+          <do_if value="$trade.$BuyOffer? and $trade.$BuyOffer.owner? and $trade.$BuyOffer.owner.exists">
+            <set_value name="$buyStationName" exact="$trade.$BuyOffer.owner.knownname"/>
+          </do_if>
+          
+          <do_if value="$trade.$SellOffer? and $trade.$SellOffer.owner? and $trade.$SellOffer.owner.exists">
+            <set_value name="$sellStationName" exact="$trade.$SellOffer.owner.knownname"/>
+          </do_if>
+          
+          <!-- Write cached trade entry with safe station names -->
+          <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
+          <!-- Format profit with thousand separators and M suffix according to global settings -->
+          <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$formattedProfit">
+            <param name="number" value="$trade.$Profit/100"/>
+            <param name="suffix" value="' Cr'"/>
+          </run_actions>
+          <set_value name="$logbookMessage" exact="{77000,3105}.[$trade.$Amount,$trade.$BuyOffer.ware,$buyStationName,$sellStationName,$formattedProfit]"/>
+          
+          <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+            <param name="Message" value="$logbookMessage"/>
+            <param name="Category" value="'tips'"/>
+            <param name="Title" value="(if ($ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK4Supply') or ($ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.defaultorder? and @$ship.commander.defaultorder.id == 'GalaxyTraderMK4Supply') then 'GalaxyTrader MK4 Supply' else 'GalaxyTrader MK3') + ': ' + $ship.knownname + ' (' + $ship.idcode + ')'"/>
+            <param name="Object" value="$ship"/>
+            <param name="Interaction" value="'showonmap'"/>
+            <param name="Bonus" value="$trade.$Profit"/>
+            <param name="CheckGlobalSettings" value="false"/>
+          </run_actions>
+          
+          <!-- DEBUG MODE: Only log when debug is enabled -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <!-- Format profit for debug output -->
+            <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$debugProfit">
+              <param name="number" value="$trade.$Profit/100"/>
+              <param name="suffix" value="' Cr'"/>
+            </run_actions>
+            <debug_text text="'[GalaxyTrader MK3] Cached trade logged for ' + $ship.knownname + ': ' + $debugProfit + ' profit'" chance="100"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- PHASE 3: Diff Patch Trade Completion Logging -->
+    <cue name="LogCompletedTrade" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$data" exact="event.param"/>
+        <!-- Defensive: This cue is signalled from diff patch trade completion; guard against null param -->
+        <set_value name="$hasTradeData" exact="true"/>
+        <do_if value="$data == null">
+          <set_value name="$hasTradeData" exact="false"/>
+        </do_if>
+        <do_if value="not $hasTradeData">
+          <cancel_cue cue="this"/>
+        </do_if>
+        <do_else>
+        <set_value name="$ship" exact="$data.$Ship"/>
+        
+        <!-- Check if logbook enabled for this ship -->
+        <run_actions ref="md.GT_Libraries_General.GT_IsLogbookEnabled" result="$logEnabled">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        
+        <do_if value="$logEnabled">
+          <!-- Build logbook entry using rich diff patch data -->
+          <set_value name="$profitCr" exact="$data.$tradeValue / 100"/>
+          
+          <!-- BUGFIX: Update lifetime profit ONLY when trade actually completes (not at planning time) -->
+          <!-- Tables guaranteed valid by GT_InitializeGlobalTables -->
+          <set_value name="$lifetimeProfit" exact="0"/>
+          <do_if value="global.$GT_TradeLogging.$LifetimeProfit.{$ship}?">
+            <set_value name="$lifetimeProfit" exact="global.$GT_TradeLogging.$LifetimeProfit.{$ship}"/>
+          </do_if>
+          <set_value name="global.$GT_TradeLogging.$LifetimeProfit.{$ship}" exact="$lifetimeProfit + $data.$tradeValue"/>
+          <set_value name="$lifetimeProfitCr" exact="global.$GT_TradeLogging.$LifetimeProfit.{$ship} / 100"/>
+          
+          <!-- Calculate revenue and cost for detailed display -->
+          <set_value name="$revenueCr" exact="0"/>
+          <set_value name="$costCr" exact="0"/>
+          <do_if value="$data.$sellRevenue?">
+            <set_value name="$revenueCr" exact="$data.$sellRevenue / 100"/>
+          </do_if>
+          <do_if value="$data.$purchaseCost?">
+            <set_value name="$costCr" exact="$data.$purchaseCost / 100"/>
+          </do_if>
+          
+          <!-- Reuse existing localized trade completion text (77000/3104) -->
+          <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$formattedProfitNoSuffix">
+            <param name="number" value="$profitCr"/>
+            <param name="suffix" value="''"/>
+          </run_actions>
+          <set_value name="$completionMessage" exact="{77000,3104}.[$data.$transferredAmount,$data.$ware,$formattedProfitNoSuffix]"/>
+          <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+            <param name="Message" value="$completionMessage"/>
+            <param name="Category" value="'general'"/>
+            <param name="Title" value="(if ($ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK4Supply') or ($ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.defaultorder? and @$ship.commander.defaultorder.id == 'GalaxyTraderMK4Supply') then 'GalaxyTrader MK4 Supply' else 'GalaxyTrader MK3') + ': ' + $ship.knownname + ' (' + $ship.idcode + ')'"/>
+            <param name="Object" value="$ship"/>
+            <param name="Interaction" value="'showonmap'"/>
+            <param name="CheckGlobalSettings" value="false"/>
+          </run_actions>
+          
+          <!-- FIX: Defensive check for race condition (initialization might not have completed yet) -->
+          <do_if value="not global.$GT_TradeStats?">
+            <set_value name="global.$GT_TradeStats" exact="table[]"/>
+            <set_value name="global.$GT_TradeStats.$TotalTrades" exact="0"/>
+            <set_value name="global.$GT_TradeStats.$TotalProfit" exact="0"/>
+          </do_if>
+          
+          <!-- Update statistics -->
+          <!-- FIX: Use nested do_if to avoid short-circuit evaluation issues -->
+          <do_if value="global.$GT_TradeStats?">
+            <do_if value="not global.$GT_TradeStats.$TotalTrades?">
+              <set_value name="global.$GT_TradeStats.$TotalTrades" exact="0"/>
+              <set_value name="global.$GT_TradeStats.$TotalProfit" exact="0"/>
+            </do_if>
+            
+            <set_value name="global.$GT_TradeStats.$TotalTrades" operation="add"/>
+            <set_value name="global.$GT_TradeStats.$TotalProfit" exact="global.$GT_TradeStats.$TotalProfit + $profitCr"/>
+            
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-TradeLogging] Diff patch trade logged: ' + $ship.idcode + ' - ' + $profitCr + ' Cr (Lifetime: ' + $lifetimeProfitCr + ' Cr, Total trades: ' + global.$GT_TradeStats.$TotalTrades + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        </do_else>
+      </actions>
+    </cue>
+    
+    <!-- Training Started Message (Immersive) -->
+    <cue name="LogTrainingStarted" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_TradeLogging_LogTrainingStarted'"/>
+      </conditions>
+      <actions>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-TradeLogging] LogTrainingStarted cue triggered'" chance="100"/>
+        </do_if>
+        
+        <!-- Extract training data -->
+        <set_value name="$ship" exact="event.param2.$Ship"/>
+        <set_value name="$pilot" exact="event.param2.$Pilot"/>
+        <set_value name="$station" exact="event.param2.$Station"/>
+        <set_value name="$trainingLevel" exact="event.param2.$TrainingLevel"/>
+        <set_value name="$duration" exact="event.param2.$Duration"/>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-TradeLogging] Training data extracted - Ship: ' + $ship.knownname + ', Pilot: ' + $pilot.name + ', Station: ' + $station.knownname + ', Level: ' + $trainingLevel" chance="100"/>
+        </do_if>
+        
+        <!-- SIMPLIFIED: Initialization guarantees global.$GT_TradeLogging exists -->
+        <!-- Initialize logging system if not already done -->
+        <do_if value="not global.$GT_TradeLogging.$Enabled?">
+          <set_value name="global.$GT_TradeLogging.$Enabled" exact="true"/>
+          <set_value name="global.$GT_TradeLogging.$TrainingMessages" exact="true"/>
+          <set_value name="global.$GT_TradeLogging.$LifetimeProfit" exact="table[]"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-TradeLogging] Training logging system auto-initialized'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-TradeLogging] Training messages enabled: ' + global.$GT_TradeLogging.$TrainingMessages" chance="100"/>
+        </do_if>
+        
+        <!-- Only log if enabled -->
+        <do_if value="global.$GT_TradeLogging.$TrainingMessages">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-TradeLogging] Training message will be created and sent to logbook'" chance="100"/>
+          </do_if>
+          
+          <!-- Get pilot title for the level -->
+          <set_value name="$pilotTitle" exact="'Advanced Trader'"/>
+          <do_if value="global.$GT_Config.$XP.$TraderTitles.{$trainingLevel}?">
+            <set_value name="$pilotTitle" exact="global.$GT_Config.$XP.$TraderTitles.{$trainingLevel}"/>
+          </do_if>
+          
+          <!-- Calculate duration in minutes -->
+          <set_value name="$durationMinutes" exact="($duration / 60)i"/>
+          
+          <!-- Get training cost (stored when training started) -->
+          <set_value name="$trainingCost" exact="0"/>
+          <do_if value="global.$GT_Pilots.{$pilot}.$TrainingCost?">
+            <set_value name="$trainingCost" exact="global.$GT_Pilots.{$pilot}.$TrainingCost"/>
+          </do_if>
+          <set_value name="$trainingCostCr" exact="($trainingCost / 100)"/>
+          
+          <!-- Build immersive training message -->
+          <set_value name="$message" exact="{77000,3200}.[player.name,$pilotTitle,$durationMinutes,$station.knownname,$pilot.name,$ship.knownname]"/>
+          
+          <!-- Append cost to message at the end (before signature) -->
+          <do_if value="$trainingCostCr gt 0">
+            <set_value name="$costText" exact="{77000,3224}.[$trainingCostCr]"/>
+            <set_value name="$message" exact="$message + '\n\n' + $costText"/>
+          </do_if>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-TradeLogging] Training message built: ' + $message" chance="100"/>
+          </do_if>
+          
+          <!-- Write to ship logbook -->
+          <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
+          <set_value name="$logbookMessage" exact="{77000,3200}.[player.name,$pilotTitle,$durationMinutes,$station.knownname,$pilot.name,$ship.knownname]"/>
+          
+          <!-- Append cost to logbook message at the end (before signature) -->
+          <do_if value="$trainingCostCr gt 0">
+            <set_value name="$costText" exact="{77000,3224}.[$trainingCostCr]"/>
+            <set_value name="$logbookMessage" exact="$logbookMessage + '\n\n' + $costText"/>
+          </do_if>
+          
+          <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+            <param name="Message" value="$logbookMessage"/>
+            <param name="Category" value="'upkeep'"/>
+            <param name="Title" value="'Training Notice: ' + $pilot.name + ' (' + $ship.knownname + ')'"/>
+            <param name="Object" value="$ship"/>
+            <param name="Interaction" value="'showonmap'"/>
+            <param name="CheckGlobalSettings" value="false"/>
+          </run_actions>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-TradeLogging] Training started logbook entry created for ' + $pilot.name + ' on ' + $ship.knownname" chance="100"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-TradeLogging] Training messages are DISABLED - no logbook entry will be created'" chance="100"/>
+          </do_if>
+        </do_else>
+      </actions>
+    </cue>
+    
+    <!-- Training En Route Message -->
+    <cue name="LogTrainingEnRoute" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_TradeLogging_LogTrainingEnRoute'"/>
+      </conditions>
+      <actions>
+        <!-- Extract training data -->
+        <set_value name="$ship" exact="event.param2.$Ship"/>
+        <set_value name="$pilot" exact="event.param2.$Pilot"/>
+        <set_value name="$station" exact="event.param2.$Station"/>
+        <set_value name="$arrivalTime" exact="event.param2.$ArrivalTime"/>
+        <set_value name="$duration" exact="event.param2.$Duration"/>
+        
+        <!-- Only log if enabled -->
+        <do_if value="global.$GT_TradeLogging.$TrainingMessages">
+          
+          <!-- Calculate times in minutes -->
+          <set_value name="$arrivalMinutes" exact="($arrivalTime / 60)i"/>
+          <set_value name="$durationMinutes" exact="($duration / 60)i"/>
+          
+          <!-- Build en route message -->
+          <set_value name="$message" exact="{77000,3203}.[player.name,$station.knownname,$arrivalMinutes,$durationMinutes,$pilot.name,$ship.knownname]"/>
+          
+          <!-- Write to ship logbook -->
+          <write_to_logbook 
+            category="upkeep" 
+            title="'Training Update: ' + $pilot.name + ' (' + $ship.knownname + ')'" 
+            interaction="showonmap" 
+            object="$ship" 
+            text="$message"
+            highlighted="false"/>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GalaxyTrader MK3] Training en route message logged for ' + $pilot.name + ' on ' + $ship.knownname" chance="100"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Training Completed Message (Success) -->
+    <cue name="LogTrainingCompleted" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_TradeLogging_LogTrainingCompleted'"/>
+      </conditions>
+      <actions>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-TradeLogging] LogTrainingCompleted cue triggered'" chance="100"/>
+        </do_if>
+        
+        <!-- Extract completion data -->
+        <set_value name="$ship" exact="event.param2.$Ship"/>
+        <set_value name="$pilot" exact="event.param2.$Pilot"/>
+        <set_value name="$newLevel" exact="event.param2.$Level"/>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-TradeLogging] Training completion data - Ship: ' + $ship.knownname + ', Pilot: ' + $pilot.name + ', New Level: ' + $newLevel" chance="100"/>
+        </do_if>
+        
+        <!-- Only log if enabled -->
+        <do_if value="global.$GT_TradeLogging.$TrainingMessages">
+          
+          <!-- Get pilot's actual current skill level from their XP -->
+          <set_value name="$currentXP" exact="@global.$GT_Pilots.{$pilot}.$XP"/>
+          <set_value name="$actualSkillLevel" exact="1"/>
+          <do_all exact="15" counter="$skillLevel">
+            <do_if value="$currentXP ge global.$GT_Config.$XP.$SkillThresholds.{$skillLevel}">
+              <set_value name="$actualSkillLevel" exact="$skillLevel"/>
+            </do_if>
+          </do_all>
+          
+          <!-- Map skill level to unified title index: floor(level/3)+1 -->
+          <set_value name="$titleIndex" exact="($actualSkillLevel / 3)i + 1"/>
+          <do_if value="$titleIndex lt 1">
+            <set_value name="$titleIndex" exact="1"/>
+          </do_if>
+          <do_if value="$titleIndex gt global.$GT_Config.$XP.$TraderTitles.keys.count">
+            <set_value name="$titleIndex" exact="global.$GT_Config.$XP.$TraderTitles.keys.count"/>
+          </do_if>
+          
+          <!-- Get pilot title for the correct index -->
+          <set_value name="$pilotTitle" exact="'Advanced Trader'"/>
+          <do_if value="global.$GT_Config.$XP.$TraderTitles.{$titleIndex}?">
+            <set_value name="$pilotTitle" exact="global.$GT_Config.$XP.$TraderTitles.{$titleIndex}"/>
+          </do_if>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-TradeLogging] Training completion: Skill Level ' + $actualSkillLevel + ' Title Index ' + $titleIndex + ' Title: ' + $pilotTitle" chance="100"/>
+          </do_if>
+          
+          <!-- Check if bonus levels were gained from blocked XP -->
+          <set_value name="$bonusLevels" exact="0"/>
+          <do_if value="$actualSkillLevel gt $newLevel">
+            <set_value name="$bonusLevels" exact="$actualSkillLevel - $newLevel"/>
+          </do_if>
+          
+          <!-- Build success message -->
+          <set_value name="$message" exact="{77000,3201}.[player.name,$pilotTitle,$pilot.name,$ship.knownname]"/>
+          
+          <!-- Append bonus information if bonus levels were gained -->
+          <do_if value="$bonusLevels gt 0">
+            <set_value name="$pluralS" exact="''"/>
+            <do_if value="$bonusLevels gt 1">
+              <set_value name="$pluralS" exact="'s'"/>
+            </do_if>
+            <set_value name="$bonusText" exact="{77000,3225}.[$bonusLevels, $pluralS, $actualSkillLevel]"/>
+            <set_value name="$message" exact="$message + '\n\n' + $bonusText"/>
+          </do_if>
+          
+          <!-- Create green color string for "Training Success:" text -->
+          <!-- Format: \033#AARRGGBB# where AA=Alpha, RR=Red, GG=Green, BB=Blue -->
+          <!-- Green color: Alpha=255(FF), Red=0(00), Green=204(CC), Blue=0(00) -->
+          <set_value name="$greenColor" exact="'\033#FF00CC00#'"/>
+          <set_value name="$colorReset" exact="'\033X'"/>
+          
+          <!-- Apply green color to "Training Success:" prefix -->
+          <set_value name="$coloredTitle" exact="$greenColor + 'Training Success: ' + $colorReset + $pilot.name + ' (' + $ship.knownname + ')'"/>
+          
+          <!-- Write to ship logbook with bonus indicator -->
+          <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+            <param name="Message" value="$message"/>
+            <param name="Category" value="'upkeep'"/>
+            <param name="Title" value="$coloredTitle"/>
+            <param name="Object" value="$ship"/>
+            <param name="Interaction" value="'showonmap'"/>
+            <param name="CheckGlobalSettings" value="false"/>
+          </run_actions>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GalaxyTrader MK3] Training completed message logged for ' + $pilot.name + ' on ' + $ship.knownname" chance="100"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Training Interrupted Message -->
+    <cue name="LogTrainingInterrupted" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_TradeLogging_LogTrainingInterrupted'"/>
+      </conditions>
+      <actions>
+        <!-- Extract interruption data -->
+        <set_value name="$ship" exact="event.param2.$Ship"/>
+        <set_value name="$pilot" exact="event.param2.$Pilot"/>
+        <set_value name="$reason" exact="event.param2.$Reason"/>
+        
+        <!-- Only log if enabled -->
+        <do_if value="global.$GT_TradeLogging.$TrainingMessages">
+          
+          <!-- Build interruption message -->
+          <set_value name="$message" exact="{77000,3202}.[player.name,$pilot.name,$ship.knownname]"/>
+          
+          <!-- Write to ship logbook -->
+          <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+            <param name="Message" value="$message"/>
+            <param name="Category" value="'alerts'"/>
+            <param name="Title" value="'Training Interrupted: ' + $pilot.name + ' (' + $ship.knownname + ')'"/>
+            <param name="Object" value="$ship"/>
+            <param name="Interaction" value="'showonmap'"/>
+            <param name="CheckGlobalSettings" value="false"/>
+          </run_actions>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GalaxyTrader MK3] Training interrupted message logged for ' + $pilot.name + ' on ' + $ship.knownname" chance="100"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Auto-Repair Initiated Logbook Entry -->
+    <cue name="LogAutoRepair" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_AutoRepair_Log'"/>
+      </conditions>
+      <actions>
+        <!-- Extract repair data -->
+        <set_value name="$ship" exact="event.param2.$Ship"/>
+        <set_value name="$station" exact="event.param2.$Station"/>
+        <set_value name="$hullBefore" exact="event.param2.$HullBefore"/>
+        <set_value name="$pilotLevel" exact="event.param2.$PilotLevel"/>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-AutoRepair] Logging repair initiation for ' + $ship.knownname + ' at ' + $station.knownname" chance="100"/>
+        </do_if>
+        
+        <!-- Build repair message -->
+        <set_value name="$message" exact="'=== AUTO-REPAIR INITIATED ===\n\n'"/>
+        <set_value name="$message" exact="$message + 'Ship: ' + $ship.knownname + ' (' + $ship.idcode + ')\n'"/>
+        <set_value name="$message" exact="$message + 'Pilot: ' + $ship.pilot.name + ' (Level ' + $pilotLevel + ')\n'"/>
+        <set_value name="$message" exact="$message + 'Hull Damage Detected: ' + $hullBefore + '%\n'"/>
+        <set_value name="$message" exact="$message + 'Repair Station: ' + $station.knownname + '\n'"/>
+        <!-- Determine station type -->
+        <set_value name="$stationType" exact="'Unknown'"/>
+        <do_if value="$station.isshipyard">
+          <set_value name="$stationType" exact="'Shipyard (Schiffswerft)'"/>
+        </do_if>
+        <do_elseif value="$station.iswharf">
+          <set_value name="$stationType" exact="'Wharf (Raumdock)'"/>
+        </do_elseif>
+        <do_elseif value="$station.isequipmentdock">
+          <set_value name="$stationType" exact="'Equipment Dock (Ausrüstungsdock)'"/>
+        </do_elseif>
+        <set_value name="$message" exact="$message + 'Station Type: ' + $stationType + '\n'"/>
+        <set_value name="$message" exact="$message + 'Location: ' + $station.sector.knownname + '\n\n'"/>
+        <set_value name="$message" exact="$message + 'The ship has been automatically sent for repairs.\n'"/>
+        <set_value name="$message" exact="$message + 'Trading will resume after repairs are completed.'"/>
+        
+        <!-- Write to player logbook (not ship logbook) -->
+        <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+          <param name="Message" value="$message"/>
+          <param name="Category" value="'general'"/>
+          <param name="Title" value="'GalaxyTrader MK3: Auto-Repair (' + $ship.knownname + ')'"/>
+          <param name="Object" value="player.entity"/>
+          <param name="Interaction" value="'showonmap'"/>
+          <param name="CheckGlobalSettings" value="false"/>
+        </run_actions>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GalaxyTrader MK3] Auto-repair log entry created for ' + $ship.knownname" chance="100"/>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Toggle Trade Logging -->
+    <cue name="ToggleTradeLogging" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_TradeLogging_ToggleTradeLogging'"/>
+      </conditions>
+      <actions>
+        <set_value name="global.$GT_TradeLogging.$Enabled" exact="not global.$GT_TradeLogging.$Enabled"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GalaxyTrader MK3] Trade logging ' + if global.$GT_TradeLogging.$Enabled then 'enabled' else 'disabled'" chance="100"/>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Toggle Training Messages -->
+    <cue name="ToggleTrainingMessages" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_TradeLogging_ToggleTrainingMessages'"/>
+      </conditions>
+      <actions>
+        <set_value name="global.$GT_TradeLogging.$TrainingMessages" exact="not global.$GT_TradeLogging.$TrainingMessages"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GalaxyTrader MK3] Training messages ' + if global.$GT_TradeLogging.$TrainingMessages then 'enabled' else 'disabled'" chance="100"/>
+        </do_if>
+      </actions>
+    </cue>
+    
+  </cues>
+</mdscript> 

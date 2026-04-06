@@ -1,0 +1,511 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_Trading_Signals" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4 Foundations/libraries/md.xsd">
+  <cues>
+    <!-- ========================================
+         GALAXY TRADER MK3 - TRADE SIGNAL HANDLER
+         Centralized listener for diff patch trade signals
+         Replaces complex event_player_trade_completed monitoring
+         ======================================== -->
+    
+    <!-- Trade Success Handler -->
+    <!-- Listen for signal instead of polling -->
+    <cue name="ProcessTradeSuccess" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_DirectTrade'"/>
+      </conditions>
+      <actions>
+        <!-- V2: process the queue incrementally to avoid same-frame bursts on mass trades -->
+        <signal_cue_instantly cue="md.GT_Trading_Signals.ProcessTradeSuccessQueue"/>
+      </actions>
+    </cue>
+
+    <cue name="ProcessTradeSuccessQueue" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="10ms"/>
+      <actions>
+        <!-- IMPORTANT: cancel_cue does NOT stop this actions block. Use explicit gating. -->
+        <set_value name="$hasWork" exact="false"/>
+        <do_if value="global.$GT_DirectTradeQueue? and global.$GT_DirectTradeQueue.count gt 0">
+          <set_value name="$hasWork" exact="true"/>
+        </do_if>
+        <do_if value="not $hasWork">
+          <cancel_cue cue="this"/>
+        </do_if>
+        <do_else>
+          <set_value name="$data" exact="global.$GT_DirectTradeQueue.{1}"/>
+          <remove_from_list name="global.$GT_DirectTradeQueue" exact="$data"/>
+
+          <!-- Defensive: if queue element is missing/null, stop safely (prevents cascading null errors). -->
+          <do_if value="$data == null">
+            <do_if value="global.$GT_DirectTradeQueue? and global.$GT_DirectTradeQueue.count gt 0">
+              <signal_cue_instantly cue="md.GT_Trading_Signals.ProcessTradeSuccessQueue"/>
+            </do_if>
+            <cancel_cue cue="this"/>
+          </do_if>
+          <do_else>
+            <set_value name="$ship" exact="$data.$Ship"/>
+            <set_value name="$skipSuccessProcessing" exact="false"/>
+            
+            <!-- Skip if ship is missing/destroyed before processing -->
+            <do_if value="not $ship? or not $ship.exists">
+              <set_value name="$skipSuccessProcessing" exact="true"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Signals] Skipping trade success for destroyed/missing ship'" chance="10"/>
+              </do_if>
+              <do_if value="global.$GT_DirectTradeQueue? and global.$GT_DirectTradeQueue.count gt 0">
+                <signal_cue_instantly cue="md.GT_Trading_Signals.ProcessTradeSuccessQueue"/>
+              </do_if>
+              <cancel_cue cue="this"/>
+            </do_if>
+            
+            <!-- Skip if ship no longer registered, unless it still has an active GT order (registry race recovery). -->
+            <do_if value="not $skipSuccessProcessing and not global.$GT_Ships.{$ship}?">
+              <set_value name="$activeGTOrder" exact="false"/>
+              <do_if value="$ship.defaultorder? and ((@$ship.defaultorder.id == 'GalaxyTraderMK4Supply' or @$ship.defaultorder.id == 'GalaxyTraderMK3' or (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.defaultorder.id})) or (@$ship.defaultorder.id == 'Assist' and $ship.defaultorder.$baseorder? and (@$ship.defaultorder.$baseorder.id == 'GalaxyTraderMK4Supply' or @$ship.defaultorder.$baseorder.id == 'GalaxyTraderMK3' or (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.defaultorder.$baseorder.id}))) )">
+                <set_value name="$activeGTOrder" exact="true"/>
+              </do_if>
+              
+              <do_if value="not $activeGTOrder">
+                <set_value name="$skipSuccessProcessing" exact="true"/>
+                <!-- Edge case: Ship removed from GT while old trade executing -->
+                <!-- Reduced logging chance since this is expected behavior -->
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Signals] ⚠ Skipping trade success for unregistered ship: ' + $ship.idcode + 
+                    '\n  Reason: Ship was removed from GalaxyTrader while old TradePerform order was still executing' +
+                    '\n  This is expected behavior when removing ships from GT - vanilla orders continue briefly'"
+                    chance="10"/>
+                </do_if>
+                <do_if value="global.$GT_DirectTradeQueue? and global.$GT_DirectTradeQueue.count gt 0">
+                  <signal_cue_instantly cue="md.GT_Trading_Signals.ProcessTradeSuccessQueue"/>
+                </do_if>
+                <cancel_cue cue="this"/>
+              </do_if>
+              <do_else>
+                <signal_objects object="player.galaxy" param="'GT_Register_Ship'" param2="table[
+                  $Ship = $ship,
+                  $Config = table[]
+                ]"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Signals] Recovery: kept trade success for active GT ship with missing registry, re-registering ' + $ship.idcode" chance="100"/>
+                </do_if>
+              </do_else>
+            </do_if>
+            
+            <do_if value="not $skipSuccessProcessing">
+              <!-- 1. XP System -->
+              <signal_cue_instantly cue="md.GT_XP_Training.ProcessSingleXPEvent" param="$data"/>
+            
+            <!-- 2. Trade Logging -->
+            <signal_cue_instantly cue="md.GT_TradeLogging.LogCompletedTrade" param="$data"/>
+            
+            <!-- 2.5. Update Ship Statistics (Total Profit and Trades Completed) -->
+            <do_if value="$ship? and $ship.exists and md.GT_Fleet_Coordination.UpdateShipStats?">
+              <run_actions ref="md.GT_Fleet_Coordination.UpdateShipStats">
+                <param name="ship" value="$ship"/>
+                <param name="profit" value="$data.$tradeValue"/>
+                <param name="tradesCompleted" value="1"/>
+              </run_actions>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Signals] Updated ship statistics for ' + $ship.idcode + ': +' + ($data.$tradeValue / 100) + ' Cr'" chance="100"/>
+              </do_if>
+            </do_if>
+            
+            <!-- 3. Fleet Coordination: Release trade reservation -->
+            <do_if value="global.$GT_ActiveTradeReservations.{$ship}?">
+              <remove_value name="global.$GT_ActiveTradeReservations.{$ship}"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Fleet] Trade reservation released for ' + $ship.idcode" chance="100"/>
+              </do_if>
+            </do_if>
+            
+            <!-- 4. Clear failed sector pairs for ship's current sector (trade succeeded, route is available) -->
+            <!-- Clear per-sector so all ships in the sector benefit from successful route -->
+            <set_value name="$currentSector" exact="$ship.sector"/>
+            <do_if value="$currentSector? and $currentSector.exists and global.$GT_FailedSectorPairs? and global.$GT_FailedSectorPairs.{$currentSector}?">
+              <!-- Savegame compatibility: sector entry can be table (new) or list (legacy). -->
+              <set_value name="$failedPairsEntry" exact="global.$GT_FailedSectorPairs.{$currentSector}"/>
+              <set_value name="$failedPairsCount" exact="0"/>
+              <do_if value="$failedPairsEntry? and typeof $failedPairsEntry == datatype.table">
+                <set_value name="$failedPairsCount" exact="$failedPairsEntry.keys.count"/>
+              </do_if>
+              <do_elseif value="$failedPairsEntry? and typeof $failedPairsEntry == datatype.list">
+                <set_value name="$failedPairsCount" exact="$failedPairsEntry.count"/>
+              </do_elseif>
+              <remove_value name="global.$GT_FailedSectorPairs.{$currentSector}"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <set_value name="$sectorName" exact="@$currentSector.knownname"/>
+                <debug_text text="'[GT-Signals] Cleared ' + $failedPairsCount + ' failed sector pairs for sector ' + (if $sectorName? then $sectorName else 'Unknown') + ' (Ship: ' + $ship.idcode + ', trade succeeded - route available)'" chance="100"/>
+              </do_if>
+            </do_if>
+            
+            <!-- 4.5. Clear pending trade entry (no longer needed) -->
+            <!-- Use library function to clear pending trade data -->
+            <run_actions ref="md.GT_Libraries_General.GT_ClearPendingTradeData">
+              <param name="ship" value="$ship"/>
+            </run_actions>
+            <run_actions ref="md.GT_Libraries_General.GT_ClearUICreditsDueForShip">
+              <param name="ship" value="$ship"/>
+            </run_actions>
+            
+            <!-- Clear sell-only cargo disposal rotation state when trade completes -->
+            <!-- Check if ship has no cargo left (cargo emptied by sell) -->
+            <set_value name="$hasCargo" exact="false"/>
+            <do_if value="$ship.cargo.list? and $ship.cargo.list.count gt 0">
+              <set_value name="$hasCargo" exact="true"/>
+            </do_if>
+            <do_if value="not $hasCargo and global.$GT_ForcedSellLastWare? and global.$GT_ForcedSellLastWare.{$ship}?">
+              <remove_value name="global.$GT_ForcedSellLastWare.{$ship}"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Disposal] (' + $ship.idcode + ') Cleared rotation state (cargo emptied by sell)'" chance="100"/>
+              </do_if>
+            </do_if>
+            
+            <!-- 5. AI Script Notification (equipment check moved to pre-trade in AI script) -->
+            <do_if value="$ship? and $ship.exists">
+              <signal_objects object="$ship" param="'GT_Trade_Completed'" delay="1ms"/>
+            </do_if>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-AI] Trade completed signal sent to ' + $ship.idcode" chance="100"/>
+            </do_if>
+            
+            <!-- Event-driven simple periodic report: check interval after trade completes (requires ProfitReports enabled) -->
+            <do_if value="global.$GT_Config? and global.$GT_Config.$Notifications? and global.$GT_Config.$Notifications.$ProfitReports">
+              <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Notifications? and global.$GT_GlobalSettings.$Notifications.$SimpleReportFrequency?">
+                <set_value name="$simpleReportFrequencyMinutes" exact="global.$GT_GlobalSettings.$Notifications.$SimpleReportFrequency"/>
+                <do_if value="$simpleReportFrequencyMinutes gt 0">
+                <do_if value="not global.$GT_Reports?">
+                  <set_value name="global.$GT_Reports" exact="table[]"/>
+                </do_if>
+                <set_value name="$lastSimpleReport" exact="0"/>
+                <do_if value="global.$GT_Reports.$LastSimpleReport?">
+                  <set_value name="$lastSimpleReport" exact="global.$GT_Reports.$LastSimpleReport"/>
+                </do_if>
+                <set_value name="$timeSinceSimpleReport" exact="player.age - $lastSimpleReport"/>
+                <set_value name="$simpleReportIntervalSeconds" exact="$simpleReportFrequencyMinutes * 60"/>
+                <do_if value="$timeSinceSimpleReport ge $simpleReportIntervalSeconds">
+                  <signal_cue cue="md.GT_Reporting.GeneratePeriodicReport"/>
+                  <set_value name="global.$GT_Reports.$LastSimpleReport" exact="player.age"/>
+                </do_if>
+                </do_if>
+              </do_if>
+            </do_if>
+        <!-- Continue if more items exist -->
+              <do_if value="global.$GT_DirectTradeQueue? and global.$GT_DirectTradeQueue.count gt 0">
+                <signal_cue_instantly cue="md.GT_Trading_Signals.ProcessTradeSuccessQueue"/>
+              </do_if>
+            </do_if>
+          </do_else>
+        </do_else>
+      </actions>
+    </cue>
+    
+    <!-- Trade Failure Handler -->
+    <!-- Listen for signal instead of polling -->
+    <cue name="ProcessTradeFailure" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_TradeFailure'"/>
+      </conditions>
+      <actions>
+        <!-- V2: process the queue incrementally to avoid same-frame bursts -->
+        <signal_cue_instantly cue="md.GT_Trading_Signals.ProcessTradeFailureQueue"/>
+      </actions>
+    </cue>
+
+    <cue name="ProcessTradeFailureQueue" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="10ms"/>
+      <actions>
+        <do_if value="not global.$GT_TradeFailureQueue? or global.$GT_TradeFailureQueue.count le 0">
+          <cancel_cue cue="this"/>
+        </do_if>
+
+        <!-- SAFE ACCESS: Use @ operator and validate before use -->
+        <set_value name="$data" exact="@global.$GT_TradeFailureQueue.{1}"/>
+        
+        <!-- VALIDATION: Check if data is valid before processing -->
+        <!-- Pre-compute validity flag: cannot combine @ with ? in a single expression -->
+        <set_value name="$dataValid" exact="false"/>
+        <do_if value="$data?">
+          <do_if value="$data.$Ship? and $data.$Ship != null">
+            <set_value name="$dataValid" exact="true"/>
+          </do_if>
+        </do_if>
+        <do_if value="not $dataValid">
+          <!-- Invalid entry: remove it if possible and continue to next -->
+          <do_if value="$data?">
+            <!-- Entry exists but is invalid - remove it -->
+            <remove_from_list name="global.$GT_TradeFailureQueue" exact="$data"/>
+          </do_if>
+          <do_else>
+            <!-- Entry was null - another instance already removed it, just cancel this instance -->
+            <!-- The next signal will handle remaining items -->
+          </do_else>
+          
+          <!-- Continue processing remaining items -->
+          <do_if value="global.$GT_TradeFailureQueue.count gt 0">
+            <signal_cue_instantly cue="md.GT_Trading_Signals.ProcessTradeFailureQueue"/>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_if>
+        
+        <!-- Remove from queue AFTER validation -->
+        <remove_from_list name="global.$GT_TradeFailureQueue" exact="$data"/>
+        <set_value name="$ship" exact="@$data.$Ship"/>
+        <set_value name="$skipFailureProcessing" exact="false"/>
+
+            <!-- Guard: ship was destroyed between queuing and processing (e.g. blown up, sold).
+                 @$data.$Ship resolves to null when the component no longer exists. -->
+            <do_if value="not $ship.exists">
+              <set_value name="$skipFailureProcessing" exact="true"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Signals] Skipping trade failure for destroyed ship (component no longer exists). Reason: ' + @$data.$reason" chance="100"/>
+              </do_if>
+              <do_if value="global.$GT_TradeFailureQueue.count gt 0">
+                <signal_cue_instantly cue="md.GT_Trading_Signals.ProcessTradeFailureQueue"/>
+              </do_if>
+              <cancel_cue cue="this"/>
+            </do_if>
+
+            <!-- Skip if ship no longer registered (removed from GT while old trade executing) -->
+            <do_if value="not $skipFailureProcessing and not global.$GT_Ships.{$ship}?">
+              <set_value name="$skipFailureProcessing" exact="true"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Signals] ⚠ Skipping trade failure for unregistered ship: ' + $ship.idcode + 
+                  '\n  Reason: Ship was removed from GalaxyTrader while old TradePerform order was still executing' +
+                  '\n  Failure type: ' + @$data.$reason +
+                  '\n  This is expected behavior when removing ships from GT - vanilla orders continue briefly'"
+                  chance="100"/>
+              </do_if>
+              <signal_cue_instantly cue="md.GT_Trading_Signals.ProcessTradeFailureQueue"/>
+              <cancel_cue cue="this"/>
+            </do_if>
+            <do_if value="not $skipFailureProcessing">
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Signals] Trade failed: ' + $ship.idcode + ' - ' + @$data.$reason" chance="100"/>
+              </do_if>
+              
+              <!-- 1. Log failure -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Failure] ' + $ship.idcode + ' trade failed: ' + @$data.$reason + ' (' + @$data.$failureText + ')'" chance="100"/>
+              </do_if>
+              
+              <!-- 2. Release fleet reservation if exists -->
+              <do_if value="global.$GT_ActiveTradeReservations.{$ship}?">
+                <remove_value name="global.$GT_ActiveTradeReservations.{$ship}"/>
+              </do_if>
+            
+            <!-- 3. Categorize failure type and build structured payload -->
+            <!-- Determine failure category and build structured payload for unified signal -->
+            <set_value name="$failureCategory" exact="'MARKET'"/> <!-- Default: market failure -->
+            <set_value name="$shouldTryNext" exact="false"/>
+            <set_value name="$pathBlocked" exact="false"/>
+            
+            <!-- Check if this is a pathing failure -->
+            <set_value name="$pathingFailureReasons" exact="[
+              'ERR_NO_PATH_TO_DESTINATION',
+              'ERR_DESTINATION_BLACKLISTED', 
+              'ERR_SECTOR_BLACKLISTED',
+              'TRADEPARTNER_BLACKLISTED',
+              'ERR_CANNOT_DOCK',
+              'ROUTE_PATH_CHANGED'
+            ]"/>
+            
+            <set_value name="$isPathingFailure" exact="false"/>
+            <do_all exact="$pathingFailureReasons.count" counter="$i">
+              <do_if value="$pathingFailureReasons.{$i} == @$data.$reason">
+                <set_value name="$isPathingFailure" exact="true"/>
+                <set_value name="$failureCategory" exact="'PATHING'"/>
+                <set_value name="$shouldTryNext" exact="true"/>
+                <set_value name="$pathBlocked" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+            
+            <!-- Handle pathing failures: track failed routes -->
+            <do_if value="$isPathingFailure">
+              <!-- PATHFINDING/BLACKLIST FAILURE: Trade route not accessible -->
+              <!-- This means the trade is theoretically good, but ship can't reach it -->
+              <!-- Solution: Try NEXT BEST TRADE from cache (skip this failed one) -->
+              
+              <!-- Track this failed trade so cache search skips it (per-sector, not per-ship) -->
+              <!-- Initialization guarantees global.$GT_FailedSectorPairs exists -->
+              <!-- Note: Actual storage happens later in the code where sector pair is extracted -->
+              
+              <!-- Get complete trade route from ACTIVE trade tracking (stored by AI at order creation time) -->
+              <!-- Only proceed if we have complete active trade data - NO FALLBACK -->
+              <do_if value="global.$GT_ActiveTrade? and global.$GT_ActiveTrade.{$ship}? and 
+                            global.$GT_ActiveTrade.{$ship}.$BuyStation? and 
+                            global.$GT_ActiveTrade.{$ship}.$SellStation? and 
+                            global.$GT_ActiveTrade.{$ship}.$Ware?">
+                <!-- Use complete route from active trade -->
+                <set_value name="$buyStation" exact="global.$GT_ActiveTrade.{$ship}.$BuyStation"/>
+                <set_value name="$sellStation" exact="global.$GT_ActiveTrade.{$ship}.$SellStation"/>
+                <set_value name="$ware" exact="global.$GT_ActiveTrade.{$ship}.$Ware"/>
+                
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Failure] RETRIEVED complete trade from pending:' +
+                    '\n  Buy: ' + @$buyStation.knownname +
+                    '\n  Sell: ' + @$sellStation.knownname +
+                    '\n  Ware: ' + @$ware.name"
+                    chance="100"/>
+                </do_if>
+                
+                <!-- Clean up pending trade data + active trade tracking -->
+                <run_actions ref="md.GT_Libraries_General.GT_ClearPendingTradeData">
+                  <param name="ship" value="$ship"/>
+                </run_actions>
+                <run_actions ref="md.GT_Libraries_General.GT_ClearUICreditsDueForShip">
+                  <param name="ship" value="$ship"/>
+                </run_actions>
+                
+                <!-- Extract sectors - only store sector PAIR (not individual stations) -->
+                <set_value name="$buySector" exact="@$buyStation.sector"/>
+                <set_value name="$sellSector" exact="@$sellStation.sector"/>
+                <set_value name="$currentSector" exact="$ship.sector"/>
+                
+                <!-- Create failed trade record with complete sector information -->
+                <!-- Store per-sector (not per-ship) so ships in same sector share knowledge -->
+                <!-- Store as nested table for O(1) lookup: FailedSectorPairs.{currentSector}.{buySector}.{sellSector} -->
+                <do_if value="$currentSector? and $currentSector.exists">
+                  <do_if value="not global.$GT_FailedSectorPairs?">
+                    <set_value name="global.$GT_FailedSectorPairs" exact="table[]"/>
+                  </do_if>
+                  <do_if value="not global.$GT_FailedSectorPairs.{$currentSector}?">
+                    <set_value name="global.$GT_FailedSectorPairs.{$currentSector}" exact="table[]"/>
+                  </do_if>
+                  <do_if value="not global.$GT_FailedSectorPairs.{$currentSector}.{$buySector}?">
+                    <set_value name="global.$GT_FailedSectorPairs.{$currentSector}.{$buySector}" exact="table[]"/>
+                  </do_if>
+                  <set_value name="global.$GT_FailedSectorPairs.{$currentSector}.{$buySector}.{$sellSector}" exact="table[
+                    $Reason = @$data.$reason,
+                    $Timestamp = player.age
+                  ]"/>
+                  
+                  <!-- M6 FIX: Cap FailedSectorPairs to prevent unbounded growth -->
+                  <do_if value="global.$GT_FailedSectorPairs.keys.count gt 100">
+                    <set_value name="global.$GT_FailedSectorPairs" exact="table[]"/>
+                  </do_if>
+                  
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <set_value name="$currentSectorName" exact="@$currentSector.knownname"/>
+                    <set_value name="$buySectorName" exact="@$buySector.knownname"/>
+                    <set_value name="$sellSectorName" exact="@$sellSector.knownname"/>
+                    <debug_text text="'[GT-Failure] BLOCKED sector pair for sector ' + (if $currentSectorName? then $currentSectorName else 'Unknown') + ':' +
+                      '\n  Ship: ' + $ship.idcode +
+                      '\n  Route: ' + (if $buySectorName? then $buySectorName else 'Unknown') + ' → ' + (if $sellSectorName? then $sellSectorName else 'Unknown') +
+                      '\n  Reason: ' + @$data.$reason +
+                      '\n  Total blocked buy-sectors for this sector: ' + global.$GT_FailedSectorPairs.{$currentSector}.keys.count +
+                      '\n  ⚠ ALL ships in this sector will skip this sector pair'"
+                      chance="100"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+              <do_else>
+                <!-- NO PENDING TRADE DATA: Cannot track failure -->
+                <!-- This indicates a serious issue: pending trade was cleared before failure occurred -->
+                <!-- OR pending trade was never created in the first place -->
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Failure] CRITICAL: Cannot track failed trade for ' + $ship.idcode +
+                    '\n  Pending trade entry MISSING - this should never happen!' +
+                    '\n  Failure reason: ' + @$data.$reason +
+                    '\n  Failure partner: ' + @$data.$partner.knownname +
+                    '\n  ⚠ Ship will continue without blacklisting this route'" chance="100"/>
+                </do_if>
+              </do_else>
+              
+              <set_value name="$currentSector" exact="$ship.sector"/>
+              <do_if value="$currentSector? and $currentSector.exists and global.$GT_FailedSectorPairs? and global.$GT_FailedSectorPairs.{$currentSector}?">
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <set_value name="$sectorName" exact="@$currentSector.knownname"/>
+                  <debug_text text="'[GT-Failure]   PATHFINDING FAILURE: ' + $ship.idcode + ' | Sector: ' + (if $sectorName? then $sectorName else 'Unknown') + ' | Failed sector pairs tracked: ' + global.$GT_FailedSectorPairs.{$currentSector}.keys.count" chance="100"/>
+                </do_if>
+              </do_if>
+            </do_if>
+            <do_else>
+              <!-- MARKET FAILURE: Market conditions changed (destroyed, no stock, etc.) -->
+              <!-- Solution: Start NEW SEARCH to find current market opportunities -->
+              
+              <!-- Clean up pending trade entry -->
+              <!-- Use library function to clear pending trade data -->
+              <run_actions ref="md.GT_Libraries_General.GT_ClearPendingTradeData">
+                <param name="ship" value="$ship"/>
+              </run_actions>
+              <run_actions ref="md.GT_Libraries_General.GT_ClearUICreditsDueForShip">
+                <param name="ship" value="$ship"/>
+              </run_actions>
+            </do_else>
+            
+            <!-- Build structured failure payload for unified signal -->
+            <set_value name="$failurePayload" exact="table[
+              $Ship = $ship,
+              $Reason = @$data.$reason,
+              $FailureText = @$data.$failureText,
+              $Partner = @$data.$partner,
+              $IsBuying = @$data.$isBuying,
+              $ReasonType = $failureCategory,
+              $PathBlocked = $pathBlocked,
+              $ShouldTryNext = $shouldTryNext,
+              $Timestamp = player.age
+            ]"/>
+            
+            <!-- Send unified GT_Trade_Failed signal with structured payload -->
+            <do_if value="$isPathingFailure">
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Signals] Sending GT_Trade_Failed (PATHING) signal to ' + $ship.idcode + ' - will try next cached trade'" chance="100"/>
+              </do_if>
+            </do_if>
+            <do_else>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Failure] MARKET FAILURE: ' + $ship.idcode + ' - market conditions changed - will search for new trade'" chance="100"/>
+              </do_if>
+            </do_else>
+            
+            <!-- SAFETY: cancel_cue does not stop the current actions block.
+                 Guard signal dispatch explicitly so null/missing ships cannot crash this cue. -->
+            <do_if value="$ship? and $ship.exists">
+              <signal_objects object="$ship" param="'GT_Trade_Failed'" param2="$failurePayload" delay="1ms"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Signals] GT_Trade_Failed signal sent successfully to ' + $ship.idcode + ' (ReasonType: ' + $failureCategory + ', ShouldTryNext: ' + $shouldTryNext + ')'" chance="100"/>
+              </do_if>
+            </do_if>
+            
+            <!-- 4. Cargo Safety: Handle destroyed sell station -->
+            <do_if value="@$data.$reason == 'ERR_TRADEPARTNER_DESTROYED' and not @$data.$isBuying">
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-CargoSafety] ⚠ Sell station destroyed for ' + $ship.idcode + ' - Cargo safety system will handle this'" chance="100"/>
+              </do_if>
+              <!-- TODO: Uncomment when cargo safety system is implemented -->
+            </do_if>
+        <!-- Continue if more items exist -->
+              <do_if value="global.$GT_TradeFailureQueue.count gt 0">
+                <signal_cue_instantly cue="md.GT_Trading_Signals.ProcessTradeFailureQueue"/>
+              </do_if>
+            </do_if>
+      </actions>
+    </cue>
+
+    <!-- Miner transfer handler: route delivery XP into shared XP pipeline -->
+    <cue name="ProcessMinerTransfer" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_MinerTransfer'"/>
+      </conditions>
+      <actions>
+        <set_value name="$transferData" exact="event.param2"/>
+        <do_if value="$transferData? and $transferData.$Ship? and $transferData.$pilot? and $transferData.$xpAmount?">
+          <signal_cue_instantly cue="md.GT_XP_Training.ProcessSingleXPEvent" param="$transferData"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Miner] XP event routed for ' + $transferData.$Ship.idcode + ': +' + $transferData.$xpAmount + ' XP, ware=' + @$transferData.$ware + ', amount=' + @$transferData.$transferredAmount" chance="100"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- All handlers are now inlined in ProcessTradeSuccess and ProcessTradeFailure
+         for better performance and simpler debugging -->
+    
+  </cues>
+</mdscript>

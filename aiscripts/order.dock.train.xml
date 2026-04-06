@@ -1,0 +1,316 @@
+<?xml version="1.0" encoding="utf-8"?>
+<aiscript name="order.dock.train" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <order id="DockAndTrain" name="{77000, 10003}" description="{77000, 10103}" category="navigation" infinite="false">
+    <params>
+      <param name="destination" type="object" text="{1041, 10141}" comment="Training station to dock at">
+        <input_param name="class" value="[class.station]"/>
+      </param>
+      <param name="debugchance" default="100" type="number" text="{1041, 10086}" comment="Chance to show debug output">
+        <input_param name="min" value="0"/>
+        <input_param name="max" value="100"/>
+        <input_param name="step" value="10"/>
+      </param>
+    </params>
+    <requires>
+      <match shiptype="shiptype.lasertower" negate="true"/>
+    </requires>
+  </order>
+  
+  <interrupts>
+    <handler ref="TargetInvalidHandler"/>
+    <handler ref="AttackHandler"/>
+  </interrupts>
+  
+  <init>
+    <set_order_syncpoint_reached order="this.ship.order"/>
+    
+    <!-- Validate parameters -->
+    <do_if value="not $destination or not this.ship.pilot">
+      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[GT-Training] ' + this.ship.idcode + ': ABORT: Invalid destination or no pilot'" chance="$debugchance"/>
+      </do_if>
+      <set_order_state order="this.ship.order" state="orderstate.critical"/>
+      <signal_objects object="this.ship" param="'training_aborted'" param2="'Invalid parameters'"/>
+      <return/>
+    </do_if>
+    
+    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+      <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Starting training at ' + $destination.knownname + ' for pilot ' + this.ship.pilot.name" chance="$debugchance"/>
+    </do_if>
+    
+    <!-- Signal MD system that training script is starting -->
+    <signal_objects object="player.galaxy" param="'GT_Training_Script_Starting'" param2="table[
+      $Ship = this.ship,
+      $Pilot = this.ship.pilot,
+      $Station = $destination
+    ]"/>
+    
+  </init>
+  
+  <attention min="unknown">
+    <actions>
+      
+      <!-- ========================================================================= -->
+      <!-- HIGH-PERFORMANCE EVENT-DRIVEN TRAINING ORDER (NO POLLING)               -->
+      <!-- ========================================================================= -->
+      
+      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Event-driven training started at ' + $destination.knownname" chance="$debugchance"/>
+      </do_if>
+      
+      <!-- Get training requirements directly from global data (instant, no signals) -->
+      <set_value name="$trainingRequired" exact="false"/>
+      <set_value name="$requiredLevel" exact="1"/>
+      
+      <do_if value="this.ship.pilot and global.$GT_Pilots.{this.ship.pilot}?">
+        <do_if value="global.$GT_Pilots.{this.ship.pilot}.$XPBlocked?">
+          <set_value name="$trainingRequired" exact="true"/>
+          <set_value name="$requiredLevel" exact="global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel"/>
+        </do_if>
+      </do_if>
+      
+      <!-- Validate training requirements -->
+      <do_if value="not $trainingRequired">
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Training] ' + this.ship.idcode + ': No training required - completing immediately'" chance="$debugchance"/>
+        </do_if>
+        <signal_objects object="this.ship" param="'GT_Training_Complete'" param2="table[
+          $Level = 0,
+          $Station = $destination,
+          $Reason = 'No training needed'
+        ]"/>
+        <return/>
+      </do_if>
+      
+      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Training required for level ' + $requiredLevel" chance="$debugchance"/>
+      </do_if>
+      
+      <!-- Notify MD system: Training starting (direct signal) -->
+      <signal_objects object="player.galaxy" param="'GT_Start_Training'" param2="table[
+        $Ship = this.ship,
+        $Pilot = this.ship.pilot,
+        $TrainingLevel = $requiredLevel,
+        $TrainingStation = $destination
+      ]"/>
+      
+      <!-- Send immersive training message to logbook - only if enabled -->
+      <do_if value="@this.ship.commander.defaultorder.$logbookentries or @this.ship.defaultorder.$logbookentries">
+        <!-- Get actual training duration from pilot data (calculated by MD system) -->
+        <set_value name="$actualDuration" exact="@global.$GT_Pilots.{this.ship.pilot}.$TrainingDuration"/>
+        
+        <signal_objects object="player.galaxy" param="'GT_TradeLogging_LogTrainingStarted'" param2="table[
+          $Ship = this.ship,
+          $Pilot = this.ship.pilot,
+          $Station = $destination,
+          $TrainingLevel = $requiredLevel,
+          $Duration = $actualDuration
+        ]"/>
+      </do_if>
+      
+      <!-- STEP 1: High-Performance Docking (VALIDATED AGAINST WORKING REFERENCE) -->
+      <do_if value="(this.ship.dock and (this.ship.dock.container == $destination)) or (this.ship.parkedat and ((this.ship.parkedat == $destination) or this.ship.parkedat.hascontext.{$destination}))">
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Already docked at ' + $destination.knownname + ' - proceeding directly to training'" chance="$debugchance"/>
+        </do_if>
+      </do_if>
+      <do_else>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Not docked at target (dock: ' + @this.ship.dock + ', parked: ' + @this.ship.parkedat + ', target: ' + $destination + ') - initiating dock sequence'" chance="$debugchance"/>
+        </do_if>
+        
+        <!-- Event-driven docking (no polling wait) -->
+        <!-- Only pass debugchance > 0 if GT debug logging is enabled globally -->
+        <set_value name="$dockDebugChance" exact="0"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <set_value name="$dockDebugChance" exact="$debugchance"/>
+        </do_if>
+        <create_order id="'DockAndWait'" object="this.ship" immediate="true">
+          <param name="destination" value="$destination"/>
+          <param name="building" value="false"/>
+          <param name="trading" value="false"/>
+          <param name="dockfollowers" value="$destination.isclass.station"/>
+          <param name="callerid" value="this.ship.order"/>
+          <param name="debugchance" value="$dockDebugChance"/>
+        </create_order>
+        
+        <!-- Event-driven wait for docking completion -->
+        <wait>
+          <interrupt>
+            <conditions>
+              <event_object_order_ready object="this.ship"/>
+            </conditions>
+          </interrupt>
+        </wait>
+        
+        <!-- Validate docking success (VALIDATED AGAINST WORKING REFERENCE) -->
+        <do_if value="not ((this.ship.dock and (this.ship.dock.container == $destination)) or (this.ship.parkedat and ((this.ship.parkedat == $destination) or this.ship.parkedat.hascontext.{$destination})))">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Training] ' + this.ship.idcode + ': CRITICAL: Docking failed (dock: ' + @this.ship.dock + ', parked: ' + @this.ship.parkedat + ', target: ' + $destination + ') - aborting training'" chance="$debugchance"/>
+          </do_if>
+          
+          <!-- Notify MD system: Training failed -->
+          <signal_objects object="player.galaxy" param="'GT_Abort_Training'" param2="table[
+            $Pilot = this.ship.pilot,
+            $Ship = this.ship,
+            $Reason = 'Docking failed'
+          ]"/>
+          
+          <signal_objects object="this.ship" param="'GT_Training_Failed'" param2="table[
+            $Reason = 'Docking failed',
+            $Station = $destination
+          ]"/>
+          <return/>
+        </do_if>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Docking successful - training can proceed'" chance="$debugchance"/>
+        </do_if>
+      </do_else>
+      
+       <!-- STEP 2: Training Simulation - Get duration calculated by MD script (PRODUCTION MODE) -->
+       <set_value name="$trainingDuration" exact="@global.$GT_Pilots.{this.ship.pilot}.$TrainingDuration"/>
+       
+       <!-- Fallback to 10 minutes if duration not set (should never happen) -->
+       <do_if value="not $trainingDuration?">
+         <set_value name="$trainingDuration" exact="600s"/>
+         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+           <debug_text text="'[GT-Training] ' + this.ship.idcode + ': WARNING - Training duration not set, using fallback 10 minutes'" chance="100"/>
+         </do_if>
+       </do_if>
+       
+       <!-- CRITICAL FIX: Ensure duration is a time value, not an integer -->
+       <do_if value="$trainingDuration and typeof $trainingDuration == datatype.integer">
+         <set_value name="$trainingDuration" exact="$trainingDuration * 1s"/>
+         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+           <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Converted integer duration to time: ' + ($trainingDuration / 1s) + 's'" chance="100"/>
+         </do_if>
+       </do_if>
+       
+       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+         <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Level ' + $requiredLevel + ' training duration: ' + ($trainingDuration / 1s) + 's'" chance="$debugchance"/>
+       </do_if>
+      
+       <!-- Event-driven training wait (no polling) -->
+       <!-- FIXED: Changed from exact= to max= to allow interrupt to fire immediately -->
+       <wait max="$trainingDuration">
+         <interrupt>
+           <conditions>
+             <event_object_signalled object="this.ship" param="'GT_Abort_Training'"/>
+           </conditions>
+           <actions>
+             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+               <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Training interrupted by abort signal'" chance="$debugchance"/>
+             </do_if>
+      
+             <signal_objects object="player.galaxy" param="'GT_Abort_Training'" param2="table[
+               $Pilot = this.ship.pilot,
+               $Ship = this.ship,
+               $Reason = 'Training interrupted'
+             ]"/>
+             
+             <signal_objects object="this.ship" param="'GT_Training_Failed'" param2="table[
+               $Reason = 'Training interrupted',
+               $Station = $destination
+             ]"/>
+             <return/>
+           </actions>
+         </interrupt>
+       </wait>
+       
+       <!-- STEP 3: Complete Training -->
+       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+         <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Training completed - processing results'" chance="$debugchance"/>
+       </do_if>
+      
+       <!-- Notify MD system: Training completed -->
+      <signal_objects object="player.galaxy" param="'GT_Complete_Training'" param2="table[
+        $Pilot = this.ship.pilot,
+        $Ship = this.ship,
+         $Level = $requiredLevel
+      ]"/>
+      
+       <!-- Send training completion message to logbook - only if enabled -->
+       <do_if value="@this.ship.commander.defaultorder.$logbookentries or @this.ship.defaultorder.$logbookentries">
+         <signal_objects object="player.galaxy" param="'GT_TradeLogging_LogTrainingCompleted'" param2="table[
+           $Ship = this.ship,
+           $Pilot = this.ship.pilot,
+           $Level = $requiredLevel
+         ]"/>
+       </do_if>
+      
+      <!-- STEP 4: Event-Driven Undocking -->
+      <do_if value="@this.ship.dockingbay.container">
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Initiating undock sequence'" chance="$debugchance"/>
+        </do_if>
+        
+        <create_order object="this.ship" id="'Undock'" immediate="true"/>
+        
+        <!-- Event-driven undocking wait -->
+        <wait>
+          <interrupt>
+            <conditions>
+              <event_object_order_ready object="this.ship"/>
+            </conditions>
+          </interrupt>
+        </wait>
+        
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Undocking completed'" chance="$debugchance"/>
+        </do_if>
+      </do_if>
+      
+      <!-- STEP 5: Signal Completion -->
+      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Training sequence completed successfully for level ' + $requiredLevel" chance="$debugchance"/>
+      </do_if>
+      
+      <signal_objects object="this.ship" param="'GT_Training_Complete'" param2="table[
+        $Level = $requiredLevel,
+        $Station = $destination,
+        $Duration = $trainingDuration
+      ]"/>
+      
+    </actions>
+  </attention>
+  
+  <on_abort>
+    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+      <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Training order was aborted'" chance="$debugchance"/>
+    </do_if>
+    
+    <!-- CRITICAL: Check if GT order is still active before sending signals -->
+    <!-- Training order can abort normally (completion) - only send signals if GT order is still active -->
+    <set_value name="$hasDirectGTOrder" exact="false"/>
+    <do_if value="this.ship.defaultorder? and (@this.ship.defaultorder.id == 'GalaxyTraderMK3' or @this.ship.defaultorder.id == 'GalaxyTraderMK2' or @this.ship.defaultorder.id == 'GalaxyTraderMK1' or @this.ship.defaultorder.id == 'GalaxyMiner')">
+      <set_value name="$hasDirectGTOrder" exact="true"/>
+    </do_if>
+    
+    <set_value name="$hasGTCommander" exact="false"/>
+    <do_if value="not $hasDirectGTOrder and this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship">
+      <do_if value="this.ship.commander.defaultorder? and (@this.ship.commander.defaultorder.id == 'GalaxyTraderMK3' or @this.ship.commander.defaultorder.id == 'GalaxyTraderMK2' or @this.ship.commander.defaultorder.id == 'GalaxyTraderMK1' or @this.ship.commander.defaultorder.id == 'GalaxyMiner')">
+        <set_value name="$hasGTCommander" exact="true"/>
+      </do_if>
+    </do_if>
+    
+    <!-- Only send signals if GT order is still active (direct or via commander) -->
+    <do_if value="$hasDirectGTOrder or $hasGTCommander">
+      <!-- Notify MD system about training abortion -->
+      <signal_objects object="player.galaxy" param="'GT_Abort_Training'" param2="table[
+        $Pilot = this.ship.pilot,
+        $Ship = this.ship,
+        $Reason = 'Training order aborted'
+      ]"/>
+      
+      <!-- Signal abortion to main trading script -->
+      <signal_objects object="this.ship" param="'training_aborted'" param2="'Training order was aborted'"/>
+    </do_if>
+    <do_else>
+      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Training order aborted but GT order no longer active - skipping signals'" chance="$debugchance"/>
+      </do_if>
+    </do_else>
+  </on_abort>
+  
+</aiscript> 

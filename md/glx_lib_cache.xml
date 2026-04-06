@@ -1,0 +1,290 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GLX_Lib_Cache" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4 Foundations/libraries/md.xsd">
+  <cues>
+    <!-- Per-home trade cache: total count + cross-home purge (split from gt_libraries_general). AI reads global.$GT_TradeCache directly. -->
+
+    <!-- ========================================= -->
+    <!-- CACHE UTILITIES -->
+    <!-- ========================================= -->
+    
+    <!-- Calculate Total Cache Count -->
+    <library name="GLX_CalculateTotalCacheCount" purpose="run_actions">
+      <params>
+      </params>
+      <actions>
+        <!-- PERFORMANCE OPTIMIZATION v5: Calculate total cache count from all home sectors -->
+        <!-- global.$GT_TradeCache is now a table indexed by home sector -->
+        <!-- Returns total count of all trades across all home sector caches -->
+        <set_value name="$totalCount" exact="0"/>
+        <do_if value="global.$GT_TradeCache?">
+          <!-- Prefer explicit home registry if it exists AND is non-empty. Some saves can end up with an empty registry
+               while the cache table still has keys; in that case, fall back to GT_TradeCache.keys so counts/dumps work. -->
+          <set_value name="$homes" exact="[]"/>
+          <set_value name="$usedRegistry" exact="false"/>
+          <do_if value="global.$GT_TradeCacheHomes? and global.$GT_TradeCacheHomes != null and typeof global.$GT_TradeCacheHomes == datatype.list and global.$GT_TradeCacheHomes.count gt 0">
+            <set_value name="$homes" exact="@global.$GT_TradeCacheHomes"/>
+            <set_value name="$usedRegistry" exact="true"/>
+          </do_if>
+          <do_else>
+            <set_value name="$homes" exact="@global.$GT_TradeCache.keys"/>
+            <do_if value="$homes == null">
+              <set_value name="$homes" exact="[]"/>
+            </do_if>
+          </do_else>
+
+          <!-- Optional self-heal: if registry exists but was empty, rebuild it from keys (best-effort). -->
+          <do_if value="not $usedRegistry and global.$GT_TradeCacheHomes? and (global.$GT_TradeCacheHomes == null or typeof global.$GT_TradeCacheHomes != datatype.list or global.$GT_TradeCacheHomes.count == 0) and $homes.count gt 0">
+            <set_value name="global.$GT_TradeCacheHomes" exact="$homes"/>
+          </do_if>
+          
+          <do_all exact="$homes.count" counter="$sectorIdx">
+            <set_value name="$home" exact="$homes.{$sectorIdx}"/>
+            <set_value name="$sectorCache" exact="@global.$GT_TradeCache.{$home}"/>
+            <do_if value="$sectorCache != null">
+              <set_value name="$totalCount" exact="$totalCount + $sectorCache.count"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <return value="$totalCount"/>
+      </actions>
+    </library>
+    
+
+    <!-- Purge cache entries by offer-pair across ALL home-sector caches -->
+    <!-- Motivation:
+         With per-home-sector caching, the same BuyOffer/SellOffer pair can be cached under multiple home sectors.
+         If we only remove from the executing ship's home sector, other home caches retain stale entries and ships revalidate "ghost" trades.
+         This helper removes matching entries from:
+           - global.$GT_TradeCache.{home}
+           - global.$GT_TradeCacheByWare.{home}.{wareKey} (best-effort for both ware object key and ware.id string key) -->
+    <library name="GLX_PurgeCacheOfferPair_AllHomes" purpose="run_actions">
+      <params>
+        <param name="ship" default="null" comment="Ship for logging context (optional)"/>
+        <param name="buyOffer" default="null" comment="Buy offer object (may be null for sell-only)"/>
+        <param name="sellOffer" comment="Sell offer object (required)"/>
+        <param name="reason" default="'unknown'" comment="Reason for purge (debug)"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <set_value name="$removedTotal" exact="0"/>
+
+        <!-- Validate required offer handle -->
+        <do_if value="$sellOffer == null">
+          <return value="table[$Removed = 0, $Homes = 0, $UsedIndex = false]"/>
+        </do_if>
+
+        <!-- PHASE 1: Use index-based lookup (O(1)) - ERROR if index missing -->
+        <set_value name="$usedIndex" exact="false"/>
+        <set_value name="$homes" exact="[]"/>
+        
+        <!-- Generate trade key -->
+        <!-- CRITICAL: Validate sellOffer has valid ID before generating trade key -->
+        <set_value name="$tradeKey" exact="''"/>
+        <set_value name="$sellOfferIdValid" exact="false"/>
+        
+        <!-- Validate sellOffer exists and has valid ID -->
+        <do_if value="$sellOffer? and $sellOffer != null and $sellOffer.exists">
+          <set_value name="$tempSellId" exact="@$sellOffer.id"/>
+          <do_if value="$tempSellId? and $tempSellId != null">
+            <set_value name="$sellOfferIdValid" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Only generate trade key if sellOffer has valid ID -->
+        <do_if value="$sellOfferIdValid">
+          <run_actions ref="md.GLX_Lib_Reservations.GLX_GenerateTradeKey" result="$tradeKey">
+            <param name="buyOffer" value="$buyOffer"/>
+            <param name="sellOffer" value="$sellOffer"/>
+            <param name="traceId" value="$traceId"/>
+          </run_actions>
+        </do_if>
+        
+        <!-- Validate trade key was generated -->
+        <!-- CRITICAL FIX: This is expected behavior when offers become invalid - log as INFO, not ERROR -->
+        <do_if value="$tradeKey == ''">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheInvalidate'"/>
+              <param name="action" value="'Info'"/>
+              <param name="details" value="'reason=invalid_tradeKey reason=' + $reason + ' note=expected_when_offers_become_invalid'"/>
+              <param name="logLevel" value="2"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-INFO] GLX_PurgeCacheOfferPair_AllHomes: Failed to generate trade key - cannot invalidate cache (offer may have been removed, trade executed but cache purge skipped)'" chance="100"/>
+          </do_else>
+          <return value="table[$Removed = 0, $Homes = 0, $UsedIndex = false]"/>
+        </do_if>
+        
+        <!-- Validate index exists -->
+        <do_if value="not global.$GT_TradeIndex?">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheInvalidate'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=index_not_initialized trade=' + $tradeKey + ' reason=' + $reason"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GLX_PurgeCacheOfferPair_AllHomes: Trade index not initialized - tradeKey=' + $tradeKey" chance="100"/>
+          </do_else>
+          <return value="table[$Removed = 0, $Homes = 0, $UsedIndex = false]"/>
+        </do_if>
+        
+        <!-- Look up homes from index -->
+        <run_actions ref="md.GLX_Lib_Reservations.GLX_GetTradeIndexHomes" result="$indexHomes">
+          <param name="tradeKey" value="$tradeKey"/>
+        </run_actions>
+        
+        <!-- Validate index lookup returned valid result -->
+        <do_if value="not $indexHomes?">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheInvalidate'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=index_lookup_failed trade=' + $tradeKey + ' reason=' + $reason"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GLX_PurgeCacheOfferPair_AllHomes: Index lookup returned null - tradeKey=' + $tradeKey" chance="100"/>
+          </do_else>
+          <return value="table[$Removed = 0, $Homes = 0, $UsedIndex = false]"/>
+        </do_if>
+        
+        <!-- Use index homes -->
+        <set_value name="$homes" exact="$indexHomes"/>
+        <set_value name="$usedIndex" exact="true"/>
+        
+        <!-- Log index-based invalidation -->
+        <do_if value="$traceId != ''">
+          <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'CacheInvalidate'"/>
+            <param name="action" value="'IndexLookup'"/>
+            <param name="details" value="'trade=' + $tradeKey + ' homes=' + $homes.count + ' reason=' + $reason"/>
+            <param name="logLevel" value="1"/>
+          </run_actions>
+        </do_if>
+        
+        <!-- ERROR if index lookup returned empty list but trade should exist -->
+        <do_if value="$homes.count == 0">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheInvalidate'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=index_entry_not_found trade=' + $tradeKey + ' reason=' + $reason"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GLX_PurgeCacheOfferPair_AllHomes: Trade not found in index - tradeKey=' + $tradeKey + ' (trade may not be cached or index incomplete)'" chance="100"/>
+          </do_else>
+          <!-- Continue with empty homes list - will result in 0 removals, which is correct -->
+        </do_if>
+
+        <do_all exact="$homes.count" counter="$hi">
+          <set_value name="$home" exact="$homes.{$hi}"/>
+          <do_if value="$home? and global.$GT_TradeCache? and global.$GT_TradeCache.{$home}?">
+            <set_value name="$sectorCache" exact="global.$GT_TradeCache.{$home}"/>
+            <do_all exact="$sectorCache.count" counter="$i" reverse="true">
+              <set_value name="$entry" exact="$sectorCache.{$i}"/>
+              <do_if value="$entry != null">
+                <set_value name="$buyOfferMatches" exact="false"/>
+                <set_value name="$sellOfferMatches" exact="false"/>
+
+                <!-- Sell-only match: buyOffer is null => only match sell offer -->
+                <do_if value="$buyOffer == null">
+                  <set_value name="$buyOfferMatches" exact="true"/>
+                  <do_if value="$entry.$SellOffer? and $entry.$SellOffer == $sellOffer">
+                    <set_value name="$sellOfferMatches" exact="true"/>
+                  </do_if>
+                </do_if>
+                <do_else>
+                  <do_if value="$entry.$BuyOffer? and $entry.$BuyOffer == $buyOffer">
+                    <set_value name="$buyOfferMatches" exact="true"/>
+                  </do_if>
+                  <do_if value="$entry.$SellOffer? and $entry.$SellOffer == $sellOffer">
+                    <set_value name="$sellOfferMatches" exact="true"/>
+                  </do_if>
+                </do_else>
+
+                <do_if value="$buyOfferMatches and $sellOfferMatches">
+                  <!-- Remove from main cache -->
+                  <remove_value name="global.$GT_TradeCache.{$home}.{$i}"/>
+                  <set_value name="$removedTotal" operation="add"/>
+
+                  <!-- Best-effort: remove from per-ware index (handles both ware-object keys and legacy ware-id keys) -->
+                  <do_if value="global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$home}?">
+                    <set_value name="$wareObj" exact="null"/>
+                    <set_value name="$wareIdKey" exact="null"/>
+                    <do_if value="$entry.$BuyOffer?">
+                      <set_value name="$wareObj" exact="@$entry.$BuyOffer.ware"/>
+                      <do_if value="$wareObj?">
+                        <set_value name="$wareIdKey" exact="@$wareObj.id"/>
+                      </do_if>
+                    </do_if>
+                    <do_elseif value="$entry.$WareId?">
+                      <set_value name="$wareIdKey" exact="@$entry.$WareId"/>
+                    </do_elseif>
+
+                    <!-- Remove by ware object key -->
+                    <do_if value="$wareObj? and global.$GT_TradeCacheByWare.{$home}.{$wareObj}?">
+                      <remove_from_list name="global.$GT_TradeCacheByWare.{$home}.{$wareObj}" exact="$entry"/>
+                    </do_if>
+                    <!-- Remove by ware id key (legacy / mixed saves) -->
+                    <do_if value="$wareIdKey? and global.$GT_TradeCacheByWare.{$home}.{$wareIdKey}?">
+                      <remove_from_list name="global.$GT_TradeCacheByWare.{$home}.{$wareIdKey}" exact="$entry"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_all>
+
+            <!-- Clean up empty home cache lists -->
+            <do_if value="global.$GT_TradeCache.{$home}? and global.$GT_TradeCache.{$home}.count == 0">
+              <remove_value name="global.$GT_TradeCache.{$home}"/>
+              <do_if value="global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$home}?">
+                <remove_value name="global.$GT_TradeCacheByWare.{$home}"/>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_all>
+
+        <!-- PHASE 1: Remove from index after invalidation -->
+        <do_if value="$tradeKey != '' and $removedTotal gt 0">
+          <run_actions ref="md.GLX_Lib_Reservations.GLX_RemoveTradeFromIndex">
+            <param name="tradeKey" value="$tradeKey"/>
+            <param name="homeSector" value="null"/>
+            <param name="traceId" value="$traceId"/>
+          </run_actions>
+        </do_if>
+        
+        <!-- Log invalidation completion -->
+        <do_if value="$traceId != ''">
+          <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'CacheInvalidate'"/>
+            <param name="action" value="'Complete'"/>
+            <param name="details" value="'trade=' + (if $tradeKey != '' then $tradeKey else 'unknown') + ' removed=' + $removedTotal + ' homes=' + $homes.count + ' usedIndex=' + (if $usedIndex then 'true' else 'false') + ' reason=' + $reason"/>
+            <param name="logLevel" value="1"/>
+          </run_actions>
+        </do_if>
+        
+        <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <set_value name="$shipId" exact="if $ship != null then $ship.idcode else 'N/A'"/>
+          <debug_text text="'[GT-Cache] Purged offer-pair across homes: removed=' + $removedTotal + ', homes=' + $homes.count + ', ship=' + $shipId + ', reason=' + $reason + ', usedIndex=' + $usedIndex" chance="100"/>
+        </do_if>
+
+        <return value="table[$Removed = $removedTotal, $Homes = $homes.count, $UsedIndex = $usedIndex]"/>
+      </actions>
+    </library>
+
+
+  </cues>
+</mdscript>

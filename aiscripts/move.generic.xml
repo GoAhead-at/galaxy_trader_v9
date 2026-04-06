@@ -1,0 +1,586 @@
+<?xml version="1.0" encoding="utf-8"?>
+<diff>
+  <!-- GalaxyTrader MK3: Sector-Change Rerouting for TradePerform orders -->
+  
+  <!-- Sector-Change Rerouting: Check destination reachability when entering new sector -->
+  <!-- This handler runs DURING move.generic execution for all GT ships (trade, repair, supply, etc.) -->
+  <!-- move.generic handles sector changes and prevents them from bubbling to parent scripts -->
+  <!-- Add BEFORE SectorChangeHandler so our handler fires first -->
+  <add sel="//aiscript[@name='move.generic']/interrupts/handler[@ref='SectorChangeHandler']" pos="before">
+    <handler comment="GT Sector-Change Rerouting: Check destination reachability on sector change (for all GT ship activities)">
+      <conditions>
+        <check_any>
+          <event_object_entered_gate object="this.ship"/>
+          <event_object_entered_anomaly object="this.ship"/>
+        </check_any>
+      </conditions>
+      <actions>
+        <!-- Get new sector from event (needed for both rerouting and logging) -->
+        <set_value name="$newSectorFromEvent" exact="null"/>
+        <do_if value="event.param2?">
+          <do_if value="event.param2.sector?">
+            <set_value name="$newSectorFromEvent" exact="event.param2.sector"/>
+          </do_if>
+        </do_if>
+        <set_value name="$newSector" exact="if $newSectorFromEvent then $newSectorFromEvent else this.ship.sector"/>
+        
+        <!-- Process for all GT ships (trade, repair, supply, etc.) -->
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}?">
+          <!-- Log sector change for GT ships -->
+          <set_value name="$oldSector" exact="null"/>
+          <do_if value="event.param?">
+            <do_if value="event.param.sector?">
+              <set_value name="$oldSector" exact="event.param.sector"/>
+            </do_if>
+          </do_if>
+          <set_value name="$oldSectorName" exact="if $oldSector then @$oldSector.knownname else 'Unknown'"/>
+          <set_value name="$newSectorName" exact="@$newSector.knownname"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-MoveGeneric] ' + this.ship.idcode + ': SECTOR CHANGE: ' + $oldSectorName + ' ' + $newSectorName" chance="100"/>
+          </do_if>
+          
+          <!-- Check destination reachability for rerouting (applies to all GT ship activities) -->
+          <!-- Only Level 12+ pilots have tactical awareness for mid-route analysis -->
+          <!-- Only check blacklist-aware paths if threat avoidance and dynamic blacklist are enabled -->
+          <do_if value="this.ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}?">
+            <set_value name="$pilotLevel" exact="@global.$GT_Pilots.{this.ship.pilot}.$Level"/>
+            
+            <do_if value="$pilotLevel ge 12">
+              <!-- Get current destination from move.generic's $destination parameter -->
+              <set_value name="$currentDestination" exact="$destination"/>
+              
+              <!-- Check if destination is valid and in different sector -->
+              <do_if value="@$currentDestination.exists and @$currentDestination.sector != null and $newSector != null and $newSector != @$currentDestination.sector">
+                <set_value name="$destinationSector" exact="@$currentDestination.sector"/>
+
+                <!-- Prefer showing the destination's container (station/ship) in logbook messages.
+                     move.generic callers often pass a dockingbay component as destination, whose knownname is unhelpful ("S Standard Docking Bay"). -->
+                <set_value name="$destinationDisplay" exact="$currentDestination"/>
+                <set_value name="$destinationContainer" exact="@$currentDestination.container"/>
+                <do_if value="$destinationContainer != null">
+                  <set_value name="$destinationDisplay" exact="$destinationContainer"/>
+                </do_if>
+                <set_value name="$destinationDisplayName" exact="@$destinationDisplay.knownname"/>
+                
+                <!-- Check if threat avoidance and dynamic blacklist are enabled -->
+                <set_value name="$threatAvoidanceEnabled" exact="false"/>
+                <set_value name="$useDynamicBlacklist" exact="false"/>
+                <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$ThreatAvoidance?">
+                  <set_value name="$threatAvoidanceEnabled" exact="@global.$GT_GlobalSettings.$ThreatAvoidance.$Enabled"/>
+                  <set_value name="$useDynamicBlacklist" exact="@global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist"/>
+                </do_if>
+
+                <!-- Determine ship blacklist group -->
+                <set_value name="$blacklistgroup" exact="blacklistgroup.civilian"/>
+                <do_if value="this.ship.isclass.[class.ship_m, class.ship_l, class.ship_xl]">
+                  <set_value name="$blacklistgroup" exact="blacklistgroup.military"/>
+                </do_if>
+
+                <!-- Calculate normal distance (shortest path) -->
+                <set_value name="$normalDistance" exact="this.ship.gatedistance.{$destinationSector}"/>
+
+                <!-- Calculate blacklist-aware distance (avoiding threats) - only if threat avoidance is enabled -->
+                <set_value name="$blacklistDistance" exact="-1"/>
+                <do_if value="$threatAvoidanceEnabled and $useDynamicBlacklist">
+                  <set_value name="$blacklistDistance" exact="this.ship.gatedistance.{$destinationSector}.{$blacklistgroup}.{this.ship}"/>
+                </do_if>
+
+                <!-- Epoch-based route cache + topology compare (catches equal-jump reroutes) -->
+                <set_value name="$currentBlacklistEpoch" exact="if global.$GT_BlacklistEpoch? then global.$GT_BlacklistEpoch else 0"/>
+                <set_value name="$epochChanged" exact="false"/>
+                <set_value name="$haveCachedPath" exact="false"/>
+                <set_value name="$routeChangedByEpoch" exact="false"/>
+                <set_value name="$cachedRemainingSectors" exact="[]"/>
+                <set_value name="$needsPathRebuild" exact="false"/>
+
+                <do_if value="global.$GT_Ships.{this.ship}.$RoutePathCache?">
+                  <set_value name="$routeCache" exact="global.$GT_Ships.{this.ship}.$RoutePathCache"/>
+                  <do_if value="$routeCache.$DestinationSector? and $routeCache.$DestinationSector == $destinationSector and $routeCache.$BlacklistGroup? and $routeCache.$BlacklistGroup == $blacklistgroup and $routeCache.$RemainingSectors?">
+                    <set_value name="$haveCachedPath" exact="true"/>
+                    <set_value name="$cachedRemainingSectors" exact="$routeCache.$RemainingSectors"/>
+                    <set_value name="$cachedEpoch" exact="if $routeCache.$BlacklistEpoch? then $routeCache.$BlacklistEpoch else 0"/>
+                    <set_value name="$epochChanged" exact="$cachedEpoch != $currentBlacklistEpoch"/>
+
+                    <!-- Exclude already passed sectors from cached path by trimming to current sector -->
+                    <set_value name="$foundCurrentIndex" exact="0"/>
+                    <do_all exact="$cachedRemainingSectors.count" counter="$idx">
+                      <do_if value="$foundCurrentIndex == 0 and $cachedRemainingSectors.{$idx} == $newSector">
+                        <set_value name="$foundCurrentIndex" exact="$idx"/>
+                      </do_if>
+                    </do_all>
+                    <do_if value="$foundCurrentIndex gt 1">
+                      <set_value name="$trimmedCachedSectors" exact="[]"/>
+                      <do_all exact="$cachedRemainingSectors.count - $foundCurrentIndex + 1" counter="$trimIdx">
+                        <set_value name="$sourceIdx" exact="$foundCurrentIndex + $trimIdx - 1"/>
+                        <append_to_list name="$trimmedCachedSectors" exact="$cachedRemainingSectors.{$sourceIdx}"/>
+                      </do_all>
+                      <set_value name="$cachedRemainingSectors" exact="$trimmedCachedSectors"/>
+                    </do_if>
+                    <do_elseif value="$foundCurrentIndex == 0 and $cachedRemainingSectors.count gt 0">
+                      <!-- Cached route no longer anchored at current sector -->
+                      <set_value name="$haveCachedPath" exact="false"/>
+                    </do_elseif>
+                  </do_if>
+                </do_if>
+
+                <do_if value="not $haveCachedPath or $epochChanged">
+                  <set_value name="$needsPathRebuild" exact="true"/>
+                </do_if>
+
+                <set_value name="$recalculatedRemainingSectors" exact="[]"/>
+                <do_if value="$needsPathRebuild and $threatAvoidanceEnabled and $useDynamicBlacklist">
+                  <set_value name="$jumppath" exact="[]"/>
+                  <get_jump_path component="$jumppath" multiple="true" uselocalhighways="true" useblacklist="$blacklistgroup" refobject="this.assignedcontrolled" useknownpath="this.isplayerowned">
+                    <start object="this.ship"/>
+                    <end object="$destinationSector"/>
+                  </get_jump_path>
+                  <do_if value="$jumppath.count lt 2">
+                    <get_jump_path component="$jumppath" multiple="true" uselocalhighways="false" useblacklist="$blacklistgroup" refobject="this.assignedcontrolled" useknownpath="this.isplayerowned">
+                      <start object="this.ship"/>
+                      <end object="$destinationSector"/>
+                    </get_jump_path>
+                  </do_if>
+
+                  <set_value name="$lastRouteSector" exact="null"/>
+                  <append_to_list name="$recalculatedRemainingSectors" exact="$newSector"/>
+                  <set_value name="$lastRouteSector" exact="$newSector"/>
+                  <do_all exact="$jumppath.count" counter="$jpidx">
+                    <set_value name="$pathComponent" exact="$jumppath.{$jpidx}"/>
+                    <do_if value="$pathComponent? and @$pathComponent.sector != null">
+                      <set_value name="$pathSector" exact="@$pathComponent.sector"/>
+                      <do_if value="$lastRouteSector == null or $pathSector != $lastRouteSector">
+                        <append_to_list name="$recalculatedRemainingSectors" exact="$pathSector"/>
+                        <set_value name="$lastRouteSector" exact="$pathSector"/>
+                      </do_if>
+                    </do_if>
+                  </do_all>
+                  <do_if value="$lastRouteSector != $destinationSector">
+                    <append_to_list name="$recalculatedRemainingSectors" exact="$destinationSector"/>
+                  </do_if>
+
+                  <do_if value="$epochChanged and $haveCachedPath">
+                    <!-- Compare route topology excluding current sector (index 1):
+                         once we're already in the sector, rerouting based on that hop is too late. -->
+                    <set_value name="$cachedCompareSectors" exact="[]"/>
+                    <set_value name="$recalculatedCompareSectors" exact="[]"/>
+                    <do_if value="$cachedRemainingSectors.count gt 1">
+                      <do_all exact="$cachedRemainingSectors.count - 1" counter="$csi">
+                        <append_to_list name="$cachedCompareSectors" exact="$cachedRemainingSectors.{$csi + 1}"/>
+                      </do_all>
+                    </do_if>
+                    <do_if value="$recalculatedRemainingSectors.count gt 1">
+                      <do_all exact="$recalculatedRemainingSectors.count - 1" counter="$nsi">
+                        <append_to_list name="$recalculatedCompareSectors" exact="$recalculatedRemainingSectors.{$nsi + 1}"/>
+                      </do_all>
+                    </do_if>
+
+                    <set_value name="$pathsMatch" exact="true"/>
+                    <do_if value="$cachedCompareSectors.count != $recalculatedCompareSectors.count">
+                      <set_value name="$pathsMatch" exact="false"/>
+                    </do_if>
+                    <do_else>
+                      <do_all exact="$cachedCompareSectors.count" counter="$cmpidx">
+                        <do_if value="$cachedCompareSectors.{$cmpidx} != $recalculatedCompareSectors.{$cmpidx}">
+                          <set_value name="$pathsMatch" exact="false"/>
+                          <break/>
+                        </do_if>
+                      </do_all>
+                    </do_else>
+                    <do_if value="not $pathsMatch">
+                      <set_value name="$routeChangedByEpoch" exact="true"/>
+                      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                        <set_value name="$cachedPathText" exact="''"/>
+                        <set_value name="$newPathText" exact="''"/>
+                        <set_value name="$cachedLimit" exact="[$cachedRemainingSectors.count, 20].min"/>
+                        <set_value name="$newLimit" exact="[$recalculatedRemainingSectors.count, 20].min"/>
+
+                        <do_all exact="$cachedLimit" counter="$cti">
+                          <set_value name="$csec" exact="$cachedRemainingSectors.{$cti}"/>
+                          <set_value name="$cname" exact="'Unknown'"/>
+                          <do_if value="$csec? and @$csec.knownname != null">
+                            <set_value name="$cname" exact="@$csec.knownname"/>
+                          </do_if>
+                          <do_if value="$cachedPathText == ''">
+                            <set_value name="$cachedPathText" exact="$cname"/>
+                          </do_if>
+                          <do_else>
+                            <set_value name="$cachedPathText" exact="$cachedPathText + ' -> ' + $cname"/>
+                          </do_else>
+                        </do_all>
+                        <do_if value="$cachedRemainingSectors.count gt 20">
+                          <set_value name="$cachedPathText" exact="$cachedPathText + ' -> ... (+' + ($cachedRemainingSectors.count - 20) + ')'"/>
+                        </do_if>
+                        <do_if value="$cachedPathText == ''">
+                          <set_value name="$cachedPathText" exact="'(empty)'"/>
+                        </do_if>
+
+                        <do_all exact="$newLimit" counter="$nti">
+                          <set_value name="$nsec" exact="$recalculatedRemainingSectors.{$nti}"/>
+                          <set_value name="$nname" exact="'Unknown'"/>
+                          <do_if value="$nsec? and @$nsec.knownname != null">
+                            <set_value name="$nname" exact="@$nsec.knownname"/>
+                          </do_if>
+                          <do_if value="$newPathText == ''">
+                            <set_value name="$newPathText" exact="$nname"/>
+                          </do_if>
+                          <do_else>
+                            <set_value name="$newPathText" exact="$newPathText + ' -> ' + $nname"/>
+                          </do_else>
+                        </do_all>
+                        <do_if value="$recalculatedRemainingSectors.count gt 20">
+                          <set_value name="$newPathText" exact="$newPathText + ' -> ... (+' + ($recalculatedRemainingSectors.count - 20) + ')'"/>
+                        </do_if>
+                        <do_if value="$newPathText == ''">
+                          <set_value name="$newPathText" exact="'(empty)'"/>
+                        </do_if>
+
+                        <debug_text text="'[GT-MoveGeneric] ' + this.ship.idcode + ': EPOCH ROUTE MISMATCH:' +
+                          '\n  Epoch old/new: ' + $cachedEpoch + ' -> ' + $currentBlacklistEpoch +
+                          '\n  Cached sectors (' + $cachedRemainingSectors.count + '): ' + $cachedPathText +
+                          '\n  New sectors (' + $recalculatedRemainingSectors.count + '): ' + $newPathText" chance="100"/>
+                      </do_if>
+                    </do_if>
+                  </do_if>
+
+                  <set_value name="global.$GT_Ships.{this.ship}.$RoutePathCache" exact="table[
+                    $DestinationSector = $destinationSector,
+                    $BlacklistGroup = $blacklistgroup,
+                    $BlacklistEpoch = $currentBlacklistEpoch,
+                    $RemainingSectors = $recalculatedRemainingSectors
+                  ]"/>
+                </do_if>
+                <do_elseif value="$haveCachedPath">
+                  <set_value name="global.$GT_Ships.{this.ship}.$RoutePathCache.$RemainingSectors" exact="$cachedRemainingSectors"/>
+                </do_elseif>
+
+                <!-- Debug: log performed validation checks -->
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <set_value name="$blacklistGroupDisplay" exact="if $threatAvoidanceEnabled and $useDynamicBlacklist then $blacklistgroup else 'N/A (threat avoidance disabled)'"/>
+                  <debug_text text="'[GT-MoveGeneric] ' + this.ship.idcode + ': SECTOR CHANGE CHECK: dest=' + $destinationDisplayName + ' (sector ' + @$destinationSector.knownname + '), normal=' + $normalDistance + ', blacklist=' + $blacklistDistance + ', group=' + $blacklistGroupDisplay + ', threatAvoidance=' + $threatAvoidanceEnabled + ', useBlacklist=' + $useDynamicBlacklist + ', epoch=' + $currentBlacklistEpoch + ', epochChanged=' + $epochChanged + ', routeChangedByEpoch=' + $routeChangedByEpoch" chance="100"/>
+                </do_if>
+
+                <!-- Unified reroute decision -->
+                <set_value name="$shouldReroute" exact="false"/>
+                <set_value name="$normalDistanceForLog" exact="$normalDistance"/>
+                <set_value name="$blacklistDistanceText" exact="if $blacklistDistance lt 0 then 'UNREACHABLE' else $blacklistDistance + ' jumps'"/>
+                <set_value name="$statusText" exact="'Path unchanged'"/>
+
+                <!-- Case 1: Normal path doesn't exist -->
+                <do_if value="$normalDistance lt 0">
+                  <set_value name="$shouldReroute" exact="true"/>
+                  <set_value name="$normalDistanceForLog" exact="-1"/>
+                  <set_value name="$blacklistDistanceText" exact="'UNREACHABLE'"/>
+                  <set_value name="$statusText" exact="'No path available'"/>
+                </do_if>
+                <!-- Case 2: blacklist-aware path blocked/longer -->
+                <do_elseif value="$threatAvoidanceEnabled and $useDynamicBlacklist and ($blacklistDistance lt 0 or $blacklistDistance gt $normalDistance)">
+                  <set_value name="$shouldReroute" exact="true"/>
+                  <set_value name="$statusText" exact="if $blacklistDistance lt 0 then 'No safe path available' else 'Path requires detour'"/>
+                </do_elseif>
+                <!-- Case 3: epoch changed and route topology changed -->
+                <do_elseif value="$routeChangedByEpoch">
+                  <set_value name="$shouldReroute" exact="true"/>
+                  <set_value name="$statusText" exact="'Route topology changed after blacklist update'"/>
+                </do_elseif>
+
+                <do_if value="$shouldReroute">
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-MoveGeneric] ' + this.ship.idcode + ': SECTOR CHANGE REROUTE: Destination ' + @$currentDestination.knownname + ' changed (normal: ' + $normalDistance + ' jumps, blacklist-aware: ' + $blacklistDistance + ' jumps, epochRouteChanged: ' + $routeChangedByEpoch + ') - aborting movement'" chance="100"/>
+                  </do_if>
+
+                  <!-- Set reroute flag for ship name -->
+                  <set_value name="global.$GT_Ships.{this.ship}.$Rerouting" exact="true"/>
+
+                  <!-- Trigger ship rename to show [REROUTE] state -->
+                  <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
+                    $Ship=this.ship,
+                    $pilot=this.ship.pilot,
+                    $xp=global.$GT_Pilots.{this.ship.pilot}.$XP,
+                    $level=global.$GT_Pilots.{this.ship.pilot}.$Level,
+                    $rank=@global.$GT_Pilots.{this.ship.pilot}.$CurrentRank,
+                    $nameType='trader'
+                  ]"/>
+
+                  <!-- Player logbook notification about route change -->
+                  <set_value name="$logbookMessage" exact="{77000,3218}.[@$newSector.knownname, $destinationDisplayName, @$destinationSector.knownname, $normalDistanceForLog, $blacklistDistanceText, $statusText, this.ship.knownname]"/>
+                  <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
+                    $Message = $logbookMessage,
+                    $Category = 'alerts',
+                    $Title = 'Route Path Changed: ' + this.ship.knownname,
+                    $Object = this.ship,
+                    $Interaction = 'showonmap',
+                    $Highlighted = false
+                  ]"/>
+
+                  <!-- Signal dock failure to parent order (TradePerform, Repair, Supply, etc.) -->
+                  <do_if value="not global.$GT_DockFailures?">
+                    <set_value name="global.$GT_DockFailures" exact="table[]"/>
+                  </do_if>
+                  <set_value name="global.$GT_DockFailures.{this.ship}" exact="table[
+                    $Reason = 'ROUTE_PATH_CHANGED',
+                    $FailureText = {1045, 124},
+                    $Destination = $destination,
+                    $Timestamp = player.age
+                  ]"/>
+
+                  <!-- Abort move.generic - this will return control to parent order -->
+                  <set_value name="$returnvalue" exact="false"/>
+                  <abort_called_scripts resume="finish"/>
+                </do_if>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_if>
+      </actions>
+    </handler>
+  </add>
+  
+  <!-- Enemy Ship Departure Detection: Track when enemy ships leave blacklisted sectors -->
+  <!-- This handler runs for ALL ships when they change sectors -->
+  <!-- If a tracked enemy ship leaves a blacklisted sector, remove it from tracking -->
+  <add sel="//aiscript[@name='move.generic']/interrupts/handler[@ref='SectorChangeHandler']" pos="before">
+    <handler comment="GT Enemy Departure Detection: Remove tracked enemies when they leave sectors">
+      <conditions>
+        <check_any>
+          <event_object_entered_gate object="this.ship"/>
+          <event_object_entered_anomaly object="this.ship"/>
+        </check_any>
+      </conditions>
+      <actions>
+        <!-- Get new sector from event -->
+        <set_value name="$newSectorFromEvent" exact="null"/>
+        <do_if value="event.param2?">
+          <do_if value="event.param2.sector?">
+            <set_value name="$newSectorFromEvent" exact="event.param2.sector"/>
+          </do_if>
+        </do_if>
+        <set_value name="$newSector" exact="if $newSectorFromEvent then $newSectorFromEvent else this.ship.sector"/>
+        
+        <!-- Get old sector from event -->
+        <set_value name="$oldSector" exact="null"/>
+        <do_if value="event.param?">
+          <do_if value="event.param.sector?">
+            <set_value name="$oldSector" exact="event.param.sector"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Check if threat intelligence system exists -->
+        <do_if value="global.$GT_ThreatIntelligence?">
+          <set_value name="$sectorsToCheck" exact="global.$GT_ThreatIntelligence.keys.list"/>
+          
+          <!-- Iterate through all tracked sectors -->
+          <do_all exact="$sectorsToCheck.count" counter="$i">
+            <set_value name="$trackedSector" exact="$sectorsToCheck.{$i}"/>
+            <set_value name="$threatData" exact="global.$GT_ThreatIntelligence.{$trackedSector}"/>
+            
+            <!-- Check if this sector has tracked ships -->
+            <do_if value="$threatData.$TrackedEnemyShips? and $threatData.$TrackedEnemyShips.count gt 0">
+              <set_value name="$trackedShips" exact="$threatData.$TrackedEnemyShips"/>
+              <set_value name="$shipFound" exact="false"/>
+              
+              <!-- Find and remove this ship from tracking if it's in the list -->
+              <do_all exact="$trackedShips.count" counter="$j" reverse="true">
+                <set_value name="$trackedShip" exact="$trackedShips.{$j}"/>
+                <do_if value="$trackedShip == this.ship">
+                  <set_value name="$shipFound" exact="true"/>
+                  
+                  <!-- Get sector name for logbook (before removal) -->
+                  <set_value name="$leftSectorName" exact="@$trackedSector.knownname"/>
+                  <set_value name="$newSectorName" exact="@$newSector.knownname"/>
+                  <set_value name="$shipName" exact="@this.ship.knownname"/>
+                  
+                  <!-- Remove ship from tracking list -->
+                  <remove_from_list name="global.$GT_ThreatIntelligence.{$trackedSector}.$TrackedEnemyShips" exact="$trackedShip"/>
+                  
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Threat] Tracked enemy ship ' + $shipName + ' left sector ' + $leftSectorName + ' and moved to ' + $newSectorName" chance="100"/>
+                  </do_if>
+                  
+                  <!-- Check if all ships gone from this sector -->
+                  <set_value name="$remainingShips" exact="@global.$GT_ThreatIntelligence.{$trackedSector}.$TrackedEnemyShips"/>
+                  <do_if value="$remainingShips == null">
+                    <set_value name="$remainingShips" exact="[]"/>
+                  </do_if>
+                  <do_if value="$remainingShips.count == 0">
+                    <!-- All tracked ships eliminated - signal MD cue to clear sector -->
+                    <signal_objects object="player.galaxy" param="'GT_ClearSectorIfAllShipsGone'" param2="table[$Sector=$trackedSector]"/>
+                  </do_if>
+                  <do_else>
+                    <!-- Ship left but others remain - send logbook message about lost track -->
+                    <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$LogbookEntries? and global.$GT_GlobalSettings.$LogbookEntries">
+                      <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
+                      <set_value name="$logbookMessage" exact="{77000,3220}.[$leftSectorName, $newSectorName, $shipName]"/>
+                      
+                      <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
+                        $Message = $logbookMessage,
+                        $Category = 'alerts',
+                        $Title = 'Enemy Ship Escaped: ' + $leftSectorName,
+                        $Object = $trackedSector,
+                        $Interaction = 'showonmap',
+                        $Highlighted = false
+                      ]"/>
+                    </do_if>
+                  </do_else>
+                  
+                  <break/>
+                </do_if>
+              </do_all>
+            </do_if>
+          </do_all>
+        </do_if>
+      </actions>
+    </handler>
+  </add>
+
+  <!-- ThreatAvoidance: Hostile gravidar contact detection (event-driven, vanilla-pattern) -->
+  <!-- WHY HERE: move.generic runs for all movement; ships may not currently be running order.trade.galaxytrader when contacts appear.
+       This provides the most reliable hook with minimal overhead by gating on min=1 contacts (no work when none). -->
+  <add sel="//aiscript[@name='move.generic']/interrupts/handler[@ref='SectorChangeHandler']" pos="before">
+    <handler comment="GT ThreatAvoidance: hostile gravidar contact detection (move.generic)">
+      <conditions>
+        <!-- Vanilla event: fires on gravidar scans -->
+        <event_gravidar_has_scanned object="this.assignedcontrolled"/>
+        <!-- Vanilla safety gates (avoid highways / critical order state) -->
+        <check_value value="this.sector and not this.zone.isclass.highway"/>
+        <check_value value="this.assignedcontrolled.order and this.assignedcontrolled.order.state != orderstate.critical"/>
+
+        <!-- Only for GT ships and only if ThreatAvoidance + DynamicBlacklist are enabled -->
+        <check_value value="global.$GT_Ships? and global.$GT_Ships.{this.ship}?"/>
+        <check_value value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$ThreatAvoidance? and global.$GT_GlobalSettings.$ThreatAvoidance.$Enabled"/>
+        <check_value value="global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist"/>
+
+        <!-- PERFORMANCE: Do not run actions unless at least 1 hostile ship contact exists (vanilla pattern: min=1 + maybeattackedby) -->
+        <count_gravidar_contacts result="$_detectedHostiles" object="this.assignedcontrolled" class="[class.ship_s, class.ship_m, class.ship_l, class.ship_xl]" maybeattackedby="this.assignedcontrolled" checkoperational="false" masstraffic="false" docked="false" multiple="true" min="1">
+          <match_context macro="this.sector.macro"/>
+          <match_context class="class.highway" negate="true"/>
+          <match class="class.buildstorage" negate="true"/>
+          <match state="componentstate.wreck" negate="true"/>
+        </count_gravidar_contacts>
+      </conditions>
+      <actions>
+        <!-- Get pilot skill level - only Level 6+ pilots can broadcast threat warnings to fleet -->
+        <set_value name="$pilotLevel" exact="1"/>
+        <do_if value="this.ship.pilot? and global.$GT_Pilots.{this.ship.pilot}?">
+          <set_value name="$pilotLevel" exact="@global.$GT_Pilots.{this.ship.pilot}.$Level"/>
+        </do_if>
+        
+        <!-- Per-ship throttle (global table; survives across move.generic instances) -->
+        <do_if value="not global.$GT_ThreatDetectThrottle?">
+          <set_value name="global.$GT_ThreatDetectThrottle" exact="table[]"/>
+        </do_if>
+        <set_value name="$_last" exact="@global.$GT_ThreatDetectThrottle.{this.ship}"/>
+        <do_if value="$_last == null">
+          <set_value name="$_last" exact="0s"/>
+        </do_if>
+
+        <!-- Always LOG when hostiles are detected, but avoid log spam by throttling to at most once per 10s per ship -->
+        <set_value name="$_logAllowed" exact="player.age - $_last ge 10s"/>
+
+        <set_value name="$hostiles" exact="$_detectedHostiles"/>
+        <!-- IMPORTANT: $hostiles.count may include non-operational contacts (checkoperational="false").
+             We want HostileCount to match the class breakdown we compute below, so we derive it from class counters. -->
+        <set_value name="$hostileListCount" exact="$hostiles.count"/>
+        <set_value name="$hostileCount" exact="0"/>
+
+        <!-- Compute threat (stop early once we exceed common thresholds) -->
+        <set_value name="$threatScore" exact="0"/>
+        <set_value name="$shipClass_XL" exact="0"/>
+        <set_value name="$shipClass_L" exact="0"/>
+        <set_value name="$shipClass_M" exact="0"/>
+        <set_value name="$shipClass_S" exact="0"/>
+        <set_value name="$factionCounts" exact="table[]"/>
+
+        <do_all exact="$hostileListCount" counter="$i">
+          <set_value name="$h" exact="$hostiles.{$i}"/>
+          <do_if value="@$h.exists and @$h.isoperational">
+            <do_if value="$h.isclass.ship_xl">
+              <set_value name="$threatScore" exact="$threatScore + 5"/>
+              <set_value name="$shipClass_XL" operation="add"/>
+            </do_if>
+            <do_elseif value="$h.isclass.ship_l">
+              <set_value name="$threatScore" exact="$threatScore + 3"/>
+              <set_value name="$shipClass_L" operation="add"/>
+            </do_elseif>
+            <do_elseif value="$h.isclass.ship_m">
+              <set_value name="$threatScore" exact="$threatScore + 2"/>
+              <set_value name="$shipClass_M" operation="add"/>
+            </do_elseif>
+            <do_else>
+              <set_value name="$threatScore" exact="$threatScore + 1"/>
+              <set_value name="$shipClass_S" operation="add"/>
+            </do_else>
+
+            <do_if value="@$h.owner != null">
+              <set_value name="$f" exact="$h.owner"/>
+              <set_value name="$factionCounts.{$f}" exact="@$factionCounts.{$f} + 1"/>
+            </do_if>
+          </do_if>
+        </do_all>
+
+        <!-- Make HostileCount match class counters -->
+        <set_value name="$hostileCount" exact="$shipClass_XL + $shipClass_L + $shipClass_M + $shipClass_S"/>
+
+        <!-- Determine primary faction (best-effort; used for logging/telemetry) -->
+        <set_value name="$primaryFaction" exact="null"/>
+        <set_value name="$maxFactionCount" exact="0"/>
+        <do_all exact="$factionCounts.keys.count" counter="$fi">
+          <set_value name="$f" exact="$factionCounts.keys.{$fi}"/>
+          <do_if value="$factionCounts.{$f} gt $maxFactionCount">
+            <set_value name="$primaryFaction" exact="$f"/>
+            <set_value name="$maxFactionCount" exact="$factionCounts.{$f}"/>
+          </do_if>
+        </do_all>
+
+        <!-- Convert score to threat level (1-5), matching GT_ThreatIntelligence receiver expectations -->
+        <set_value name="$threatLevel" exact="2"/>
+        <do_if value="$shipClass_XL gt 0 or $shipClass_L gt 0">
+          <set_value name="$threatLevel" exact="4"/>
+        </do_if>
+        <do_elseif value="$threatScore ge 6">
+          <set_value name="$threatLevel" exact="3"/>
+        </do_elseif>
+
+        <!-- Compare to configured threshold (fallback 3) -->
+        <set_value name="$threshold" exact="global.$GT_GlobalSettings.$ThreatAvoidance.$BlacklistThreshold"/>
+        <do_if value="not $threshold?">
+          <set_value name="$threshold" exact="3"/>
+        </do_if>
+
+        <!-- Broadcast throttle (separate from logging throttle) -->
+        <set_value name="$_broadcastAllowed" exact="player.age - $_last ge 30s"/>
+        
+        <!-- Only Level 6+ pilots broadcast to fleet (matches ShipUnderAttack handler pattern) -->
+        <do_if value="$pilotLevel ge 6">
+          <do_if value="$hostileCount gt 0 and $_broadcastAllowed and $threatLevel ge $threshold">
+            <signal_objects object="player.galaxy" param="'GT_Threat_Warning'" param2="table[
+              $Sector = this.sector,
+              $DetectedBy = this.ship,
+              $HostileCount = $hostileCount,
+              $PrimaryFaction = $primaryFaction,
+              $ShipClass_XL = $shipClass_XL,
+              $ShipClass_L = $shipClass_L,
+              $ShipClass_M = $shipClass_M,
+              $ShipClass_S = $shipClass_S,
+              $ThreatScore = $threatScore,
+              $Timestamp = player.age
+            ]"/>
+          </do_if>
+        </do_if>
+
+        <do_if value="$hostileCount gt 0 and $_logAllowed and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <set_value name="global.$GT_ThreatDetectThrottle.{this.ship}" exact="player.age"/>
+          <set_value name="$_primaryFactionName" exact="if $primaryFaction? then @$primaryFaction.knownname else 'UNKNOWN'"/>
+          <set_value name="$_broadcasted" exact="if ($pilotLevel ge 6 and $_broadcastAllowed and $threatLevel ge $threshold) then 'YES' else 'NO'"/>
+          <set_value name="$_broadcastReason" exact="if $pilotLevel lt 6 then 'PILOT LEVEL TOO LOW (Lv.' + $pilotLevel + ', requires Lv.6+)' else if not $_broadcastAllowed then 'THROTTLED' else if $threatLevel lt $threshold then 'THREAT BELOW THRESHOLD' else 'OK'"/>
+          <debug_text text="'[GT-Threat-Detect] ' + this.ship.idcode + ' (Pilot Lv.' + $pilotLevel + ') in ' + this.sector.knownname
+            + ' - hostiles=' + $hostileCount
+            + ' (XL=' + $shipClass_XL + ', L=' + $shipClass_L + ', M=' + $shipClass_M + ', S=' + $shipClass_S + ')'
+            + ', threatScore=' + $threatScore + ', threatLevel=' + $threatLevel + ', threshold=' + $threshold
+            + ', primaryFaction=' + $_primaryFactionName
+            + ', broadcasted=' + $_broadcasted + ' (' + $_broadcastReason + ')'" chance="100"/>
+        </do_if>
+      </actions>
+    </handler>
+  </add>
+  
+</diff>

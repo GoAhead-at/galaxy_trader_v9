@@ -1,0 +1,803 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GLX_Lib_Reservations" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4 Foundations/libraries/md.xsd">
+  <cues>
+    <!-- Trade key, index, failure reasons, reservations, orphaned credits cleanup (split from gt_libraries_general). -->
+
+    <!-- Generate Trade Key (Option A: BuyOffer.id + SellOffer.id) -->
+    <!-- Simple approach: uses offer IDs which are unique per offer instance -->
+    <!-- Trade key format: "buyOfferId_sellOfferId" or "null_sellOfferId" for sell-only -->
+    <library name="GLX_GenerateTradeKey" purpose="run_actions">
+      <params>
+        <param name="buyOffer" default="null" comment="Buy offer object (may be null for sell-only trades)"/>
+        <param name="sellOffer" comment="Sell offer object (required)"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <set_value name="$tradeKey" exact="''"/>
+        
+        <!-- Validate sell offer - ERROR if missing -->
+        <do_if value="not $sellOffer? or not $sellOffer.exists">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=missing_sellOffer'"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GLX_GenerateTradeKey: sellOffer is null or missing - cannot generate trade key'" chance="100"/>
+          </do_else>
+          <return value="''"/>
+        </do_if>
+        
+        <!-- Get offer IDs -->
+        <set_value name="$buyOfferId" exact="'null'"/>
+        <set_value name="$sellOfferId" exact="''"/>
+        
+        <do_if value="$buyOffer? and $buyOffer.exists">
+          <set_value name="$tempBuyId" exact="@$buyOffer.id"/>
+          <do_if value="$tempBuyId? and $tempBuyId != null">
+            <set_value name="$buyOfferId" exact="'' + $tempBuyId"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Validate sellOffer has valid ID before generating key -->
+        <!-- CRITICAL: Check if sellOffer.id exists and is not null before converting to string -->
+        <set_value name="$tempSellId" exact="@$sellOffer.id"/>
+        <do_if value="$tempSellId? and $tempSellId != null and typeof $tempSellId != datatype.null">
+          <!-- Valid ID - convert to string -->
+          <set_value name="$sellOfferId" exact="'' + $tempSellId"/>
+          <!-- Double-check: ensure sellOfferId is not empty or 'null' string -->
+          <do_if value="$sellOfferId == '' or $sellOfferId == 'null'">
+            <!-- ID conversion failed - log error and return empty key -->
+            <do_if value="$traceId != ''">
+              <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+                <param name="traceId" value="$traceId"/>
+                <param name="stage" value="'CacheIndex'"/>
+                <param name="action" value="'Error'"/>
+                <param name="details" value="'reason=invalid_sellOffer_id_conversion tempSellId=' + (if $tempSellId? then $tempSellId else 'null') + ' sellOfferId=' + $sellOfferId"/>
+                <param name="logLevel" value="0"/>
+              </run_actions>
+            </do_if>
+            <do_else>
+              <debug_text text="'[GT-ERROR] GLX_GenerateTradeKey: sellOffer.id conversion failed - tempSellId=' + (if $tempSellId? then $tempSellId else 'null') + ', sellOfferId=' + $sellOfferId" chance="100"/>
+            </do_else>
+            <return value="''"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <!-- Fallback (Method B): offer.id is not available in many X4 trade-offer objects.
+               Use the SELL offer object itself as the reservation key.
+               This restores reservation behavior under fleet load and prevents mass cache collisions. -->
+          <set_value name="$tradeKey" exact="$sellOffer"/>
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'KeyGenerated'"/>
+              <param name="details" value="'trade=SellOfferObj method=B buyOffer=' + (if $buyOffer? then 'valid' else 'null') + ' sellOffer=valid'"/>
+              <param name="logLevel" value="2"/>
+            </run_actions>
+          </do_if>
+          <return value="$tradeKey"/>
+        </do_else>
+        
+        <!-- Generate key: "buyOfferId_sellOfferId" -->
+        <!-- CRITICAL: Validate sellOfferId is not empty before generating key -->
+        <do_if value="$sellOfferId == ''">
+          <!-- sellOfferId is empty - this should have been caught earlier, but double-check -->
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=empty_sellOfferId buyOfferId=' + $buyOfferId"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GLX_GenerateTradeKey: sellOfferId is empty - cannot generate trade key'" chance="100"/>
+          </do_else>
+          <return value="''"/>
+        </do_if>
+        
+        <set_value name="$tradeKey" exact="$buyOfferId + '_' + $sellOfferId"/>
+        
+        <!-- Validate generated key is not null_null (indicates invalid offer IDs) -->
+        <do_if value="$tradeKey == 'null_null'">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=invalid_offer_ids buyOfferId=' + $buyOfferId + ' sellOfferId=' + $sellOfferId"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GLX_GenerateTradeKey: Generated invalid trade key null_null - buyOfferId=' + $buyOfferId + ', sellOfferId=' + $sellOfferId" chance="100"/>
+          </do_else>
+          <return value="''"/>
+        </do_if>
+        
+        <!-- Log key generation -->
+        <do_if value="$traceId != ''">
+          <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'CacheIndex'"/>
+            <param name="action" value="'KeyGenerated'"/>
+            <param name="details" value="'trade=' + $tradeKey + ' method=A buyOffer=' + (if $buyOffer? then 'valid' else 'null') + ' sellOffer=valid'"/>
+            <param name="logLevel" value="3"/>
+          </run_actions>
+        </do_if>
+        
+        <return value="$tradeKey"/>
+      </actions>
+    </library>
+    
+    <!-- Initialize Trade Index Structure -->
+    <library name="GLX_InitializeTradeIndex" purpose="run_actions">
+      <actions>
+        <do_if value="not global.$GT_TradeIndex?">
+          <set_value name="global.$GT_TradeIndex" exact="table[]"/>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- Add Trade to Index -->
+    <!-- Called when writing to cache: adds home sector to index entry -->
+    <library name="GLX_AddTradeToIndex" purpose="run_actions">
+      <params>
+        <param name="tradeKey" comment="Trade key (from GLX_GenerateTradeKey)"/>
+        <param name="homeSector" comment="Home sector where this trade is cached"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <!-- Initialize index if needed -->
+        <run_actions ref="md.GLX_Lib_Reservations.GLX_InitializeTradeIndex"/>
+        
+        <!-- Validate inputs - ERROR if missing or invalid (null_null indicates invalid offers) -->
+        <do_if value="$tradeKey == '' or $tradeKey == 'null_null'">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=' + (if $tradeKey == 'null_null' then 'invalid_tradeKey_null_null' else 'empty_tradeKey')"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GLX_AddTradeToIndex: tradeKey is empty or invalid (' + $tradeKey + ') - cannot add to index'" chance="100"/>
+          </do_else>
+          <return value="false"/>
+        </do_if>
+        <do_if value="not $homeSector? or not $homeSector.exists">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=invalid_homeSector tradeKey=' + $tradeKey"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GLX_AddTradeToIndex: homeSector is null or invalid - tradeKey=' + $tradeKey" chance="100"/>
+          </do_else>
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Get or create index entry -->
+        <set_value name="$indexEntry" exact="null"/>
+        <do_if value="global.$GT_TradeIndex.{$tradeKey}?">
+          <set_value name="$indexEntry" exact="global.$GT_TradeIndex.{$tradeKey}"/>
+        </do_if>
+        <do_else>
+          <set_value name="$indexEntry" exact="table[
+            $Homes = [],
+            $ReservedBy = null,
+            $ReservedUntil = null
+          ]"/>
+          <set_value name="global.$GT_TradeIndex.{$tradeKey}" exact="$indexEntry"/>
+        </do_else>
+        
+        <!-- Add home sector to list if not already present -->
+        <set_value name="$homeExists" exact="false"/>
+        <do_if value="$indexEntry.$Homes?">
+          <do_all exact="$indexEntry.$Homes.count" counter="$i">
+            <do_if value="$indexEntry.$Homes.{$i} == $homeSector">
+              <set_value name="$homeExists" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+        </do_if>
+        
+        <do_if value="not $homeExists">
+          <append_to_list name="global.$GT_TradeIndex.{$tradeKey}.$Homes" exact="$homeSector"/>
+          
+          <!-- Log index update -->
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Added'"/>
+              <param name="details" value="'trade=' + $tradeKey + ' home=' + (if $homeSector? then @$homeSector.knownname else 'null') + ' homes=' + global.$GT_TradeIndex.{$tradeKey}.$Homes.count"/>
+              <param name="logLevel" value="2"/>
+            </run_actions>
+          </do_if>
+        </do_if>
+        
+        <return value="true"/>
+      </actions>
+    </library>
+    
+    <!-- Remove Trade from Index -->
+    <!-- Called when invalidating: removes home sector from index entry, removes entry if empty -->
+    <library name="GLX_RemoveTradeFromIndex" purpose="run_actions">
+      <params>
+        <param name="tradeKey" comment="Trade key (from GLX_GenerateTradeKey)"/>
+        <param name="homeSector" comment="Home sector to remove (null to remove all)"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <!-- Validate index exists - ERROR if missing -->
+        <do_if value="not global.$GT_TradeIndex?">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=index_not_initialized trade=' + $tradeKey"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GLX_RemoveTradeFromIndex: Trade index not initialized - tradeKey=' + $tradeKey" chance="100"/>
+          </do_else>
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Validate trade key entry exists -->
+        <do_if value="not global.$GT_TradeIndex.{$tradeKey}?">
+          <!-- This is expected if trade was never cached - log but don't error -->
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Warning'"/>
+              <param name="details" value="'reason=entry_not_found trade=' + $tradeKey"/>
+              <param name="logLevel" value="2"/>
+            </run_actions>
+          </do_if>
+          <return value="false"/>
+        </do_if>
+        
+        <set_value name="$indexEntry" exact="global.$GT_TradeIndex.{$tradeKey}"/>
+        
+        <!-- Remove specific home sector or all -->
+        <do_if value="$homeSector? and $homeSector.exists">
+          <!-- Remove specific home sector -->
+          <do_if value="$indexEntry.$Homes?">
+            <remove_from_list name="global.$GT_TradeIndex.{$tradeKey}.$Homes" exact="$homeSector"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <!-- Remove all home sectors (trade fully consumed) -->
+          <set_value name="global.$GT_TradeIndex.{$tradeKey}.$Homes" exact="[]"/>
+        </do_else>
+        
+        <!-- Remove index entry if no homes remain -->
+        <do_if value="not global.$GT_TradeIndex.{$tradeKey}.$Homes? or global.$GT_TradeIndex.{$tradeKey}.$Homes.count == 0">
+          <remove_value name="global.$GT_TradeIndex.{$tradeKey}"/>
+          
+          <!-- Log index removal -->
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Removed'"/>
+              <param name="details" value="'trade=' + $tradeKey + ' reason=no_homes'"/>
+              <param name="logLevel" value="2"/>
+            </run_actions>
+          </do_if>
+        </do_if>
+        <do_else>
+          <!-- Log partial removal -->
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'CacheIndex'"/>
+              <param name="action" value="'Updated'"/>
+              <param name="details" value="'trade=' + $tradeKey + ' homes=' + global.$GT_TradeIndex.{$tradeKey}.$Homes.count"/>
+              <param name="logLevel" value="3"/>
+            </run_actions>
+          </do_if>
+        </do_else>
+        
+        <return value="true"/>
+      </actions>
+    </library>
+    
+    <!-- Get Home Sectors for Trade Key -->
+    <!-- Returns list of home sectors where this trade is cached -->
+    <!-- ERROR if index not initialized or entry missing -->
+    <library name="GLX_GetTradeIndexHomes" purpose="run_actions">
+      <params>
+        <param name="tradeKey" comment="Trade key (from GLX_GenerateTradeKey)"/>
+      </params>
+      <actions>
+        <set_value name="$homes" exact="[]"/>
+        
+        <!-- Validate index exists -->
+        <do_if value="not global.$GT_TradeIndex?">
+          <debug_text text="'[GT-ERROR] GLX_GetTradeIndexHomes: Trade index not initialized - tradeKey=' + $tradeKey" chance="100"/>
+          <return value="$homes"/>
+        </do_if>
+        
+        <!-- Validate trade key entry exists -->
+        <do_if value="not global.$GT_TradeIndex.{$tradeKey}?">
+          <!-- This is expected if trade was never cached - return empty list -->
+          <return value="$homes"/>
+        </do_if>
+        
+        <!-- Validate Homes list exists -->
+        <do_if value="not global.$GT_TradeIndex.{$tradeKey}.$Homes?">
+          <debug_text text="'[GT-ERROR] GLX_GetTradeIndexHomes: Index entry missing $Homes property - tradeKey=' + $tradeKey" chance="100"/>
+          <return value="$homes"/>
+        </do_if>
+        
+        <set_value name="$homes" exact="global.$GT_TradeIndex.{$tradeKey}.$Homes"/>
+        
+        <return value="$homes"/>
+      </actions>
+    </library>
+    
+    <!-- Failure Reason Constants -->
+    <!-- Standardized failure reasons for trade search pipeline -->
+    <library name="GLX_GetFailureReason" purpose="run_actions">
+      <params>
+        <param name="reason" comment="Failure reason code"/>
+      </params>
+      <actions>
+        <!-- Initialize failure reason constants if not exists -->
+        <do_if value="not global.$GT_FailureReasons?">
+          <set_value name="global.$GT_FailureReasons" exact="table[
+            $NoSectors = 'no_sectors',
+            $NoOffers = 'no_offers',
+            $NoProfitableMatches = 'no_profitable_matches',
+            $DockingBlocked = 'docking_blocked',
+            $IllegalBlocked = 'illegal_blocked',
+            $BlacklistBlocked = 'blacklist_blocked',
+            $PathBlocked = 'path_blocked',
+            $ReservedConflict = 'reserved_conflict',
+            $CacheMiss = 'cache_miss',
+            $CacheEmpty = 'cache_empty',
+            $CacheNoValidTrades = 'cache_no_valid_trades',
+            $ShipDestroyed = 'ship_destroyed',
+            $NoGTOrder = 'no_gt_order',
+            $ShipBusy = 'ship_busy',
+            $InvalidParams = 'invalid_params',
+            $StaleState = 'stale_state',
+            $BatchStall = 'batch_stall',
+            $Timeout = 'timeout',
+            $StateCorruption = 'state_corruption',
+            $Unknown = 'unknown'
+          ]"/>
+        </do_if>
+        
+        <!-- Return failure reason string -->
+        <set_value name="$reasonStr" exact="'unknown'"/>
+        <do_if value="global.$GT_FailureReasons.{$reason}?">
+          <set_value name="$reasonStr" exact="global.$GT_FailureReasons.{$reason}"/>
+        </do_if>
+        <return value="$reasonStr"/>
+      </actions>
+    </library>
+    
+    <!-- ========================================= -->
+    <!-- RESERVATION SYSTEM (Phase 3) -->
+    <!-- Trade-search logging: see glx_lib_trading_log.xml (GLX_Lib_TradingLog) -->
+    <!-- ========================================= -->
+    
+    <!-- Reserve Trade -->
+    <!-- Creates a reservation for a trade key, preventing other ships from selecting it -->
+    <library name="GLX_ReserveTrade" purpose="run_actions">
+      <params>
+        <param name="tradeKey" comment="Trade key (from GLX_GenerateTradeKey)"/>
+        <param name="ship" comment="Ship reserving the trade"/>
+        <param name="ttl" default="10s" comment="Time-to-live for reservation (default: 10 seconds)"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <!-- Validate inputs - ERROR if missing -->
+        <do_if value="$tradeKey == ''">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'Reservation'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=empty_tradeKey'"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GLX_ReserveTrade: tradeKey is empty - cannot reserve'" chance="100"/>
+          </do_else>
+          <return value="false"/>
+        </do_if>
+        
+        <do_if value="not $ship? or not $ship.exists">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'Reservation'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=invalid_ship tradeKey=' + $tradeKey"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GLX_ReserveTrade: ship is null or invalid - tradeKey=' + $tradeKey" chance="100"/>
+          </do_else>
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Initialize reservations if needed -->
+        <do_if value="not global.$GT_Reservations?">
+          <set_value name="global.$GT_Reservations" exact="table[]"/>
+        </do_if>
+        
+        <!-- Check if already reserved -->
+        <set_value name="$alreadyReserved" exact="false"/>
+        <set_value name="$existingReservation" exact="null"/>
+        <do_if value="global.$GT_Reservations.{$tradeKey}?">
+          <set_value name="$existingReservation" exact="global.$GT_Reservations.{$tradeKey}"/>
+          <set_value name="$reservedUntil" exact="@$existingReservation.$Until"/>
+          <do_if value="$reservedUntil? and player.age lt $reservedUntil">
+            <set_value name="$alreadyReserved" exact="true"/>
+          </do_if>
+        </do_if>
+        
+        <!-- If already reserved by another ship, log conflict -->
+        <do_if value="$alreadyReserved">
+          <set_value name="$reservedBy" exact="@$existingReservation.$Ship"/>
+          <do_if value="$reservedBy? and $reservedBy != $ship">
+            <do_if value="not global.$GT_ReservationStats?">
+              <set_value name="global.$GT_ReservationStats" exact="table[$Active = 0, $Expired = 0, $Conflicts = 0, $Created = 0, $Cleared = 0]"/>
+            </do_if>
+            <set_value name="global.$GT_ReservationStats.$Conflicts" operation="add"/>
+            
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'Reservation'"/>
+              <param name="action" value="'Conflict'"/>
+              <param name="details" value="'trade=' + $tradeKey + ' ship=' + $ship.idcode + ' reservedBy=' + $reservedBy.idcode + ' until=' + ($reservedUntil / 1s) + 's'"/>
+              <param name="logLevel" value="1"/>
+            </run_actions>
+            <return value="false"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Create or update reservation -->
+        <set_value name="$reservationUntil" exact="player.age + $ttl"/>
+        <set_value name="global.$GT_Reservations.{$tradeKey}" exact="table[
+          $Ship = $ship,
+          $Until = $reservationUntil
+        ]"/>
+        
+        <!-- Update statistics -->
+        <do_if value="not global.$GT_ReservationStats?">
+          <set_value name="global.$GT_ReservationStats" exact="table[$Active = 0, $Expired = 0, $Conflicts = 0, $Created = 0, $Cleared = 0]"/>
+        </do_if>
+        <set_value name="global.$GT_ReservationStats.$Created" operation="add"/>
+        <set_value name="global.$GT_ReservationStats.$Active" operation="add"/>
+        
+        <!-- Update trade index reservation fields (if index entry exists) -->
+        <do_if value="global.$GT_TradeIndex? and global.$GT_TradeIndex.{$tradeKey}?">
+          <set_value name="global.$GT_TradeIndex.{$tradeKey}.$ReservedBy" exact="$ship"/>
+          <set_value name="global.$GT_TradeIndex.{$tradeKey}.$ReservedUntil" exact="$reservationUntil"/>
+        </do_if>
+        
+        <!-- Log reservation creation -->
+        <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+          <param name="traceId" value="$traceId"/>
+          <param name="stage" value="'Reservation'"/>
+          <param name="action" value="'Create'"/>
+          <param name="details" value="'trade=' + $tradeKey + ' ship=' + $ship.idcode + ' ttl=' + ($ttl / 1s) + 's'"/>
+          <param name="logLevel" value="1"/>
+        </run_actions>
+        
+        <return value="true"/>
+      </actions>
+    </library>
+    
+    <!-- Release Trade Reservation -->
+    <!-- Removes a reservation for a trade key -->
+    <library name="GLX_ReleaseTrade" purpose="run_actions">
+      <params>
+        <param name="tradeKey" comment="Trade key (from GLX_GenerateTradeKey)"/>
+        <param name="reason" default="'consumed'" comment="Reason for release (consumed, invalidated, expired, etc.)"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <!-- Validate trade key - ERROR if empty -->
+        <do_if value="$tradeKey == ''">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'Reservation'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=empty_tradeKey'"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-ERROR] GLX_ReleaseTrade: tradeKey is empty - cannot release'" chance="100"/>
+          </do_else>
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Check if reservation exists -->
+        <do_if value="not global.$GT_Reservations? or not global.$GT_Reservations.{$tradeKey}?">
+          <!-- No reservation exists - this is OK, just log and return -->
+          <return value="true"/>
+        </do_if>
+        
+        <!-- Remove reservation -->
+        <remove_value name="global.$GT_Reservations.{$tradeKey}"/>
+        
+        <!-- Update statistics -->
+        <do_if value="global.$GT_ReservationStats?">
+          <set_value name="global.$GT_ReservationStats.$Cleared" operation="add"/>
+          <do_if value="global.$GT_ReservationStats.$Active gt 0">
+            <set_value name="global.$GT_ReservationStats.$Active" operation="subtract"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Clear trade index reservation fields -->
+        <do_if value="global.$GT_TradeIndex? and global.$GT_TradeIndex.{$tradeKey}?">
+          <set_value name="global.$GT_TradeIndex.{$tradeKey}.$ReservedBy" exact="null"/>
+          <set_value name="global.$GT_TradeIndex.{$tradeKey}.$ReservedUntil" exact="null"/>
+        </do_if>
+        
+        <!-- Log reservation release -->
+        <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+          <param name="traceId" value="$traceId"/>
+          <param name="stage" value="'Reservation'"/>
+          <param name="action" value="'Clear'"/>
+          <param name="details" value="'trade=' + $tradeKey + ' reason=' + $reason"/>
+          <param name="logLevel" value="1"/>
+        </run_actions>
+        
+        <return value="true"/>
+      </actions>
+    </library>
+    
+    <!-- Check if Trade is Reserved -->
+    <!-- Returns true if trade is reserved by another ship, false otherwise -->
+    <library name="GLX_IsTradeReserved" purpose="run_actions">
+      <params>
+        <param name="tradeKey" comment="Trade key (from GLX_GenerateTradeKey)"/>
+        <param name="ship" default="null" comment="Ship checking reservation (if null, checks if reserved by any ship)"/>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <!-- Validate trade key - ERROR if empty -->
+        <do_if value="$tradeKey == ''">
+          <do_if value="$traceId != ''">
+            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+              <param name="traceId" value="$traceId"/>
+              <param name="stage" value="'Reservation'"/>
+              <param name="action" value="'Error'"/>
+              <param name="details" value="'reason=empty_tradeKey'"/>
+              <param name="logLevel" value="0"/>
+            </run_actions>
+          </do_if>
+          <return value="false"/>
+        </do_if>
+        
+        <!-- Check if reservation exists -->
+        <set_value name="$isReserved" exact="false"/>
+        <do_if value="global.$GT_Reservations? and global.$GT_Reservations.{$tradeKey}?">
+          <set_value name="$reservation" exact="global.$GT_Reservations.{$tradeKey}"/>
+          <set_value name="$reservedUntil" exact="@$reservation.$Until"/>
+          <set_value name="$reservedBy" exact="@$reservation.$Ship"/>
+          
+          <!-- Check if reservation is still valid (not expired) -->
+          <do_if value="$reservedUntil? and player.age lt $reservedUntil">
+            <!-- Check if reserved by different ship -->
+            <do_if value="$ship == null or ($reservedBy? and $reservedBy != $ship)">
+              <set_value name="$isReserved" exact="true"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- Log reservation check -->
+        <do_if value="$traceId != ''">
+          <set_value name="$logDetails" exact="'trade=' + $tradeKey + ' reserved=' + $isReserved"/>
+          <do_if value="$isReserved and $reservedBy?">
+            <set_value name="$logDetails" exact="$logDetails + ' reservedBy=' + $reservedBy.idcode"/>
+          </do_if>
+          <do_if value="$ship?">
+            <set_value name="$logDetails" exact="$logDetails + ' ship=' + $ship.idcode"/>
+          </do_if>
+          
+          <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'Reservation'"/>
+            <param name="action" value="'Check'"/>
+            <param name="details" value="$logDetails"/>
+            <param name="logLevel" value="3"/>
+          </run_actions>
+        </do_if>
+        
+        <return value="$isReserved"/>
+      </actions>
+    </library>
+    
+    <!-- Cleanup Expired Reservations -->
+    <!-- Called periodically to remove expired reservations and clean up invalid ones -->
+    <library name="GLX_CleanupExpiredReservations" purpose="run_actions">
+      <params>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <!-- Ensure reservations table exists and is a table (savegame compatibility / corruption guard) -->
+        <do_if value="not global.$GT_Reservations? or typeof global.$GT_Reservations != datatype.table">
+          <set_value name="global.$GT_Reservations" exact="table[]"/>
+          <return value="table[$Expired = 0, $Cleared = 0]"/>
+        </do_if>
+        
+        <set_value name="$expiredCount" exact="0"/>
+        <set_value name="$clearedCount" exact="0"/>
+        <set_value name="$keysToRemove" exact="[]"/>
+        
+        <!-- Check all reservations -->
+        <set_value name="$reservationKeysCount" exact="@global.$GT_Reservations.keys.count"/>
+        <do_if value="$reservationKeysCount != null and $reservationKeysCount gt 0">
+          <do_all exact="$reservationKeysCount" counter="$i">
+            <set_value name="$tradeKey" exact="global.$GT_Reservations.keys.{$i}"/>
+            <set_value name="$reservation" exact="global.$GT_Reservations.{$tradeKey}"/>
+            <set_value name="$shouldRemove" exact="false"/>
+            <set_value name="$removeReason" exact="'unknown'"/>
+            
+            <!-- Check expiration -->
+            <set_value name="$reservedUntil" exact="@$reservation.$Until"/>
+            <do_if value="not $reservedUntil? or player.age ge $reservedUntil">
+              <set_value name="$shouldRemove" exact="true"/>
+              <set_value name="$removeReason" exact="'ttl_expired'"/>
+            </do_if>
+            
+            <!-- Check if ship still exists -->
+            <set_value name="$reservedShip" exact="@$reservation.$Ship"/>
+            <do_if value="not $reservedShip? or not $reservedShip.exists">
+              <set_value name="$shouldRemove" exact="true"/>
+              <set_value name="$removeReason" exact="'ship_destroyed'"/>
+            </do_if>
+            
+            <!-- Check if ship still has GT order (default order id or Assist under GT commander; matches all MK1/MK2/MK3/Miner) -->
+            <do_if value="$reservedShip? and $reservedShip.exists">
+              <run_actions ref="md.GLX_Lib_Orders.GLX_ShipIsInGTService" result="$hasGTOrder">
+                <param name="ship" value="$reservedShip"/>
+              </run_actions>
+              <do_if value="not $hasGTOrder">
+                <set_value name="$shouldRemove" exact="true"/>
+                <set_value name="$removeReason" exact="'no_gt_order'"/>
+              </do_if>
+            </do_if>
+            
+            <!-- Remove if needed -->
+            <do_if value="$shouldRemove">
+              <append_to_list name="$keysToRemove" exact="$tradeKey"/>
+              <set_value name="$expiredCount" operation="add"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        
+        <!-- Remove expired reservations -->
+        <do_all exact="$keysToRemove.count" counter="$j">
+          <set_value name="$tradeKey" exact="$keysToRemove.{$j}"/>
+          <run_actions ref="md.GLX_Lib_Reservations.GLX_ReleaseTrade">
+            <param name="tradeKey" value="$tradeKey"/>
+            <param name="reason" value="if $removeReason == 'ttl_expired' then 'expired' else $removeReason"/>
+            <param name="traceId" value="$traceId"/>
+          </run_actions>
+          <set_value name="$clearedCount" operation="add"/>
+          
+          <!-- Update statistics -->
+          <do_if value="global.$GT_ReservationStats?">
+            <set_value name="global.$GT_ReservationStats.$Expired" operation="add"/>
+          </do_if>
+        </do_all>
+        
+        <!-- Log cleanup results -->
+        <do_if value="$expiredCount gt 0 and $traceId != ''">
+          <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
+            <param name="traceId" value="$traceId"/>
+            <param name="stage" value="'Reservation'"/>
+            <param name="action" value="'Expire'"/>
+            <param name="details" value="'count=' + $expiredCount + ' cleared=' + $clearedCount"/>
+            <param name="logLevel" value="2"/>
+          </run_actions>
+        </do_if>
+        
+        <return value="table[$Expired = $expiredCount, $Cleared = $clearedCount]"/>
+      </actions>
+    </library>
+    
+    <!-- Cleanup Orphaned Credits Due and Reservations -->
+    <!-- Safety net: clears credits due and reservations for ships no longer in GT_Ships registry.
+         Addresses edge cases where cleanup was not done correctly (save/load, commander revoke, etc.). -->
+    <library name="GLX_CleanupOrphanedCreditsDueAndReservations" purpose="run_actions">
+      <params>
+        <param name="traceId" default="''" comment="Trace ID for logging"/>
+      </params>
+      <actions>
+        <set_value name="$cleanedCount" exact="0"/>
+        <set_value name="$candidateShips" exact="table[]"/>
+        
+        <!-- Collect ships from UICreditsDueByShip -->
+        <do_if value="global.$GT_UICreditsDueByShip? and typeof global.$GT_UICreditsDueByShip == datatype.table and global.$GT_UICreditsDueByShip.keys.count gt 0">
+          <do_all exact="global.$GT_UICreditsDueByShip.keys.count" counter="$i">
+            <set_value name="$ship" exact="global.$GT_UICreditsDueByShip.keys.{$i}"/>
+            <set_value name="$candidateShips.{$ship}" exact="true"/>
+          </do_all>
+        </do_if>
+        
+        <!-- Collect ships from Reservations -->
+        <do_if value="global.$GT_Reservations? and typeof global.$GT_Reservations == datatype.table and global.$GT_Reservations.keys.count gt 0">
+          <do_all exact="global.$GT_Reservations.keys.count" counter="$j">
+            <set_value name="$tradeKey" exact="global.$GT_Reservations.keys.{$j}"/>
+            <set_value name="$reservation" exact="global.$GT_Reservations.{$tradeKey}"/>
+            <do_if value="$reservation? and $reservation.$Ship?">
+              <set_value name="$resShip" exact="$reservation.$Ship"/>
+              <set_value name="$candidateShips.{$resShip}" exact="true"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        
+        <!-- For each candidate: if orphan (not in GT_Ships or destroyed), run cleanup -->
+        <do_if value="$candidateShips.keys.count gt 0">
+          <set_value name="$shipList" exact="$candidateShips.keys.list"/>
+          <do_all exact="$shipList.count" counter="$k">
+            <set_value name="$ship" exact="$shipList.{$k}"/>
+            <set_value name="$isOrphan" exact="false"/>
+            <do_if value="not $ship?">
+              <set_value name="$isOrphan" exact="true"/>
+            </do_if>
+            <do_elseif value="not $ship.exists">
+              <set_value name="$isOrphan" exact="true"/>
+            </do_elseif>
+            <do_elseif value="not global.$GT_Ships?">
+              <set_value name="$isOrphan" exact="true"/>
+            </do_elseif>
+            <do_elseif value="not global.$GT_Ships.{$ship}?">
+              <set_value name="$isOrphan" exact="true"/>
+            </do_elseif>
+            <do_if value="$isOrphan and $ship?">
+              <run_actions ref="md.GT_Libraries_General.GT_ClearPendingTradeData">
+                <param name="ship" value="$ship"/>
+              </run_actions>
+              <run_actions ref="md.GT_Libraries_General.GT_ClearUICreditsDueForShip">
+                <param name="ship" value="$ship"/>
+              </run_actions>
+              <set_value name="$cleanedCount" operation="add"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        
+        <do_if value="$cleanedCount gt 0 and global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and global.$GT_GlobalSettings.$Debug.$EnableDebugLogging?">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-OrphanCleanup] Removed stale credits/reservations for ' + $cleanedCount + ' orphan ship(s)'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <return value="table[$Cleaned = $cleanedCount]"/>
+      </actions>
+    </library>
+
+  </cues>
+</mdscript>

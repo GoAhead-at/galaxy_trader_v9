@@ -1,0 +1,1492 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_Libraries_Pathfinding" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4 Foundations/libraries/md.xsd">
+  <cues>
+    <!-- PROOF-OF-LOAD:
+         Emit a single log line on game start/load so we can confirm this MD script is actually loaded and executing
+         in the game instance that produces player.log. -->
+    <cue name="Init" instantiate="true" version="1">
+      <conditions>
+        <check_any>
+          <event_game_loaded/>
+          <event_player_created/>
+        </check_any>
+      </conditions>
+      <actions>
+        <debug_text text="'[GT-Pathfinding] GT_Libraries_Pathfinding loaded (md/gt_libraries_pathfinding.xml)'" chance="100"/>
+
+        <!-- Initialize global sector distance cache (persists across searches, shared by all ships) -->
+        <!-- Gate distances only change when gates are built/destroyed (extremely rare) -->
+        <!-- Format: global.$GT_SectorDistanceCache.{fromSector}.{toSector} = distance (integer) -->
+        <do_if value="not global.$GT_SectorDistanceCache?">
+          <set_value name="global.$GT_SectorDistanceCache" exact="table[]"/>
+        </do_if>
+
+        <!-- SAVEGAME COMPAT / CRASH RECOVERY:
+             These are transient, in-flight coordination globals. If they persist (crash/refresh/old save),
+             they can deadlock ships behind "live search already in progress" forever.
+             Reset them on game load. -->
+        <set_value name="global.$GT_PathfindingQueue" exact="table[
+          $Requests = [],
+          $ActiveShips = [],
+          $ActiveInstances = 0,
+          $MaxConcurrent = 2
+        ]"/>
+        
+        <!-- Debug/proof helpers (safe to reset on load) -->
+        <set_value name="global.$GT_Pathfinding_Proof" exact="table[
+          $QueueProcessorRan = false,
+          $IncrementalRan = false,
+          $StartedShips = table[],
+          $IncrementalStartedShips = table[],
+          $LastQueueBlockedLogTime = 0
+        ]"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Pathfinding] Reset transient pathfinding queue state on game load'" chance="100"/>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- ========================================= -->
+    <!-- PATHFINDING UTILITIES -->
+    <!-- ========================================= -->
+    <!-- Consolidated from: gt_pathfinding_utilities.xml -->
+    
+    <!-- Calculate Path Distance -->
+    <library name="GT_CalculatePathDistance" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship for pathfinding"/>
+        <param name="fromSector" comment="Source sector"/>
+        <param name="toSector" comment="Destination sector"/>
+        <param name="blacklistgroup" default="null" comment="Blacklist group"/>
+        <param name="useEscapeMode" default="false" comment="If true, use non-blacklist-aware for escape"/>
+      </params>
+      <actions>
+        <!-- Same sector = 0 -->
+        <do_if value="$fromSector == $toSector">
+          <return value="0"/>
+        </do_if>
+        
+        <!-- Escape mode: non-blacklist-aware -->
+        <do_if value="$useEscapeMode">
+          <return value="$fromSector.gatedistance.{$toSector}"/>
+        </do_if>
+        
+        <!-- Normal mode: blacklist-aware -->
+        <!-- Get blacklist group if not provided or null (memory:10529400 - ? checks existence, not null) -->
+        <do_if value="not $blacklistgroup? or $blacklistgroup == null">
+          <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroup">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+        </do_if>
+        <return value="$fromSector.gatedistance.{$toSector}.{$blacklistgroup}.{$ship}"/>
+      </actions>
+    </library>
+    
+    <!-- Calculate Trade Route Distance -->
+    <library name="GT_CalculateTradeRouteDistance" purpose="run_actions">
+      <params>
+        <param name="homeSector" comment="Home/base sector"/>
+        <param name="buyStation" comment="Buy station (or buy station sector)"/>
+        <param name="sellStation" comment="Sell station (or sell station sector)"/>
+      </params>
+      <actions>
+        <!-- Extract sectors from stations if needed -->
+        <set_value name="$buySector" exact="$buyStation"/>
+        <do_if value="$buyStation.isclass.station">
+          <set_value name="$buySector" exact="$buyStation.sector"/>
+        </do_if>
+        <set_value name="$sellSector" exact="$sellStation"/>
+        <do_if value="$sellStation.isclass.station">
+          <set_value name="$sellSector" exact="$sellStation.sector"/>
+        </do_if>
+        
+        <!-- Calculate distance from home to buy station -->
+        <set_value name="$buyDistance" exact="0"/>
+        <do_if value="$homeSector == $buySector">
+          <set_value name="$buyDistance" exact="0"/>
+        </do_if>
+        <do_else>
+          <set_value name="$buyDistance" exact="$homeSector.gatedistance.{$buySector}"/>
+        </do_else>
+        
+        <!-- Calculate distance from buy station to sell station (route distance) -->
+        <set_value name="$routeDistance" exact="0"/>
+        <do_if value="$buySector == $sellSector">
+          <set_value name="$routeDistance" exact="0"/>
+        </do_if>
+        <do_else>
+          <set_value name="$routeDistance" exact="$buySector.gatedistance.{$sellSector}"/>
+        </do_else>
+        
+        <!-- Return total route distance (home buy sell) -->
+        <return value="$buyDistance + $routeDistance"/>
+      </actions>
+    </library>
+    
+    <!-- Calculate Range-Only Distance (Universal Cache Validation) -->
+    <!-- OPTIMIZATION: Uses global sector distance cache to avoid redundant gatedistance API calls -->
+    <!-- Gate distances only change when gates are built/destroyed (extremely rare) -->
+    <library name="GT_CalculateRangeOnlyDistance" purpose="run_actions">
+      <params>
+        <param name="fromSector" comment="Source sector (typically home sector)"/>
+        <param name="toSector" comment="Destination sector"/>
+      </params>
+      <actions>
+        <!-- UNIVERSAL CACHE: Use range-only distance (NO blacklist params) -->
+        <!-- Same sector = 0, otherwise use cached gatedistance -->
+        <!-- Defensive: if sectors are missing/null, treat as unreachable -->
+        <do_if value="not $fromSector? or $fromSector == null or not $toSector? or $toSector == null">
+          <return value="-1"/>
+        </do_if>
+        <do_if value="$fromSector == $toSector">
+          <return value="0"/>
+        </do_if>
+        <do_else>
+          <!-- Check global sector distance cache first -->
+          <do_if value="global.$GT_SectorDistanceCache? and global.$GT_SectorDistanceCache.{$fromSector}? and global.$GT_SectorDistanceCache.{$fromSector}.{$toSector}?">
+            <return value="global.$GT_SectorDistanceCache.{$fromSector}.{$toSector}"/>
+          </do_if>
+          <!-- Cache miss: compute and store -->
+          <set_value name="$dist" exact="$fromSector.gatedistance.{$toSector}"/>
+          <!-- Initialize nested table if needed -->
+          <do_if value="not global.$GT_SectorDistanceCache?">
+            <set_value name="global.$GT_SectorDistanceCache" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_SectorDistanceCache.{$fromSector}?">
+            <set_value name="global.$GT_SectorDistanceCache.{$fromSector}" exact="table[]"/>
+          </do_if>
+          <set_value name="global.$GT_SectorDistanceCache.{$fromSector}.{$toSector}" exact="$dist"/>
+          <return value="$dist"/>
+        </do_else>
+      </actions>
+    </library>
+    
+    <!-- Calculate Station Distance Cache -->
+    <library name="GT_CalculateStationDistanceCache" purpose="run_actions">
+      <params>
+        <param name="stations" comment="List of stations to calculate distances for"/>
+        <param name="homeSector" comment="Home/base sector for distance calculation"/>
+      </params>
+      <actions>
+        <set_value name="$distanceCache" exact="table[]"/>
+        <do_all exact="$stations.count" counter="$i">
+          <set_value name="$station" exact="$stations.{$i}"/>
+          <do_if value="not $distanceCache.{$station}?">
+            <!-- UNIVERSAL CACHE: Use range-only distance (using library function) -->
+            <set_value name="$targetSector" exact="$station.sector"/>
+            <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculateRangeOnlyDistance" result="$distanceCache.{$station}">
+              <param name="fromSector" value="$homeSector"/>
+              <param name="toSector" value="$targetSector"/>
+            </run_actions>
+          </do_if>
+        </do_all>
+        <return value="$distanceCache"/>
+      </actions>
+    </library>
+    
+    <!-- Calculate Trade Path Distances (with escape logic) -->
+    <library name="GT_CalculateTradePathDistances" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship for pathfinding"/>
+        <param name="currentSector" comment="Ship's current sector"/>
+        <param name="buySector" comment="Buy station sector"/>
+        <param name="sellSector" comment="Sell station sector"/>
+        <param name="blacklistgroup" default="null" comment="Blacklist group"/>
+      </params>
+      <actions>
+        <!-- FIX: Handle same-sector cases first (ship already there = 0 distance) -->
+        <!-- If ship is in blacklisted sector, allow trades where ship stays in same sector OR escapes -->
+        <set_value name="$buyPathDistance" exact="-1"/>
+        <set_value name="$sellPathDistance" exact="-1"/>
+        
+        <!-- ESCAPE LOGIC: Buy path calculation with escape support -->
+        <!-- Check if current sector is blacklisted for escape logic -->
+        <run_actions ref="md.GT_Libraries_Blacklist.GT_IsSectorBlacklisted" result="$currentSectorIsBlacklistedForEscape">
+          <param name="sector" value="$currentSector"/>
+          <param name="ship" value="$ship"/>
+          <param name="blacklistgroup" value="$blacklistgroup"/>
+        </run_actions>
+        
+        <!-- Buy path calculation -->
+        <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculatePathDistance" result="$buyPathDistance">
+          <param name="ship" value="$ship"/>
+          <param name="fromSector" value="$currentSector"/>
+          <param name="toSector" value="$buySector"/>
+          <param name="blacklistgroup" value="$blacklistgroup"/>
+          <param name="useEscapeMode" value="$currentSectorIsBlacklistedForEscape"/>
+        </run_actions>
+        
+        <!-- Sell path calculation -->
+        <!-- CRITICAL: If ship is in blacklisted sector and buy is same sector, use ship position (not buy sector) -->
+        <!-- This allows escape: ship in Lasting Vengeance buy in Lasting Vengeance sell in safe sector -->
+        <do_if value="$sellSector == $buySector">
+          <!-- Buy and sell in same sector -->
+          <set_value name="$sellPathDistance" exact="0"/>
+        </do_if>
+        <do_elseif value="$sellSector == $currentSector">
+          <!-- ISOLATION FIX: Sell sector is current sector (intra-sector trade) - distance is 0 -->
+          <set_value name="$sellPathDistance" exact="0"/>
+        </do_elseif>
+        <do_elseif value="$buySector == $currentSector">
+          <!-- Ship is in buy sector (same as current) - check path FROM ship's current position to sell sector -->
+          <!-- This handles escape case: ship in blacklisted sector, staying there to buy, then selling in safe sector -->
+          <!-- ESCAPE LOGIC: If ship is in blacklisted sector, use NON-blacklist-aware gatedistance to find ANY path -->
+          <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculatePathDistance" result="$sellPathDistance">
+            <param name="ship" value="$ship"/>
+            <param name="fromSector" value="$currentSector"/>
+            <param name="toSector" value="$sellSector"/>
+            <param name="blacklistgroup" value="$blacklistgroup"/>
+            <param name="useEscapeMode" value="$currentSectorIsBlacklistedForEscape"/>
+          </run_actions>
+        </do_elseif>
+        <do_else>
+          <!-- Normal case: Need to travel from buy to sell sector -->
+          <!-- Note: GT_CalculatePathDistance uses ship.gatedistance, but here we need buySector.gatedistance -->
+          <!-- For sector-to-sector distance, calculate manually -->
+          <do_if value="$buySector == $sellSector">
+            <set_value name="$sellPathDistance" exact="0"/>
+          </do_if>
+          <do_else>
+            <set_value name="$sellPathDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{$ship}"/>
+          </do_else>
+        </do_else>
+        
+        <!-- Check if paths are reachable -->
+        <set_value name="$isReachable" exact="($buyPathDistance ge 0 and $sellPathDistance ge 0)"/>
+        
+        <!-- Check if intra-sector trade -->
+        <run_actions ref="md.GT_Libraries_General.GT_IsIntraSectorTrade" result="$isIntraSectorTrade">
+          <param name="buySector" value="$buySector"/>
+          <param name="sellSector" value="$sellSector"/>
+          <param name="currentSector" value="$currentSector"/>
+        </run_actions>
+        
+        <!-- Return result table -->
+        <set_value name="$result" exact="table[]"/>
+        <set_value name="$result.$BuyPathDistance" exact="$buyPathDistance"/>
+        <set_value name="$result.$SellPathDistance" exact="$sellPathDistance"/>
+        <set_value name="$result.$IsReachable" exact="$isReachable"/>
+        <set_value name="$result.$IsIntraSectorTrade" exact="$isIntraSectorTrade"/>
+        <set_value name="$result.$CurrentSectorIsBlacklisted" exact="$currentSectorIsBlacklistedForEscape"/>
+        <return value="$result"/>
+      </actions>
+    </library>
+    
+    <!-- Check if Station is Reachable -->
+    <library name="GT_IsStationReachable" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship for pathfinding"/>
+        <param name="station" comment="Station to check reachability for"/>
+        <param name="blacklistgroup" default="null" comment="Blacklist group (will be auto-determined if null)"/>
+        <param name="returnDetails" default="false" comment="If true, returns table with detailed results"/>
+      </params>
+      <actions>
+        <!-- Initialize result -->
+        <set_value name="$isReachable" exact="false"/>
+        <set_value name="$failureReason" exact="''"/>
+        
+        <!-- Check 1: Station exists -->
+        <do_if value="not $station? or not $station.exists">
+          <set_value name="$failureReason" exact="'Station does not exist'"/>
+          <do_if value="$returnDetails">
+            <set_value name="$result" exact="table[]"/>
+            <set_value name="$result.$IsReachable" exact="false"/>
+            <set_value name="$result.$FailureReason" exact="$failureReason"/>
+            <set_value name="$result.$StationKnown" exact="false"/>
+            <set_value name="$result.$BasicPathDistance" exact="-1"/>
+            <set_value name="$result.$BlacklistAwarePathDistance" exact="-1"/>
+            <return value="$result"/>
+          </do_if>
+          <do_else>
+            <return value="false"/>
+          </do_else>
+        </do_if>
+        
+        <!-- Check 2: Station is known to player OR ship is in same zone/sector -->
+        <!-- FIX: Use correct property syntax - $station.isknown (not player.entity.isknown.{$station}) -->
+        <!-- FIX: If ship is in same zone as station, skip "known" check (ship can see it) -->
+        <set_value name="$sameZone" exact="$ship.zone == $station.zone"/>
+        <set_value name="$sameSector" exact="$ship.sector == $station.sector"/>
+        <set_value name="$stationIsKnown" exact="@$station.isknown"/>
+        
+        <!-- Station is accessible if: known to player OR ship is in same zone/sector -->
+        <set_value name="$stationAccessible" exact="$stationIsKnown or $sameZone or $sameSector"/>
+        
+        <do_if value="not $stationAccessible">
+          <set_value name="$failureReason" exact="'Station not known to player and not in same zone/sector'"/>
+          <do_if value="$returnDetails">
+            <set_value name="$result" exact="table[]"/>
+            <set_value name="$result.$IsReachable" exact="false"/>
+            <set_value name="$result.$FailureReason" exact="$failureReason"/>
+            <set_value name="$result.$StationKnown" exact="$stationIsKnown"/>
+            <set_value name="$result.$BasicPathDistance" exact="-1"/>
+            <set_value name="$result.$BlacklistAwarePathDistance" exact="-1"/>
+            <return value="$result"/>
+          </do_if>
+          <do_else>
+            <return value="false"/>
+          </do_else>
+        </do_if>
+        
+        <!-- Check 3: If ship and station are in same zone, they're reachable (no pathfinding needed) -->
+        <do_if value="$sameZone">
+          <!-- Ship is in same zone as station - can reach directly -->
+          <set_value name="$isReachable" exact="true"/>
+          <set_value name="$basicPathDistance" exact="0"/>
+          <set_value name="$blacklistAwarePathDistance" exact="0"/>
+        </do_if>
+        <do_else>
+          <!-- Different zones - need to check pathfinding -->
+          <!-- Get blacklist group if not provided -->
+          <do_if value="not $blacklistgroup? or $blacklistgroup == null">
+            <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroup">
+              <param name="ship" value="$ship"/>
+            </run_actions>
+          </do_if>
+          
+          <!-- Check 3a: Basic path (what vanilla's move.generic checks) -->
+          <set_value name="$basicPathDistance" exact="$ship.gatedistance.{$station}"/>
+          
+          <!-- Check 3b: Blacklist-aware path (what we want to use) -->
+          <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculatePathDistance" result="$blacklistAwarePathDistance">
+            <param name="ship" value="$ship"/>
+            <param name="fromSector" value="$ship.sector"/>
+            <param name="toSector" value="$station.sector"/>
+            <param name="blacklistgroup" value="$blacklistgroup"/>
+            <param name="useEscapeMode" value="false"/>
+          </run_actions>
+          
+          <!-- Determine if reachable (both paths must exist) -->
+          <do_if value="$basicPathDistance lt 0">
+            <set_value name="$failureReason" exact="'No basic path exists (distance: ' + $basicPathDistance + ')'"/>
+          </do_if>
+          <do_elseif value="$blacklistAwarePathDistance lt 0">
+            <set_value name="$failureReason" exact="'No blacklist-aware path exists (distance: ' + $blacklistAwarePathDistance + ')'"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$isReachable" exact="true"/>
+          </do_else>
+        </do_else>
+        
+        <!-- Return result -->
+        <do_if value="$returnDetails">
+          <set_value name="$result" exact="table[]"/>
+          <set_value name="$result.$IsReachable" exact="$isReachable"/>
+          <set_value name="$result.$FailureReason" exact="$failureReason"/>
+          <set_value name="$result.$StationKnown" exact="$stationIsKnown"/>
+          <set_value name="$result.$BasicPathDistance" exact="$basicPathDistance"/>
+          <set_value name="$result.$BlacklistAwarePathDistance" exact="$blacklistAwarePathDistance"/>
+          <return value="$result"/>
+        </do_if>
+        <do_else>
+          <return value="$isReachable"/>
+        </do_else>
+      </actions>
+    </library>
+    
+    <!-- Find Sectors In Range (Vanilla Pattern) -->
+    <!-- Replicates vanilla lib.find.sectors.inrange logic for MD scripts -->
+    <!-- Pre-filters sectors by gate distance and blacklist BEFORE native trade queries -->
+    <!-- CRITICAL: Vanilla pattern using find_cluster_in_range -->
+    <library name="GT_FindSectorsInRange" purpose="run_actions">
+      <params>
+        <param name="refobject" comment="Reference object (sector/station) from which gate distance is measured"/>
+        <param name="mingatedistance" default="0" comment="Minimum gate distance from refobject"/>
+        <param name="maxgatedistance" default="1" comment="Maximum gate distance from refobject"/>
+        <param name="ship" comment="Ship for blacklist checks"/>
+        <param name="blacklistgroup" default="null" comment="Blacklist group (auto-determined if null)"/>
+        <param name="applyblacklist" default="true" comment="Apply blacklist filtering"/>
+        <param name="sectorWhitelist" default="null" comment="List of sectors to exclude from blacklist checks (if null, will be auto-determined from ship's order)"/>
+      </params>
+      <actions>
+        <!-- Get blacklist group if not provided -->
+        <do_if value="not $blacklistgroup? or $blacklistgroup == null">
+          <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroup">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+        </do_if>
+        
+        <!-- Get whitelist if not provided -->
+        <set_value name="$whitelist" exact="[]"/>
+        <do_if value="not $sectorWhitelist? or $sectorWhitelist == null">
+          <run_actions ref="md.GT_Libraries_Blacklist.GT_GetSectorWhitelist" result="$whitelist">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+        </do_if>
+        <do_else>
+          <set_value name="$whitelist" exact="$sectorWhitelist"/>
+        </do_else>
+        
+        <!-- Extract reference sector from refobject -->
+        <set_value name="$refsector" exact="null"/>
+        
+        <!-- Validate refobject exists and is valid -->
+        <do_if value="not $refobject? or not $refobject.exists">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Pathfinding] ERROR: refobject is null or does not exist in GT_FindSectorsInRange'" chance="100"/>
+          </do_if>
+          <return value="[]"/>
+        </do_if>
+        
+        <!-- Check if refobject is a sector -->
+        <do_if value="$refobject.isclass.sector">
+          <set_value name="$refsector" exact="$refobject"/>
+        </do_if>
+        <!-- Check if refobject has a sector property (station, ship, etc.) -->
+        <do_elseif value="$refobject.sector?">
+          <set_value name="$refsector" exact="$refobject.sector"/>
+        </do_elseif>
+        <!-- Check if refobject has a zone property - try to get sector from zone -->
+        <do_elseif value="$refobject.zone?">
+          <set_value name="$refzone" exact="$refobject.zone"/>
+          <do_if value="$refzone.sector?">
+            <set_value name="$refsector" exact="$refzone.sector"/>
+          </do_if>
+          <do_elseif value="$refzone.destination? and $refzone.destination.sector?">
+            <!-- Highway zone - use destination sector -->
+            <set_value name="$refsector" exact="$refzone.destination.sector"/>
+          </do_elseif>
+        </do_elseif>
+        
+        <!-- Validate refsector -->
+        <do_if value="not $refsector? or not $refsector.exists">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Pathfinding] ERROR: Failed to extract sector from refobject in GT_FindSectorsInRange (refobject type: ' + (if $refobject.isclass? then 'has isclass' else 'no isclass') + ')'" chance="100"/>
+          </do_if>
+          <return value="[]"/>
+        </do_if>
+        
+        <!-- Get commander sector (ships can always operate in commander's sector regardless of blacklist) -->
+        <set_value name="$commandersector" exact="null"/>
+        <do_if value="$ship.commander? and $ship.commander.exists">
+          <set_value name="$commandersector" exact="@$ship.commander.sector"/>
+        </do_if>
+        
+        <!-- Get ship's current sector (fallback if all sectors blacklisted) -->
+        <set_value name="$mysector" exact="$ship.sector"/>
+        <do_if value="@$ship.zone.issuperhighway">
+          <set_value name="$mysector" exact="@$ship.zone.destination.sector"/>
+        </do_if>
+        
+        <!-- Use native find_cluster_in_range to find sectors within range -->
+        <!-- This is the vanilla pattern - uses native C++ pathfinding for performance -->
+        <set_value name="$locclusters" exact="table[]"/>
+        <find_cluster_in_range distances="$locclusters" multiple="true" object="$refobject" mindistance="$mingatedistance" maxdistance="$maxgatedistance"/>
+        
+        <!-- Build sector table from clusters -->
+        <set_value name="$sectortable" exact="table[]"/>
+        <do_for_each name="$loccluster" valuename="$jumpdist" in="$locclusters">
+          <find_sector name="$sectorlist" space="$loccluster" multiple="true"/>
+          <do_if value="$sectorlist.count == 1">
+            <!-- Single-sector cluster -->
+            <set_value name="$locsector" exact="$sectorlist.{1}"/>
+            <do_if value="not player.entity.isknown.{$locsector}? or @player.entity.isknown.{$locsector}">
+              <!-- Check gate distance (for multi-sector clusters with one-way superhighways) -->
+              <set_value name="$locgatedist" exact="$refsector.gatedistance.{$locsector}"/>
+              <do_if value="($locgatedist ge 0) and ($locgatedist ge $mingatedistance) and ($locgatedist le $maxgatedistance)">
+                <!-- Check return path distance -->
+                <set_value name="$locreturngatedist" exact="$locsector.gatedistance.{$refsector}"/>
+                <do_if value="($locreturngatedist ge 0) and ($locreturngatedist le $maxgatedistance)">
+                  <!-- Apply blacklist filtering if enabled -->
+                  <set_value name="$sectorValid" exact="true"/>
+                  <do_if value="$applyblacklist">
+                    <!-- Always allow commander's sector and ship's current sector -->
+                    <do_if value="$locsector != $commandersector and $locsector != $mysector">
+                      <!-- Check whitelist first: if sector is in whitelist, it's allowed -->
+                      <set_value name="$isWhitelisted" exact="false"/>
+                      <do_if value="(if $whitelist != null then $whitelist.count else 0) gt 0">
+                        <do_all exact="$whitelist.count" counter="$w">
+                          <do_if value="$whitelist.{$w} == $locsector">
+                            <set_value name="$isWhitelisted" exact="true"/>
+                            <break/>
+                          </do_if>
+                        </do_all>
+                      </do_if>
+                      
+                      <!-- Only check blacklist if not whitelisted -->
+                      <do_if value="not $isWhitelisted">
+                        <!-- Check blacklist (sectoractivity AND sectortravel) -->
+                        <set_value name="$sectorActivityBlacklisted" exact="@$locsector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
+                        <set_value name="$sectorTravelBlacklisted" exact="@$locsector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
+                        <do_if value="$sectorActivityBlacklisted or $sectorTravelBlacklisted">
+                          <set_value name="$sectorValid" exact="false"/>
+                        </do_if>
+                      </do_if>
+                      <do_else>
+                        <!-- Check blacklist-aware path distance (for return path) -->
+                        <set_value name="$blacklistAwareDist" exact="$refsector.gatedistance.{$locsector}.{$blacklistgroup}.{$ship}"/>
+                        <do_if value="$blacklistAwareDist lt 0">
+                          <!-- No blacklist-aware path exists -->
+                          <set_value name="$sectorValid" exact="false"/>
+                        </do_if>
+                        <do_else>
+                          <!-- Check return path with blacklist -->
+                          <set_value name="$blacklistAwareReturnDist" exact="$locsector.gatedistance.{$refsector}.{$blacklistgroup}.{$ship}"/>
+                          <do_if value="$blacklistAwareReturnDist lt 0 or $blacklistAwareReturnDist gt $maxgatedistance">
+                            <set_value name="$sectorValid" exact="false"/>
+                          </do_if>
+                        </do_else>
+                      </do_else>
+                    </do_if>
+                  </do_if>
+                  
+                  <!-- Add sector if valid -->
+                  <do_if value="$sectorValid">
+                    <set_value name="$sectortable.{$locsector}" exact="$locgatedist"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- Multi-sector cluster -->
+            <do_for_each name="$locsector" in="$sectorlist">
+              <do_if value="not player.entity.isknown.{$locsector}? or @player.entity.isknown.{$locsector}">
+                <!-- Check gate distance -->
+                <set_value name="$locgatedist" exact="$refsector.gatedistance.{$locsector}"/>
+                <do_if value="($locgatedist ge 0) and ($locgatedist ge $mingatedistance) and ($locgatedist le $maxgatedistance)">
+                  <!-- Check return path distance -->
+                  <set_value name="$locreturngatedist" exact="$locsector.gatedistance.{$refsector}"/>
+                  <do_if value="($locreturngatedist ge 0) and ($locreturngatedist le $maxgatedistance)">
+                    <!-- Apply blacklist filtering if enabled -->
+                    <set_value name="$sectorValid" exact="true"/>
+                    <do_if value="$applyblacklist">
+                      <!-- Always allow commander's sector and ship's current sector -->
+                      <do_if value="$locsector != $commandersector and $locsector != $mysector">
+                        <!-- Check whitelist first: if sector is in whitelist, it's allowed -->
+                        <set_value name="$isWhitelisted" exact="false"/>
+                        <do_if value="(if $whitelist != null then $whitelist.count else 0) gt 0">
+                          <do_all exact="$whitelist.count" counter="$w">
+                            <do_if value="$whitelist.{$w} == $locsector">
+                              <set_value name="$isWhitelisted" exact="true"/>
+                              <break/>
+                            </do_if>
+                          </do_all>
+                        </do_if>
+                        
+                        <!-- Only check blacklist if not whitelisted -->
+                        <do_if value="not $isWhitelisted">
+                          <!-- Check blacklist (sectoractivity AND sectortravel) -->
+                          <set_value name="$sectorActivityBlacklisted" exact="@$locsector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}"/>
+                          <set_value name="$sectorTravelBlacklisted" exact="@$locsector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{$ship}"/>
+                          <do_if value="$sectorActivityBlacklisted or $sectorTravelBlacklisted">
+                            <set_value name="$sectorValid" exact="false"/>
+                          </do_if>
+                        </do_if>
+                        <do_else>
+                          <!-- Check blacklist-aware path distance -->
+                          <set_value name="$blacklistAwareDist" exact="$refsector.gatedistance.{$locsector}.{$blacklistgroup}.{$ship}"/>
+                          <do_if value="$blacklistAwareDist lt 0">
+                            <set_value name="$sectorValid" exact="false"/>
+                          </do_if>
+                          <do_else>
+                            <!-- Check return path with blacklist -->
+                            <set_value name="$blacklistAwareReturnDist" exact="$locsector.gatedistance.{$refsector}.{$blacklistgroup}.{$ship}"/>
+                            <do_if value="$blacklistAwareReturnDist lt 0 or $blacklistAwareReturnDist gt $maxgatedistance">
+                              <set_value name="$sectorValid" exact="false"/>
+                            </do_if>
+                          </do_else>
+                        </do_else>
+                      </do_if>
+                    </do_if>
+                    
+                    <!-- Add sector if valid -->
+                    <do_if value="$sectorValid">
+                      <set_value name="$sectortable.{$locsector}" exact="$locgatedist"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_for_each>
+          </do_else>
+        </do_for_each>
+        
+        <!-- If mingatedistance <= 0, include the refsector itself -->
+        <do_if value="($mingatedistance le 0) and not $sectortable.{$refsector}?">
+          <set_value name="$sectortable.{$refsector}" exact="0"/>
+        </do_if>
+        
+        <!-- If no valid sectors found (probably due to blacklist), add ship's current sector as fallback -->
+        <do_if value="not $sectortable.keys.count">
+          <do_if value="@$mysector.exists">
+            <set_value name="$sectortable.{$mysector}" exact="0"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Sort sectors by gate distance (vanilla pattern) -->
+        <set_value name="$spaces" exact="$sectortable.keys.list"/>
+        <shuffle_list list="$spaces"/>
+        <sort_list list="$spaces" sortbyvalue="$sectortable.{loop.element}"/>
+        
+        <!-- If mingatedistance <= 0, ensure refsector is first -->
+        <do_if value="($mingatedistance le 0) and $refsector?">
+          <!-- FIX: Use explicit loop to check if refsector is in spaces -->
+          <set_value name="$refSectorInList" exact="false"/>
+          <do_all exact="$spaces.count" counter="$i">
+            <do_if value="$spaces.{$i} == $refsector">
+              <set_value name="$refSectorInList" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+          
+          <do_if value="not $refSectorInList">
+            <set_value name="$spaces.{1}" exact="$refsector" operation="insert"/>
+          </do_if>
+        </do_if>
+        
+        <!-- If still no sectors, add ship's current sector -->
+        <do_if value="not $spaces.count">
+          <do_if value="@$mysector.exists">
+            <set_value name="$spaces.{1}" exact="$mysector" operation="insert"/>
+          </do_if>
+        </do_if>
+        
+        <!-- Return sorted list of sectors -->
+        <return value="$spaces"/>
+      </actions>
+    </library>
+    
+    <!-- Build Station Distance Cache from Offers -->
+    <library name="GT_BuildStationDistanceCache" purpose="run_actions">
+      <params>
+        <param name="sellOffers" comment="List of sell offers"/>
+        <param name="buyOffers" comment="List of buy offers"/>
+        <param name="homeSector" comment="Home/base sector for distance calculation"/>
+      </params>
+      <actions>
+        <!-- Extract unique stations from offers -->
+        <set_value name="$sellStations" exact="[]"/>
+        <set_value name="$buyStations" exact="[]"/>
+        <set_value name="$sellStationsSeen" exact="table[]"/>
+        <set_value name="$buyStationsSeen" exact="table[]"/>
+        <do_all exact="$sellOffers.count" counter="$i">
+          <set_value name="$station" exact="$sellOffers.{$i}.owner"/>
+          <do_if value="not $sellStationsSeen.{$station}?">
+            <set_value name="$sellStationsSeen.{$station}" exact="true"/>
+            <append_to_list name="$sellStations" exact="$station"/>
+          </do_if>
+        </do_all>
+        <do_all exact="$buyOffers.count" counter="$i">
+          <set_value name="$station" exact="$buyOffers.{$i}.owner"/>
+          <do_if value="not $buyStationsSeen.{$station}?">
+            <set_value name="$buyStationsSeen.{$station}" exact="true"/>
+            <append_to_list name="$buyStations" exact="$station"/>
+          </do_if>
+        </do_all>
+        <!-- Calculate distance cache for sell stations -->
+        <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculateStationDistanceCache" result="$sellDistanceCache">
+          <param name="stations" value="$sellStations"/>
+          <param name="homeSector" value="$homeSector"/>
+        </run_actions>
+        <!-- Calculate distance cache for buy stations -->
+        <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculateStationDistanceCache" result="$buyDistanceCache">
+          <param name="stations" value="$buyStations"/>
+          <param name="homeSector" value="$homeSector"/>
+        </run_actions>
+        <!-- Merge caches -->
+        <set_value name="$stationDistanceCache" exact="table[]"/>
+        <do_all exact="$sellStations.count" counter="$i">
+          <set_value name="$station" exact="$sellStations.{$i}"/>
+          <set_value name="$stationDistanceCache.{$station}" exact="$sellDistanceCache.{$station}"/>
+        </do_all>
+        <do_all exact="$buyStations.count" counter="$i">
+          <set_value name="$station" exact="$buyStations.{$i}"/>
+          <set_value name="$stationDistanceCache.{$station}" exact="$buyDistanceCache.{$station}"/>
+        </do_all>
+        <return value="$stationDistanceCache"/>
+      </actions>
+    </library>
+    
+    <!-- Build Trade Sector Lists -->
+    <!-- CRITICAL: Vanilla pattern using find_cluster_in_range -->
+    <library name="GT_BuildTradeSectorLists" purpose="run_actions">
+      <params>
+        <param name="ship" comment="Ship to build sector lists for"/>
+        <param name="homeSector" comment="Home sector for distance calculations"/>
+        <param name="maxDistance" comment="Maximum gate distance"/>
+        <param name="blacklistgroup" comment="Blacklist group for filtering"/>
+      </params>
+      <actions>
+        <!-- Builds sector lists for trade searches with isolation handling -->
+        <!-- Returns: $buyspaces, $sellspaces, $shipIsIsolated -->
+        <!-- For isolated ships: Uses current sector only -->
+        <!-- For normal ships: Uses GT_FindSectorsInRange to build lists -->
+        <set_value name="$currentSector" exact="$ship.sector"/>
+        <set_value name="$shipIsIsolated" exact="false"/>
+        <set_value name="$buyspaces" exact="[]"/>
+        <set_value name="$sellspaces" exact="[]"/>
+        
+        <!-- Check if ship is isolated -->
+        <do_if value="$currentSector?">
+          <run_actions ref="md.GT_Libraries_Blacklist.GT_CheckConnectedSectorsBlacklisted" result="$isolationCheck">
+            <param name="sector" value="$currentSector"/>
+            <param name="ship" value="$ship"/>
+            <param name="returnDetails" value="false"/>
+          </run_actions>
+          <set_value name="$isolatedValue" exact="@$isolationCheck.$IsIsolated"/>
+          <set_value name="$shipIsIsolated" exact="if $isolatedValue? and ($isolatedValue == true or $isolatedValue == 1) then true else false"/>
+          <do_if value="$shipIsIsolated">
+            <!-- Ship is isolated - use current sector only -->
+            <set_value name="$buyspaces" exact="[$currentSector]"/>
+            <set_value name="$sellspaces" exact="[$currentSector]"/>
+            <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$sectorName" exact="@$currentSector.knownname"/>
+              <debug_text text="'[GT-Search] (' + $ship.idcode + ') 🔒 ISOLATED: Using current sector only: ' + (if $sectorName? then $sectorName else 'NULL') + ' (price range expanded)'" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        
+        <!-- Build sector lists for non-isolated ships -->
+        <do_if value="not $shipIsIsolated">
+          <!-- Build buy sector list (sectors where ship can buy from) -->
+          <run_actions ref="md.GT_Libraries_Pathfinding.GT_FindSectorsInRange" result="$buyspaces">
+            <param name="refobject" value="$homeSector"/>
+            <param name="mingatedistance" value="0"/>
+            <param name="maxgatedistance" value="$maxDistance"/>
+            <param name="ship" value="$ship"/>
+            <param name="blacklistgroup" value="$blacklistgroup"/>
+            <param name="applyblacklist" value="true"/>
+          </run_actions>
+          
+          <!-- Build sell sector list (sectors where ship can sell to) -->
+          <!-- For now, use same range as buy (can be optimized later if maxbuy != maxsell) -->
+          <set_value name="$sellspaces" exact="$buyspaces"/>
+          
+          <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Search] (' + $ship.idcode + ') VANILLA PATTERN: Built sector lists - ' + $buyspaces.count + ' buy sectors, ' + $sellspaces.count + ' sell sectors (max distance: ' + $maxDistance + ')'" chance="100"/>
+          </do_if>
+        </do_if>
+        
+        <set_value name="$result" exact="table[]"/>
+        <set_value name="$result.$BuySpaces" exact="$buyspaces"/>
+        <set_value name="$result.$SellSpaces" exact="$sellspaces"/>
+        <set_value name="$result.$ShipIsIsolated" exact="$shipIsIsolated"/>
+        <return value="$result"/>
+      </actions>
+    </library>
+    
+    <!-- ========================================= -->
+    <!-- INCREMENTAL RADIUS SEARCH (Cue-Based) -->
+    <!-- ========================================= -->
+    
+    <!-- Pathfinding Queue Processor -->
+    <!-- Manages concurrency for pathfinding instances to prevent CPU spikes -->
+    <cue name="ProcessPathfindingQueue" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <!-- CPU YIELDING: Prevent queue-drain avalanches in a single frame when many ships request pathfinding at once -->
+      <delay exact="10ms"/>
+      <actions>
+        <!-- PROOF (once): confirm that the queue processor is actually executing in this game instance -->
+        <do_if value="not global.$GT_Pathfinding_Proof?">
+          <set_value name="global.$GT_Pathfinding_Proof" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_Pathfinding_Proof.$QueueProcessorRan?">
+          <set_value name="global.$GT_Pathfinding_Proof.$QueueProcessorRan" exact="true"/>
+          <debug_text text="'[GT-Pathfinding] ProcessPathfindingQueue running (requests=' + (if global.$GT_PathfindingQueue? and global.$GT_PathfindingQueue.$Requests? then global.$GT_PathfindingQueue.$Requests.count else 0) + ')'" chance="100"/>
+        </do_if>
+
+        <!-- Initialize queue properties if they don't exist -->
+        <do_if value="not global.$GT_PathfindingQueue?">
+          <set_value name="global.$GT_PathfindingQueue" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_PathfindingQueue.$Requests? or global.$GT_PathfindingQueue.$Requests == null">
+          <set_value name="global.$GT_PathfindingQueue.$Requests" exact="[]"/>
+        </do_if>
+        <do_if value="not global.$GT_PathfindingQueue.$ActiveInstances? or global.$GT_PathfindingQueue.$ActiveInstances == null">
+          <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" exact="0"/>
+        </do_if>
+        <do_if value="not global.$GT_PathfindingQueue.$MaxConcurrent? or global.$GT_PathfindingQueue.$MaxConcurrent == null">
+          <set_value name="global.$GT_PathfindingQueue.$MaxConcurrent" exact="2"/>
+        </do_if>
+        <do_if value="not global.$GT_PathfindingQueue.$ActiveShips? or global.$GT_PathfindingQueue.$ActiveShips == null">
+          <set_value name="global.$GT_PathfindingQueue.$ActiveShips" exact="[]"/>
+        </do_if>
+
+        <!-- SANITY: Prevent stale save/crash state from blocking the queue forever -->
+        <do_if value="global.$GT_PathfindingQueue.$ActiveInstances lt 0">
+          <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" exact="0"/>
+        </do_if>
+        <do_if value="global.$GT_PathfindingQueue.$MaxConcurrent le 0">
+          <set_value name="global.$GT_PathfindingQueue.$MaxConcurrent" exact="2"/>
+        </do_if>
+        <!-- If counters got out of sync, trust the ActiveShips list -->
+        <do_if value="global.$GT_PathfindingQueue.$ActiveInstances gt global.$GT_PathfindingQueue.$ActiveShips.count">
+          <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" exact="global.$GT_PathfindingQueue.$ActiveShips.count"/>
+        </do_if>
+
+        <!-- DEBUG (throttled): explain why queue is not starting workers when requests are pending -->
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and global.$GT_PathfindingQueue.$Requests.count gt 0 and global.$GT_PathfindingQueue.$ActiveInstances ge global.$GT_PathfindingQueue.$MaxConcurrent">
+          <do_if value="not global.$GT_Pathfinding_Proof.$LastQueueBlockedLogTime?">
+            <set_value name="global.$GT_Pathfinding_Proof.$LastQueueBlockedLogTime" exact="0"/>
+          </do_if>
+          <do_if value="(player.age - global.$GT_Pathfinding_Proof.$LastQueueBlockedLogTime) ge 5s">
+            <set_value name="global.$GT_Pathfinding_Proof.$LastQueueBlockedLogTime" exact="player.age"/>
+            <debug_text text="'[GT-Pathfinding] Queue BLOCKED (active=' + global.$GT_PathfindingQueue.$ActiveInstances + '/' + global.$GT_PathfindingQueue.$MaxConcurrent + ', activeShips=' + global.$GT_PathfindingQueue.$ActiveShips.count + ', queued=' + global.$GT_PathfindingQueue.$Requests.count + ')'" chance="100"/>
+          </do_if>
+        </do_if>
+
+        <!-- Process if below max concurrent and there are requests in the queue -->
+        <do_if value="global.$GT_PathfindingQueue.$ActiveInstances lt global.$GT_PathfindingQueue.$MaxConcurrent and global.$GT_PathfindingQueue.$Requests.count gt 0">
+          <set_value name="$request" exact="global.$GT_PathfindingQueue.$Requests.{1}"/>
+          <remove_from_list name="global.$GT_PathfindingQueue.$Requests" exact="$request"/>
+          <!-- Mark request as coming FROM the queue. The queue processor already reserves the concurrency slot,
+               so the worker must NOT re-apply concurrency gating and re-queue itself (would stall forever). -->
+          <set_value name="$request.$FromQueue" exact="true"/>
+          
+          <set_value name="$ship" exact="$request.$Ship"/>
+          <!-- IMPORTANT:
+               NEVER drop queued pathfinding requests based on SearchLiveTrades_State lookups.
+               If that lookup fails for any reason (object-key mismatch, transient ordering), dropping the request leaves
+               SearchTradeRoutes stuck behind "live search already in progress" forever.
+               Instead: always run the incremental radius search; SearchLiveTrades_Resume will safely ignore results if
+               the live-search state was already cleaned up. -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Pathfinding-Queue] Processing queued pathfinding for ' + $ship.idcode + ' (active: ' + global.$GT_PathfindingQueue.$ActiveInstances + '/' + global.$GT_PathfindingQueue.$MaxConcurrent + ', queued: ' + global.$GT_PathfindingQueue.$Requests.count + ')'" chance="10"/>
+          </do_if>
+
+          <!-- DEBUG (once per ship): record that the queue started pathfinding for this ship -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <do_if value="not global.$GT_Pathfinding_Proof.$StartedShips?">
+              <set_value name="global.$GT_Pathfinding_Proof.$StartedShips" exact="table[]"/>
+            </do_if>
+            <do_if value="not global.$GT_Pathfinding_Proof.$StartedShips.{$ship}?">
+              <set_value name="global.$GT_Pathfinding_Proof.$StartedShips.{$ship}" exact="player.age"/>
+              <debug_text text="'[GT-Pathfinding] Queue STARTED worker for ' + $ship.idcode + ' (active now=' + (global.$GT_PathfindingQueue.$ActiveInstances + 1) + '/' + global.$GT_PathfindingQueue.$MaxConcurrent + ', queued now=' + global.$GT_PathfindingQueue.$Requests.count + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+
+          <!-- Increment active instances counter -->
+          <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" operation="add"/>
+          <append_to_list name="global.$GT_PathfindingQueue.$ActiveShips" exact="$ship"/>
+
+          <!-- Signal the actual pathfinding cue -->
+          <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch" param="$request"/>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Incremental Radius Search Cue -->
+    <!-- Cue-based pattern with CPU yielding between radius increments -->
+    <!-- Phase 1: Detection only - no runtime behavior changes -->
+    <!-- Uses recursive signaling pattern (MD script compatible) -->
+    <cue name="GT_IncrementalRadiusSearch" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <!-- CPU YIELDING: Delay before each iteration (including recursive signals) -->
+      <!-- This ensures CPU is yielded between radius increments, preventing game stutter -->
+      <delay exact="25ms"/>
+      <actions>
+        <!-- Extract parameters from signal -->
+        <set_value name="$params" exact="event.param"/>
+        <set_value name="$shouldProceed" exact="true"/>
+        <set_value name="$fromQueue" exact="false"/>
+        <do_if value="$params.$FromQueue? and $params.$FromQueue == true">
+          <set_value name="$fromQueue" exact="true"/>
+        </do_if>
+        
+        <!-- Ship object from request -->
+        <set_value name="$ship" exact="$params.$Ship"/>
+
+        <!-- PROOF (once): confirm that GT_IncrementalRadiusSearch is actually starting -->
+        <do_if value="not global.$GT_Pathfinding_Proof?">
+          <set_value name="global.$GT_Pathfinding_Proof" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_Pathfinding_Proof.$IncrementalRan?">
+          <set_value name="global.$GT_Pathfinding_Proof.$IncrementalRan" exact="true"/>
+          <debug_text text="'[GT-Pathfinding] GT_IncrementalRadiusSearch running (ship=' + (if $ship? then $ship.idcode else 'NULL') + ')'" chance="100"/>
+        </do_if>
+        
+        <!-- DEBUG (once per ship): make sure we always get a line for the ships we care about -->
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <do_if value="not global.$GT_Pathfinding_Proof.$IncrementalStartedShips?">
+            <set_value name="global.$GT_Pathfinding_Proof.$IncrementalStartedShips" exact="table[]"/>
+          </do_if>
+          <do_if value="$ship? and not global.$GT_Pathfinding_Proof.$IncrementalStartedShips.{$ship}?">
+            <set_value name="global.$GT_Pathfinding_Proof.$IncrementalStartedShips.{$ship}" exact="player.age"/>
+            <!-- NOTE: $isContinuation is initialized below; keep this log null-safe. -->
+            <set_value name="$isContinuationForLog" exact="false"/>
+            <do_if value="$params.$IsContinuation? and $params.$IsContinuation == true">
+              <set_value name="$isContinuationForLog" exact="true"/>
+            </do_if>
+            <debug_text text="'[GT-Pathfinding] Incremental START for ' + $ship.idcode + ' (fromQueue=' + (if $fromQueue then 1 else 0) + ', isContinuation=' + (if $isContinuationForLog then 1 else 0) + ')'" chance="100"/>
+          </do_if>
+        </do_if>
+
+        <!-- IMPORTANT:
+             Do NOT drop/abort the incremental radius search based on SearchLiveTrades_State lookups.
+             In player.log, ships can get stuck if the request is aborted but SearchTradeRoutes still sees an in-progress
+             live-search state. SearchLiveTrades_Resume has its own guards and can ignore results if state is missing. -->
+        
+        <!-- CONCURRENCY CONTROL: Check if this is a NEW request (not continuation) -->
+        <!-- Continuation batches (IsContinuation=true) don't need queuing - they're for the same ship -->
+        <set_value name="$isContinuation" exact="false"/>
+        <do_if value="$params.$IsContinuation? and $params.$IsContinuation == true">
+          <set_value name="$isContinuation" exact="true"/>
+        </do_if>
+        
+        <!-- For NEW requests (not continuation), check concurrency before processing.
+             IMPORTANT: Requests coming FROM ProcessPathfindingQueue already reserved the slot, so skip gating. -->
+        <do_if value="not $isContinuation and not $fromQueue">
+          <do_if value="global.$GT_PathfindingQueue? and global.$GT_PathfindingQueue.$ActiveInstances? and global.$GT_PathfindingQueue.$MaxConcurrent?">
+            <do_if value="global.$GT_PathfindingQueue.$ActiveInstances ge global.$GT_PathfindingQueue.$MaxConcurrent">
+              <!-- Max concurrent reached - queue this request -->
+              <do_if value="not global.$GT_PathfindingQueue.$Requests?">
+                <set_value name="global.$GT_PathfindingQueue.$Requests" exact="[]"/>
+              </do_if>
+              
+              <!-- Mark as queued so it will bypass concurrency gating when ProcessPathfindingQueue starts it -->
+              <set_value name="$params.$FromQueue" exact="true"/>
+              <append_to_list name="global.$GT_PathfindingQueue.$Requests" exact="$params"/>
+              
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <set_value name="$debugShip" exact="@$params.$Ship"/>
+                <debug_text text="'[GT-Pathfinding-Queue] Pathfinding queued for ' + (if $debugShip != null then @$debugShip.idcode else 'NULL') + ' (active: ' + global.$GT_PathfindingQueue.$ActiveInstances + '/' + global.$GT_PathfindingQueue.$MaxConcurrent + ')'" chance="10"/>
+              </do_if>
+              
+              <!-- Signal queue processor -->
+              <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.ProcessPathfindingQueue"/>
+              
+              <!-- Cancel this instance - queue will process it -->
+              <set_value name="$shouldProceed" exact="false"/>
+              <cancel_cue cue="this"/>
+            </do_if>
+            <do_else>
+              <!-- Below max concurrent - increment counter for NEW requests -->
+              <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" operation="add"/>
+              <do_if value="not global.$GT_PathfindingQueue.$ActiveShips?">
+                <set_value name="global.$GT_PathfindingQueue.$ActiveShips" exact="[]"/>
+              </do_if>
+              <set_value name="$debugShip" exact="@$params.$Ship"/>
+              <append_to_list name="global.$GT_PathfindingQueue.$ActiveShips" exact="$debugShip"/>
+            </do_else>
+          </do_if>
+        </do_if>
+
+        <!-- cancel_cue does NOT stop the current actions block; explicitly gate the rest -->
+        <do_if value="$shouldProceed">
+          <!-- Check if this is initialization or continuation -->
+          <do_if value="not this.$initialized?">
+          <!-- Check if this is a continuation from a previous instance -->
+          <do_if value="$params.$IsContinuation? and $params.$IsContinuation == true">
+            <!-- CONTINUATION: Restore state from previous instance -->
+            <!-- Note: Continuation batches don't increment active counter (same ship) -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$debugShip" exact="@$params.$Ship"/>
+              <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: CONTINUATION - Ship=' + (if $debugShip != null then @$debugShip.idcode else 'NULL') + ', Phase=' + $params.$Phase + ', EscapeRadius=' + $params.$EscapeSearchRadius + ', TradeRadius=' + $params.$TradeSearchRadius + ', BuySpaces=' + (if @$params.$BuySpaces != null then @$params.$BuySpaces.count else 0) + ', SellSpaces=' + (if @$params.$SellSpaces != null then @$params.$SellSpaces.count else 0)" chance="10"/>
+            </do_if>
+            <set_value name="this.$initialized" exact="true"/>
+            <set_value name="this.$ship" exact="$params.$Ship"/>
+            <set_value name="this.$homeSector" exact="$params.$HomeSector"/>
+            <set_value name="this.$maxDistance" exact="$params.$MaxDistance"/>
+            <set_value name="this.$blacklistgroup" exact="$params.$BlacklistGroup"/>
+            <set_value name="this.$phase" exact="$params.$Phase"/>
+            <set_value name="this.$escapeSearchRadius" exact="$params.$EscapeSearchRadius"/>
+            <set_value name="this.$tradeSearchRadius" exact="$params.$TradeSearchRadius"/>
+            <set_value name="this.$buyspaces" exact="$params.$BuySpaces"/>
+            <set_value name="this.$sellspaces" exact="$params.$SellSpaces"/>
+            <set_value name="this.$shipIsIsolated" exact="$params.$ShipIsIsolated"/>
+            <set_value name="this.$escapeSector" exact="$params.$EscapeSector"/>
+            <set_value name="this.$currentSector" exact="$params.$CurrentSector"/>
+            <set_value name="this.$currentSectorIsBlacklisted" exact="$params.$CurrentSectorIsBlacklisted"/>
+            <set_value name="this.$escapeMaxRadius" exact="10"/>
+          </do_if>
+          <do_else>
+            <!-- INITIALIZATION: First signal - set up state -->
+            <set_value name="$ship" exact="$params.$Ship"/>
+            <set_value name="$homeSector" exact="$params.$HomeSector"/>
+            <set_value name="$maxDistance" exact="$params.$MaxDistance"/>
+            <set_value name="$blacklistgroup" exact="$params.$BlacklistGroup"/>
+            
+            <!-- Debug logging for initialization -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$homeSectorName" exact="@$homeSector.knownname"/>
+              <set_value name="$currentSectorName" exact="@$ship.sector.knownname"/>
+              <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: INITIALIZATION - Ship=' + $ship.idcode + ', HomeSector=' + (if $homeSectorName? then $homeSectorName else 'NULL') + ', CurrentSector=' + (if $currentSectorName? then $currentSectorName else 'NULL') + ', MaxDistance=' + $maxDistance" chance="10"/>
+            </do_if>
+            
+            <!-- Initialize state in cue instance variables (persists across delays) -->
+            <set_value name="this.$initialized" exact="true"/>
+            <set_value name="this.$buyspaces" exact="[]"/>
+            <set_value name="this.$sellspaces" exact="[]"/>
+            <set_value name="this.$shipIsIsolated" exact="false"/>
+            <set_value name="this.$escapeSector" exact="null"/>
+            <set_value name="this.$currentSector" exact="$ship.sector"/>
+            <set_value name="this.$currentSectorIsBlacklisted" exact="false"/>
+            <set_value name="this.$escapeSearchRadius" exact="0"/>
+            <set_value name="this.$escapeMaxRadius" exact="10"/>
+            <set_value name="this.$tradeSearchRadius" exact="0"/>
+            <set_value name="this.$phase" exact="'escape'"/>
+            <set_value name="this.$ship" exact="$ship"/>
+            <set_value name="this.$homeSector" exact="$homeSector"/>
+            <set_value name="this.$maxDistance" exact="$maxDistance"/>
+            <set_value name="this.$blacklistgroup" exact="$blacklistgroup"/>
+            
+            <!-- Check if current sector is blacklisted (for escape detection) -->
+            <do_if value="this.$currentSector? and $blacklistgroup?">
+              <run_actions ref="md.GT_Libraries_Blacklist.GT_IsSectorBlacklisted" result="this.$currentSectorIsBlacklisted">
+                <param name="sector" value="this.$currentSector"/>
+                <param name="ship" value="$ship"/>
+                <param name="blacklistgroup" value="$blacklistgroup"/>
+              </run_actions>
+            </do_if>
+            
+            <!-- Start with escape path search if current sector is blacklisted -->
+            <do_if value="this.$currentSectorIsBlacklisted">
+              <set_value name="this.$phase" exact="'escape'"/>
+              <set_value name="this.$escapeSearchRadius" exact="0"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Starting ESCAPE search (current sector blacklisted) - Ship=' + $ship.idcode" chance="10"/>
+              </do_if>
+            </do_if>
+            <do_else>
+              <!-- Skip escape search, go directly to trade search -->
+              <set_value name="this.$phase" exact="'trade'"/>
+              <set_value name="this.$tradeSearchRadius" exact="0"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Starting TRADE search (current sector not blacklisted) - Ship=' + $ship.idcode" chance="100"/>
+              </do_if>
+              
+              <!-- ISOLATION CHECK (CRITICAL):
+                   A ship can be in a non-blacklisted sector but still be effectively isolated if all directly connected sectors
+                   (including superhighway/cluster links) are blacklisted for this ship. In that case we must constrain trade search
+                   to the current sector only (otherwise home-centered radius search returns sectors the ship cannot reach). -->
+              <do_if value="this.$currentSector? and this.$blacklistgroup?">
+                <run_actions ref="md.GT_Libraries_Blacklist.GT_CheckConnectedSectorsBlacklisted" result="$isolationCheck">
+                  <param name="sector" value="this.$currentSector"/>
+                  <param name="ship" value="this.$ship"/>
+                  <param name="blacklistgroup" value="this.$blacklistgroup"/>
+                  <param name="returnDetails" value="false"/>
+                </run_actions>
+                <set_value name="$isolatedValue" exact="@$isolationCheck.$IsIsolated"/>
+                <do_if value="$isolatedValue? and ($isolatedValue == true or $isolatedValue == 1)">
+                  <set_value name="this.$shipIsIsolated" exact="true"/>
+                  <set_value name="this.$buyspaces" exact="[this.$currentSector]"/>
+                  <set_value name="this.$sellspaces" exact="[this.$currentSector]"/>
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Search] (' + this.$ship.idcode + ') 🔒 ISOLATED (current sector pocket): All connected sectors are blacklisted - using current sector only (' + (if @this.$currentSector.knownname then @this.$currentSector.knownname else 'NULL') + ')'" chance="100"/>
+                  </do_if>
+                  <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch_Complete" param="this"/>
+                  <cancel_cue cue="this"/>
+                </do_if>
+              </do_if>
+            </do_else>
+          </do_else>
+          </do_if>
+        
+        <!-- CONTINUATION: Process based on current phase -->
+        <!-- Escape Path Search Phase -->
+        <do_if value="this.$phase == 'escape'">
+          <!-- Check if escape path already found or max radius reached -->
+          <do_if value="this.$escapeSector? or this.$escapeSearchRadius gt this.$escapeMaxRadius">
+            <!-- Escape search complete - transition to trade search or mark as isolated -->
+            <do_if value="not this.$escapeSector?">
+              <!-- NO ESCAPE PATH FOUND: Mark ship as isolated (Phase 1: detection only) -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Search] (' + this.$ship.idcode + ') ⚠️ NO ESCAPE PATH FOUND: Ship in blacklisted sector, no valid escape route within range. Ship marked as isolated (Phase 1: detection only).'" chance="100"/>
+              </do_if>
+              <set_value name="this.$shipIsIsolated" exact="true"/>
+              <set_value name="this.$escapeSector" exact="null"/>
+              <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch_Complete" param="this"/>
+              <cancel_cue cue="this"/>
+            </do_if>
+            <do_else>
+              <!-- Escape path found - transition to trade search -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <set_value name="$escapeSectorName" exact="@this.$escapeSector.knownname"/>
+                <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: ESCAPE found, transitioning to TRADE search - Ship=' + this.$ship.idcode + ', EscapeSector=' + (if $escapeSectorName? then $escapeSectorName else 'NULL')" chance="10"/>
+              </do_if>
+              <set_value name="this.$phase" exact="'trade'"/>
+              <set_value name="this.$tradeSearchRadius" exact="0"/>
+              <!-- Continue to trade search processing below -->
+            </do_else>
+          </do_if>
+          <do_else>
+            <!-- Process current escape search radius -->
+            <run_actions ref="md.GT_Libraries_Pathfinding.GT_FindSectorsInRange" result="$escapeRadiusSectors">
+              <param name="refobject" value="this.$currentSector"/>
+              <param name="mingatedistance" value="this.$escapeSearchRadius"/>
+              <param name="maxgatedistance" value="this.$escapeSearchRadius"/>
+              <param name="ship" value="this.$ship"/>
+              <param name="blacklistgroup" value="this.$blacklistgroup"/>
+              <param name="applyblacklist" value="false"/>
+            </run_actions>
+            
+            <!-- Check for fallback vs legitimate sectors -->
+            <set_value name="$newSectorsFound" exact="false"/>
+            <set_value name="$onlyFallbackSector" exact="false"/>
+            <do_if value="(if $escapeRadiusSectors != null then $escapeRadiusSectors.count else 0) gt 0">
+              <!-- Radius 0: Current sector is expected, always process it -->
+              <do_if value="this.$escapeSearchRadius == 0">
+                <set_value name="$newSectorsFound" exact="true"/>
+              </do_if>
+              <do_else>
+                <!-- Radius > 0: Check if only current sector returned (fallback) -->
+                <set_value name="$onlyCurrentSector" exact="false"/>
+                <do_if value="$escapeRadiusSectors.count == 1">
+                  <do_if value="$escapeRadiusSectors.{1} == this.$currentSector">
+                    <set_value name="$onlyCurrentSector" exact="true"/>
+                  </do_if>
+                </do_if>
+                <do_if value="$onlyCurrentSector and this.$escapeSearchRadius gt 0">
+                  <set_value name="$onlyFallbackSector" exact="true"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$newSectorsFound" exact="true"/>
+                </do_else>
+              </do_else>
+            </do_if>
+            
+            <!-- Process sectors: Radius 0 always processes, radius > 0 processes if legitimate (not fallback) -->
+            <do_if value="$newSectorsFound">
+              <do_all exact="$escapeRadiusSectors.count" counter="$i">
+                <set_value name="$testSector" exact="$escapeRadiusSectors.{$i}"/>
+                <do_if value="$testSector?">
+                  <set_value name="$testSectorIsBlacklisted" exact="false"/>
+                  <set_value name="$testSectorInRange" exact="false"/>
+                  
+                  <!-- Check if sector is blacklisted -->
+                  <do_if value="$testSector? and this.$blacklistgroup?">
+                    <run_actions ref="md.GT_Libraries_Blacklist.GT_IsSectorBlacklisted" result="$testSectorIsBlacklisted">
+                      <param name="sector" value="$testSector"/>
+                      <param name="ship" value="this.$ship"/>
+                      <param name="blacklistgroup" value="this.$blacklistgroup"/>
+                    </run_actions>
+                  </do_if>
+                  
+                  <!-- Check if candidate sector is within jump distance from HOME sector -->
+                  <do_if value="not $testSectorIsBlacklisted and $testSector? and this.$homeSector?">
+                    <!-- Special case: home sector is the escape candidate (distance = 0) -->
+                    <do_if value="$testSector == this.$homeSector">
+                      <set_value name="$distanceFromHome" exact="0"/>
+                    </do_if>
+                    <do_else>
+                      <!-- Calculate distance from home sector to candidate sector -->
+                      <set_value name="$distanceFromHome" exact="this.$homeSector.gatedistance.{$testSector}"/>
+                    </do_else>
+                    <do_if value="$distanceFromHome ge 0 and $distanceFromHome le this.$maxDistance">
+                      <set_value name="$testSectorInRange" exact="true"/>
+                      <set_value name="$testSectorDistanceFromHome" exact="$distanceFromHome"/>
+                    </do_if>
+                  </do_if>
+                  
+                  <!-- First non-blacklisted sector found (within home sector range) = escape path -->
+                  <do_if value="not $testSectorIsBlacklisted and $testSectorInRange">
+                    <do_if value="not this.$escapeSector?">
+                      <!-- First candidate found -->
+                      <set_value name="this.$escapeSector" exact="$testSector"/>
+                    </do_if>
+                    <do_elseif value="$testSectorDistanceFromHome lt this.$homeSector.gatedistance.{this.$escapeSector}">
+                      <!-- New candidate is closer to home sector - prefer this one -->
+                      <set_value name="this.$escapeSector" exact="$testSector"/>
+                    </do_elseif>
+                  </do_if>
+                </do_if>
+              </do_all>
+              
+              <!-- If escape path found, transition to trade search -->
+              <do_if value="this.$escapeSector?">
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <set_value name="$escapeSectorName" exact="@this.$escapeSector.knownname"/>
+                  <debug_text text="'[GT-Search] (' + this.$ship.idcode + ') 🚀 ESCAPE PATH FOUND: ' + (if $escapeSectorName? then $escapeSectorName else 'UNKNOWN') + ' at radius ' + this.$escapeSearchRadius + ' from current position'" chance="100"/>
+                </do_if>
+                <!-- Escape path found - transition to trade search -->
+                <set_value name="this.$phase" exact="'trade'"/>
+                <set_value name="this.$tradeSearchRadius" exact="0"/>
+              </do_if>
+            </do_if>
+            
+            <!-- Early termination: Only fallback current sector returned = no new sectors found -->
+            <do_if value="$onlyFallbackSector">
+              <!-- Only current sector returned (fallback) means no new sectors at this radius -->
+              <!-- Further radii will also be empty, so stop searching -->
+              <set_value name="this.$shipIsIsolated" exact="true"/>
+              <set_value name="this.$escapeSector" exact="null"/>
+              
+              <!-- CONCURRENCY CONTROL: Decrement counter and process queue on completion -->
+              <do_if value="global.$GT_PathfindingQueue? and global.$GT_PathfindingQueue.$ActiveInstances?">
+                <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" operation="subtract"/>
+                <do_if value="global.$GT_PathfindingQueue.$ActiveShips?">
+                  <remove_from_list name="global.$GT_PathfindingQueue.$ActiveShips" exact="this.$ship"/>
+                </do_if>
+                <!-- Signal queue processor to process next item -->
+                <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.ProcessPathfindingQueue"/>
+              </do_if>
+              
+              <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch_Complete" param="this"/>
+              <cancel_cue cue="this"/>
+            </do_if>
+            
+            <!-- Increment radius for next iteration (if not found and not terminated) -->
+            <do_if value="not this.$escapeSector? and not $onlyFallbackSector">
+              <set_value name="this.$escapeSearchRadius" operation="add"/>
+            </do_if>
+          </do_else>
+        </do_if>
+        
+        <!-- Trade Search Phase -->
+        <do_if value="this.$phase == 'trade'">
+          <!-- Check if max radius reached -->
+          <do_if value="this.$tradeSearchRadius gt this.$maxDistance">
+            <!-- Trade search complete - signal completion -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: TRADE search COMPLETE (max radius reached) - Ship=' + this.$ship.idcode + ', BuySpaces=' + this.$buyspaces.count + ', SellSpaces=' + this.$sellspaces.count + ', FinalRadius=' + this.$tradeSearchRadius" chance="10"/>
+            </do_if>
+            
+            <!-- CONCURRENCY CONTROL: Decrement counter and process queue on completion -->
+            <do_if value="global.$GT_PathfindingQueue? and global.$GT_PathfindingQueue.$ActiveInstances?">
+              <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" operation="subtract"/>
+              <do_if value="global.$GT_PathfindingQueue.$ActiveShips?">
+                <remove_from_list name="global.$GT_PathfindingQueue.$ActiveShips" exact="this.$ship"/>
+              </do_if>
+              <!-- Signal queue processor to process next item -->
+              <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.ProcessPathfindingQueue"/>
+            </do_if>
+            
+            <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch_Complete" param="this"/>
+            <cancel_cue cue="this"/>
+          </do_if>
+          <do_else>
+            <!-- Process current trade search radius -->
+            <!-- IMPORTANT: Trade searches must be centered on HOME sector, not the ship's current sector.
+                 Otherwise ships far away from home (e.g. 5 jumps away, maxDistance=3 from home) will get EMPTY sector lists
+                 because we'd search around current position then filter by home distance. -->
+            <set_value name="$tradeRefSector" exact="this.$currentSector"/>
+            <do_if value="this.$homeSector?">
+              <set_value name="$tradeRefSector" exact="this.$homeSector"/>
+            </do_if>
+            <run_actions ref="md.GT_Libraries_Pathfinding.GT_FindSectorsInRange" result="$radiusSectors">
+              <param name="refobject" value="$tradeRefSector"/>
+              <param name="mingatedistance" value="this.$tradeSearchRadius"/>
+              <param name="maxgatedistance" value="this.$tradeSearchRadius"/>
+              <param name="ship" value="this.$ship"/>
+              <param name="blacklistgroup" value="this.$blacklistgroup"/>
+              <param name="applyblacklist" value="true"/>
+            </run_actions>
+            
+            <!-- Check for fallback vs legitimate sectors -->
+            <set_value name="$newSectorsFound" exact="false"/>
+            <set_value name="$onlyFallbackSector" exact="false"/>
+            <do_if value="(if $radiusSectors != null then $radiusSectors.count else 0) gt 0">
+              <!-- Radius 0: Current sector is expected, always process it -->
+              <do_if value="this.$tradeSearchRadius == 0">
+                <set_value name="$newSectorsFound" exact="true"/>
+              </do_if>
+              <do_else>
+                <!-- Radius > 0: Check if only current sector returned (fallback) -->
+                <set_value name="$onlyCurrentSector" exact="false"/>
+                <do_if value="$radiusSectors.count == 1">
+                  <do_if value="$radiusSectors.{1} == this.$currentSector">
+                    <set_value name="$onlyCurrentSector" exact="true"/>
+                  </do_if>
+                </do_if>
+                <do_if value="$onlyCurrentSector and this.$tradeSearchRadius gt 0">
+                  <set_value name="$onlyFallbackSector" exact="true"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$newSectorsFound" exact="true"/>
+                </do_else>
+              </do_else>
+            </do_if>
+            
+            <!-- ISOLATION DETECTION: If radius 1 returns only fallback current sector, ship is isolated -->
+            <do_if value="this.$tradeSearchRadius == 1 and $onlyFallbackSector">
+              <set_value name="this.$shipIsIsolated" exact="true"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Search] (' + this.$ship.idcode + ') 🔒 ISOLATED: Only fallback current sector returned at radius 1 (all connected sectors blacklisted or unreachable)'" chance="100"/>
+              </do_if>
+            </do_if>
+            
+            <!-- Process sectors: Radius 0 always processes, radius > 0 processes if legitimate (not fallback) -->
+            <do_if value="$newSectorsFound">
+              <!-- Debug logging for sector collection -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Processing TRADE radius ' + this.$tradeSearchRadius + ' - Found ' + $radiusSectors.count + ' sectors - Ship=' + this.$ship.idcode" chance="10"/>
+              </do_if>
+              <!-- Collect sectors at this radius for downstream processing -->
+              <do_all exact="$radiusSectors.count" counter="$i">
+                <set_value name="$sectorToAdd" exact="$radiusSectors.{$i}"/>
+                <do_if value="@$sectorToAdd.exists">
+                  <!-- CRITICAL: Validate sector is within maxDistance from HOME SECTOR -->
+                  <set_value name="$sectorDistanceFromHome" exact="-1"/>
+                  <do_if value="@this.$homeSector.exists">
+                    <!-- Special case: sector is home sector (distance = 0) -->
+                    <do_if value="$sectorToAdd == this.$homeSector">
+                      <set_value name="$sectorDistanceFromHome" exact="0"/>
+                    </do_if>
+                    <do_else>
+                      <!-- Calculate distance from home sector to candidate sector -->
+                      <set_value name="$sectorDistanceFromHome" exact="this.$homeSector.gatedistance.{$sectorToAdd}"/>
+                    </do_else>
+                  </do_if>
+                  
+                  <!-- Only add sector if it's within maxDistance from home sector -->
+                  <do_if value="$sectorDistanceFromHome ge 0 and $sectorDistanceFromHome le this.$maxDistance">
+                    <!-- Add to buy spaces list -->
+                    <append_to_list name="this.$buyspaces" exact="$sectorToAdd"/>
+                    <!-- Add to sell spaces list -->
+                    <append_to_list name="this.$sellspaces" exact="$sectorToAdd"/>
+                  </do_if>
+                </do_if>
+              </do_all>
+            </do_if>
+            
+            <!-- Early termination: Only fallback current sector returned = no new sectors found -->
+            <do_if value="$onlyFallbackSector">
+              <!-- Only current sector returned (fallback) means no new sectors at this radius -->
+              <!-- Further radii will also be empty, so stop searching -->
+              
+              <!-- CONCURRENCY CONTROL: Decrement counter and process queue on completion -->
+              <do_if value="global.$GT_PathfindingQueue? and global.$GT_PathfindingQueue.$ActiveInstances?">
+                <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" operation="subtract"/>
+                <do_if value="global.$GT_PathfindingQueue.$ActiveShips?">
+                  <remove_from_list name="global.$GT_PathfindingQueue.$ActiveShips" exact="this.$ship"/>
+                </do_if>
+                <!-- Signal queue processor to process next item -->
+                <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.ProcessPathfindingQueue"/>
+              </do_if>
+              
+              <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch_Complete" param="this"/>
+              <cancel_cue cue="this"/>
+            </do_if>
+            
+            <!-- CRITICAL FIX: Check BEFORE incrementing to determine if we should signal next iteration -->
+            <!-- We need to signal when current radius <= maxDistance so next iteration can check completion -->
+            <do_if value="not $onlyFallbackSector">
+              <!-- Check if we should continue (before incrementing) -->
+              <set_value name="$shouldContinue" exact="this.$tradeSearchRadius le this.$maxDistance"/>
+              
+              <!-- Increment radius for next iteration -->
+              <set_value name="this.$tradeSearchRadius" operation="add"/>
+              
+              <!-- Signal next iteration if we should continue -->
+              <do_if value="$shouldContinue">
+                <!-- Debug logging for recursive signaling -->
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Signaling next TRADE iteration - Ship=' + this.$ship.idcode + ', NextRadius=' + this.$tradeSearchRadius + ', BuySpaces=' + this.$buyspaces.count + ', SellSpaces=' + this.$sellspaces.count" chance="10"/>
+                </do_if>
+                <!-- Signal new instance for next radius iteration with current state -->
+                <!-- Note: Continuation batches signal directly (don't go through queue) -->
+                <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch" param="table[
+                  $Ship = this.$ship,
+                  $HomeSector = this.$homeSector,
+                  $MaxDistance = this.$maxDistance,
+                  $BlacklistGroup = this.$blacklistgroup,
+                  $IsContinuation = true,
+                  $Phase = this.$phase,
+                  $EscapeSearchRadius = this.$escapeSearchRadius,
+                  $TradeSearchRadius = this.$tradeSearchRadius,
+                  $BuySpaces = this.$buyspaces,
+                  $SellSpaces = this.$sellspaces,
+                  $ShipIsIsolated = this.$shipIsIsolated,
+                  $EscapeSector = this.$escapeSector,
+                  $CurrentSector = this.$currentSector,
+                  $CurrentSectorIsBlacklisted = this.$currentSectorIsBlacklisted
+                ]"/>
+              </do_if>
+            </do_if>
+          </do_else>
+        </do_if>
+        
+        <!-- CPU YIELDING: Signal new instance for next iteration (ESCAPE phase) -->
+        <!-- Only signal if we haven't completed (not cancelled) -->
+        <!-- Note: Delay happens at cue level (before actions), so each recursive signal gets delayed -->
+        <!-- Pass current state via params so new instance can restore it -->
+        <do_if value="this.$phase == 'escape' and not this.$escapeSector? and this.$escapeSearchRadius le this.$escapeMaxRadius">
+          <!-- Debug logging for recursive signaling -->
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch: Signaling next ESCAPE iteration - Ship=' + this.$ship.idcode + ', NextRadius=' + (this.$escapeSearchRadius + 1)" chance="10"/>
+          </do_if>
+          <!-- Signal new instance for next radius iteration with current state -->
+          <signal_cue_instantly cue="md.GT_Libraries_Pathfinding.GT_IncrementalRadiusSearch" param="table[
+            $Ship = this.$ship,
+            $HomeSector = this.$homeSector,
+            $MaxDistance = this.$maxDistance,
+            $BlacklistGroup = this.$blacklistgroup,
+            $IsContinuation = true,
+            $Phase = this.$phase,
+            $EscapeSearchRadius = this.$escapeSearchRadius,
+            $TradeSearchRadius = this.$tradeSearchRadius,
+            $BuySpaces = this.$buyspaces,
+            $SellSpaces = this.$sellspaces,
+            $ShipIsIsolated = this.$shipIsIsolated,
+            $EscapeSector = this.$escapeSector,
+            $CurrentSector = this.$currentSector,
+            $CurrentSectorIsBlacklisted = this.$currentSectorIsBlacklisted
+          ]"/>
+        </do_if>
+        </do_if>
+      </actions>
+    </cue>
+    
+    <!-- Completion Handler -->
+    <cue name="GT_IncrementalRadiusSearch_Complete" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <!-- Extract state from signaled cue instance -->
+        <set_value name="$searchInstance" exact="event.param"/>
+        
+        <!-- Debug logging -->
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <set_value name="$debugShip" exact="@$searchInstance.$ship"/>
+          <set_value name="$debugBuySpacesCount" exact="0"/>
+          <set_value name="$debugSellSpacesCount" exact="0"/>
+          <set_value name="$debugBuySpacesCount" exact="if @$searchInstance.$buyspaces != null then @$searchInstance.$buyspaces.count else 0"/>
+          <set_value name="$debugSellSpacesCount" exact="if @$searchInstance.$sellspaces != null then @$searchInstance.$sellspaces.count else 0"/>
+          <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch_Complete: Ship=' + (if $debugShip != null then @$debugShip.idcode else 'NULL') + ', BuySpaces=' + $debugBuySpacesCount + ', SellSpaces=' + $debugSellSpacesCount + ', Isolated=' + $searchInstance.$shipIsIsolated" chance="10"/>
+        </do_if>
+        
+        <!-- Build result table (matches GT_BuildTradeSectorLists format for drop-in replacement) -->
+        <set_value name="$result" exact="table[]"/>
+        <set_value name="$result.$Ship" exact="$searchInstance.$ship"/>
+        <set_value name="$result.$BuySpaces" exact="$searchInstance.$buyspaces"/>
+        <set_value name="$result.$SellSpaces" exact="$searchInstance.$sellspaces"/>
+        <set_value name="$result.$ShipIsIsolated" exact="$searchInstance.$shipIsIsolated"/>
+        <set_value name="$result.$EscapeSector" exact="$searchInstance.$escapeSector"/>
+        
+        <!-- CRITICAL FIX: Check if ship still has GT order before signaling resume -->
+        <set_value name="$ship" exact="$searchInstance.$ship"/>
+        <set_value name="$hasGTOrder" exact="false"/>
+        <do_if value="$ship.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.defaultorder.id})">
+          <set_value name="$hasGTOrder" exact="true"/>
+        </do_if>
+        <do_else>
+          <!-- Check if subordinate to GT commander -->
+          <do_if value="$ship.commander? and $ship.commander.exists and $ship.commander != $ship">
+            <do_if value="$ship.commander.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.commander.defaultorder.id})">
+              <set_value name="$hasGTOrder" exact="true"/>
+            </do_if>
+          </do_if>
+        </do_else>
+        
+        <!-- Only signal resume if ship still has GT order -->
+        <do_if value="not $hasGTOrder">
+          <!-- Clean up from active ships list -->
+          <do_if value="global.$GT_PathfindingQueue? and global.$GT_PathfindingQueue.$ActiveShips?">
+            <do_all exact="global.$GT_PathfindingQueue.$ActiveShips.count" counter="$i" reverse="true">
+              <do_if value="global.$GT_PathfindingQueue.$ActiveShips.{$i} == $ship">
+                <remove_from_list name="global.$GT_PathfindingQueue.$ActiveShips" exact="$ship"/>
+                <do_if value="global.$GT_PathfindingQueue.$ActiveInstances? and global.$GT_PathfindingQueue.$ActiveInstances gt 0">
+                  <set_value name="global.$GT_PathfindingQueue.$ActiveInstances" operation="subtract"/>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Search] GT_IncrementalRadiusSearch_Complete: Ship ' + $ship.idcode + ' no longer has GT order - cancelling completion signal'" chance="10"/>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_if>
+        <do_else>
+          <!-- Legacy SearchLiveTrades resume path removed; fail fast for any stale caller. -->
+          <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'legacy_pathfinding_resume_removed'" delay="1ms"/>
+        </do_else>
+      </actions>
+    </cue>
+    
+  </cues>
+</mdscript>

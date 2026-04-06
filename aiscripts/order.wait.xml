@@ -1,0 +1,209 @@
+<?xml version="1.0" encoding="utf-8"?>
+<diff>
+  <!-- GalaxyTrader MK3: Detect GT order removal when Hold Position is assigned -->
+  <!-- When GT order is removed, X4 assigns Hold Position (Wait order) as default order -->
+  <!-- This patch detects when Hold Position is assigned to a ship that previously had a GT order -->
+  
+  <!-- PHASE 7: Add GT order detection in init block -->
+  <!-- Add detection logic at the start of init block (after set_command) -->
+  <add sel="//aiscript[@name='order.wait']/init/set_command_action[@commandaction='commandaction.standingby']" pos="after">
+    
+    <!-- PHASE 7: Detect GT order removal when Hold Position is assigned -->
+    <!-- When GT order is removed, X4 assigns Hold Position as default order -->
+    <!-- Check if this ship was previously registered with GT order -->
+    <do_if value="global.$GT_Ship_State? and global.$GT_Ship_State.{this.assignedcontrolled}?">
+      <set_value name="$state" exact="global.$GT_Ship_State.{this.assignedcontrolled}"/>
+      
+      <!-- Unified GT order status check (inline for AI scripts) -->
+      <set_value name="$currentDefaultOrder" exact="@this.assignedcontrolled.defaultorder.id"/>
+      <set_value name="$hasDirectGTOrder" exact="false"/>
+      <set_value name="$hasGTCommander" exact="false"/>
+      <set_value name="$commanderExists" exact="false"/>
+      <set_value name="$isGTControlled" exact="false"/>
+      <set_value name="$shouldCleanup" exact="false"/>
+      <set_value name="$shouldRestoreName" exact="false"/>
+      
+      <!-- Check direct GT order (including MK4 and Assist baseorder variants) -->
+      <do_if value="$currentDefaultOrder == 'GalaxyTraderMK4Supply' or $currentDefaultOrder == 'GalaxyTraderMK3' or $currentDefaultOrder == 'GalaxyTraderMK2' or $currentDefaultOrder == 'GalaxyTraderMK1' or $currentDefaultOrder == 'GalaxyMiner'">
+        <set_value name="$hasDirectGTOrder" exact="true"/>
+        <set_value name="$isGTControlled" exact="true"/>
+      </do_if>
+      <do_elseif value="$currentDefaultOrder == 'Assist' and this.assignedcontrolled.defaultorder? and this.assignedcontrolled.defaultorder.$baseorder? and (@this.assignedcontrolled.defaultorder.$baseorder.id == 'GalaxyTraderMK4Supply' or @this.assignedcontrolled.defaultorder.$baseorder.id == 'GalaxyTraderMK3' or @this.assignedcontrolled.defaultorder.$baseorder.id == 'GalaxyTraderMK2' or @this.assignedcontrolled.defaultorder.$baseorder.id == 'GalaxyTraderMK1' or @this.assignedcontrolled.defaultorder.$baseorder.id == 'GalaxyMiner')">
+        <set_value name="$hasDirectGTOrder" exact="true"/>
+        <set_value name="$isGTControlled" exact="true"/>
+      </do_elseif>
+      
+      <!-- Check commander status -->
+      <do_if value="not $hasDirectGTOrder and this.assignedcontrolled.commander? and this.assignedcontrolled.commander.exists and this.assignedcontrolled.commander != this.assignedcontrolled">
+        <set_value name="$commanderExists" exact="true"/>
+        <do_if value="this.assignedcontrolled.commander.defaultorder? and (@this.assignedcontrolled.commander.defaultorder.id == 'GalaxyTraderMK4Supply' or @this.assignedcontrolled.commander.defaultorder.id == 'GalaxyTraderMK3' or @this.assignedcontrolled.commander.defaultorder.id == 'GalaxyTraderMK2' or @this.assignedcontrolled.commander.defaultorder.id == 'GalaxyTraderMK1' or @this.assignedcontrolled.commander.defaultorder.id == 'GalaxyMiner')">
+          <set_value name="$hasGTCommander" exact="true"/>
+          <do_if value="$currentDefaultOrder == 'Assist'">
+            <set_value name="$isGTControlled" exact="true"/>
+          </do_if>
+        </do_if>
+        <do_elseif value="this.assignedcontrolled.commander.defaultorder? and @this.assignedcontrolled.commander.defaultorder.id == 'Assist' and this.assignedcontrolled.commander.defaultorder.$baseorder? and (@this.assignedcontrolled.commander.defaultorder.$baseorder.id == 'GalaxyTraderMK4Supply' or @this.assignedcontrolled.commander.defaultorder.$baseorder.id == 'GalaxyTraderMK3' or @this.assignedcontrolled.commander.defaultorder.$baseorder.id == 'GalaxyTraderMK2' or @this.assignedcontrolled.commander.defaultorder.$baseorder.id == 'GalaxyTraderMK1' or @this.assignedcontrolled.commander.defaultorder.$baseorder.id == 'GalaxyMiner')">
+          <set_value name="$hasGTCommander" exact="true"/>
+          <do_if value="$currentDefaultOrder == 'Assist'">
+            <set_value name="$isGTControlled" exact="true"/>
+          </do_if>
+        </do_elseif>
+      </do_if>
+      
+      <!-- Check if ship was GT-controlled (in registry or state says so) -->
+      <set_value name="$wasGTControlled" exact="false"/>
+      <do_if value="(global.$GT_Ships? and global.$GT_Ships.{this.assignedcontrolled}?) or ($state.$HasGTOrder? and $state.$HasGTOrder)">
+        <set_value name="$wasGTControlled" exact="true"/>
+      </do_if>
+      
+      <!-- Determine if cleanup needed -->
+      <do_if value="$wasGTControlled and not $isGTControlled">
+        <set_value name="$shouldCleanup" exact="true"/>
+        <do_if value="not $hasDirectGTOrder and not $hasGTCommander and this.assignedcontrolled.pilot?">
+          <set_value name="$shouldRestoreName" exact="true"/>
+        </do_if>
+      </do_if>
+      
+      <!-- Check for cancellation using the unified "was vs is" outcome.
+           This avoids missing cleanup when state flag exists but is false (e.g. stateHasGT=0 while still in registry). -->
+      <set_value name="$shouldCheckCleanup" exact="false"/>
+      <do_if value="$wasGTControlled and not $isGTControlled">
+        <set_value name="$shouldCheckCleanup" exact="true"/>
+      </do_if>
+      
+      <do_if value="$shouldCheckCleanup">
+        <!-- CRITICAL: Check if ship has Assist order with GT commander (subordinate indicator) -->
+        <!-- If default order is Assist and commander has GT, ship is still GT-controlled -->
+        <do_if value="$currentDefaultOrder == 'Assist' and $hasGTCommander">
+          <!-- Ship is subordinate with Assist order - still GT-controlled, don't cleanup -->
+        </do_if>
+        <do_elseif value="$shouldCleanup">
+          <!-- FIX: Prevent duplicate signals - only send if we haven't already sent cancellation recently -->
+          <!-- Check if cancellation signal was already sent recently (within last 10 seconds) -->
+          <set_value name="$lastCancellationTime" exact="0"/>
+          <do_if value="$state.$LastCancellationSignalTime?">
+            <set_value name="$lastCancellationTime" exact="@$state.$LastCancellationSignalTime"/>
+          </do_if>
+          
+          <set_value name="$timeSinceLastCancellation" exact="player.age - $lastCancellationTime"/>
+          <do_if value="$timeSinceLastCancellation gt 10s or $lastCancellationTime == 0">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-State] Phase 7: ' + this.assignedcontrolled.idcode + ' - GT order removed (detected in Hold Position order, new default order: ' + (if $currentDefaultOrder then $currentDefaultOrder else 'NONE') + ')'" chance="100"/>
+            </do_if>
+            
+            <!-- Update state to reflect GT order cancellation -->
+            <set_value name="$state.$HasGTOrder" exact="false"/>
+            <set_value name="$state.$OperationalState" exact="'orphaned'"/>
+            <set_value name="$state.$ActiveTradeOrders" exact="0"/>
+            
+            <!-- Determine subordinate state from unified check -->
+            <do_if value="$commanderExists">
+              <set_value name="$state.$Commander" exact="this.assignedcontrolled.commander"/>
+              <set_value name="$state.$CommanderHasGT" exact="$hasGTCommander"/>
+              
+              <do_if value="$hasGTCommander">
+                <set_value name="$state.$SubordinateState" exact="'subordinate'"/>
+              </do_if>
+              <do_else>
+                <set_value name="$state.$SubordinateState" exact="'orphaned'"/>
+              </do_else>
+            </do_if>
+            <do_else>
+              <set_value name="$state.$Commander" exact="null"/>
+              <set_value name="$state.$CommanderHasGT" exact="false"/>
+              <set_value name="$state.$SubordinateState" exact="'orphaned'"/>
+            </do_else>
+            
+            <set_value name="$state.$LastStateUpdate" exact="player.age"/>
+            <set_value name="$state.$LastCancellationSignalTime" exact="player.age"/>
+            <set_value name="$cleanupTraceId" exact="this.assignedcontrolled.idcode + '|WAIT_INIT|' + (player.age / 1s)i"/>
+            <!-- Detach intent latch: commander/default order state can be stale for a few seconds. -->
+            <do_if value="not global.$GT_CleanupIntent?">
+              <set_value name="global.$GT_CleanupIntent" exact="table[]"/>
+            </do_if>
+            <set_value name="global.$GT_CleanupIntent.{this.assignedcontrolled}" exact="table[
+              $Active = true,
+              $StartTime = player.age,
+              $ExpireTime = player.age + 8s,
+              $Source = 'WAIT_INIT',
+              $TraceId = $cleanupTraceId,
+              $DefaultOrderAtSignal = $currentDefaultOrder,
+              $CommanderAtSignal = if $commanderExists and this.assignedcontrolled.commander? and this.assignedcontrolled.commander.exists then this.assignedcontrolled.commander.idcode else 'NONE'
+            ]"/>
+            
+            <!-- MOD REMOVAL: Send GT_Ship_State_Update signal for mod removal system -->
+            <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+              $Ship = this.assignedcontrolled,
+              $UpdateType = 'GT_Order_Cancelled',
+              $Source = 'WAIT_INIT',
+              $TraceId = $cleanupTraceId
+            ]"/>
+            
+            <!-- EVENT-DRIVEN: Always trigger orphaned ship check.
+                 CheckShipOrphaned handles registry membership internally. -->
+            <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[
+              $Ship = this.assignedcontrolled,
+              $Source = 'WAIT_INIT',
+              $TraceId = $cleanupTraceId
+            ]"/>
+            <!-- Also schedule delayed verification from WAIT_INIT in case commander/default order is still transitional. -->
+            <signal_objects object="player.galaxy" param="'GT_Delayed_Verification'" param2="table[
+              $Ship = this.assignedcontrolled,
+              $CheckTime = player.age,
+              $Source = 'WAIT_INIT',
+              $TraceId = $cleanupTraceId
+            ]"/>
+            
+            <!-- EVENT-DRIVEN: Also check if this ship has subordinates that might need checking -->
+            <!-- When a commander loses GT order, subordinates will detect it via their own checks -->
+            <!-- But we also check commander here in case it lost GT order -->
+            
+            <!-- NAME RESTORATION: Inline name restoration (AI scripts can't call MD library functions) -->
+            <do_if value="$shouldRestoreName">
+              <set_value name="$originalName" exact="null"/>
+              <do_if value="$state.$OriginalShipName?">
+                <set_value name="$originalName" exact="$state.$OriginalShipName"/>
+              </do_if>
+              <do_elseif value="global.$GT_Pilots? and global.$GT_Pilots.{this.assignedcontrolled.pilot}? and global.$GT_Pilots.{this.assignedcontrolled.pilot}.$OriginalShipName?">
+                <set_value name="$originalName" exact="global.$GT_Pilots.{this.assignedcontrolled.pilot}.$OriginalShipName"/>
+              </do_elseif>
+              
+              <do_if value="$originalName">
+                <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+                  $Ship = this.assignedcontrolled,
+                  $Pilot = this.assignedcontrolled.pilot,
+                  $Reason = 'GT order removed - restoring original name',
+                  $OriginalName = $originalName,
+                  $Source = 'WAIT_INIT',
+                  $TraceId = $cleanupTraceId
+                ]"/>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-CleanupTrace] trace=' + $cleanupTraceId + ' source=WAIT_INIT cue=order.wait ship=' + this.assignedcontrolled.idcode + ' action=SIGNAL_ABORT_RESTORE_NAME'" chance="100"/>
+                  <debug_text text="'[GT-State] Phase 7: Name restoration signal sent for ' + this.assignedcontrolled.idcode" chance="100"/>
+                </do_if>
+              </do_if>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- Duplicate guard blocks repeated cancellation state updates, but verification must still run. -->
+            <set_value name="$cleanupTraceId" exact="this.assignedcontrolled.idcode + '|WAIT_INIT_DUP|' + (player.age / 1s)i"/>
+            <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[
+              $Ship = this.assignedcontrolled,
+              $Source = 'WAIT_INIT_DUP',
+              $TraceId = $cleanupTraceId
+            ]"/>
+            <signal_objects object="player.galaxy" param="'GT_Delayed_Verification'" param2="table[
+              $Ship = this.assignedcontrolled,
+              $CheckTime = player.age,
+              $Source = 'WAIT_INIT_DUP',
+              $TraceId = $cleanupTraceId
+            ]"/>
+          </do_else>
+        </do_elseif>
+        <do_else>
+        </do_else>
+      </do_if>
+    </do_if>
+    
+  </add>
+</diff>

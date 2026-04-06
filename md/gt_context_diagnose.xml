@@ -1,0 +1,2871 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_Context_Diagnose" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../ORIGINAL_MODS_DO NOT_MODIFY/X4 Foundations/libraries/md.xsd">
+  <cues>
+    <!-- ============================================================ -->
+    <!-- GT DIAGNOSE — Context Menu Integration                        -->
+    <!-- Registers "GT Diagnose" on player ships with GT order.       -->
+    <!-- When clicked, runs an exhaustive diagnostic and sends the    -->
+    <!-- result to Lua for display in a scrollable report.            -->
+    <!-- ============================================================ -->
+
+    <!-- Register custom action group "GalaxyTrader" in the interact menu -->
+    <!-- This creates a separate section for all GT actions, keeping them out of vanilla -->
+    <cue name="RegisterGTActionGroup" instantiate="true">
+      <conditions>
+        <event_ui_triggered screen="'Interact_Menu_API'" control="'reloaded'"/>
+      </conditions>
+      <actions>
+        <raise_lua_event name="'Interact_Menu_API.Add_Custom_Actions_Group_Id'" param="'gt_actions'"/>
+        <raise_lua_event name="'Interact_Menu_API.Add_Custom_Actions_Group_Text'" param="'GalaxyTrader'"/>
+      </actions>
+    </cue>
+
+    <!-- Register "GT Diagnose" in the interact menu -->
+    <cue name="AddDiagnoseAction" instantiate="true">
+      <conditions>
+        <event_cue_signalled cue="md.Interact_Menu_API.Get_Actions"/>
+      </conditions>
+      <actions>
+        <set_value name="$target" exact="event.param.$object"/>
+        <!-- Only for player-owned ships with GT order -->
+        <do_if value="$target.isclass.{class.ship} and $target.isplayerowned">
+          <!-- Check if this ship has GT order -->
+          <set_value name="$hasGTOrder" exact="false"/>
+          <do_if value="global.$GT_ProtectedOrderIDs? and $target.defaultorder? and global.$GT_ProtectedOrderIDs.indexof.{@$target.defaultorder.id}">
+            <set_value name="$hasGTOrder" exact="true"/>
+          </do_if>
+          <do_elseif value="$target.commander? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$target.commander.defaultorder.id})">
+            <set_value name="$hasGTOrder" exact="true"/>
+          </do_elseif>
+          
+          <do_if value="$hasGTOrder">
+            <signal_cue_instantly
+              cue="md.Interact_Menu_API.Add_Action"
+              param="table[
+                $id         = 'gt_mk3_diagnose',
+                $text       = 'GT Diagnose',
+                $section    = 'gt_actions',
+                $callback   = GT_DiagnoseAction,
+              ]"/>
+
+            <!-- Add Redistribute Pilots action for GT fleet commanders -->
+            <do_if value="$target.allsubordinates? and @$target.allsubordinates.count gt 0 and $target.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$target.defaultorder.id})">
+              <signal_cue_instantly
+                cue="md.Interact_Menu_API.Add_Action"
+                param="table[
+                  $id         = 'gt_mk3_redistribute_pilots',
+                  $text       = 'Redistribute Pilots',
+                  $section    = 'gt_actions',
+                  $callback   = GT_RedistributePilotsAction,
+                ]"/>
+            </do_if>
+
+            <!-- Add Promote action for GT subordinates -->
+            <do_if value="$target.commander? and $target.commander.exists and $target.commander != $target">
+              <set_value name="$isGTSubordinate" exact="false"/>
+              <do_if value="$target.defaultorder? and @$target.defaultorder.id == 'Assist' and $target.commander.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$target.commander.defaultorder.id})">
+                <set_value name="$isGTSubordinate" exact="true"/>
+              </do_if>
+              <do_elseif value="global.$GT_Ships? and global.$GT_Ships.{$target}? and global.$GT_Ships.{$target.commander}? and $target.commander.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$target.commander.defaultorder.id})">
+                <set_value name="$isGTSubordinate" exact="true"/>
+              </do_elseif>
+
+              <do_if value="$isGTSubordinate">
+                <signal_cue_instantly
+                  cue="md.Interact_Menu_API.Add_Action"
+                  param="table[
+                    $id         = 'gt_mk3_promote_subordinate',
+                    $text       = 'Promote',
+                    $section    = 'gt_actions',
+                    $callback   = GT_PromoteSubordinateAction,
+                  ]"/>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- Handle fleet pilot redistribution request from commander context menu -->
+    <cue name="GT_RedistributePilotsAction" instantiate="true" namespace="this">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$commander" exact="event.param.$object"/>
+        <set_value name="$canRun" exact="true"/>
+        <do_if value="not $commander? or not $commander.exists or not $commander.allsubordinates? or @$commander.allsubordinates.count lt 1">
+          <show_notification text="'[GT] Redistribute Pilots unavailable: no eligible subordinates found.'" timeout="5s" priority="6"/>
+          <set_value name="$canRun" exact="false"/>
+        </do_if>
+
+        <do_if value="$canRun">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT Redistribute] Requested for commander ' + $commander.idcode + ' with ' + @$commander.allsubordinates.count + ' subordinates'" chance="100"/>
+          </do_if>
+
+          <raise_lua_event name="'gt.redistributePilots'" param="$commander"/>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- Receive lightweight miner diagnostics snapshots from GalaxyMiner AI -->
+    <cue name="HandleMinerDiagUpdate" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_Miner_Diag_Update'"/>
+      </conditions>
+      <actions>
+        <set_value name="$diagData" exact="event.param2"/>
+        <do_if value="$diagData? and $diagData.$Ship?">
+          <do_if value="not global.$GT_MinerDiag?">
+            <set_value name="global.$GT_MinerDiag" exact="table[]"/>
+          </do_if>
+          <set_value name="global.$GT_MinerDiag.{$diagData.$Ship}" exact="$diagData"/>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- Handle when user clicks "GT Diagnose" -->
+    <cue name="GT_DiagnoseAction" instantiate="true" namespace="this">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$ship" exact="event.param.$object"/>
+        <debug_text text="'[GT Diagnose] === DIAGNOSTIC STARTED for ship ' + $ship.idcode + ' ==='" chance="100"/>
+
+        <!-- Notify player that diagnosis is running -->
+        <show_notification text="'GT Diagnose: Generating report for ' + $ship.knownname + '...'" timeout="5s"/>
+
+        <!-- ======================================================== -->
+        <!-- SECTION 1: Ship State Summary                            -->
+        <!-- ======================================================== -->
+        <set_value name="$report" exact="table[]"/>
+        <set_value name="$report.$Timestamp" exact="player.age"/>
+        <set_value name="$report.$ShipId" exact="$ship.idcode"/>
+        <set_value name="$report.$ShipName" exact="$ship.knownname"/>
+        <set_value name="$report.$Sections" exact="[]"/>
+
+        <set_value name="$sec1" exact="table[]"/>
+        <set_value name="$sec1.$Name" exact="'Ship State'"/>
+        <set_value name="$sec1.$Rows" exact="[]"/>
+
+        <!-- Ship basics -->
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Ship ID', $Status = 'INFO', $Detail = $ship.idcode]"/>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Ship Name', $Status = 'INFO', $Detail = $ship.knownname]"/>
+        
+        <!-- Pilot -->
+        <set_value name="$pilotName" exact="'No Pilot'"/>
+        <set_value name="$skillLevel" exact="1"/>
+        <do_if value="$ship.pilot?">
+          <set_value name="$pilotName" exact="$ship.pilot.name"/>
+          <do_if value="global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$Level?">
+            <set_value name="$skillLevel" exact="global.$GT_Pilots.{$ship.pilot}.$Level"/>
+          </do_if>
+          <do_else>
+            <do_if value="$ship.pilot.skill.management?">
+              <set_value name="$skillLevel" exact="$ship.pilot.skill.management"/>
+            </do_if>
+          </do_else>
+        </do_if>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Pilot', $Status = 'INFO', $Detail = $pilotName]"/>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Skill Level', $Status = 'INFO', $Detail = '' + $skillLevel]"/>
+
+        <!-- GT Order -->
+        <set_value name="$orderStatus" exact="'MISSING'"/>
+        <set_value name="$orderResult" exact="'FAIL'"/>
+        <do_if value="global.$GT_ProtectedOrderIDs? and $ship.defaultorder? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.defaultorder.id}">
+          <set_value name="$orderStatus" exact="'Active (direct)'"/>
+          <set_value name="$orderResult" exact="'PASS'"/>
+        </do_if>
+        <do_elseif value="$ship.commander? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.commander.defaultorder.id})">
+          <set_value name="$orderStatus" exact="'Active (via commander ' + $ship.commander.knownname + ')'"/>
+          <set_value name="$orderResult" exact="'PASS'"/>
+        </do_elseif>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'GT Order', $Status = $orderResult, $Detail = $orderStatus]"/>
+
+        <!-- MK3/MK4 Custom Faction Blacklist (commander + subordinate inheritance) -->
+        <set_value name="$mk3BlacklistApplies" exact="false"/>
+        <set_value name="$mk3BlacklistOwner" exact="null"/>
+        <set_value name="$mk3BlacklistOwnerDetail" exact="'N/A (MK3/MK4 only)'"/>
+        <do_if value="$ship.defaultorder? and (@$ship.defaultorder.id == 'GalaxyTraderMK3' or @$ship.defaultorder.id == 'GalaxyTraderMK4Supply')">
+          <set_value name="$mk3BlacklistApplies" exact="true"/>
+          <set_value name="$mk3BlacklistOwner" exact="$ship"/>
+          <set_value name="$mk3BlacklistOwnerDetail" exact="'Self (' + $ship.idcode + ')'"/>
+        </do_if>
+        <do_elseif value="$ship.commander? and $ship.commander.exists and $ship.commander.defaultorder? and (@$ship.commander.defaultorder.id == 'GalaxyTraderMK3' or @$ship.commander.defaultorder.id == 'GalaxyTraderMK4Supply')">
+          <set_value name="$mk3BlacklistApplies" exact="true"/>
+          <set_value name="$mk3BlacklistOwner" exact="$ship.commander"/>
+          <set_value name="$mk3BlacklistOwnerDetail" exact="'Commander ' + $ship.commander.idcode"/>
+        </do_elseif>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Custom Blacklist Owner', $Status = if $mk3BlacklistApplies then 'INFO' else 'WARN', $Detail = $mk3BlacklistOwnerDetail]"/>
+
+        <set_value name="$mk3BlockedCount" exact="0"/>
+        <set_value name="$mk3BlacklistActive" exact="false"/>
+        <set_value name="$mk3BlockedListText" exact="''"/>
+        <do_if value="$mk3BlacklistApplies and $mk3BlacklistOwner? and global.$GT_MK3FactionBlacklist? and global.$GT_MK3FactionBlacklist.$ShipSelections? and global.$GT_MK3FactionBlacklist.$ShipSelections.{$mk3BlacklistOwner}?">
+          <set_value name="$mk3BlockedFactions" exact="global.$GT_MK3FactionBlacklist.$ShipSelections.{$mk3BlacklistOwner}.keys.list"/>
+          <set_value name="$mk3BlockedCount" exact="$mk3BlockedFactions.count"/>
+          <set_value name="$mk3BlacklistActive" exact="$mk3BlockedCount gt 0"/>
+          <do_if value="$mk3BlockedCount gt 0">
+            <do_all exact="$mk3BlockedFactions.count" counter="$fbli">
+              <set_value name="$bf" exact="$mk3BlockedFactions.{$fbli}"/>
+              <set_value name="$bfName" exact="if $bf? and $bf.name? and $bf.name != '' then $bf.name else 'Unknown Faction'"/>
+              <set_value name="$bfShort" exact="if $bf? and $bf.shortname? and $bf.shortname != '' then $bf.shortname else (if $bf? and $bf.id? and $bf.id != '' then $bf.id else '')"/>
+              <set_value name="$bfDisplay" exact="if $bfShort != '' then ($bfShort + ' - ' + $bfName) else $bfName"/>
+              <do_if value="$mk3BlockedListText == ''">
+                <set_value name="$mk3BlockedListText" exact="$bfDisplay"/>
+              </do_if>
+              <do_else>
+                <set_value name="$mk3BlockedListText" exact="$mk3BlockedListText + ', ' + $bfDisplay"/>
+              </do_else>
+            </do_all>
+          </do_if>
+        </do_if>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Custom Blacklist Active', $Status = if not $mk3BlacklistApplies then 'INFO' else if $mk3BlacklistActive then 'WARN' else 'PASS', $Detail = if not $mk3BlacklistApplies then 'No (not an MK3/MK4 ship)' else if $mk3BlacklistActive then ('Yes (' + $mk3BlockedCount + ' factions blocked)') else 'No']"/>
+        <do_if value="$mk3BlacklistApplies and $mk3BlacklistActive">
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Blocked Factions', $Status = 'INFO', $Detail = $mk3BlockedListText]"/>
+        </do_if>
+
+        <!-- Ship class / dock size -->
+        <set_value name="$dockSize" exact="'Unknown'"/>
+        <do_if value="$ship.islasertower">
+          <set_value name="$dockSize" exact="'Laser Tower (no docking)'"/>
+        </do_if>
+        <do_elseif value="$ship.isclass.{class.ship_xs}">
+          <set_value name="$dockSize" exact="'XS'"/>
+        </do_elseif>
+        <do_elseif value="$ship.isclass.{class.ship_s}">
+          <set_value name="$dockSize" exact="'S'"/>
+        </do_elseif>
+        <do_elseif value="$ship.isclass.{class.ship_m}">
+          <set_value name="$dockSize" exact="'M'"/>
+        </do_elseif>
+        <do_elseif value="$ship.isclass.{class.ship_l}">
+          <set_value name="$dockSize" exact="'L'"/>
+        </do_elseif>
+        <do_elseif value="$ship.isclass.{class.ship_xl}">
+          <set_value name="$dockSize" exact="'XL'"/>
+        </do_elseif>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Dock Size', $Status = 'INFO', $Detail = $dockSize]"/>
+
+        <!-- Current sector -->
+        <set_value name="$currentSectorName" exact="'Unknown'"/>
+        <do_if value="$ship.sector?">
+          <set_value name="$currentSectorName" exact="$ship.sector.knownname"/>
+        </do_if>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Current Sector', $Status = 'INFO', $Detail = $currentSectorName]"/>
+
+        <!-- Home sector -->
+        <set_value name="$homeSector" exact="null"/>
+        <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        <set_value name="$homeSectorName" exact="'NONE'"/>
+        <set_value name="$homeSectorResult" exact="'FAIL'"/>
+        <do_if value="$homeSector? and $homeSector.exists">
+          <set_value name="$homeSectorName" exact="$homeSector.knownname"/>
+          <set_value name="$homeSectorResult" exact="'PASS'"/>
+        </do_if>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Home Sector', $Status = $homeSectorResult, $Detail = $homeSectorName]"/>
+
+        <!-- Cargo -->
+        <set_value name="$cargoFree" exact="$ship.cargo.free.all"/>
+        <set_value name="$cargoCap" exact="$ship.cargo.capacity.all"/>
+        <set_value name="$cargoUsed" exact="$cargoCap - $cargoFree"/>
+        <set_value name="$cargoDetail" exact="$cargoUsed + ' / ' + $cargoCap + ' (Free: ' + $cargoFree + ')'"/>
+        <set_value name="$cargoResult" exact="if $cargoFree gt 0 then 'PASS' else 'WARN'"/>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Cargo', $Status = $cargoResult, $Detail = $cargoDetail]"/>
+
+        <!-- Registration -->
+        <set_value name="$regResult" exact="'FAIL'"/>
+        <set_value name="$regDetail" exact="'Ship NOT registered in global.$GT_Ships'"/>
+        <do_if value="global.$GT_Ships.{$ship}?">
+          <set_value name="$regResult" exact="'PASS'"/>
+          <set_value name="$regDetail" exact="'Registered'"/>
+        </do_if>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Ship Registration', $Status = $regResult, $Detail = $regDetail]"/>
+
+        <!-- Current Activity State (comprehensive GT state detection) -->
+        <set_value name="$activityState" exact="'Unknown'"/>
+        <set_value name="$activityDesc" exact="'Could not determine ship activity'"/>
+        <set_value name="$activityStatus" exact="'INFO'"/>
+
+        <!-- Check GT-specific state flags (priority order: most specific first) -->
+        <set_value name="$shipData" exact="null"/>
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
+          <set_value name="$shipData" exact="global.$GT_Ships.{$ship}"/>
+        </do_if>
+
+        <!-- Priority 1: Escaping (actively fleeing dangerous/blacklisted sector) -->
+        <do_if value="$shipData? and $shipData.$Escaping? and $shipData.$Escaping">
+          <set_value name="$activityState" exact="'ESCAPE'"/>
+          <set_value name="$activityDesc" exact="'Ship is in a blacklisted or dangerous sector and is actively trying to leave. No trades will be searched until the ship reaches a safe sector.'"/>
+          <set_value name="$activityStatus" exact="'WARN'"/>
+        </do_if>
+
+        <!-- Priority 2: Rerouting (destination threatened/blacklisted, finding alternative) -->
+        <do_elseif value="$shipData? and $shipData.$Rerouting? and $shipData.$Rerouting">
+          <set_value name="$activityState" exact="'REROUTE'"/>
+          <set_value name="$activityDesc" exact="'Ship trade destination was threatened or blacklisted. Ship is searching for an alternative route or cancelling the current trade.'"/>
+          <set_value name="$activityStatus" exact="'WARN'"/>
+        </do_elseif>
+
+        <!-- Priority 3: Clearance (selling existing cargo before normal trading) -->
+        <do_elseif value="$shipData? and $shipData.$CargoDisposal? and $shipData.$CargoDisposal">
+          <set_value name="$activityState" exact="'CLEARANCE'"/>
+          <set_value name="$activityDesc" exact="'Ship has cargo from a previous session or order. It must sell all existing cargo before it can search for new buy trades. The ship is looking for the best buyer for its current cargo.'"/>
+          <set_value name="$activityStatus" exact="'WARN'"/>
+        </do_elseif>
+
+        <!-- Priority 4: Needs Repair -->
+        <do_elseif value="$shipData? and $shipData.$NeedsRepair? and $shipData.$NeedsRepair">
+          <set_value name="$activityState" exact="'REPAIR'"/>
+          <set_value name="$activityDesc" exact="'Ship is damaged and heading to a shipyard or equipment dock for repairs. Trading is paused until repairs are complete.'"/>
+          <set_value name="$activityStatus" exact="'WARN'"/>
+        </do_elseif>
+
+        <!-- Priority 5: Check current active order for more context -->
+        <do_else>
+          <set_value name="$activeOrderId" exact="@$ship.order.id"/>
+          <do_if value="global.$GT_ProtectedOrderIDs? and $activeOrderId? and global.$GT_ProtectedOrderIDs.indexof.{$activeOrderId}">
+            <set_value name="$activityState" exact="'TRADING (GT Order Active)'"/>
+            <set_value name="$activityDesc" exact="'Ship is actively running the GalaxyTrader order. It is either searching for trades, executing a trade (buying/selling), or waiting for a work unit from the scheduler.'"/>
+            <set_value name="$activityStatus" exact="'PASS'"/>
+          </do_if>
+          <do_elseif value="$activeOrderId == 'TradePerform'">
+            <set_value name="$activityState" exact="'EXECUTING TRADE'"/>
+            <set_value name="$activityDesc" exact="'Ship is currently executing a trade order (buying or selling at a station). This is a sub-order created by GalaxyTrader.'"/>
+            <set_value name="$activityStatus" exact="'PASS'"/>
+          </do_elseif>
+          <do_elseif value="$activeOrderId == 'Equip' or $activeOrderId == 'Resupply'">
+            <set_value name="$activityState" exact="'RESUPPLY'"/>
+            <set_value name="$activityDesc" exact="'Ship is resupplying (ammunition, deployables, etc.) at a station. Trading resumes after resupply is complete.'"/>
+            <set_value name="$activityStatus" exact="'INFO'"/>
+          </do_elseif>
+          <do_elseif value="$activeOrderId == 'Repair'">
+            <set_value name="$activityState" exact="'REPAIR (Order)'"/>
+            <set_value name="$activityDesc" exact="'Ship has an active repair order. It is heading to or being repaired at a shipyard/equipment dock.'"/>
+            <set_value name="$activityStatus" exact="'WARN'"/>
+          </do_elseif>
+          <do_elseif value="$activeOrderId == 'DockAndWait'">
+            <set_value name="$activityState" exact="'DOCKED / WAITING'"/>
+            <set_value name="$activityDesc" exact="'Ship is docked at a station or waiting. This may indicate it is waiting for docking clearance or between trade cycles.'"/>
+            <set_value name="$activityStatus" exact="'INFO'"/>
+          </do_elseif>
+          <do_elseif value="$activeOrderId == 'MoveToZone' or $activeOrderId == 'FlyToZone'">
+            <set_value name="$activityState" exact="'IN TRANSIT'"/>
+            <set_value name="$activityDesc" exact="'Ship is flying to a destination zone. It may be heading to a buy or sell station.'"/>
+            <set_value name="$activityStatus" exact="'INFO'"/>
+          </do_elseif>
+          <do_elseif value="$activeOrderId?">
+            <set_value name="$activityState" exact="'OTHER ORDER: ' + $activeOrderId"/>
+            <set_value name="$activityDesc" exact="'Ship is executing a non-GT order (' + $activeOrderId + '). This order may have been queued externally or by another mod.'"/>
+            <set_value name="$activityStatus" exact="'INFO'"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$activityState" exact="'IDLE (No Active Order)'"/>
+            <set_value name="$activityDesc" exact="'Ship has no active order. It may be waiting for the default order to kick in, or the GT order may not be properly assigned.'"/>
+            <set_value name="$activityStatus" exact="'WARN'"/>
+          </do_else>
+        </do_else>
+
+        <!-- Set clearance mode flag for dynamic tab display -->
+        <set_value name="$isClearanceMode" exact="$activityState == 'CLEARANCE'"/>
+
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = '--- Current Activity ---', $Status = 'INFO', $Detail = '']"/>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Activity State', $Status = $activityStatus, $Detail = $activityState]"/>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Description', $Status = 'INFO', $Detail = $activityDesc]"/>
+
+        <!-- Active order details -->
+        <set_value name="$activeOrderDetail" exact="'None'"/>
+        <do_if value="$ship.order?">
+          <set_value name="$activeOrderDetail" exact="@$ship.order.id"/>
+          <do_if value="$ship.order.state?">
+            <set_value name="$activeOrderDetail" exact="$activeOrderDetail + ' (state: ' + $ship.order.state + ')'"/>
+          </do_if>
+        </do_if>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Active Order', $Status = 'INFO', $Detail = $activeOrderDetail]"/>
+
+        <!-- Current cargo wares (relevant for clearance state) -->
+        <do_if value="$cargoUsed gt 0">
+          <set_value name="$cargoWareList" exact="''"/>
+          <set_value name="$cargoWareCount" exact="0"/>
+          <do_all exact="$ship.cargo.list.count" counter="$cwi">
+            <set_value name="$cWare" exact="$ship.cargo.list.{$cwi}"/>
+            <do_if value="$cWare? and $ship.cargo.{$cWare}.count gt 0">
+              <set_value name="$cargoWareCount" operation="add"/>
+              <do_if value="$cargoWareList != ''">
+                <set_value name="$cargoWareList" exact="$cargoWareList + ', '"/>
+              </do_if>
+              <set_value name="$cargoWareList" exact="$cargoWareList + $cWare.name + ' x' + $ship.cargo.{$cWare}.count"/>
+            </do_if>
+          </do_all>
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Cargo Contents', $Status = 'INFO', $Detail = $cargoWareList]"/>
+        </do_if>
+
+        <!-- GT Status from registry -->
+        <do_if value="$shipData? and $shipData.$Status?">
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'GT Registry Status', $Status = 'INFO', $Detail = '' + $shipData.$Status]"/>
+        </do_if>
+
+        <!-- Search Pipeline State (Fallback / Isolated flags) -->
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = '--- Search Pipeline ---', $Status = 'INFO', $Detail = '']"/>
+        <set_value name="$pipelineState" exact="'Normal'"/>
+        <set_value name="$pipelineResult" exact="'PASS'"/>
+        <set_value name="$pipelineDesc" exact="'Ship is using the normal search pipeline with standard price ranges and full search radius.'"/>
+        <do_if value="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?">
+          <set_value name="$pipelineState" exact="'ISOLATED'"/>
+          <set_value name="$pipelineResult" exact="'WARN'"/>
+          <set_value name="$pipelineDesc" exact="'Ship is isolated (all connected sectors blacklisted or unreachable). Using isolated price ranges (no filter) and searching only within current sector.'"/>
+        </do_if>
+        <do_elseif value="global.$GT_FallbackTradeActive? and global.$GT_FallbackTradeActive.{$ship}?">
+          <set_value name="$pipelineState" exact="'FALLBACK'"/>
+          <set_value name="$pipelineResult" exact="'WARN'"/>
+          <set_value name="$pipelineDesc" exact="'Normal search found no trades. Fallback active: searching near ship position with reduced radius (1/3 of normal), relaxed profit thresholds (ROI halved, min 100 Cr), and fallback price ranges. Trades still limited to home sector max distance.'"/>
+        </do_elseif>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Search Pipeline', $Status = $pipelineResult, $Detail = $pipelineState]"/>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Pipeline Detail', $Status = 'INFO', $Detail = $pipelineDesc]"/>
+
+        <!-- Training Gate Status (separate from pipeline state) -->
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = '--- Training Gate ---', $Status = 'INFO', $Detail = '']"/>
+        <set_value name="$diagTrainingGateDetail" exact="'No pilot assigned'"/>
+        <set_value name="$diagTrainingGateStatus" exact="'INFO'"/>
+        <set_value name="$diagMustTrain" exact="false"/>
+        <set_value name="$diagXPBlocked" exact="false"/>
+        <set_value name="$diagBlockedLevel" exact="0"/>
+        <do_if value="$ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}?">
+          <run_actions ref="md.GT_Libraries_General.GT_GetTrainingGate" result="$diagTrainingGate">
+            <param name="pilot" value="$ship.pilot"/>
+            <param name="ship" value="$ship"/>
+            <param name="respect_hard_force" value="true"/>
+          </run_actions>
+          <set_value name="$diagMustTrain" exact="if $diagTrainingGate.$MustTrainNow? then $diagTrainingGate.$MustTrainNow else false"/>
+          <set_value name="$diagXPBlocked" exact="if $diagTrainingGate.$XPBlocked? then $diagTrainingGate.$XPBlocked else false"/>
+          <set_value name="$diagBlockedLevel" exact="if $diagTrainingGate.$BlockedLevel? then $diagTrainingGate.$BlockedLevel else 0"/>
+          <set_value name="$diagHardForce" exact="if $diagTrainingGate.$HardForce? then $diagTrainingGate.$HardForce else false"/>
+          <set_value name="$diagReason" exact="if $diagTrainingGate.$Reason? then $diagTrainingGate.$Reason else 'none'"/>
+          <set_value name="$diagTrainingGateDetail" exact="'MustTrainNow=' + $diagMustTrain + ', XPBlocked=' + $diagXPBlocked + ', BlockedLevel=' + $diagBlockedLevel + ', HardForce=' + $diagHardForce + ', Reason=' + $diagReason"/>
+          <do_if value="$diagMustTrain">
+            <set_value name="$diagTrainingGateStatus" exact="'WARN'"/>
+          </do_if>
+          <do_elseif value="$diagBlockedLevel gt 1">
+            <set_value name="$diagTrainingGateStatus" exact="'WARN'"/>
+          </do_elseif>
+          <do_elseif value="$diagXPBlocked">
+            <set_value name="$diagTrainingGateStatus" exact="'WARN'"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$diagTrainingGateStatus" exact="'PASS'"/>
+          </do_else>
+        </do_if>
+        <do_elseif value="$ship.pilot">
+          <set_value name="$diagTrainingGateDetail" exact="'Pilot is not in GT registry'"/>
+          <set_value name="$diagTrainingGateStatus" exact="'WARN'"/>
+        </do_elseif>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Training Block State', $Status = $diagTrainingGateStatus, $Detail = $diagTrainingGateDetail]"/>
+
+        <!-- Training station candidates (same search as auto-training) when XP/training gate active -->
+        <do_if value="$ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}? and ($diagXPBlocked or $diagMustTrain or ($diagBlockedLevel gt 1))">
+          <run_actions ref="md.GT_Libraries_General.GT_DiagnoseTrainingStationCandidates" result="$diagTrainingStationReport">
+            <param name="ship" value="$ship"/>
+            <param name="maxFailureRows" value="30"/>
+          </run_actions>
+          <do_if value="$diagTrainingStationReport.$Rows? and $diagTrainingStationReport.$Rows.count gt 0">
+            <append_to_list name="$sec1.$Rows" exact="table[$Check = '--- Training stations (auto search) ---', $Status = 'INFO', $Detail = '']"/>
+            <do_all exact="$diagTrainingStationReport.$Rows.count" counter="$tsi">
+              <append_to_list name="$sec1.$Rows" exact="$diagTrainingStationReport.$Rows.{$tsi}"/>
+            </do_all>
+          </do_if>
+        </do_if>
+
+        <!-- Show configured price ranges for the active pipeline -->
+        <!-- Defaults: no filter (1.0 = max price, -1.0 = min price) — must be numeric for relativeprice filter -->
+        <set_value name="$activeSellPriceMax" exact="1.0"/>
+        <set_value name="$activeBuyPriceMin" exact="-1.0"/>
+        <do_if value="global.$GT_Config? and global.$GT_Config.$Trading?">
+          <do_if value="$pipelineState == 'ISOLATED'">
+            <set_value name="$activeSellPriceMax" exact="if global.$GT_Config.$Trading.$IsolatedSellPriceMax? then @global.$GT_Config.$Trading.$IsolatedSellPriceMax else 1.0"/>
+            <set_value name="$activeBuyPriceMin" exact="if global.$GT_Config.$Trading.$IsolatedBuyPriceMin? then @global.$GT_Config.$Trading.$IsolatedBuyPriceMin else -1.0"/>
+          </do_if>
+          <do_elseif value="$pipelineState == 'FALLBACK'">
+            <set_value name="$activeSellPriceMax" exact="if global.$GT_Config.$Trading.$FallbackSellPriceMax? then @global.$GT_Config.$Trading.$FallbackSellPriceMax else 0.2"/>
+            <set_value name="$activeBuyPriceMin" exact="if global.$GT_Config.$Trading.$FallbackBuyPriceMin? then @global.$GT_Config.$Trading.$FallbackBuyPriceMin else -0.2"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$activeSellPriceMax" exact="if global.$GT_Config.$Trading.$SellPriceMax? then @global.$GT_Config.$Trading.$SellPriceMax else 1.0"/>
+            <set_value name="$activeBuyPriceMin" exact="if global.$GT_Config.$Trading.$BuyPriceMin? then @global.$GT_Config.$Trading.$BuyPriceMin else -1.0"/>
+          </do_else>
+        </do_if>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Active Price Range', $Status = 'INFO', $Detail = 'Sell max: ' + ($activeSellPriceMax * 100) + '%, Buy min: ' + ($activeBuyPriceMin * 100) + '%']"/>
+
+        <!-- ================================================ -->
+        <!-- Blacklist Status                                  -->
+        <!-- ================================================ -->
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = '--- Blacklist Status ---', $Status = 'INFO', $Detail = '']"/>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Note', $Status = 'INFO', $Detail = 'Sectors on Sector Whitelist (Config) are exempt from blacklist and show as Not blacklisted.']"/>
+
+        <!-- Get blacklist group for this ship -->
+        <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$diagBlacklistGroup">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Blacklist Group', $Status = 'INFO', $Detail = '' + $diagBlacklistGroup]"/>
+
+        <!-- Route cache (stored jump path sectors for reroute diagnostics) -->
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = '--- Route Cache ---', $Status = 'INFO', $Detail = '']"/>
+        <set_value name="$globalBlacklistEpoch" exact="if global.$GT_BlacklistEpoch? then global.$GT_BlacklistEpoch else 0"/>
+        <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Global Blacklist Epoch', $Status = 'INFO', $Detail = '' + $globalBlacklistEpoch]"/>
+        <set_value name="$routeCacheExists" exact="false"/>
+        <set_value name="$routeCache" exact="null"/>
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$RoutePathCache?">
+          <set_value name="$routeCacheExists" exact="true"/>
+          <set_value name="$routeCache" exact="global.$GT_Ships.{$ship}.$RoutePathCache"/>
+        </do_if>
+        <do_if value="$routeCacheExists and $routeCache?">
+          <set_value name="$cacheEpoch" exact="if $routeCache.$BlacklistEpoch? then $routeCache.$BlacklistEpoch else 0"/>
+          <set_value name="$cacheGroup" exact="if $routeCache.$BlacklistGroup? then '' + $routeCache.$BlacklistGroup else 'N/A'"/>
+          <set_value name="$cacheDestName" exact="'Unknown'"/>
+          <do_if value="$routeCache.$DestinationSector? and @$routeCache.$DestinationSector.knownname != null">
+            <set_value name="$cacheDestName" exact="@$routeCache.$DestinationSector.knownname"/>
+          </do_if>
+          <set_value name="$remainingCount" exact="0"/>
+          <do_if value="$routeCache.$RemainingSectors?">
+            <set_value name="$remainingCount" exact="$routeCache.$RemainingSectors.count"/>
+          </do_if>
+
+          <set_value name="$routeSectorChain" exact="''"/>
+          <do_if value="$remainingCount gt 0">
+            <set_value name="$routeLimit" exact="[$remainingCount, 20].min"/>
+            <do_all exact="$routeLimit" counter="$rci">
+              <set_value name="$rcSector" exact="$routeCache.$RemainingSectors.{$rci}"/>
+              <set_value name="$rcSectorName" exact="'Unknown'"/>
+              <do_if value="$rcSector? and @$rcSector.knownname != null">
+                <set_value name="$rcSectorName" exact="@$rcSector.knownname"/>
+              </do_if>
+              <do_if value="$routeSectorChain == ''">
+                <set_value name="$routeSectorChain" exact="$rcSectorName"/>
+              </do_if>
+              <do_else>
+                <set_value name="$routeSectorChain" exact="$routeSectorChain + ' -> ' + $rcSectorName"/>
+              </do_else>
+            </do_all>
+            <do_if value="$remainingCount gt 20">
+              <set_value name="$routeSectorChain" exact="$routeSectorChain + ' -> ... (+' + ($remainingCount - 20) + ')'"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <set_value name="$routeSectorChain" exact="'(empty)'"/>
+          </do_else>
+
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Cache Epoch (Ship)', $Status = if $cacheEpoch == $globalBlacklistEpoch then 'PASS' else 'WARN', $Detail = '' + $cacheEpoch + ' (global: ' + $globalBlacklistEpoch + ')']"/>
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Cache Blacklist Group', $Status = 'INFO', $Detail = $cacheGroup]"/>
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Cache Destination', $Status = 'INFO', $Detail = $cacheDestName]"/>
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Cache Remaining Sectors', $Status = if $remainingCount gt 0 then 'INFO' else 'WARN', $Detail = '' + $remainingCount]"/>
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Cached Jump Path', $Status = 'INFO', $Detail = $routeSectorChain]"/>
+        </do_if>
+        <do_else>
+          <!-- Route cache is only built by move.generic sector-change logic when:
+               - pilot level >= 12
+               - threat avoidance + dynamic blacklist are enabled -->
+          <set_value name="$routeCachePilotLevel" exact="0"/>
+          <set_value name="$routeCacheTAEnabled" exact="false"/>
+          <set_value name="$routeCacheDynBL" exact="false"/>
+          <set_value name="$routeCacheEligiblePilot" exact="false"/>
+          <set_value name="$routeCacheExpected" exact="false"/>
+          <set_value name="$routeCacheReason" exact="'Route cache is not available yet'"/>
+
+          <do_if value="$ship.pilot? and global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$Level?">
+            <set_value name="$routeCachePilotLevel" exact="@global.$GT_Pilots.{$ship.pilot}.$Level"/>
+          </do_if>
+          <set_value name="$routeCacheEligiblePilot" exact="$routeCachePilotLevel ge 12"/>
+
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$ThreatAvoidance?">
+            <set_value name="$routeCacheTAEnabled" exact="@global.$GT_GlobalSettings.$ThreatAvoidance.$Enabled"/>
+            <set_value name="$routeCacheDynBL" exact="@global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist"/>
+          </do_if>
+
+          <set_value name="$routeCacheExpected" exact="$routeCacheEligiblePilot and $routeCacheTAEnabled and $routeCacheDynBL"/>
+          <do_if value="not $routeCacheEligiblePilot">
+            <set_value name="$routeCacheReason" exact="'No stored jump path cache (pilot level ' + $routeCachePilotLevel + ' &lt; 12; cache logic inactive)'"/>
+          </do_if>
+          <do_elseif value="not $routeCacheTAEnabled or not $routeCacheDynBL">
+            <set_value name="$routeCacheReason" exact="'No stored jump path cache (ThreatAvoidance=' + $routeCacheTAEnabled + ', DynamicBlacklist=' + $routeCacheDynBL + ')'"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$routeCacheReason" exact="'No stored jump path cache yet (eligible; cache populates on sector-change route evaluation)'"/>
+          </do_else>
+
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Route Cache', $Status = if $routeCacheExpected then 'WARN' else 'INFO', $Detail = $routeCacheReason]"/>
+        </do_else>
+
+        <!-- Check current sector blacklist status -->
+        <do_if value="$ship.sector? and $diagBlacklistGroup?">
+          <run_actions ref="md.GT_Libraries_Blacklist.GT_IsSectorBlacklisted" result="$currentSectorBL">
+            <param name="sector" value="$ship.sector"/>
+            <param name="ship" value="$ship"/>
+            <param name="blacklistgroup" value="$diagBlacklistGroup"/>
+            <param name="returnDetails" value="true"/>
+          </run_actions>
+          <set_value name="$currentBLStatus" exact="'Not blacklisted'"/>
+          <set_value name="$currentBLResult" exact="'PASS'"/>
+          <do_if value="$currentSectorBL? and $currentSectorBL.$IsBlacklisted">
+            <set_value name="$currentBLResult" exact="'FAIL'"/>
+            <do_if value="$currentSectorBL.$ActivityBlacklisted and $currentSectorBL.$TravelBlacklisted">
+              <set_value name="$currentBLStatus" exact="'BLACKLISTED (activity + travel) - ship cannot trade here and should not travel through this sector'"/>
+            </do_if>
+            <do_elseif value="$currentSectorBL.$ActivityBlacklisted">
+              <set_value name="$currentBLStatus" exact="'BLACKLISTED (activity only) - ship cannot trade here but may travel through'"/>
+            </do_elseif>
+            <do_elseif value="$currentSectorBL.$TravelBlacklisted">
+              <set_value name="$currentBLStatus" exact="'BLACKLISTED (travel only) - ship should not travel through this sector'"/>
+            </do_elseif>
+            <do_else>
+              <set_value name="$currentBLStatus" exact="'BLACKLISTED (unknown type)'"/>
+            </do_else>
+          </do_if>
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Current Sector', $Status = $currentBLResult, $Detail = $ship.sector.knownname + ': ' + $currentBLStatus]"/>
+        </do_if>
+
+        <!-- Check home sector blacklist status -->
+        <do_if value="$homeSector? and $homeSector.exists and $diagBlacklistGroup?">
+          <run_actions ref="md.GT_Libraries_Blacklist.GT_IsSectorBlacklisted" result="$homeSectorBL">
+            <param name="sector" value="$homeSector"/>
+            <param name="ship" value="$ship"/>
+            <param name="blacklistgroup" value="$diagBlacklistGroup"/>
+            <param name="returnDetails" value="true"/>
+          </run_actions>
+          <set_value name="$homeBLStatus" exact="'Not blacklisted'"/>
+          <set_value name="$homeBLResult" exact="'PASS'"/>
+          <do_if value="$homeSectorBL? and $homeSectorBL.$IsBlacklisted">
+            <set_value name="$homeBLResult" exact="'WARN'"/>
+            <do_if value="$homeSectorBL.$ActivityBlacklisted and $homeSectorBL.$TravelBlacklisted">
+              <set_value name="$homeBLStatus" exact="'BLACKLISTED (activity + travel) - trade search from home sector is severely limited'"/>
+            </do_if>
+            <do_elseif value="$homeSectorBL.$ActivityBlacklisted">
+              <set_value name="$homeBLStatus" exact="'BLACKLISTED (activity) - no trades will originate from home sector stations'"/>
+            </do_elseif>
+            <do_elseif value="$homeSectorBL.$TravelBlacklisted">
+              <set_value name="$homeBLStatus" exact="'BLACKLISTED (travel) - ships may not route through home sector'"/>
+            </do_elseif>
+            <do_else>
+              <set_value name="$homeBLStatus" exact="'BLACKLISTED'"/>
+            </do_else>
+          </do_if>
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Home Sector', $Status = $homeBLResult, $Detail = $homeSector.knownname + ': ' + $homeBLStatus]"/>
+        </do_if>
+
+        <!-- Check connected sectors - isolation detection -->
+        <do_if value="$ship.sector? and $diagBlacklistGroup?">
+          <run_actions ref="md.GT_Libraries_Blacklist.GT_CheckConnectedSectorsBlacklisted" result="$isolationResult">
+            <param name="sector" value="$ship.sector"/>
+            <param name="ship" value="$ship"/>
+            <param name="blacklistgroup" value="$diagBlacklistGroup"/>
+            <param name="returnDetails" value="true"/>
+          </run_actions>
+
+          <set_value name="$connectedCount" exact="@$isolationResult.$ConnectedSectorsCount"/>
+          <set_value name="$blNeighborCount" exact="@$isolationResult.$BlacklistedSectorsCount"/>
+          <set_value name="$okNeighborCount" exact="@$isolationResult.$NonBlacklistedSectorsCount"/>
+          <do_if value="not $connectedCount?">
+            <set_value name="$connectedCount" exact="0"/>
+          </do_if>
+          <do_if value="not $blNeighborCount?">
+            <set_value name="$blNeighborCount" exact="0"/>
+          </do_if>
+          <do_if value="not $okNeighborCount?">
+            <set_value name="$okNeighborCount" exact="0"/>
+          </do_if>
+
+          <set_value name="$isolatedResult" exact="'PASS'"/>
+          <set_value name="$isolatedDesc" exact="'' + $connectedCount + ' connected sectors (' + $okNeighborCount + ' accessible, ' + $blNeighborCount + ' blacklisted)'"/>
+          <do_if value="$isolationResult? and $isolationResult.$IsIsolated">
+            <set_value name="$isolatedResult" exact="'FAIL'"/>
+            <set_value name="$isolatedDesc" exact="'ISOLATED - All ' + $connectedCount + ' connected sectors are blacklisted. Ship can only trade within its current sector.'"/>
+          </do_if>
+          <do_elseif value="$blNeighborCount gt 0">
+            <set_value name="$isolatedResult" exact="'WARN'"/>
+          </do_elseif>
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Sector Isolation', $Status = $isolatedResult, $Detail = $isolatedDesc]"/>
+
+          <!-- List blacklisted neighboring sectors -->
+          <do_if value="$isolationResult.$BlacklistedSectors? and $isolationResult.$BlacklistedSectors.count gt 0">
+            <set_value name="$blSectorNames" exact="''"/>
+            <do_all exact="[$isolationResult.$BlacklistedSectors.count, 10].min" counter="$bli">
+              <set_value name="$blSec" exact="$isolationResult.$BlacklistedSectors.{$bli}"/>
+              <do_if value="$blSec? and $blSec.exists">
+                <do_if value="$blSectorNames != ''">
+                  <set_value name="$blSectorNames" exact="$blSectorNames + ', '"/>
+                </do_if>
+                <set_value name="$blSectorNames" exact="$blSectorNames + $blSec.knownname"/>
+              </do_if>
+            </do_all>
+            <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Blacklisted Neighbors', $Status = 'WARN', $Detail = $blSectorNames]"/>
+          </do_if>
+
+          <!-- List accessible neighboring sectors -->
+          <do_if value="$isolationResult.$NonBlacklistedSectors? and $isolationResult.$NonBlacklistedSectors.count gt 0">
+            <set_value name="$okSectorNames" exact="''"/>
+            <do_all exact="[$isolationResult.$NonBlacklistedSectors.count, 10].min" counter="$oki">
+              <set_value name="$okSec" exact="$isolationResult.$NonBlacklistedSectors.{$oki}"/>
+              <do_if value="$okSec? and $okSec.exists">
+                <do_if value="$okSectorNames != ''">
+                  <set_value name="$okSectorNames" exact="$okSectorNames + ', '"/>
+                </do_if>
+                <set_value name="$okSectorNames" exact="$okSectorNames + $okSec.knownname"/>
+              </do_if>
+            </do_all>
+            <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Accessible Neighbors', $Status = 'PASS', $Detail = $okSectorNames]"/>
+          </do_if>
+        </do_if>
+
+        <append_to_list name="$report.$Sections" exact="$sec1"/>
+
+        <!-- ======================================================== -->
+        <!-- SECTION 2: Miner Coordination Snapshot                    -->
+        <!-- ======================================================== -->
+        <set_value name="$isMinerContext" exact="false"/>
+        <do_if value="@$ship.defaultorder.id == 'GalaxyMiner'">
+          <set_value name="$isMinerContext" exact="true"/>
+        </do_if>
+        <do_elseif value="$ship.commander? and @$ship.commander.defaultorder.id == 'GalaxyMiner'">
+          <set_value name="$isMinerContext" exact="true"/>
+        </do_elseif>
+        <do_elseif value="global.$GT_MinerDiag? and global.$GT_MinerDiag.{$ship}?">
+          <set_value name="$isMinerContext" exact="true"/>
+        </do_elseif>
+
+        <do_if value="$isMinerContext">
+          <set_value name="$sec2" exact="table[]"/>
+          <set_value name="$sec2.$Name" exact="'Miner Coordination'"/>
+          <set_value name="$sec2.$Rows" exact="[]"/>
+
+          <set_value name="$minerDiag" exact="null"/>
+          <do_if value="global.$GT_MinerDiag? and global.$GT_MinerDiag.{$ship}?">
+            <set_value name="$minerDiag" exact="global.$GT_MinerDiag.{$ship}"/>
+          </do_if>
+
+          <set_value name="$selectedWareText" exact="'UNKNOWN'"/>
+          <set_value name="$urgencyText" exact="'0'"/>
+          <set_value name="$overflowText" exact="'false'"/>
+          <set_value name="$targetsText" exact="'0'"/>
+          <set_value name="$supplierCountText" exact="'0'"/>
+          <set_value name="$intentCountText" exact="'0'"/>
+          <set_value name="$intentPhaseText" exact="'unknown'"/>
+          <set_value name="$primaryCapacityText" exact="'unknown'"/>
+          <set_value name="$overflowFallbackText" exact="'unknown'"/>
+          <set_value name="$primaryDeliveryStationText" exact="'n/a'"/>
+          <set_value name="$overflowDetachedText" exact="'false'"/>
+          <set_value name="$lastUpdateText" exact="'n/a'"/>
+          <set_value name="$diagStatus" exact="'WARN'"/>
+          <set_value name="$coordEntriesStatus" exact="'INFO'"/>
+          <set_value name="$coordEntriesDetail" exact="'Assignments: 0, Intents: 0'"/>
+
+          <do_if value="$minerDiag?">
+            <set_value name="$diagStatus" exact="'PASS'"/>
+            <set_value name="$selectedWareText" exact="if $minerDiag.$SelectedWare? then '' + $minerDiag.$SelectedWare else 'UNKNOWN'"/>
+            <set_value name="$urgencyText" exact="if $minerDiag.$Urgency? then '' + $minerDiag.$Urgency else '0'"/>
+            <set_value name="$overflowText" exact="if $minerDiag.$OverflowMode? then 'true' else 'false'"/>
+            <set_value name="$targetsText" exact="if $minerDiag.$TargetStationCount? then '' + $minerDiag.$TargetStationCount else '0'"/>
+            <set_value name="$supplierCountText" exact="if $minerDiag.$SupplierCount? then '' + $minerDiag.$SupplierCount else '0'"/>
+            <set_value name="$intentCountText" exact="if $minerDiag.$IntentCount? then '' + $minerDiag.$IntentCount else '0'"/>
+            <set_value name="$intentPhaseText" exact="if $minerDiag.$IntentPhase? then '' + $minerDiag.$IntentPhase else 'unknown'"/>
+            <set_value name="$primaryCapacityText" exact="if $minerDiag.$PrimaryCapacityAvailable? then (if $minerDiag.$PrimaryCapacityAvailable then 'true' else 'false') else 'unknown'"/>
+            <set_value name="$overflowFallbackText" exact="if $minerDiag.$OverflowFallbackAllowed? then (if $minerDiag.$OverflowFallbackAllowed then 'true' else 'false') else 'unknown'"/>
+            <set_value name="$primaryDeliveryStationText" exact="if $minerDiag.$PrimaryDeliveryStation? and $minerDiag.$PrimaryDeliveryStation.exists then $minerDiag.$PrimaryDeliveryStation.knownname else 'n/a'"/>
+            <set_value name="$overflowDetachedText" exact="if $minerDiag.$OverflowDetachedCommander? and $minerDiag.$OverflowDetachedCommander then 'true' else 'false'"/>
+            <do_if value="$minerDiag.$Timestamp?">
+              <set_value name="$lastUpdateText" exact="'' + ((player.age - $minerDiag.$Timestamp) / 1s)i + 's ago'"/>
+            </do_if>
+          </do_if>
+
+          <!-- Detect live/stale coordination entries for this ship -->
+          <set_value name="$assignmentEntryCount" exact="0"/>
+          <set_value name="$intentEntryCount" exact="0"/>
+          <do_if value="global.$GT_MinerStationAssignments? and global.$GT_MinerStationAssignments.keys.count gt 0">
+            <set_value name="$assignStations" exact="global.$GT_MinerStationAssignments.keys.list"/>
+            <do_all exact="$assignStations.count" counter="$asi">
+              <set_value name="$assignStation" exact="$assignStations.{$asi}"/>
+              <do_if value="global.$GT_MinerStationAssignments.{$assignStation}?">
+                <set_value name="$assignWares" exact="global.$GT_MinerStationAssignments.{$assignStation}.keys.list"/>
+                <do_all exact="$assignWares.count" counter="$awi">
+                  <set_value name="$assignWare" exact="$assignWares.{$awi}"/>
+                  <do_if value="global.$GT_MinerStationAssignments.{$assignStation}.{$assignWare}? and global.$GT_MinerStationAssignments.{$assignStation}.{$assignWare}.{$ship}?">
+                    <set_value name="$assignmentEntryCount" exact="$assignmentEntryCount + 1"/>
+                  </do_if>
+                </do_all>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="global.$GT_MinerIntents? and global.$GT_MinerIntents.keys.count gt 0">
+            <set_value name="$intentStations" exact="global.$GT_MinerIntents.keys.list"/>
+            <do_all exact="$intentStations.count" counter="$isi">
+              <set_value name="$intentStation" exact="$intentStations.{$isi}"/>
+              <do_if value="global.$GT_MinerIntents.{$intentStation}?">
+                <set_value name="$intentWares" exact="global.$GT_MinerIntents.{$intentStation}.keys.list"/>
+                <do_all exact="$intentWares.count" counter="$iwi">
+                  <set_value name="$intentWare" exact="$intentWares.{$iwi}"/>
+                  <do_if value="global.$GT_MinerIntents.{$intentStation}.{$intentWare}? and global.$GT_MinerIntents.{$intentStation}.{$intentWare}.{$ship}?">
+                    <set_value name="$intentEntryCount" exact="$intentEntryCount + 1"/>
+                  </do_if>
+                </do_all>
+              </do_if>
+            </do_all>
+          </do_if>
+          <set_value name="$coordEntriesDetail" exact="'Assignments: ' + $assignmentEntryCount + ', Intents: ' + $intentEntryCount"/>
+          <set_value name="$coordEntriesStatus" exact="'PASS'"/>
+          <do_if value="$assignmentEntryCount == 0 and $intentEntryCount == 0">
+            <set_value name="$coordEntriesStatus" exact="'WARN'"/>
+          </do_if>
+          <do_if value="not $ship.defaultorder? or @$ship.defaultorder.id != 'GalaxyMiner'">
+            <do_if value="$assignmentEntryCount gt 0 or $intentEntryCount gt 0">
+              <set_value name="$coordEntriesStatus" exact="'FAIL'"/>
+              <set_value name="$coordEntriesDetail" exact="$coordEntriesDetail + ' (stale entries on non-miner order)'"/>
+            </do_if>
+          </do_if>
+
+          <append_to_list name="$sec2.$Rows" exact="table[$Check = 'Snapshot', $Status = $diagStatus, $Detail = if $diagStatus == 'PASS' then 'Available' else 'No live miner snapshot received yet']"/>
+          <append_to_list name="$sec2.$Rows" exact="table[$Check = 'Selected Ware', $Status = 'INFO', $Detail = $selectedWareText]"/>
+          <append_to_list name="$sec2.$Rows" exact="table[$Check = 'Urgency', $Status = 'INFO', $Detail = $urgencyText]"/>
+          <append_to_list name="$sec2.$Rows" exact="table[$Check = 'Overflow Mode', $Status = 'INFO', $Detail = $overflowText]"/>
+          <append_to_list name="$sec2.$Rows" exact="table[$Check = 'Primary Capacity Available', $Status = 'INFO', $Detail = $primaryCapacityText]"/>
+          <append_to_list name="$sec2.$Rows" exact="table[$Check = 'Overflow Fallback Allowed', $Status = 'INFO', $Detail = $overflowFallbackText]"/>
+          <append_to_list name="$sec2.$Rows" exact="table[$Check = 'Primary Delivery Station', $Status = 'INFO', $Detail = $primaryDeliveryStationText]"/>
+          <append_to_list name="$sec2.$Rows" exact="table[$Check = 'Overflow Commander Detached', $Status = 'INFO', $Detail = $overflowDetachedText]"/>
+          <append_to_list name="$sec2.$Rows" exact="table[$Check = 'Target Stations', $Status = 'INFO', $Detail = $targetsText]"/>
+          <append_to_list name="$sec2.$Rows" exact="table[$Check = 'Suppliers (selected ware)', $Status = 'INFO', $Detail = $supplierCountText]"/>
+          <append_to_list name="$sec2.$Rows" exact="table[$Check = 'Active Intents (selected ware)', $Status = 'INFO', $Detail = $intentCountText]"/>
+          <append_to_list name="$sec2.$Rows" exact="table[$Check = 'Intent Phase (this ship)', $Status = 'INFO', $Detail = $intentPhaseText]"/>
+          <append_to_list name="$sec2.$Rows" exact="table[$Check = 'Coordination Entries (this ship)', $Status = $coordEntriesStatus, $Detail = $coordEntriesDetail]"/>
+          <append_to_list name="$sec2.$Rows" exact="table[$Check = 'Last Snapshot Update', $Status = 'INFO', $Detail = $lastUpdateText]"/>
+
+          <append_to_list name="$report.$Sections" exact="$sec2"/>
+        </do_if>
+
+        <!-- Player economy variables (needed for pair evaluation + VERDICT) -->
+        <set_value name="$playerMoney" exact="player.money"/>
+        <set_value name="$minPlayerMoney" exact="0"/>
+        <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$MinPlayerMoney?">
+          <set_value name="$minPlayerMoney" exact="global.$GT_AIParameters.{$ship}.$MinPlayerMoney"/>
+        </do_if>
+        <set_value name="$moneyGateThreshold" exact="$minPlayerMoney + 100000"/>
+
+        <!-- ======================================================== -->
+        <!-- SECTION 3: Configuration Snapshot                        -->
+        <!-- ======================================================== -->
+        <set_value name="$sec3" exact="table[]"/>
+        <set_value name="$sec3.$Name" exact="'Configuration'"/>
+        <set_value name="$sec3.$Rows" exact="[]"/>
+
+        <!-- Determine the authoritative order source (ship or commander for subordinates) -->
+        <set_value name="$orderSource" exact="$ship"/>
+        <set_value name="$orderSourceLabel" exact="'direct'"/>
+        <set_value name="$gtOrder" exact="@$ship.defaultorder"/>
+        <do_if value="$ship.commander? and $ship.commander.exists">
+          <do_if value="global.$GT_ProtectedOrderIDs? and $ship.commander.defaultorder? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.commander.defaultorder.id}">
+            <set_value name="$orderSource" exact="$ship.commander"/>
+            <set_value name="$orderSourceLabel" exact="'commander (' + $ship.commander.idcode + ')'"/>
+            <set_value name="$gtOrder" exact="$ship.commander.defaultorder"/>
+          </do_if>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Order Source', $Status = 'INFO', $Detail = $orderSourceLabel]"/>
+
+        <!-- Order type (MK1/MK2/MK3/Miner) for conditional display -->
+        <set_value name="$orderId" exact="'Unknown'"/>
+        <do_if value="$gtOrder? and $gtOrder.id?">
+          <set_value name="$orderId" exact="$gtOrder.id"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Order Type', $Status = 'INFO', $Detail = $orderId]"/>
+
+        <!-- Min Player Money (global gate - ships wait below this) -->
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Min Player Money', $Status = 'INFO', $Detail = '' + ($minPlayerMoney / 100) + ' Cr (ships idle below this)']"/>
+
+        <!-- Max distance (maxbuy / maxsell from order params) -->
+        <!-- IMPORTANT: order param default expressions use this.ship which doesn't resolve in MD context.
+             Reading defaultorder.$maxbuy in MD can return 25 (the fallback maximum) instead of the
+             skill-based default. We must compute the pilot skill cap independently and apply it. -->
+        <set_value name="$rawMaxBuy" exact="0"/>
+        <set_value name="$rawMaxSell" exact="0"/>
+        <do_if value="$orderId == 'GalaxyTraderMK2' and $gtOrder? and $gtOrder.$maxDistance?">
+          <set_value name="$rawMaxBuy" exact="$gtOrder.$maxDistance"/>
+          <set_value name="$rawMaxSell" exact="$gtOrder.$maxDistance"/>
+        </do_if>
+        <do_elseif value="$orderId == 'GalaxyMiner' and $gtOrder?">
+          <do_if value="$gtOrder.$maxGatherDistance?">
+            <set_value name="$rawMaxBuy" exact="$gtOrder.$maxGatherDistance"/>
+          </do_if>
+          <do_if value="$gtOrder.$maxSellDistance?">
+            <set_value name="$rawMaxSell" exact="$gtOrder.$maxSellDistance"/>
+          </do_if>
+        </do_elseif>
+        <do_elseif value="$orderId == 'GalaxyTraderMK4Supply' and $gtOrder?">
+          <do_if value="$gtOrder.$jumpDistanceBuy?">
+            <set_value name="$rawMaxBuy" exact="$gtOrder.$jumpDistanceBuy"/>
+          </do_if>
+          <do_elseif value="$gtOrder.$maxbuy?">
+            <set_value name="$rawMaxBuy" exact="$gtOrder.$maxbuy"/>
+          </do_elseif>
+          <do_if value="$gtOrder.$jumpDistanceCoverage?">
+            <set_value name="$rawMaxSell" exact="$gtOrder.$jumpDistanceCoverage"/>
+          </do_if>
+          <do_elseif value="$gtOrder.$maxsell?">
+            <set_value name="$rawMaxSell" exact="$gtOrder.$maxsell"/>
+          </do_elseif>
+        </do_elseif>
+        <do_else>
+          <do_if value="$gtOrder? and $gtOrder.$maxbuy?">
+            <set_value name="$rawMaxBuy" exact="$gtOrder.$maxbuy"/>
+          </do_if>
+          <do_if value="$gtOrder? and $gtOrder.$maxsell?">
+            <set_value name="$rawMaxSell" exact="$gtOrder.$maxsell"/>
+          </do_if>
+        </do_else>
+
+        <!-- Compute pilot skill cap (mirrors AI script logic in order.trade.galaxytrader.xml lines 765-787) -->
+        <set_value name="$pilotMaxJumps" exact="25"/>
+        <do_if value="$ship.pilot? and $ship.pilot.skill.management?">
+          <set_value name="$diagPilotSkill" exact="$ship.pilot.skill.management"/>
+          <do_if value="$diagPilotSkill le 2">
+            <set_value name="$pilotMaxJumps" exact="1"/>
+          </do_if>
+          <do_elseif value="$diagPilotSkill le 5">
+            <set_value name="$pilotMaxJumps" exact="3"/>
+          </do_elseif>
+          <do_elseif value="$diagPilotSkill le 8">
+            <set_value name="$pilotMaxJumps" exact="5"/>
+          </do_elseif>
+          <do_elseif value="$diagPilotSkill le 11">
+            <set_value name="$pilotMaxJumps" exact="10"/>
+          </do_elseif>
+          <do_elseif value="$diagPilotSkill le 13">
+            <set_value name="$pilotMaxJumps" exact="15"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$pilotMaxJumps" exact="25"/>
+          </do_else>
+        </do_if>
+
+        <!-- Apply pilot skill cap: effective = min(order value, pilot capability) -->
+        <set_value name="$maxBuy" exact="[$rawMaxBuy, $pilotMaxJumps].min"/>
+        <set_value name="$maxSell" exact="[$rawMaxSell, $pilotMaxJumps].min"/>
+        <set_value name="$maxDistance" exact="[$maxBuy, $maxSell].max"/>
+        <set_value name="$diagSearchDistance" exact="$maxDistance"/>
+        <do_if value="$orderId == 'GalaxyMiner'">
+          <!-- Miner diagnose should use sell radius (not max of buy/sell). -->
+          <set_value name="$diagSearchDistance" exact="$maxSell"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Max Buy Distance', $Status = 'INFO', $Detail = '' + $maxBuy + ' jumps (order: ' + $rawMaxBuy + ', pilot cap: ' + $pilotMaxJumps + ')']"/>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Max Sell Distance', $Status = 'INFO', $Detail = '' + $maxSell + ' jumps (order: ' + $rawMaxSell + ', pilot cap: ' + $pilotMaxJumps + ')']"/>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Effective Max Distance', $Status = if $maxDistance gt 0 then 'PASS' else 'FAIL', $Detail = '' + $maxDistance + ' jumps (max of buy/sell)']"/>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Diagnose Search Distance', $Status = 'INFO', $Detail = '' + $diagSearchDistance + ' jumps' + (if $orderId == 'GalaxyMiner' then ' (miner sell range)' else '')]"/>
+
+        <!-- Minimum cargo utilization (hard filter) -->
+        <set_value name="$rawCargoTarget" exact="90"/>
+        <do_if value="$orderId == 'GalaxyTraderMK1' and $gtOrder?">
+          <do_if value="$gtOrder.$selltarget?">
+            <set_value name="$rawCargoTarget" exact="$gtOrder.$selltarget"/>
+          </do_if>
+        </do_if>
+        <do_elseif value="$orderId == 'GalaxyTraderMK2' and $gtOrder?">
+          <do_if value="$gtOrder.$maxStorage?">
+            <set_value name="$rawCargoTarget" exact="$gtOrder.$maxStorage"/>
+          </do_if>
+        </do_elseif>
+        <do_elseif value="$orderId == 'GalaxyMiner' and $gtOrder?">
+          <do_if value="$gtOrder.$overflowThreshold?">
+            <set_value name="$rawCargoTarget" exact="$gtOrder.$overflowThreshold"/>
+          </do_if>
+        </do_elseif>
+        <do_elseif value="$orderId == 'GalaxyTraderMK4Supply' and $gtOrder?">
+          <do_if value="$gtOrder.$minCargoUsed?">
+            <set_value name="$rawCargoTarget" exact="$gtOrder.$minCargoUsed"/>
+          </do_if>
+          <do_elseif value="$gtOrder.$cargotarget?">
+            <set_value name="$rawCargoTarget" exact="$gtOrder.$cargotarget"/>
+          </do_elseif>
+        </do_elseif>
+        <do_else>
+          <do_if value="$gtOrder? and $gtOrder.$cargotarget?">
+            <set_value name="$rawCargoTarget" exact="$gtOrder.$cargotarget"/>
+          </do_if>
+        </do_else>
+        <set_value name="$effectiveCargoTarget" exact="[10,[$rawCargoTarget,100].min].max"/>
+        <set_value name="$useMinCargoThreshold" exact="true"/>
+        <do_if value="$orderId == 'GalaxyTraderMK4Supply'">
+          <set_value name="$useMinCargoThreshold" exact="false"/>
+          <do_if value="$gtOrder? and $gtOrder.$useMinCargoThreshold?">
+            <set_value name="$useMinCargoThreshold" exact="$gtOrder.$useMinCargoThreshold"/>
+          </do_if>
+        </do_if>
+        <set_value name="$cargoFilterMode" exact="'ACTIVE (live/cache/fallback)'"/>
+        <set_value name="$cargoFilterStatus" exact="'PASS'"/>
+        <do_if value="not $useMinCargoThreshold">
+          <set_value name="$cargoFilterMode" exact="'DISABLED (order toggle)'"/>
+          <set_value name="$cargoFilterStatus" exact="'WARN'"/>
+        </do_if>
+        <do_if value="$useMinCargoThreshold and global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?">
+          <set_value name="$cargoFilterMode" exact="'DISABLED (isolated mode)'"/>
+          <set_value name="$cargoFilterStatus" exact="'WARN'"/>
+        </do_if>
+        <do_if value="$orderId == 'GalaxyTraderMK4Supply'">
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Use Min Cargo Threshold', $Status = 'INFO', $Detail = if $useMinCargoThreshold then 'true' else 'false']"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Min Cargo Utilization', $Status = 'INFO', $Detail = '' + $effectiveCargoTarget + '% (order: ' + $rawCargoTarget + ')']"/>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Cargo Util Filter Mode', $Status = $cargoFilterStatus, $Detail = $cargoFilterMode]"/>
+
+        <!-- Allow illegal (from order params, with explicit true/false) -->
+        <set_value name="$allowIllegal" exact="false"/>
+        <do_if value="$gtOrder? and $gtOrder.$allowillegal?">
+          <set_value name="$allowIllegal" exact="$gtOrder.$allowillegal"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Allow Illegal', $Status = 'INFO', $Detail = if $allowIllegal then 'true' else 'false']"/>
+
+        <!-- Illegal Route Filter (MK3/MK4 - from order params) -->
+        <do_if value="$orderId == 'GalaxyTraderMK3' or $orderId == 'GalaxyTraderMK4Supply'">
+          <set_value name="$enforceRouteIllegalLegality" exact="false"/>
+          <do_if value="$gtOrder? and $gtOrder.$enforceRouteIllegalLegality?">
+            <set_value name="$enforceRouteIllegalLegality" exact="$gtOrder.$enforceRouteIllegalLegality"/>
+          </do_if>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Illegal Route Filter', $Status = 'INFO', $Detail = if $enforceRouteIllegalLegality then 'true' else 'false']"/>
+        </do_if>
+
+        <!-- Ignore trade rules (from order params) -->
+        <set_value name="$ignoreTradeRules" exact="false"/>
+        <do_if value="$gtOrder? and $gtOrder.$ignoretraderules?">
+          <set_value name="$ignoreTradeRules" exact="$gtOrder.$ignoretraderules"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Ignore Trade Rules', $Status = 'INFO', $Detail = if $ignoreTradeRules then 'true' else 'false']"/>
+
+        <!-- Ignore MK1-supplied stations (from order params) -->
+        <set_value name="$ignoreMK1Supply" exact="true"/>
+        <do_if value="$gtOrder? and $gtOrder.$ignoremk1supply?">
+          <set_value name="$ignoreMK1Supply" exact="$gtOrder.$ignoremk1supply"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Ignore MK1 Supply', $Status = 'INFO', $Detail = if $ignoreMK1Supply then 'true' else 'false']"/>
+
+        <!-- Ignore build storage (from order params) -->
+        <set_value name="$ignoreBuildStorage" exact="false"/>
+        <do_if value="$gtOrder? and $gtOrder.$ignorebuildstorage?">
+          <set_value name="$ignoreBuildStorage" exact="$gtOrder.$ignorebuildstorage"/>
+        </do_if>
+        <do_if value="not ($gtOrder? and $gtOrder.$ignorebuildstorage?) and $orderId == 'GalaxyTraderMK4Supply' and $gtOrder? and $gtOrder.$allowBuildstorage?">
+          <set_value name="$ignoreBuildStorage" exact="not $gtOrder.$allowBuildstorage"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Ignore Build Storage', $Status = 'INFO', $Detail = if $ignoreBuildStorage then 'true' else 'false']"/>
+
+        <!-- Ignore carrier/aux (from order params) -->
+        <set_value name="$ignoreCarrierAux" exact="false"/>
+        <do_if value="$gtOrder? and $gtOrder.$ignorecarrieraux?">
+          <set_value name="$ignoreCarrierAux" exact="$gtOrder.$ignorecarrieraux"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Ignore Carrier/Aux', $Status = 'INFO', $Detail = if $ignoreCarrierAux then 'true' else 'false']"/>
+
+        <!-- Auto Wares (MK3/MK2 - when off, Ware Basket is used) -->
+        <set_value name="$autoWares" exact="true"/>
+        <do_if value="$gtOrder? and $gtOrder.$autowares?">
+          <set_value name="$autoWares" exact="$gtOrder.$autowares"/>
+        </do_if>
+        <set_value name="$autoWaresDetail" exact="if $autoWares then 'On (auto-select)' else 'Off (manual Ware Basket)'"/>
+        <do_if value="$orderId == 'GalaxyTraderMK1'">
+          <set_value name="$autoWaresDetail" exact="'N/A (MK1 uses station products)'"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Auto Wares', $Status = 'INFO', $Detail = $autoWaresDetail]"/>
+
+        <!-- Ware basket (or MK1 Ware Filter) -->
+        <set_value name="$wareBasket" exact="[]"/>
+        <do_if value="$gtOrder? and $gtOrder.$warebasket? and $gtOrder.$warebasket.count gt 0">
+          <set_value name="$wareBasket" exact="$gtOrder.$warebasket"/>
+        </do_if>
+        <set_value name="$wareBasketDetail" exact="'All wares (no restriction)'"/>
+        <do_if value="$wareBasket.count gt 0">
+          <set_value name="$wareBasketNames" exact="''"/>
+          <do_all exact="[$wareBasket.count, 15].min" counter="$wbi">
+            <set_value name="$wbWare" exact="$wareBasket.{$wbi}"/>
+            <do_if value="$wbWare?">
+              <set_value name="$wbName" exact="if $wbWare.name? then $wbWare.name else '?'"/>
+              <do_if value="$wareBasketNames != ''">
+                <set_value name="$wareBasketNames" exact="$wareBasketNames + ', '"/>
+              </do_if>
+              <set_value name="$wareBasketNames" exact="$wareBasketNames + $wbName"/>
+            </do_if>
+          </do_all>
+          <do_if value="$wareBasket.count gt 15">
+            <set_value name="$wareBasketDetail" exact="'' + $wareBasket.count + ' wares: ' + $wareBasketNames + ', ...'"/>
+          </do_if>
+          <do_else>
+            <set_value name="$wareBasketDetail" exact="'' + $wareBasket.count + ' wares: ' + $wareBasketNames"/>
+          </do_else>
+        </do_if>
+        <set_value name="$wareBasketCheckName" exact="'Ware Basket'"/>
+        <do_if value="$orderId == 'GalaxyTraderMK1' and $wareBasket.count gt 0">
+          <set_value name="$wareBasketCheckName" exact="'Ware Filter (MK1 sell restriction)'"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = $wareBasketCheckName, $Status = 'INFO', $Detail = $wareBasketDetail]"/>
+
+        <!-- Priority wares (MK3 only) -->
+        <set_value name="$priorityWares" exact="[]"/>
+        <do_if value="$gtOrder? and $gtOrder.$prioritywares? and $gtOrder.$prioritywares.count gt 0">
+          <set_value name="$priorityWares" exact="$gtOrder.$prioritywares"/>
+        </do_if>
+        <set_value name="$priorityWaresDetail" exact="'None (no priority override)'"/>
+        <do_if value="$priorityWares.count gt 0">
+          <set_value name="$priorityWaresNames" exact="''"/>
+          <do_all exact="[$priorityWares.count, 15].min" counter="$pwi">
+            <set_value name="$pwWare" exact="$priorityWares.{$pwi}"/>
+            <do_if value="$pwWare?">
+              <set_value name="$pwName" exact="if $pwWare.name? then $pwWare.name else '?'"/>
+              <do_if value="$priorityWaresNames != ''">
+                <set_value name="$priorityWaresNames" exact="$priorityWaresNames + ', '"/>
+              </do_if>
+              <set_value name="$priorityWaresNames" exact="$priorityWaresNames + $pwName"/>
+            </do_if>
+          </do_all>
+          <do_if value="$priorityWares.count gt 15">
+            <set_value name="$priorityWaresDetail" exact="'' + $priorityWares.count + ' wares: ' + $priorityWaresNames + ', ...'"/>
+          </do_if>
+          <do_else>
+            <set_value name="$priorityWaresDetail" exact="'' + $priorityWares.count + ' wares: ' + $priorityWaresNames"/>
+          </do_else>
+        </do_if>
+        <do_if value="$orderId == 'GalaxyTraderMK1' or $orderId == 'GalaxyTraderMK2' or $orderId == 'GalaxyMiner'">
+          <set_value name="$priorityWaresDetail" exact="'N/A'"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Priority Wares', $Status = 'INFO', $Detail = $priorityWaresDetail]"/>
+
+        <!-- Faction Priority (MK3 only - 10% score bonus for own stations) -->
+        <set_value name="$factionPriority" exact="false"/>
+        <do_if value="$gtOrder? and $gtOrder.$factionpriority?">
+          <set_value name="$factionPriority" exact="$gtOrder.$factionpriority"/>
+        </do_if>
+        <set_value name="$factionPriorityDetail" exact="if $factionPriority then 'On (+10% own stations)' else 'Off'"/>
+        <do_if value="$orderId == 'GalaxyTraderMK1' or $orderId == 'GalaxyTraderMK2' or $orderId == 'GalaxyMiner'">
+          <set_value name="$factionPriorityDetail" exact="'N/A'"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Faction Priority', $Status = 'INFO', $Detail = $factionPriorityDetail]"/>
+
+        <!-- Distance Penalty (MK3/MK2 - % impact on trade scoring) -->
+        <set_value name="$distancePenalty" exact="50"/>
+        <do_if value="$gtOrder? and $gtOrder.$distancepenalty?">
+          <set_value name="$distancePenalty" exact="$gtOrder.$distancepenalty"/>
+        </do_if>
+        <set_value name="$distancePenaltyDetail" exact="'' + $distancePenalty + '% (0=ignore dist, 100=strongly prefer close)'"/>
+        <do_if value="$orderId == 'GalaxyTraderMK1' or $orderId == 'GalaxyMiner'">
+          <set_value name="$distancePenaltyDetail" exact="'N/A'"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Distance Penalty', $Status = 'INFO', $Detail = $distancePenaltyDetail]"/>
+
+        <!-- Sector Whitelist (sectors exempt from threat blacklist) -->
+        <run_actions ref="md.GT_Libraries_Blacklist.GT_GetSectorWhitelist" result="$sectorWhitelist">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        <set_value name="$sectorWhitelistDetail" exact="'None'"/>
+        <set_value name="$swCount" exact="0"/>
+        <do_if value="$sectorWhitelist? and $sectorWhitelist.count?">
+          <set_value name="$swCount" exact="$sectorWhitelist.count"/>
+          <do_if value="$swCount gt 0">
+            <set_value name="$swNames" exact="''"/>
+            <do_all exact="[$swCount, 8].min" counter="$swi">
+              <set_value name="$swSec" exact="$sectorWhitelist.{$swi}"/>
+              <do_if value="$swSec? and $swSec.knownname?">
+                <do_if value="$swNames != ''">
+                  <set_value name="$swNames" exact="$swNames + ', '"/>
+                </do_if>
+                <set_value name="$swNames" exact="$swNames + $swSec.knownname"/>
+              </do_if>
+            </do_all>
+            <set_value name="$sectorWhitelistDetail" exact="'' + $swCount + ' sectors exempt' + (if $swNames != '' then ': ' + $swNames + (if $swCount gt 8 then ', ...' else '') else '')"/>
+          </do_if>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Sector Whitelist', $Status = 'INFO', $Detail = $sectorWhitelistDetail]"/>
+
+        <!-- MK1-specific: Home Station, Supply Mode -->
+        <do_if value="$orderId == 'GalaxyTraderMK1'">
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = '--- MK1 Specific ---', $Status = 'INFO', $Detail = '']"/>
+          <set_value name="$mk1HomeStation" exact="'Not set'"/>
+          <do_if value="$gtOrder? and $gtOrder.$homeStation? and $gtOrder.$homeStation.exists">
+            <set_value name="$mk1HomeStation" exact="$gtOrder.$homeStation.knownname"/>
+          </do_if>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Home Station', $Status = if $mk1HomeStation == 'Not set' then 'FAIL' else 'PASS', $Detail = $mk1HomeStation]"/>
+          <set_value name="$mk1Supply" exact="false"/>
+          <do_if value="$gtOrder? and $gtOrder.$supply?">
+            <set_value name="$mk1Supply" exact="$gtOrder.$supply"/>
+          </do_if>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Supply Mode', $Status = 'INFO', $Detail = if $mk1Supply then 'On (also buys resources)' else 'Off']"/>
+        </do_if>
+
+        <!-- MK2-specific: Source/Destination lists -->
+        <do_if value="$orderId == 'GalaxyTraderMK2'">
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = '--- MK2 Specific ---', $Status = 'INFO', $Detail = '']"/>
+          <set_value name="$mk2SourceCount" exact="0"/>
+          <set_value name="$mk2DestCount" exact="0"/>
+          <do_if value="$gtOrder? and $gtOrder.$sourceList? and $gtOrder.$sourceList.count?">
+            <set_value name="$mk2SourceCount" exact="$gtOrder.$sourceList.count"/>
+          </do_if>
+          <do_if value="$gtOrder? and $gtOrder.$destList? and $gtOrder.$destList.count?">
+            <set_value name="$mk2DestCount" exact="$gtOrder.$destList.count"/>
+          </do_if>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Source Stations', $Status = if $mk2SourceCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $mk2SourceCount + ' stations']"/>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Destination Stations', $Status = if $mk2DestCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $mk2DestCount + ' stations']"/>
+        </do_if>
+
+        <!-- Miner-specific: Home Anchor, Target Stations, Overflow -->
+        <do_if value="$orderId == 'GalaxyMiner'">
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = '--- Miner Specific ---', $Status = 'INFO', $Detail = '']"/>
+          <set_value name="$minerHome" exact="'Not set'"/>
+          <do_if value="$gtOrder?">
+            <do_if value="$gtOrder.$homeStation? and $gtOrder.$homeStation.exists">
+              <set_value name="$minerHome" exact="'Station: ' + $gtOrder.$homeStation.knownname"/>
+            </do_if>
+            <do_elseif value="$gtOrder.$homeSector? and $gtOrder.$homeSector.exists">
+              <set_value name="$minerHome" exact="'Sector: ' + $gtOrder.$homeSector.knownname"/>
+            </do_elseif>
+          </do_if>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Home Anchor', $Status = if $minerHome == 'Not set' then 'FAIL' else 'PASS', $Detail = $minerHome]"/>
+          
+          <set_value name="$minerTargetStations" exact="0"/>
+          <do_if value="$gtOrder? and $gtOrder.$stationList? and $gtOrder.$stationList.count?">
+            <set_value name="$minerTargetStations" exact="$gtOrder.$stationList.count"/>
+          </do_if>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Target Stations', $Status = 'INFO', $Detail = '' + $minerTargetStations + ' stations']"/>
+          
+          <set_value name="$minerOverflow" exact="false"/>
+          <do_if value="$gtOrder? and $gtOrder.$allowOverflowSellToOthers?">
+            <set_value name="$minerOverflow" exact="$gtOrder.$allowOverflowSellToOthers"/>
+          </do_if>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Overflow Sell', $Status = 'INFO', $Detail = if $minerOverflow then 'Enabled' else 'Disabled']"/>
+          <set_value name="$minerPlayerOnly" exact="false"/>
+          <do_if value="$gtOrder? and $gtOrder.$playerStationsOnly?">
+            <set_value name="$minerPlayerOnly" exact="$gtOrder.$playerStationsOnly"/>
+          </do_if>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Player Stations Only', $Status = 'INFO', $Detail = if $minerPlayerOnly then 'true' else 'false']"/>
+          <set_value name="$minerOverflowThreshold" exact="90"/>
+          <do_if value="$gtOrder? and $gtOrder.$overflowThreshold?">
+            <set_value name="$minerOverflowThreshold" exact="[70, [100, $gtOrder.$overflowThreshold].min].max"/>
+          </do_if>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Overflow Threshold', $Status = 'INFO', $Detail = '' + $minerOverflowThreshold + '%']"/>
+        </do_if>
+
+        <!-- Miner diagnose ware scope: only mineable wares currently in cargo or actively mined now. -->
+        <set_value name="$diagMinerOfferWares" exact="[]"/>
+        <set_value name="$diagMinerOfferWaresDetail" exact="'N/A (non-miner order)'"/>
+        <set_value name="$diagMinerPlayerStationsOnly" exact="false"/>
+        <set_value name="$diagMinerOverflowThreshold" exact="90"/>
+        <set_value name="$diagMinerAllowOverflowSellToOthers" exact="false"/>
+        <set_value name="$diagMinerOverflowMode" exact="false"/>
+        <set_value name="$diagMinerPrimaryStations" exact="[]"/>
+        <set_value name="$diagMinerPolicySummary" exact="'N/A (non-miner order)'"/>
+        <do_if value="$orderId == 'GalaxyMiner'">
+          <set_value name="$diagMinerOfferWaresDetail" exact="'none (no mineable cargo and no active mining ware snapshot)'"/>
+          <do_if value="$gtOrder? and $gtOrder.$playerStationsOnly?">
+            <set_value name="$diagMinerPlayerStationsOnly" exact="$gtOrder.$playerStationsOnly"/>
+          </do_if>
+          <do_if value="$gtOrder? and $gtOrder.$overflowThreshold?">
+            <set_value name="$diagMinerOverflowThreshold" exact="[70, [100, $gtOrder.$overflowThreshold].min].max"/>
+          </do_if>
+          <do_if value="$gtOrder? and $gtOrder.$allowOverflowSellToOthers?">
+            <set_value name="$diagMinerAllowOverflowSellToOthers" exact="$gtOrder.$allowOverflowSellToOthers"/>
+          </do_if>
+          <do_if value="$minerDiag? and $minerDiag.$OverflowMode? and $minerDiag.$OverflowMode">
+            <set_value name="$diagMinerOverflowMode" exact="true"/>
+          </do_if>
+          <!-- Rebuild primary station list from miner settings for policy-accurate diagnose filtering. -->
+          <do_if value="$gtOrder? and $gtOrder.$stationList? and $gtOrder.$stationList.count gt 0">
+            <do_all exact="$gtOrder.$stationList.count" counter="$dsti">
+              <set_value name="$diagStationCandidate" exact="$gtOrder.$stationList.{$dsti}"/>
+              <do_if value="$diagStationCandidate? and $diagStationCandidate.exists and $diagStationCandidate.isclass.station and $diagStationCandidate.isoperational">
+                <set_value name="$diagAllowStation" exact="true"/>
+                <do_if value="$diagMinerPlayerStationsOnly and $diagStationCandidate.owner != $ship.owner">
+                  <set_value name="$diagAllowStation" exact="false"/>
+                </do_if>
+                <do_if value="$gtOrder.$homeSector? and $gtOrder.$homeSector.exists and $diagStationCandidate.sector != $gtOrder.$homeSector">
+                  <set_value name="$diagAllowStation" exact="false"/>
+                </do_if>
+                <do_if value="$diagAllowStation and not $diagMinerPrimaryStations.indexof.{$diagStationCandidate}">
+                  <append_to_list name="$diagMinerPrimaryStations" exact="$diagStationCandidate"/>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="$gtOrder? and $gtOrder.$homeStation? and $gtOrder.$homeStation.exists and $gtOrder.$homeStation.isoperational and ((not $diagMinerPlayerStationsOnly) or ($gtOrder.$homeStation.owner == $ship.owner)) and ((not $gtOrder.$homeSector?) or (not $gtOrder.$homeSector.exists) or ($gtOrder.$homeStation.sector == $gtOrder.$homeSector)) and not $diagMinerPrimaryStations.indexof.{$gtOrder.$homeStation}">
+            <append_to_list name="$diagMinerPrimaryStations" exact="$gtOrder.$homeStation"/>
+          </do_if>
+          <set_value name="$diagMinerPolicySummary" exact="'Primary mode: only primary stations below ' + $diagMinerOverflowThreshold + '% target fill'"/>
+          <do_if value="$diagMinerOverflowMode">
+            <do_if value="not $diagMinerAllowOverflowSellToOthers">
+              <set_value name="$diagMinerPolicySummary" exact="'Overflow mode: fallback disabled, no additional sell targets allowed'"/>
+            </do_if>
+            <do_elseif value="$diagMinerPlayerStationsOnly">
+              <set_value name="$diagMinerPolicySummary" exact="'Overflow mode: only other player stations (non-primary)'" />
+            </do_elseif>
+            <do_else>
+              <set_value name="$diagMinerPolicySummary" exact="'Overflow mode: any faction allowed'" />
+            </do_else>
+          </do_if>
+          <set_value name="$diagMinerSelectedWare" exact="null"/>
+          <do_if value="global.$GT_MinerDiag? and global.$GT_MinerDiag.{$ship}? and global.$GT_MinerDiag.{$ship}.$SelectedWare?">
+            <set_value name="$diagMinerSelectedWare" exact="global.$GT_MinerDiag.{$ship}.$SelectedWare"/>
+          </do_if>
+          <do_if value="$diagMinerSelectedWare? and $diagMinerSelectedWare.hastag.minable and $ship.cargo.{$diagMinerSelectedWare}.max gt 0 and not $diagMinerOfferWares.indexof.{$diagMinerSelectedWare}">
+            <append_to_list name="$diagMinerOfferWares" exact="$diagMinerSelectedWare"/>
+          </do_if>
+          <do_all exact="$ship.cargo.list.count" counter="$mwi">
+            <set_value name="$mWare" exact="$ship.cargo.list.{$mwi}"/>
+            <do_if value="$mWare? and $mWare.hastag.minable and $ship.cargo.{$mWare}.count gt 0 and $ship.cargo.{$mWare}.max gt 0 and not $diagMinerOfferWares.indexof.{$mWare}">
+              <append_to_list name="$diagMinerOfferWares" exact="$mWare"/>
+            </do_if>
+          </do_all>
+          <do_if value="$diagMinerOfferWares.count gt 0">
+            <set_value name="$diagMinerOfferWaresNames" exact="''"/>
+            <do_all exact="$diagMinerOfferWares.count" counter="$mwni">
+              <set_value name="$mWareName" exact="if $diagMinerOfferWares.{$mwni}.name? then $diagMinerOfferWares.{$mwni}.name else '?'"/>
+              <do_if value="$diagMinerOfferWaresNames != ''">
+                <set_value name="$diagMinerOfferWaresNames" exact="$diagMinerOfferWaresNames + ', '"/>
+              </do_if>
+              <set_value name="$diagMinerOfferWaresNames" exact="$diagMinerOfferWaresNames + $mWareName"/>
+            </do_all>
+            <set_value name="$diagMinerOfferWaresDetail" exact="'' + $diagMinerOfferWares.count + ' wares: ' + $diagMinerOfferWaresNames"/>
+          </do_if>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Diagnose Sell Wares', $Status = if $diagMinerOfferWares.count gt 0 then 'PASS' else 'WARN', $Detail = $diagMinerOfferWaresDetail]"/>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Diagnose Miner Policy', $Status = 'INFO', $Detail = $diagMinerPolicySummary]"/>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Diagnose Primary Stations', $Status = if $diagMinerPrimaryStations.count gt 0 then 'PASS' else 'WARN', $Detail = '' + $diagMinerPrimaryStations.count + ' stations']"/>
+        </do_if>
+
+        <append_to_list name="$report.$Sections" exact="$sec3"/>
+
+        <!-- ======================================================== -->
+        <!-- Profit Threshold (merged into Ship State sec1)           -->
+        <!-- SKIPPED in clearance mode (clearance sells at any price) -->
+        <!-- ======================================================== -->
+        <do_if value="not $isClearanceMode">
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = '--- Profit Threshold ---', $Status = 'INFO', $Detail = '']"/>
+
+          <!-- Config base profit -->
+          <set_value name="$configBaseProfit" exact="10000"/>
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$ConfigBaseProfit?">
+            <set_value name="$configBaseProfit" exact="global.$GT_AIParameters.{$ship}.$ConfigBaseProfit"/>
+          </do_if>
+
+          <!-- Skill scaling -->
+          <set_value name="$skillNumerator" exact="($skillLevel - 1) * ($skillLevel - 1) * $configBaseProfit"/>
+          <set_value name="$baseThreshold" exact="$skillNumerator / 196"/>
+
+          <!-- Cargo scaling -->
+          <set_value name="$referenceCargo" exact="8200"/>
+          <set_value name="$shipCargoCap" exact="$ship.cargo.capacity.all"/>
+          <set_value name="$scalingFactor" exact="($shipCargoCap * 100) / $referenceCargo"/>
+          <set_value name="$scaledThreshold" exact="($baseThreshold * $scalingFactor) / 100"/>
+          <set_value name="$minFloor" exact="($baseThreshold * 25) / 100"/>
+          <set_value name="$finalProfitThreshold" exact="[$scaledThreshold, $minFloor].max"/>
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Profit Threshold', $Status = 'INFO', $Detail = '' + ($finalProfitThreshold / 100) + ' Cr']"/>
+
+          <!-- ROI threshold -->
+          <set_value name="$minROI" exact="5"/>
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$MinROI?">
+            <set_value name="$minROI" exact="global.$GT_AIParameters.{$ship}.$MinROI"/>
+          </do_if>
+          <!-- Apply skill multiplier to ROI -->
+          <run_actions ref="md.GT_Libraries_General.GT_GetSkillMultiplier" result="$roiMultiplier">
+            <param name="skillLevel" value="$skillLevel"/>
+          </run_actions>
+          <set_value name="$effectiveROI" exact="$minROI * $roiMultiplier"/>
+          <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Min ROI', $Status = 'INFO', $Detail = '' + $effectiveROI + '%']"/>
+        </do_if>
+
+        <!-- ======================================================== -->
+        <!-- SECTION 6: Scheduler State                               -->
+        <!-- ======================================================== -->
+        <set_value name="$sec6" exact="table[]"/>
+        <set_value name="$sec6.$Name" exact="'Scheduler State'"/>
+        <set_value name="$sec6.$Rows" exact="[]"/>
+
+        <!-- Queue status -->
+        <set_value name="$queueResult" exact="'INFO'"/>
+        <do_if value="$orderId == 'GalaxyTraderMK3' or $orderId == 'GalaxyTraderMK4Supply'">
+          <set_value name="$queueDetail" exact="'Not queued'"/>
+        </do_if>
+        <do_else>
+          <set_value name="$queueDetail" exact="'N/A (MK3/MK4 only)'"/>
+        </do_else>
+        <do_if value="($orderId == 'GalaxyTraderMK3' or $orderId == 'GalaxyTraderMK4Supply') and global.$GT_SearchSemaphore?">
+          <do_if value="global.$GT_SearchSemaphore.$CacheQueued? and global.$GT_SearchSemaphore.$CacheQueued.{$ship}?">
+            <set_value name="$queueDetail" exact="'In cache queue'"/>
+          </do_if>
+          <do_if value="global.$GT_SearchSemaphore.$CacheActiveShips? and global.$GT_SearchSemaphore.$CacheActiveShips.{$ship}?">
+            <set_value name="$queueDetail" exact="'Cache search active'"/>
+            <set_value name="$queueResult" exact="'OK'"/>
+          </do_if>
+          <do_if value="global.$GT_SearchSemaphore.$LiveQueued? and global.$GT_SearchSemaphore.$LiveQueued.{$ship}?">
+            <set_value name="$queueDetail" exact="'In live queue'"/>
+          </do_if>
+          <do_if value="global.$GT_SearchSemaphore.$LiveActiveShips? and global.$GT_SearchSemaphore.$LiveActiveShips.{$ship}?">
+            <set_value name="$queueDetail" exact="'Live search active'"/>
+            <set_value name="$queueResult" exact="'OK'"/>
+          </do_if>
+        </do_if>
+        <append_to_list name="$sec6.$Rows" exact="table[$Check = 'Queue Status', $Status = $queueResult, $Detail = $queueDetail]"/>
+
+        <!-- Scheduler pool usage -->
+        <set_value name="$procLockDetail" exact="'No active searches'"/>
+        <do_if value="global.$GT_SearchSemaphore?">
+          <set_value name="$cacheActive" exact="if global.$GT_SearchSemaphore.$CacheActive? then global.$GT_SearchSemaphore.$CacheActive else 0"/>
+          <set_value name="$cacheMax" exact="if global.$GT_SearchSemaphore.$MaxConcurrentCache? then global.$GT_SearchSemaphore.$MaxConcurrentCache else 0"/>
+          <set_value name="$liveActive" exact="if global.$GT_SearchSemaphore.$LiveActive? then global.$GT_SearchSemaphore.$LiveActive else 0"/>
+          <set_value name="$liveMax" exact="if global.$GT_SearchSemaphore.$MaxConcurrentLive? then global.$GT_SearchSemaphore.$MaxConcurrentLive else 0"/>
+          <set_value name="$procLockDetail" exact="'Cache active: ' + $cacheActive + '/' + $cacheMax + ' | Live active: ' + $liveActive + '/' + $liveMax"/>
+        </do_if>
+        <append_to_list name="$sec6.$Rows" exact="table[$Check = 'Scheduler Slots', $Status = 'INFO', $Detail = $procLockDetail]"/>
+
+        <!-- Home sector refresh lock -->
+        <set_value name="$refreshLockDetail" exact="'Not locked'"/>
+        <do_if value="$homeSector? and $homeSector.exists and global.$GT_TS_LiveRefreshBySector? and global.$GT_TS_LiveRefreshBySector.{$homeSector}? and global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Active?">
+          <set_value name="$lockInitiator" exact="@global.$GT_TS_LiveRefreshBySector.{$homeSector}.$Initiator"/>
+          <set_value name="$refreshLockDetail" exact="'LOCKED by ' + (if $lockInitiator? then $lockInitiator.idcode else 'unknown')"/>
+          <do_if value="$lockInitiator? and $lockInitiator == $ship">
+            <set_value name="$refreshLockDetail" exact="'LOCKED by THIS ship (self)'"/>
+          </do_if>
+        </do_if>
+        <append_to_list name="$sec6.$Rows" exact="table[$Check = 'Home Sector Refresh Lock', $Status = 'INFO', $Detail = $refreshLockDetail]"/>
+
+        <!-- Live search cooldown -->
+        <set_value name="$cooldownDetail" exact="'No cooldown'"/>
+        <do_if value="global.$GT_CacheMissCooldowns? and global.$GT_CacheMissCooldowns.{$ship}?">
+          <set_value name="$cooldownExpiry" exact="@global.$GT_CacheMissCooldowns.{$ship}.$Expiry"/>
+          <do_if value="$cooldownExpiry? and player.age lt $cooldownExpiry">
+            <set_value name="$cooldownRemaining" exact="$cooldownExpiry - player.age"/>
+            <set_value name="$cooldownDetail" exact="'Active — ' + $cooldownRemaining + 's remaining'"/>
+          </do_if>
+          <do_else>
+            <set_value name="$cooldownDetail" exact="'Expired'"/>
+          </do_else>
+        </do_if>
+        <append_to_list name="$sec6.$Rows" exact="table[$Check = 'Live Search Cooldown', $Status = 'INFO', $Detail = $cooldownDetail]"/>
+
+        <append_to_list name="$report.$Sections" exact="$sec6"/>
+
+        <!-- ======================================================== -->
+        <!-- SECTION 7: Cache State Dump                              -->
+        <!-- SKIPPED in clearance mode (clearance doesn't use cache)  -->
+        <!-- SKIPPED for MK1/MK2/Miner (they don't use cache)         -->
+        <!-- ======================================================== -->
+        <do_if value="not $isClearanceMode and ($orderId == 'GalaxyTraderMK3' or $orderId == 'GalaxyTraderMK4Supply')">
+        <set_value name="$sec7" exact="table[]"/>
+        <set_value name="$sec7.$Name" exact="'Cache State'"/>
+        <set_value name="$sec7.$Rows" exact="[]"/>
+
+        <set_value name="$cacheExists" exact="false"/>
+        <set_value name="$cacheEntryCount" exact="0"/>
+        <do_if value="$homeSector? and $homeSector.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$homeSector}?">
+          <set_value name="$cacheExists" exact="true"/>
+          <set_value name="$cacheList" exact="global.$GT_TradeCache.{$homeSector}"/>
+          <do_if value="$cacheList.count?">
+            <set_value name="$cacheEntryCount" exact="$cacheList.count"/>
+          </do_if>
+        </do_if>
+        <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Cache Exists', $Status = if $cacheExists then 'PASS' else 'FAIL', $Detail = '' + $cacheEntryCount + ' entries']"/>
+
+        <!-- Cache max distance (cache metadata only, not ship order distance) -->
+        <set_value name="$cacheMaxDist" exact="-1"/>
+        <set_value name="$cacheDistResult" exact="'INFO'"/>
+        <set_value name="$cacheDistDetail" exact="'N/A (no cache max-distance metadata yet) — ship needs: ' + $maxDistance + ' jumps'"/>
+        <do_if value="$homeSector? and global.$GT_TradeCacheMaxDistance? and global.$GT_TradeCacheMaxDistance.{$homeSector}?">
+          <set_value name="$cacheMaxDist" exact="global.$GT_TradeCacheMaxDistance.{$homeSector}"/>
+          <set_value name="$cacheDistResult" exact="if $cacheMaxDist ge $maxDistance then 'PASS' else 'WARN'"/>
+          <set_value name="$cacheDistDetail" exact="'Cache max distance metadata: ' + $cacheMaxDist + ' jumps; ship needs ' + $maxDistance + ' jumps'"/>
+        </do_if>
+        <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Cache Max Distance', $Status = $cacheDistResult, $Detail = $cacheDistDetail]"/>
+
+        <!-- Cache age analysis + per-entry dump (top 20 by ROI) -->
+        <do_if value="$cacheExists and $cacheEntryCount gt 0">
+          <set_value name="$oldestAge" exact="0"/>
+          <set_value name="$newestAge" exact="999999"/>
+          <set_value name="$expiredCount" exact="0"/>
+          <set_value name="$failedShipCount" exact="0"/>
+          <set_value name="$uniqueWares" exact="table[]"/>
+          <set_value name="$cacheDetails" exact="[]"/>
+          <set_value name="$cacheIdx" exact="0"/>
+
+          <!-- Count unique wares across ALL cache entries (not just the top 20 detail dump) -->
+          <!-- NOTE: Must NOT combine @ and ? operators (X4 rule: @$x? is invalid) -->
+          <do_all exact="$cacheEntryCount" counter="$wi">
+            <set_value name="$wareEntry" exact="@$cacheList.{$wi}"/>
+            <do_if value="$wareEntry?">
+              <set_value name="$tempWare" exact="@$wareEntry.$Ware"/>
+              <do_if value="$tempWare?">
+                <set_value name="$uniqueWares.{$tempWare}" exact="true"/>
+              </do_if>
+            </do_if>
+          </do_all>
+
+          <!-- Detail dump: top 20 entries by score (cache is sorted descending) -->
+          <do_all exact="[20, $cacheEntryCount].min" counter="$ci">
+            <set_value name="$entry" exact="@$cacheList.{$ci}"/>
+            <do_if value="$entry?">
+              <set_value name="$entryAge" exact="0"/>
+              <do_if value="$entry.$Timestamp?">
+                <set_value name="$entryAge" exact="player.age - $entry.$Timestamp"/>
+              </do_if>
+              <do_if value="$entryAge gt $oldestAge">
+                <set_value name="$oldestAge" exact="$entryAge"/>
+              </do_if>
+              <do_if value="$entryAge lt $newestAge">
+                <set_value name="$newestAge" exact="$entryAge"/>
+              </do_if>
+              <do_if value="$entryAge gt 600">
+                <set_value name="$expiredCount" operation="add"/>
+              </do_if>
+
+              <set_value name="$entryWare" exact="@$entry.$Ware"/>
+
+              <!-- Failed ships check -->
+              <set_value name="$shipFailed" exact="'No'"/>
+              <do_if value="$entry.$FailedShipSet? and $entry.$FailedShipSet.{$ship}?">
+                <set_value name="$shipFailed" exact="'YES'"/>
+                <set_value name="$failedShipCount" operation="add"/>
+              </do_if>
+
+              <!-- Build detail string -->
+              <set_value name="$entryBuyStation" exact="@$entry.$BuyOffer.owner.knownname"/>
+              <do_if value="not $entryBuyStation?">
+                <set_value name="$entryBuyStation" exact="'???'"/>
+              </do_if>
+              <set_value name="$entrySellStation" exact="@$entry.$SellOffer.owner.knownname"/>
+              <do_if value="not $entrySellStation?">
+                <set_value name="$entrySellStation" exact="'???'"/>
+              </do_if>
+              <set_value name="$entryWareName" exact="'???'"/>
+              <do_if value="$entryWare?">
+                <set_value name="$entryWareName" exact="$entryWare.name"/>
+              </do_if>
+              <!-- ROI is not stored in cache entries — compute from UnitProfit / BuyPrice -->
+              <set_value name="$entryBuyPrice" exact="@$entry.$BuyPrice"/>
+              <set_value name="$entryUnitProfit" exact="@$entry.$UnitProfit"/>
+              <set_value name="$entryROI" exact="0"/>
+              <do_if value="$entryBuyPrice? and $entryBuyPrice gt 0 and $entryUnitProfit?">
+                <set_value name="$entryROI" exact="($entryUnitProfit * 100) / $entryBuyPrice"/>
+              </do_if>
+              <set_value name="$entryFailCount" exact="@$entry.$FailCount"/>
+              <do_if value="not $entryFailCount?">
+                <set_value name="$entryFailCount" exact="0"/>
+              </do_if>
+
+              <set_value name="$entryScore" exact="@$entry.$Score"/>
+              <do_if value="not $entryScore?">
+                <set_value name="$entryScore" exact="0"/>
+              </do_if>
+              <set_value name="$entryProfit" exact="@$entry.$Profit"/>
+              <do_if value="not $entryProfit?">
+                <set_value name="$entryProfit" exact="0"/>
+              </do_if>
+              <set_value name="$detailStr" exact="$entryWareName + ' | ' + $entryBuyStation + ' -> ' + $entrySellStation + ' | ' + ($entryProfit / 100) + 'Cr | ROI ' + $entryROI + '% | ' + $entryAge + 's'"/>
+              <do_if value="$shipFailed == 'YES'">
+                <set_value name="$detailStr" exact="$detailStr + ' | FAILED'"/>
+              </do_if>
+              <append_to_list name="$sec7.$Rows" exact="table[$Check = '#' + $ci, $Status = if $shipFailed == 'YES' then 'WARN' else 'INFO', $Detail = $detailStr]"/>
+            </do_if>
+          </do_all>
+
+          <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Unique Wares In Cache', $Status = 'INFO', $Detail = '' + $uniqueWares.keys.count + ' wares']"/>
+          <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Expired Entries (>600s)', $Status = if $expiredCount gt 0 then 'WARN' else 'PASS', $Detail = '' + $expiredCount + ' / ' + [20, $cacheEntryCount].min]"/>
+          <append_to_list name="$sec7.$Rows" exact="table[$Check = 'This Ship In FailedShips', $Status = if $failedShipCount gt 0 then 'WARN' else 'PASS', $Detail = '' + $failedShipCount + ' entries have this ship in FailedShips']"/>
+        </do_if>
+
+        <append_to_list name="$report.$Sections" exact="$sec7"/>
+        </do_if>
+
+        <!-- ======================================================== -->
+        <!-- Compute search sectors (needed by both live search and   -->
+        <!-- clearance analysis)                                       -->
+        <!-- ======================================================== -->
+        <set_value name="$searchSectors" exact="[]"/>
+        <do_if value="$homeSector? and $homeSector.exists">
+          <!-- Always include home sector -->
+          <append_to_list name="$searchSectors" exact="$homeSector"/>
+          <!-- Add neighboring sectors within diagnose search distance -->
+          <do_if value="$diagSearchDistance gt 0">
+            <find_sector name="$nearbySectors" space="player.galaxy" multiple="true">
+              <match_gate_distance object="$homeSector" min="0" max="$diagSearchDistance"/>
+            </find_sector>
+            <do_if value="$nearbySectors? and $nearbySectors.count gt 0">
+              <do_all exact="$nearbySectors.count" counter="$si">
+                <set_value name="$nearbySec" exact="$nearbySectors.{$si}"/>
+                <do_if value="$nearbySec != $homeSector">
+                  <!-- Diagnose parity fix: only include sectors reachable with blacklist-aware pathing. -->
+                  <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculatePathDistance" result="$diagSecDist">
+                    <param name="ship" value="$ship"/>
+                    <param name="fromSector" value="$homeSector"/>
+                    <param name="toSector" value="$nearbySec"/>
+                    <param name="blacklistgroup" value="$diagBlacklistGroup"/>
+                    <param name="useEscapeMode" value="false"/>
+                  </run_actions>
+                  <do_if value="$diagSecDist ge 0 and $diagSecDist le $diagSearchDistance">
+                    <append_to_list name="$searchSectors" exact="$nearbySec"/>
+                  </do_if>
+                </do_if>
+              </do_all>
+            </do_if>
+          </do_if>
+        </do_if>
+
+        <!-- ======================================================== -->
+        <!-- SECTION 8: Live Search (EXPLICIT)                        -->
+        <!-- Runs find_sell_offer / find_buy_offer for all sectors     -->
+        <!-- in range and evaluates EVERY pair                         -->
+        <!-- SKIPPED in clearance mode (ship is selling, not searching)-->
+        <!-- ======================================================== -->
+        <do_if value="not $isClearanceMode">
+        <set_value name="$sec8" exact="table[]"/>
+        <set_value name="$sec8.$Name" exact="'Search Summary'"/>
+        <set_value name="$sec8.$Rows" exact="[]"/>
+        <!-- Miner runtime parity: mining-routine sell search uses lib.gt.live.search
+             with default buyPriceMin (-1.0), i.e. no relative-price floor. -->
+        <set_value name="$diagBuyPriceMinForSearch" exact="$activeBuyPriceMin"/>
+        <do_if value="$orderId == 'GalaxyMiner'">
+          <set_value name="$diagBuyPriceMinForSearch" exact="-1.0"/>
+        </do_if>
+
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Search Pipeline', $Status = 'INFO', $Detail = $pipelineState + ' (Sell max: ' + ($activeSellPriceMax * 100) + '%, Buy min: ' + ($activeBuyPriceMin * 100) + '%)']"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Sectors In Range', $Status = 'INFO', $Detail = '' + $searchSectors.count + ' sectors (distance=' + $diagSearchDistance + ')']"/>
+        <do_if value="$orderId == 'GalaxyMiner'">
+          <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Miner Offer Ware Scope', $Status = if $diagMinerOfferWares.count gt 0 then 'PASS' else 'WARN', $Detail = $diagMinerOfferWaresDetail]"/>
+        </do_if>
+
+        <!-- Collect sell offers and buy offers from all sectors -->
+        <set_value name="$allSellOffers" exact="[]"/>
+        <set_value name="$allBuyOffers" exact="[]"/>
+        <set_value name="$sectorBreakdown" exact="[]"/>
+
+        <do_all exact="$searchSectors.count" counter="$si">
+          <set_value name="$searchSec" exact="$searchSectors.{$si}"/>
+
+          <!-- For miners we only diagnose sell opportunities (buyers), not buy opportunities. -->
+          <do_if value="$orderId == 'GalaxyMiner'">
+            <set_value name="$secSellOffers" exact="[]"/>
+          </do_if>
+          <do_elseif value="$ignoreTradeRules">
+            <find_sell_offer space="$searchSec" result="$secSellOffers" multiple="true">
+              <match_seller tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_seller>
+              <amount min="1"/>
+              <relativeprice max="$activeSellPriceMax"/>
+            </find_sell_offer>
+          </do_elseif>
+          <do_else>
+            <find_sell_offer space="$searchSec" result="$secSellOffers" multiple="true">
+              <match_seller tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_seller>
+              <amount min="1"/>
+              <relativeprice max="$activeSellPriceMax"/>
+            </find_sell_offer>
+          </do_else>
+          <set_value name="$secSellCount" exact="0"/>
+          <do_if value="$secSellOffers? and $secSellOffers.count?">
+            <set_value name="$secSellCount" exact="$secSellOffers.count"/>
+            <do_all exact="$secSellCount" counter="$soi">
+              <append_to_list name="$allSellOffers" exact="$secSellOffers.{$soi}"/>
+            </do_all>
+          </do_if>
+
+          <!-- Find buy offers (ship sells to station). For miners, strictly filter to relevant wares. -->
+          <do_if value="$orderId == 'GalaxyMiner'">
+            <do_if value="$diagMinerOfferWares.count gt 0">
+              <find_buy_offer wares="$diagMinerOfferWares" tradepartner="$ship" space="$searchSec" result="$secBuyOffers" multiple="true">
+                <match_buyer tradesknownto="$ship.owner">
+                  <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+                </match_buyer>
+                <offeramount min="1" tradepartner="$ship"/>
+                <relativeprice min="$diagBuyPriceMinForSearch" tradepartner="if $ship.isplayerowned then $ship else null"/>
+              </find_buy_offer>
+            </do_if>
+            <do_else>
+              <set_value name="$secBuyOffers" exact="[]"/>
+            </do_else>
+          </do_if>
+          <do_elseif value="$ignoreTradeRules">
+            <find_buy_offer space="$searchSec" result="$secBuyOffers" multiple="true">
+              <match_buyer tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_buyer>
+              <amount min="1"/>
+              <relativeprice min="$activeBuyPriceMin"/>
+            </find_buy_offer>
+          </do_elseif>
+          <do_else>
+            <find_buy_offer space="$searchSec" result="$secBuyOffers" multiple="true">
+              <match_buyer tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_buyer>
+              <amount min="1"/>
+              <relativeprice min="$activeBuyPriceMin"/>
+            </find_buy_offer>
+          </do_else>
+          <set_value name="$secBuyCount" exact="0"/>
+          <do_if value="$secBuyOffers? and $secBuyOffers.count?">
+            <do_all exact="$secBuyOffers.count" counter="$boi">
+              <set_value name="$boffer" exact="$secBuyOffers.{$boi}"/>
+              <set_value name="$diagOfferAllowed" exact="true"/>
+              <set_value name="$diagOfferStation" exact="if $boffer? and $boffer.owner? then $boffer.owner else null"/>
+              <set_value name="$diagOfferWare" exact="if $boffer? and $boffer.ware? then $boffer.ware else null"/>
+              <set_value name="$diagOfferIsPrimary" exact="false"/>
+              <do_if value="$orderId == 'GalaxyMiner' and $diagOfferStation? and $diagOfferStation.exists and $diagMinerPrimaryStations.count gt 0">
+                <do_all exact="$diagMinerPrimaryStations.count" counter="$dpsi">
+                  <do_if value="$diagMinerPrimaryStations.{$dpsi}? and $diagMinerPrimaryStations.{$dpsi}.exists and $diagMinerPrimaryStations.{$dpsi} == $diagOfferStation">
+                    <set_value name="$diagOfferIsPrimary" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+              </do_if>
+              <do_if value="$orderId == 'GalaxyMiner'">
+                <do_if value="$diagMinerPlayerStationsOnly and (not $diagOfferStation? or not $diagOfferStation.exists or not $diagOfferStation.isplayerowned)">
+                  <set_value name="$diagOfferAllowed" exact="false"/>
+                </do_if>
+                <do_if value="$diagOfferAllowed and $diagMinerOverflowMode">
+                  <do_if value="not $diagMinerAllowOverflowSellToOthers">
+                    <set_value name="$diagOfferAllowed" exact="false"/>
+                  </do_if>
+                  <do_elseif value="$diagMinerPlayerStationsOnly and $diagOfferIsPrimary">
+                    <set_value name="$diagOfferAllowed" exact="false"/>
+                  </do_elseif>
+                </do_if>
+                <do_if value="$diagOfferAllowed and (not $diagMinerOverflowMode)">
+                  <do_if value="not $diagOfferIsPrimary">
+                    <set_value name="$diagOfferAllowed" exact="false"/>
+                  </do_if>
+                  <do_else>
+                    <set_value name="$diagPrimaryTargetAmount" exact="$diagOfferStation.cargo.{$diagOfferWare}.target"/>
+                    <do_if value="$diagPrimaryTargetAmount le 0">
+                      <set_value name="$diagOfferAllowed" exact="false"/>
+                    </do_if>
+                    <do_else>
+                      <set_value name="$diagPrimaryStoragePercent" exact="($diagOfferStation.cargo.{$diagOfferWare}.count * 100) / [$diagPrimaryTargetAmount, 1].max"/>
+                      <do_if value="$diagPrimaryStoragePercent ge $diagMinerOverflowThreshold">
+                        <set_value name="$diagOfferAllowed" exact="false"/>
+                      </do_if>
+                    </do_else>
+                  </do_else>
+                </do_if>
+              </do_if>
+              <do_if value="not $diagOfferAllowed">
+                <continue/>
+              </do_if>
+              <do_if value="$ignoreMK1Supply and global.$GT_MK1SuppliedStations? and global.$GT_MK1SuppliedStations.{$boffer.owner}?">
+                <continue/>
+              </do_if>
+              <append_to_list name="$allBuyOffers" exact="$boffer"/>
+              <set_value name="$secBuyCount" operation="add"/>
+            </do_all>
+          </do_if>
+
+          <!-- Store per-sector breakdown with structured columns -->
+          <set_value name="$sectorOfferStatus" exact="if ($secSellCount + $secBuyCount) gt 0 then 'INFO' else 'WARN'"/>
+          <append_to_list name="$sectorBreakdown" exact="table[$Check = $searchSec.knownname, $Status = $sectorOfferStatus, $Detail = '' + $secSellCount, $Col4 = '' + $secBuyCount, $Col5 = '' + ($secSellCount + $secBuyCount), $Col6 = '']"/>
+        </do_all>
+
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Total Sell Offers', $Status = 'INFO', $Detail = '' + $allSellOffers.count]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Total Buy Offers', $Status = 'INFO', $Detail = '' + $allBuyOffers.count]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = '--- Per Sector ---', $Status = 'INFO', $Detail = '']"/>
+        <do_all exact="$sectorBreakdown.count" counter="$sbi">
+          <append_to_list name="$sec8.$Rows" exact="$sectorBreakdown.{$sbi}"/>
+        </do_all>
+
+        <!-- NOTE: No cooperative yield in MD scripts (<wait> is AI-script only) -->
+        <!-- This diagnostic runs synchronously — acceptable for manual trigger -->
+
+        <!-- ======================================================== -->
+        <!-- SECTION 8b: Pair Evaluation                              -->
+        <!-- Evaluate sell-buy pairs (cap at 500 pairs total)         -->
+        <!-- ======================================================== -->
+        <set_value name="$pairCount" exact="0"/>
+        <set_value name="$passCount" exact="0"/>
+        <set_value name="$rejectNoProfit" exact="0"/>
+        <set_value name="$rejectBelowThreshold" exact="0"/>
+        <set_value name="$rejectBelowROI" exact="0"/>
+        <set_value name="$rejectDocking" exact="0"/>
+        <set_value name="$rejectDockSize" exact="0"/>
+        <set_value name="$rejectNotOperational" exact="0"/>
+        <set_value name="$rejectZeroAmount" exact="0"/>
+        <set_value name="$rejectCantAfford" exact="0"/>
+        <set_value name="$rejectDistance" exact="0"/>
+        <set_value name="$rejectPathBlocked" exact="0"/>
+        <set_value name="$rejectIllegal" exact="0"/>
+        <set_value name="$rejectBlacklist" exact="0"/>
+        <set_value name="$rejectMK1Supply" exact="0"/>
+        <set_value name="$rejectBuildStorage" exact="0"/>
+        <set_value name="$rejectCarrierAux" exact="0"/>
+        <set_value name="$rejectSameStation" exact="0"/>
+        <set_value name="$rejectCargoType" exact="0"/>
+        <set_value name="$rejectCargoUtil" exact="0"/>
+        <set_value name="$maxPairs" exact="500"/>
+        <set_value name="$pairDetails" exact="[]"/>
+        <set_value name="$bestDiagProfit" exact="0"/>
+        <set_value name="$bestDiagPairDesc" exact="'none'"/>
+        <set_value name="$diagIsolatedForCargoFilter" exact="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?"/>
+
+        <!-- Blacklist group for distance checks -->
+        <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroup">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+
+        <!-- Index sell offers by ware for efficient pairing -->
+        <set_value name="$sellByWare" exact="table[]"/>
+        <do_all exact="$allSellOffers.count" counter="$soi">
+          <set_value name="$sOffer" exact="$allSellOffers.{$soi}"/>
+          <do_if value="$sOffer.exists and $sOffer.ware?">
+            <set_value name="$sWare" exact="$sOffer.ware"/>
+            <do_if value="not $sellByWare.{$sWare}?">
+              <set_value name="$sellByWare.{$sWare}" exact="[]"/>
+            </do_if>
+            <append_to_list name="$sellByWare.{$sWare}" exact="$sOffer"/>
+          </do_if>
+        </do_all>
+
+        <!-- Iterate buy offers and match with sell offers of same ware -->
+        <set_value name="$pairLoopDone" exact="false"/>
+        <do_all exact="$allBuyOffers.count" counter="$boi">
+          <do_if value="$pairLoopDone">
+            <continue/>
+          </do_if>
+          <set_value name="$buyOffer" exact="$allBuyOffers.{$boi}"/>
+          <do_if value="not $buyOffer.exists or not $buyOffer.ware?">
+            <continue/>
+          </do_if>
+          <set_value name="$pairWare" exact="$buyOffer.ware"/>
+
+          <!-- Skip if no sell offers for this ware -->
+          <do_if value="not $sellByWare.{$pairWare}?">
+            <continue/>
+          </do_if>
+
+          <do_all exact="$sellByWare.{$pairWare}.count" counter="$soi">
+            <do_if value="$pairLoopDone">
+              <continue/>
+            </do_if>
+            <set_value name="$sellOffer" exact="$sellByWare.{$pairWare}.{$soi}"/>
+
+            <!-- Skip same station -->
+            <do_if value="$buyOffer.owner == $sellOffer.owner">
+              <set_value name="$rejectSameStation" operation="add"/>
+              <continue/>
+            </do_if>
+
+            <set_value name="$pairCount" operation="add"/>
+
+            <!-- Cap total pairs -->
+            <do_if value="$pairCount gt $maxPairs">
+              <set_value name="$pairLoopDone" exact="true"/>
+              <continue/>
+            </do_if>
+
+            <!-- === Evaluate this pair === -->
+            <set_value name="$pairVerdict" exact="'PASS'"/>
+            <set_value name="$pairReason" exact="''"/>
+
+            <set_value name="$buyStation" exact="$sellOffer.owner"/>
+            <set_value name="$sellStation" exact="$buyOffer.owner"/>
+            <set_value name="$buyPrice" exact="$sellOffer.unitprice"/>
+            <set_value name="$sellPrice" exact="$buyOffer.unitprice"/>
+            <set_value name="$sellOfferAmount" exact="$sellOffer.offeramount.{$ship}"/>
+            <do_if value="$sellOfferAmount == null">
+              <set_value name="$sellOfferAmount" exact="$sellOffer.amount"/>
+            </do_if>
+            <do_if value="$sellOfferAmount == null">
+              <set_value name="$sellOfferAmount" exact="0"/>
+            </do_if>
+            <set_value name="$buyOfferAmount" exact="$buyOffer.offeramount.{$ship}"/>
+            <do_if value="$buyOfferAmount == null">
+              <set_value name="$buyOfferAmount" exact="$buyOffer.amount"/>
+            </do_if>
+            <do_if value="$buyOfferAmount == null">
+              <set_value name="$buyOfferAmount" exact="0"/>
+            </do_if>
+
+            <!-- Compute financials upfront so ALL pairs have price/profit/ROI info -->
+            <set_value name="$profitPerUnit" exact="$sellPrice - $buyPrice"/>
+            <set_value name="$volumePerUnit" exact="$pairWare.volume"/>
+            <do_if value="$volumePerUnit le 0">
+              <set_value name="$volumePerUnit" exact="1"/>
+            </do_if>
+            <set_value name="$maxByCargo" exact="$cargoFree / $volumePerUnit"/>
+            <set_value name="$maxByMoney" exact="999999"/>
+            <do_if value="$buyPrice gt 0">
+              <set_value name="$maxByMoney" exact="$playerMoney / $buyPrice"/>
+            </do_if>
+            <set_value name="$maxByOffer" exact="[$sellOfferAmount, $buyOfferAmount].min"/>
+            <set_value name="$maxAmount" exact="[$maxByCargo, $maxByMoney, $maxByOffer].min"/>
+            <do_if value="$maxAmount lt 0">
+              <set_value name="$maxAmount" exact="0"/>
+            </do_if>
+            <set_value name="$totalProfit" exact="$profitPerUnit * $maxAmount"/>
+            <set_value name="$roi" exact="0"/>
+            <do_if value="$buyPrice gt 0">
+              <set_value name="$roi" exact="($profitPerUnit * 100) / $buyPrice"/>
+            </do_if>
+
+            <!-- Check 1: Profit -->
+            <do_if value="$sellPrice le $buyPrice">
+              <set_value name="$pairVerdict" exact="'FAIL'"/>
+              <set_value name="$pairReason" exact="'no_profit (sell=' + ($sellPrice / 100) + ' le buy=' + ($buyPrice / 100) + ')'"/>
+              <set_value name="$rejectNoProfit" operation="add"/>
+            </do_if>
+
+            <do_if value="$pairVerdict == 'PASS'">
+              <!-- Check 2: Operational -->
+              <do_if value="not $buyStation.isoperational">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'buy_station_not_operational'"/>
+                <set_value name="$rejectNotOperational" operation="add"/>
+              </do_if>
+              <do_elseif value="not $sellStation.isoperational">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'sell_station_not_operational'"/>
+                <set_value name="$rejectNotOperational" operation="add"/>
+              </do_elseif>
+            </do_if>
+
+            <do_if value="$pairVerdict == 'PASS'">
+              <!-- Check 3: Docking permission -->
+              <do_if value="not $buyStation.dockingallowed.{$ship}">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'docking_denied_buy (' + $buyStation.knownname + ')'"/>
+                <set_value name="$rejectDocking" operation="add"/>
+              </do_if>
+              <do_elseif value="not $sellStation.dockingallowed.{$ship}">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'docking_denied_sell (' + $sellStation.knownname + ')'"/>
+                <set_value name="$rejectDocking" operation="add"/>
+              </do_elseif>
+            </do_if>
+
+            <do_if value="$pairVerdict == 'PASS'">
+              <!-- Check 4: Runtime station-class exclusions -->
+              <do_if value="$ignoreBuildStorage and ($buyStation.isbuildstorage or $sellStation.isbuildstorage)">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'build_storage_excluded'"/>
+                <set_value name="$rejectBuildStorage" operation="add"/>
+              </do_if>
+              <do_elseif value="$ignoreCarrierAux and (($buyStation.isclass.ship and ($buyStation.type == shiptype.carrier or $buyStation.type == shiptype.resupplier)) or ($sellStation.isclass.ship and ($sellStation.type == shiptype.carrier or $sellStation.type == shiptype.resupplier)))">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'carrier_aux_excluded'"/>
+                <set_value name="$rejectCarrierAux" operation="add"/>
+              </do_elseif>
+            </do_if>
+
+            <do_if value="$pairVerdict == 'PASS'">
+              <!-- Check 5: MK1 supply exclusion -->
+              <do_if value="$ignoreMK1Supply and global.$GT_MK1SuppliedStations? and global.$GT_MK1SuppliedStations.{$sellStation}?">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'mk1_supply_excluded (' + $sellStation.knownname + ')'"/>
+                <set_value name="$rejectMK1Supply" operation="add"/>
+              </do_if>
+            </do_if>
+
+            <do_if value="$pairVerdict == 'PASS'">
+              <!-- Check 6: Illegal ware -->
+              <do_if value="not $allowIllegal and @$pairWare.illegal gt 0">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'ware_illegal (' + $pairWare.name + ')'"/>
+                <set_value name="$rejectIllegal" operation="add"/>
+              </do_if>
+            </do_if>
+
+            <do_if value="$pairVerdict == 'PASS'">
+              <!-- Check 7: Ship can carry ware type -->
+              <do_if value="$ship.cargo.{$pairWare}.max le 0">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'cargo_incompatible (' + $pairWare.name + ')'"/>
+                <set_value name="$rejectCargoType" operation="add"/>
+              </do_if>
+            </do_if>
+
+            <do_if value="$pairVerdict == 'PASS'">
+              <!-- Check 8: Amount / affordability (values pre-computed above) -->
+              <do_if value="$maxAmount le 0">
+                <do_if value="$maxByMoney le 0">
+                  <set_value name="$pairVerdict" exact="'FAIL'"/>
+                  <set_value name="$pairReason" exact="'cant_afford (need ' + ($buyPrice / 100) + ' Cr/unit, have ' + ($playerMoney / 100) + ' Cr)'"/>
+                  <set_value name="$rejectCantAfford" operation="add"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$pairVerdict" exact="'FAIL'"/>
+                  <set_value name="$pairReason" exact="'zero_amount (cargo=' + $maxByCargo + ', money=' + $maxByMoney + ', offer=' + $maxByOffer + ')'"/>
+                  <set_value name="$rejectZeroAmount" operation="add"/>
+                </do_else>
+              </do_if>
+            </do_if>
+
+            <do_if value="$pairVerdict == 'PASS'">
+              <!-- Check 8b: Runtime minimum cargo utilization (excluded in isolated mode) -->
+              <do_if value="not $diagIsolatedForCargoFilter">
+                <set_value name="$diagTradeVolume" exact="$maxAmount * $volumePerUnit"/>
+                <set_value name="$diagRequiredVolume" exact="($ship.cargo.capacity.all * $effectiveCargoTarget) / 100.0"/>
+                <set_value name="$diagUtilPct" exact="if $ship.cargo.capacity.all gt 0 then ($diagTradeVolume * 100.0) / $ship.cargo.capacity.all else 0"/>
+                <do_if value="$diagTradeVolume lt $diagRequiredVolume">
+                  <set_value name="$pairVerdict" exact="'FAIL'"/>
+                  <set_value name="$pairReason" exact="'cargo_utilization_below_min (' + $diagUtilPct + '% lt ' + $effectiveCargoTarget + '%)'"/>
+                  <set_value name="$rejectCargoUtil" operation="add"/>
+                </do_if>
+              </do_if>
+            </do_if>
+
+            <do_if value="$pairVerdict == 'PASS'">
+              <!-- Check 9: Profit threshold (values pre-computed above) -->
+              <do_if value="$totalProfit lt $finalProfitThreshold">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'below_profit_threshold (' + ($totalProfit / 100) + ' Cr lt ' + ($finalProfitThreshold / 100) + ' Cr)'"/>
+                <set_value name="$rejectBelowThreshold" operation="add"/>
+              </do_if>
+            </do_if>
+
+            <do_if value="$pairVerdict == 'PASS'">
+              <!-- Check 10: ROI threshold -->
+              <do_if value="$roi lt $effectiveROI">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'below_roi (' + $roi + '% lt ' + $effectiveROI + '%)'"/>
+                <set_value name="$rejectBelowROI" operation="add"/>
+              </do_if>
+            </do_if>
+
+            <do_if value="$pairVerdict == 'PASS'">
+              <!-- Check 11: Blacklist (explicit object/sector activity checks) -->
+              <do_if value="$blacklistgroup? and (@$buyStation.sector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship} or @$buyStation.isblacklisted.{blacklisttype.objectactivity}.{$blacklistgroup}.{$ship})">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'blacklisted_buy (' + $buyStation.knownname + ')'"/>
+                <set_value name="$rejectBlacklist" operation="add"/>
+              </do_if>
+              <do_elseif value="$blacklistgroup? and (@$sellStation.sector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship} or @$sellStation.isblacklisted.{blacklisttype.objectactivity}.{$blacklistgroup}.{$ship})">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'blacklisted_sell (' + $sellStation.knownname + ')'"/>
+                <set_value name="$rejectBlacklist" operation="add"/>
+              </do_elseif>
+            </do_if>
+
+            <do_if value="$pairVerdict == 'PASS'">
+              <!-- Check 12: Path reachability on both trade legs (ship->buy and buy->sell) -->
+              <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculatePathDistance" result="$buyDist">
+                <param name="ship" value="$ship"/>
+                <param name="fromSector" value="if $homeSector? and $homeSector.exists then $homeSector else $ship.sector"/>
+                <param name="toSector" value="$buyStation.sector"/>
+                <param name="blacklistgroup" value="$blacklistgroup"/>
+                <param name="useEscapeMode" value="false"/>
+              </run_actions>
+              <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculatePathDistance" result="$sellDist">
+                <param name="ship" value="$ship"/>
+                <param name="fromSector" value="$buyStation.sector"/>
+                <param name="toSector" value="$sellStation.sector"/>
+                <param name="blacklistgroup" value="$blacklistgroup"/>
+                <param name="useEscapeMode" value="false"/>
+              </run_actions>
+
+              <do_if value="$buyDist lt 0">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'path_blocked_buy (unreachable: ' + $buyStation.knownname + ')'"/>
+                <set_value name="$rejectPathBlocked" operation="add"/>
+              </do_if>
+              <do_elseif value="$sellDist lt 0">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'path_blocked_sell (unreachable: ' + $sellStation.knownname + ')'"/>
+                <set_value name="$rejectPathBlocked" operation="add"/>
+              </do_elseif>
+            </do_if>
+
+            <!-- Record pass / track best -->
+            <do_if value="$pairVerdict == 'PASS'">
+              <set_value name="$passCount" operation="add"/>
+              <do_if value="$totalProfit gt $bestDiagProfit">
+                <set_value name="$bestDiagProfit" exact="$totalProfit"/>
+                <set_value name="$bestDiagPairDesc" exact="$pairWare.name + ': ' + $buyStation.knownname + ' -> ' + $sellStation.knownname + ' (' + ($totalProfit / 100) + ' Cr, ROI ' + $roi + '%)'"/>
+              </do_if>
+            </do_if>
+
+            <!-- Record pair details: Ware | Route | Profit | ROI | Reason -->
+            <set_value name="$pdRoute" exact="$buyStation.knownname + ' -> ' + $sellStation.knownname"/>
+            <set_value name="$pdProfitStr" exact="($totalProfit / 100) + 'Cr'"/>
+            <set_value name="$pdROIStr" exact="$roi + '%'"/>
+            <set_value name="$pdReason" exact="''"/>
+            <do_if value="$pairVerdict != 'PASS'">
+              <set_value name="$pdReason" exact="$pairReason"/>
+            </do_if>
+            <append_to_list name="$pairDetails" exact="table[$Check = $pairWare.name, $Status = $pairVerdict, $Detail = $pdRoute, $Col4 = $pdProfitStr, $Col5 = $pdROIStr, $Col6 = $pdReason]"/>
+          </do_all>
+        </do_all>
+
+        <!-- Add pair evaluation summary -->
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Total Pairs Evaluated', $Status = 'INFO', $Detail = '' + $pairCount + (if $pairCount gt $maxPairs then ' (capped at ' + $maxPairs + ')' else '')]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Pairs Passing All Checks', $Status = if $passCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $passCount + ' / ' + $pairCount]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Best Passing Pair', $Status = if $passCount gt 0 then 'PASS' else 'FAIL', $Detail = $bestDiagPairDesc]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = '--- Rejection Breakdown ---', $Status = 'INFO', $Detail = '']"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'No Profit (sell le buy)', $Status = if $rejectNoProfit gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectNoProfit]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Below Profit Threshold', $Status = if $rejectBelowThreshold gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectBelowThreshold]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Below ROI Threshold', $Status = if $rejectBelowROI gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectBelowROI]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Not Operational', $Status = if $rejectNotOperational gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectNotOperational]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Docking Denied', $Status = if $rejectDocking gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectDocking]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Dock Size Incompatible', $Status = if $rejectDockSize gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectDockSize]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Zero Amount', $Status = if $rejectZeroAmount gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectZeroAmount]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Cant Afford', $Status = if $rejectCantAfford gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectCantAfford]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Path Blocked', $Status = if $rejectPathBlocked gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectPathBlocked]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Blacklisted (station/sector)', $Status = if $rejectBlacklist gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectBlacklist]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'MK1 Supply Excluded', $Status = if $rejectMK1Supply gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectMK1Supply]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Build Storage Excluded', $Status = if $rejectBuildStorage gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectBuildStorage]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Carrier/Aux Excluded', $Status = if $rejectCarrierAux gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectCarrierAux]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Illegal Ware', $Status = if $rejectIllegal gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectIllegal]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Cargo Incompatible', $Status = if $rejectCargoType gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectCargoType]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Cargo Utilization Below Min', $Status = if $rejectCargoUtil gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectCargoUtil + (if $diagIsolatedForCargoFilter then ' (ignored in isolated mode)' else '')]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Same Station (skipped)', $Status = 'INFO', $Detail = '' + $rejectSameStation]"/>
+
+        <append_to_list name="$report.$Sections" exact="$sec8"/>
+
+        <!-- ======================================================== -->
+        <!-- SECTION: Trade Pair Details / Miner Sell Offer Details    -->
+        <!-- ======================================================== -->
+        <set_value name="$sec8b" exact="table[]"/>
+        <set_value name="$sec8b.$Name" exact="if $orderId == 'GalaxyMiner' then 'Miner Sell Offer Details' else 'Pair Details'"/>
+        <set_value name="$sec8b.$Rows" exact="[]"/>
+        <do_if value="$orderId == 'GalaxyMiner'">
+          <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Sell Offers Passing Policy', $Status = if $allBuyOffers.count gt 0 then 'PASS' else 'FAIL', $Detail = '' + $allBuyOffers.count + ' offers']"/>
+          <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Search Sectors', $Status = if $searchSectors.count gt 0 then 'INFO' else 'FAIL', $Detail = '' + $searchSectors.count + ' sectors']"/>
+          <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Diagnose Wares', $Status = if $diagMinerOfferWares.count gt 0 then 'INFO' else 'WARN', $Detail = $diagMinerOfferWaresDetail]"/>
+          <do_if value="$allBuyOffers.count gt 0">
+            <do_all exact="$allBuyOffers.count" counter="$mbi">
+              <set_value name="$mOffer" exact="$allBuyOffers.{$mbi}"/>
+              <set_value name="$mStation" exact="if $mOffer? and $mOffer.owner? then $mOffer.owner else null"/>
+              <set_value name="$mStationText" exact="if $mStation? and $mStation.exists then ($mStation.knownname + ' (' + $mStation.sector.knownname + ')') else 'UNKNOWN'"/>
+              <set_value name="$mAmount" exact="if $mOffer? and $mOffer.offeramount? and $mOffer.offeramount.{$ship}? then $mOffer.offeramount.{$ship} else (if $mOffer? and $mOffer.amount? then $mOffer.amount else 0)"/>
+              <append_to_list name="$sec8b.$Rows" exact="table[$Check = if $mOffer? and $mOffer.ware? then $mOffer.ware.name else 'UNKNOWN', $Status = 'PASS', $Detail = $mStationText, $Col4 = '' + (if $mOffer? and $mOffer.unitprice? then ($mOffer.unitprice / 100) else 0) + 'Cr', $Col5 = '' + $mAmount + ' units', $Col6 = '']"/>
+            </do_all>
+          </do_if>
+          <do_else>
+            <set_value name="$mNoOfferReason" exact="'No sell opportunities found with current miner policy.'"/>
+            <do_if value="$searchSectors.count == 0">
+              <set_value name="$mNoOfferReason" exact="'No search sectors resolved (home sector/anchor unavailable for diagnose).'"/>
+            </do_if>
+            <do_elseif value="$diagMinerOfferWares.count == 0">
+              <set_value name="$mNoOfferReason" exact="'No diagnose wares available (no mineable cargo and no active miner ware snapshot).'"/>
+            </do_elseif>
+            <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Reason', $Status = 'FAIL', $Detail = $mNoOfferReason]"/>
+            <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Hint', $Status = 'INFO', $Detail = 'See Clearance section for per-sector/per-station rejection details.' ]"/>
+          </do_else>
+        </do_if>
+        <do_else>
+          <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Pairs Evaluated', $Status = 'INFO', $Detail = '' + $pairDetails.count + ' total (' + $passCount + ' PASS, ' + ($pairDetails.count - $passCount) + ' FAIL)']"/>
+          <do_all exact="$pairDetails.count" counter="$pi">
+            <append_to_list name="$sec8b.$Rows" exact="$pairDetails.{$pi}"/>
+          </do_all>
+        </do_else>
+        <append_to_list name="$report.$Sections" exact="$sec8b"/>
+        </do_if>
+
+        <!-- ======================================================== -->
+        <!-- SECTION: Clearance Analysis                               -->
+        <!-- When the ship has cargo, evaluates ALL potential buyers    -->
+        <!-- for each ware the ship is carrying, with per-station      -->
+        <!-- rejection reasons. This is what the ship sees when it     -->
+        <!-- tries to sell its current cargo in clearance mode.         -->
+        <!-- ======================================================== -->
+        <!-- Initialize clearance totals (safe defaults for VERDICT) -->
+        <set_value name="$clTotalBuyers" exact="0"/>
+        <set_value name="$clTotalPass" exact="0"/>
+        <set_value name="$clTotalIllegal" exact="0"/>
+        <do_if value="$cargoUsed gt 0">
+          <set_value name="$secCL" exact="table[]"/>
+          <set_value name="$secCL.$Name" exact="'Clearance'"/>
+          <set_value name="$secCL.$Rows" exact="[]"/>
+
+          <append_to_list name="$secCL.$Rows" exact="table[$Check = 'Mode', $Status = 'WARN', $Detail = 'Ship has cargo (' + $cargoUsed + '/' + $cargoCap + ' used). In clearance mode, the ship must sell ALL existing cargo before it can search for new buy trades.']"/>
+
+          <!-- Iterate each ware the ship is carrying -->
+          <do_all exact="$ship.cargo.list.count" counter="$clwi">
+            <set_value name="$clWare" exact="$ship.cargo.list.{$clwi}"/>
+            <do_if value="$clWare? and $ship.cargo.{$clWare}.count gt 0 and (($orderId != 'GalaxyMiner') or $clWare.hastag.minable)">
+              <set_value name="$clWareAmount" exact="$ship.cargo.{$clWare}.count"/>
+              <append_to_list name="$secCL.$Rows" exact="table[$Check = '--- ' + $clWare.name + ' ---', $Status = 'INFO', $Detail = 'Carrying ' + $clWareAmount + ' units (volume: ' + $clWare.volume + '/unit)']"/>
+
+              <!-- Find all buy offers for this ware in search sectors -->
+              <set_value name="$clBuyerCount" exact="0"/>
+              <set_value name="$clPassCount" exact="0"/>
+
+              <do_all exact="$searchSectors.count" counter="$clsi">
+                <set_value name="$clSector" exact="$searchSectors.{$clsi}"/>
+
+                <!-- Find buy offers for this specific ware (with price range filter) -->
+                <do_if value="$ignoreTradeRules">
+                  <find_buy_offer wares="[$clWare]" tradepartner="$ship" space="$clSector" result="$clBuyOffers" multiple="true">
+                    <match_buyer tradesknownto="$ship.owner">
+                      <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                      <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+                    </match_buyer>
+                    <offeramount min="1" tradepartner="$ship"/>
+                    <relativeprice min="if $orderId == 'GalaxyMiner' then -1.0 else $activeBuyPriceMin" tradepartner="if $ship.isplayerowned then $ship else null"/>
+                  </find_buy_offer>
+                </do_if>
+                <do_else>
+                  <find_buy_offer wares="[$clWare]" tradepartner="$ship" space="$clSector" result="$clBuyOffers" multiple="true">
+                    <match_buyer tradesknownto="$ship.owner">
+                      <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                      <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+                    </match_buyer>
+                    <offeramount min="1" tradepartner="$ship"/>
+                    <relativeprice min="if $orderId == 'GalaxyMiner' then -1.0 else $activeBuyPriceMin" tradepartner="if $ship.isplayerowned then $ship else null"/>
+                  </find_buy_offer>
+                </do_else>
+
+                <do_if value="$clBuyOffers? and $clBuyOffers.count?">
+                  <do_all exact="$clBuyOffers.count" counter="$clbi">
+                    <set_value name="$clOffer" exact="$clBuyOffers.{$clbi}"/>
+                    <do_if value="not $clOffer.exists">
+                      <continue/>
+                    </do_if>
+                    <set_value name="$clBuyerCount" operation="add"/>
+                    <set_value name="$clTotalBuyers" operation="add"/>
+                    <set_value name="$clStation" exact="$clOffer.owner"/>
+                    <set_value name="$clStationName" exact="@$clStation.knownname"/>
+                    <do_if value="not $clStationName?">
+                      <set_value name="$clStationName" exact="'???'"/>
+                    </do_if>
+
+                    <!-- Evaluate this buyer -->
+                    <set_value name="$clVerdict" exact="'PASS'"/>
+                    <set_value name="$clReason" exact="''"/>
+                    <set_value name="$clPrice" exact="$clOffer.unitprice"/>
+                    <set_value name="$clDemand" exact="$clOffer.offeramount.{$ship}"/>
+                    <do_if value="$clDemand == null">
+                      <set_value name="$clDemand" exact="$clOffer.amount"/>
+                    </do_if>
+                    <do_if value="$clDemand == null">
+                      <set_value name="$clDemand" exact="0"/>
+                    </do_if>
+                    <set_value name="$clTradeAmount" exact="[$clWareAmount, $clDemand].min"/>
+
+                    <!-- Miner policy checks (player-only, primary targets, overflow threshold) -->
+                    <do_if value="$clVerdict == 'PASS' and $orderId == 'GalaxyMiner'">
+                      <set_value name="$clIsPrimary" exact="false"/>
+                      <do_if value="$diagMinerPrimaryStations.count gt 0">
+                        <do_all exact="$diagMinerPrimaryStations.count" counter="$dpsi">
+                          <do_if value="$diagMinerPrimaryStations.{$dpsi}? and $diagMinerPrimaryStations.{$dpsi}.exists and $diagMinerPrimaryStations.{$dpsi} == $clStation">
+                            <set_value name="$clIsPrimary" exact="true"/>
+                            <break/>
+                          </do_if>
+                        </do_all>
+                      </do_if>
+                      <do_if value="$diagMinerPlayerStationsOnly and not $clStation.isplayerowned">
+                        <set_value name="$clVerdict" exact="'FAIL'"/>
+                        <set_value name="$clReason" exact="'playerStationsOnly: non-player station excluded'"/>
+                      </do_if>
+                      <do_if value="$clVerdict == 'PASS' and $diagMinerOverflowMode">
+                        <do_if value="not $diagMinerAllowOverflowSellToOthers">
+                          <set_value name="$clVerdict" exact="'FAIL'"/>
+                          <set_value name="$clReason" exact="'overflow active but fallback disabled'"/>
+                        </do_if>
+                        <do_elseif value="$diagMinerPlayerStationsOnly and $clIsPrimary">
+                          <set_value name="$clVerdict" exact="'FAIL'"/>
+                          <set_value name="$clReason" exact="'overflow player-only mode excludes primary stations'"/>
+                        </do_elseif>
+                      </do_if>
+                      <do_if value="$clVerdict == 'PASS' and (not $diagMinerOverflowMode)">
+                        <do_if value="not $clIsPrimary">
+                          <set_value name="$clVerdict" exact="'FAIL'"/>
+                          <set_value name="$clReason" exact="'not in primary target stations'"/>
+                        </do_if>
+                        <do_else>
+                          <set_value name="$clTargetAmount" exact="$clStation.cargo.{$clWare}.target"/>
+                          <do_if value="$clTargetAmount le 0">
+                            <set_value name="$clVerdict" exact="'FAIL'"/>
+                            <set_value name="$clReason" exact="'station target amount is 0 for ware'"/>
+                          </do_if>
+                          <do_else>
+                            <set_value name="$clStoragePercent" exact="($clStation.cargo.{$clWare}.count * 100) / [$clTargetAmount, 1].max"/>
+                            <do_if value="$clStoragePercent ge $diagMinerOverflowThreshold">
+                              <set_value name="$clVerdict" exact="'FAIL'"/>
+                              <set_value name="$clReason" exact="'at/above overflow threshold (' + $clStoragePercent + '% >= ' + $diagMinerOverflowThreshold + '%)'"/>
+                            </do_if>
+                          </do_else>
+                        </do_else>
+                      </do_if>
+                    </do_if>
+
+                    <!-- Check 1: Station operational -->
+                    <do_if value="not $clStation.isoperational">
+                      <set_value name="$clVerdict" exact="'FAIL'"/>
+                      <set_value name="$clReason" exact="'station not operational'"/>
+                    </do_if>
+
+                    <!-- Check 2: Docking -->
+                    <do_if value="$clVerdict == 'PASS' and not $clStation.dockingallowed.{$ship}">
+                      <set_value name="$clVerdict" exact="'FAIL'"/>
+                      <set_value name="$clReason" exact="'docking denied for this ship size'"/>
+                    </do_if>
+
+                    <!-- Check 3: Runtime station-class exclusions -->
+                    <do_if value="$clVerdict == 'PASS' and $ignoreBuildStorage and $clStation.isbuildstorage">
+                      <set_value name="$clVerdict" exact="'FAIL'"/>
+                      <set_value name="$clReason" exact="'build storage excluded'"/>
+                    </do_if>
+                    <do_if value="$clVerdict == 'PASS' and $ignoreCarrierAux and $clStation.isclass.ship and ($clStation.type == shiptype.carrier or $clStation.type == shiptype.resupplier)">
+                      <set_value name="$clVerdict" exact="'FAIL'"/>
+                      <set_value name="$clReason" exact="'carrier/aux excluded'"/>
+                    </do_if>
+                    <do_if value="$clVerdict == 'PASS' and $ignoreMK1Supply and global.$GT_MK1SuppliedStations? and global.$GT_MK1SuppliedStations.{$clStation}?">
+                      <set_value name="$clVerdict" exact="'FAIL'"/>
+                      <set_value name="$clReason" exact="'already supplied by MK1 (excluded)'"/>
+                    </do_if>
+
+                    <!-- Check 4: Distance -->
+                    <do_if value="$clVerdict == 'PASS'">
+                      <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculatePathDistance" result="$clDist">
+                        <param name="ship" value="$ship"/>
+                        <param name="fromSector" value="if $homeSector? and $homeSector.exists then $homeSector else $ship.sector"/>
+                        <param name="toSector" value="$clStation.sector"/>
+                        <param name="blacklistgroup" value="$diagBlacklistGroup"/>
+                        <param name="useEscapeMode" value="false"/>
+                      </run_actions>
+                      <do_if value="$clDist lt 0">
+                        <set_value name="$clVerdict" exact="'FAIL'"/>
+                        <set_value name="$clReason" exact="'unreachable (no path or blocked by blacklist)'"/>
+                      </do_if>
+                      <do_elseif value="$maxSell gt 0 and $clDist gt $maxSell">
+                        <set_value name="$clVerdict" exact="'FAIL'"/>
+                        <set_value name="$clReason" exact="'too far (' + $clDist + ' jumps, max sell distance: ' + $maxSell + ')'"/>
+                      </do_elseif>
+                    </do_if>
+
+                    <!-- Check 5: Blacklist (sector) -->
+                    <do_if value="$clVerdict == 'PASS' and $diagBlacklistGroup?">
+                      <set_value name="$clSectorBL" exact="@$clStation.sector.isblacklisted.{blacklisttype.sectoractivity}.{$diagBlacklistGroup}.{$ship}"/>
+                      <do_if value="$clSectorBL">
+                        <set_value name="$clVerdict" exact="'FAIL'"/>
+                        <set_value name="$clReason" exact="'station sector blacklisted (activity)'"/>
+                      </do_if>
+                    </do_if>
+
+                    <!-- Check 6: Blacklist (station) -->
+                    <do_if value="$clVerdict == 'PASS' and $diagBlacklistGroup?">
+                      <set_value name="$clStationBL" exact="@$clStation.isblacklisted.{blacklisttype.objectactivity}.{$diagBlacklistGroup}.{$ship}"/>
+                      <do_if value="$clStationBL">
+                        <set_value name="$clVerdict" exact="'FAIL'"/>
+                        <set_value name="$clReason" exact="'station itself is blacklisted'"/>
+                      </do_if>
+                    </do_if>
+
+                    <!-- Check 7: Demand amount -->
+                    <do_if value="$clVerdict == 'PASS' and $clDemand le 0">
+                      <set_value name="$clVerdict" exact="'FAIL'"/>
+                      <set_value name="$clReason" exact="'station has no demand (0 units wanted)'"/>
+                    </do_if>
+
+                    <!-- Check 8: Price sanity -->
+                    <do_if value="$clVerdict == 'PASS' and $clPrice le 0">
+                      <set_value name="$clVerdict" exact="'FAIL'"/>
+                      <set_value name="$clReason" exact="'station offers 0 Cr per unit'"/>
+                    </do_if>
+
+                    <!-- Check 9: Illegal ware (matches execution-time check in gt_trading_execution.xml) -->
+                    <do_if value="$clVerdict == 'PASS' and not $allowIllegal and @$clWare.illegal gt 0">
+                      <set_value name="$clVerdict" exact="'FAIL'"/>
+                      <set_value name="$clReason" exact="'ware is illegal to a faction (AllowIllegal: false)'"/>
+                      <set_value name="$clTotalIllegal" operation="add"/>
+                    </do_if>
+
+                    <!-- Build structured multi-column data for buyer -->
+                    <!-- Fields: Status || Ware || Station (Sector) || Price/Demand || Revenue/Dist || Reason -->
+                    <do_if value="$clVerdict == 'PASS'">
+                      <set_value name="$clPassCount" operation="add"/>
+                      <set_value name="$clTotalPass" operation="add"/>
+                      <set_value name="$clRevenue" exact="$clPrice * $clTradeAmount"/>
+                      <set_value name="$clDistStr" exact="''"/>
+                      <do_if value="$clDist?">
+                        <set_value name="$clDistStr" exact="' (' + $clDist + 'j)'"/>
+                      </do_if>
+                    </do_if>
+                    <do_else>
+                      <set_value name="$clRevenue" exact="0"/>
+                      <set_value name="$clDistStr" exact="''"/>
+                    </do_else>
+                    <set_value name="$clStationFull" exact="$clStationName + ' (' + $clSector.knownname + ')'"/>
+                    <set_value name="$clPriceDemand" exact="($clPrice / 100) + 'Cr x' + $clDemand"/>
+                    <set_value name="$clRevenueStr" exact="($clRevenue / 100) + 'Cr' + $clDistStr"/>
+                    <set_value name="$clReasonStr" exact="''"/>
+                    <do_if value="$clVerdict != 'PASS'">
+                      <set_value name="$clReasonStr" exact="$clReason"/>
+                    </do_if>
+                    <append_to_list name="$secCL.$Rows" exact="table[$Check = $clWare.name, $Status = $clVerdict, $Detail = $clStationFull, $Col4 = $clPriceDemand, $Col5 = $clRevenueStr, $Col6 = $clReasonStr]"/>
+                  </do_all>
+                </do_if>
+                <do_else>
+                  <append_to_list name="$secCL.$Rows" exact="table[$Check = $clWare.name, $Status = 'WARN', $Detail = 'Sector: ' + $clSector.knownname, $Col4 = '-', $Col5 = '-', $Col6 = 'No buy offers found in this sector for this ware (after current filters).']"/>
+                </do_else>
+              </do_all>
+
+              <!-- Summary for this ware -->
+              <set_value name="$clWareResult" exact="if $clPassCount gt 0 then 'PASS' else 'FAIL'"/>
+              <append_to_list name="$secCL.$Rows" exact="table[$Check = $clWare.name + ' Summary', $Status = $clWareResult, $Detail = '' + $clPassCount + ' viable buyers out of ' + $clBuyerCount + ' total offers found']"/>
+            </do_if>
+          </do_all>
+
+          <append_to_list name="$report.$Sections" exact="$secCL"/>
+        </do_if>
+
+        <!-- ======================================================== -->
+        <!-- SECTION 9: Reservations & Route Conflicts                -->
+        <!-- ======================================================== -->
+        <set_value name="$sec9" exact="table[]"/>
+        <set_value name="$sec9.$Name" exact="'Reservations and Fleet'"/>
+        <set_value name="$sec9.$Rows" exact="[]"/>
+
+        <!-- Active reservations dump -->
+        <set_value name="$totalReservations" exact="0"/>
+        <do_if value="global.$GT_Reservations?">
+          <set_value name="$resKeys" exact="global.$GT_Reservations.keys.list"/>
+          <set_value name="$totalReservations" exact="$resKeys.count"/>
+          <set_value name="$activeRes" exact="0"/>
+          <do_all exact="$totalReservations" counter="$ri">
+            <set_value name="$resKey" exact="$resKeys.{$ri}"/>
+            <set_value name="$resData" exact="@global.$GT_Reservations.{$resKey}"/>
+            <do_if value="$resData?">
+              <set_value name="$resExpiry" exact="@$resData.$Until"/>
+              <set_value name="$resShip" exact="@$resData.$Ship"/>
+              <set_value name="$resActive" exact="$resExpiry? and player.age lt $resExpiry"/>
+              <do_if value="$resActive">
+                <set_value name="$activeRes" operation="add"/>
+                <set_value name="$resShipName" exact="if $resShip? and $resShip.exists then ($resShip.idcode + ' (' + $resShip.knownname + ')') else '???'"/>
+                <set_value name="$resTTL" exact="$resExpiry - player.age"/>
+                <set_value name="$resWareName" exact="'Unknown'"/>
+                <do_if value="$resKey? and @$resKey.ware != null and @$resKey.ware.name != null">
+                  <set_value name="$resWareName" exact="@$resKey.ware.name"/>
+                </do_if>
+                <append_to_list name="$sec9.$Rows" exact="table[
+                  $Check = 'Reservation #' + $ri,
+                  $Status = if $resShip == $ship then 'PASS' else 'INFO',
+                  $Detail = $resShipName + (if $resShip == $ship then ' (THIS SHIP)' else ''),
+                  $Col4 = $resWareName,
+                  $Col5 = 'TTL=' + $resTTL + 's',
+                  $Col6 = 'Key=' + $resKey
+                ]"/>
+              </do_if>
+            </do_if>
+          </do_all>
+          <append_to_list name="$sec9.$Rows" exact="table[$Check = 'Total Reservations', $Status = 'INFO', $Detail = '' + $totalReservations + ' total, ' + $activeRes + ' active']"/>
+        </do_if>
+        <do_else>
+          <append_to_list name="$sec9.$Rows" exact="table[$Check = 'Reservations', $Status = 'INFO', $Detail = 'No reservation system initialized']"/>
+        </do_else>
+
+        <!-- Cumulative reservation statistics (shows lifetime activity even when table is currently empty).
+             Reservations have a 10s TTL and are cleared immediately after create_trade_order,
+             so the table is almost always empty. These stats prove the system is working. -->
+        <do_if value="global.$GT_ReservationStats?">
+          <set_value name="$rsCreated"  exact="@global.$GT_ReservationStats.$Created"/>
+          <set_value name="$rsCleared"  exact="@global.$GT_ReservationStats.$Cleared"/>
+          <set_value name="$rsExpired"  exact="@global.$GT_ReservationStats.$Expired"/>
+          <set_value name="$rsConflicts" exact="@global.$GT_ReservationStats.$Conflicts"/>
+          <append_to_list name="$sec9.$Rows" exact="table[
+            $Check = 'Reservation Stats (Lifetime)',
+            $Status = if ($rsCreated? and $rsCreated gt 0) then 'PASS' else 'WARN',
+            $Detail = 'Created: ' + (if $rsCreated? then $rsCreated else 0) + ' | Cleared: ' + (if $rsCleared? then $rsCleared else 0) + ' | Expired: ' + (if $rsExpired? then $rsExpired else 0) + ' | Conflicts: ' + (if $rsConflicts? then $rsConflicts else 0)
+          ]"/>
+        </do_if>
+        <do_else>
+          <append_to_list name="$sec9.$Rows" exact="table[$Check = 'Reservation Stats', $Status = 'WARN', $Detail = 'No stats available (system may not have initialized)']"/>
+        </do_else>
+
+        <!-- Active trades (authoritative runtime source).
+             global.$GT_ActiveTrade is written by MK3 AI right before native trade order creation
+             and cleared when the order exits. -->
+        <set_value name="$activeTradingShips" exact="[]"/>
+        <set_value name="$activeTradeSourceInfo" exact="'none'"/>
+        <do_if value="global.$GT_ActiveTrade? and global.$GT_ActiveTrade.keys.count gt 0">
+          <set_value name="$activeTradeSourceInfo" exact="'global.$GT_ActiveTrade (' + global.$GT_ActiveTrade.keys.count + ' keys)'"/>
+          <set_value name="$atrKeys" exact="global.$GT_ActiveTrade.keys.list"/>
+          <do_all exact="$atrKeys.count" counter="$ai">
+            <set_value name="$atrShip" exact="$atrKeys.{$ai}"/>
+            <do_if value="$atrShip? and $atrShip.exists and $atrShip.isoperational">
+              <set_value name="$atrData" exact="@global.$GT_ActiveTrade.{$atrShip}"/>
+              <set_value name="$tradeSource" exact="'active trade pipeline'"/>
+              <set_value name="$tradeWareName" exact="'Unknown'"/>
+              <do_if value="$atrData? and $atrData.$Ware?">
+                <set_value name="$tradeWareName" exact="$atrData.$Ware.name"/>
+                <set_value name="$tradeSource" exact="$tradeSource + ' | Ware=' + $atrData.$Ware.name"/>
+              </do_if>
+              <append_to_list name="$activeTradingShips" exact="table[$Ship = $atrShip, $Source = $tradeSource, $Ware = $tradeWareName]"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <do_elseif value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
+          <!-- Fallback for older saves/mod versions where $GT_ActiveTrade may not be initialized yet -->
+          <set_value name="$activeTradeSourceInfo" exact="'fallback: current trade orders via global.$GT_Ships (' + global.$GT_Ships.keys.count + ' ships)'"/>
+          <set_value name="$atrKeys" exact="global.$GT_Ships.keys.list"/>
+          <do_all exact="$atrKeys.count" counter="$ai">
+            <set_value name="$atrShip" exact="$atrKeys.{$ai}"/>
+            <do_if value="$atrShip? and $atrShip.exists and $atrShip.isoperational and $atrShip.order? and (@$atrShip.order.id == 'TradePerform' or @$atrShip.order.id == 'TradeBuy' or @$atrShip.order.id == 'TradeSell')">
+              <append_to_list name="$activeTradingShips" exact="table[$Ship = $atrShip, $Source = 'fallback current order: ' + @$atrShip.order.id, $Ware = 'Unknown (fallback)']"/>
+            </do_if>
+          </do_all>
+        </do_elseif>
+        <set_value name="$atrCount" exact="$activeTradingShips.count"/>
+        <append_to_list name="$sec9.$Rows" exact="table[$Check = 'Ships With Active Trades', $Status = if $atrCount gt 0 then 'PASS' else 'WARN', $Detail = '' + $atrCount]"/>
+        <append_to_list name="$sec9.$Rows" exact="table[$Check = 'Active Trade Source', $Status = 'INFO', $Detail = $activeTradeSourceInfo]"/>
+        <do_all exact="$atrCount" counter="$ai">
+          <set_value name="$atrEntry" exact="$activeTradingShips.{$ai}"/>
+          <do_if value="$atrEntry? and $atrEntry.$Ship? and $atrEntry.$Ship.exists">
+            <set_value name="$atrDetail" exact="$atrEntry.$Ship.idcode + ' (' + $atrEntry.$Ship.knownname + ')'"/>
+            <set_value name="$atrWareName" exact="if $atrEntry.$Ware? then $atrEntry.$Ware else 'Unknown'"/>
+            <append_to_list name="$sec9.$Rows" exact="table[
+              $Check = 'Active Trade #' + $ai,
+              $Status = if $atrEntry.$Ship == $ship then 'PASS' else 'INFO',
+              $Detail = $atrDetail,
+              $Col4 = $atrWareName,
+              $Col5 = $atrEntry.$Source,
+              $Col6 = if $atrEntry.$Ship == $ship then 'THIS SHIP' else ''
+            ]"/>
+          </do_if>
+        </do_all>
+
+        <!-- Fleet summary (GT ships in same home sector) -->
+        <set_value name="$totalGTShips" exact="0"/>
+        <set_value name="$sameHomeCount" exact="0"/>
+        <do_if value="global.$GT_Ships?">
+          <set_value name="$gtShipKeys" exact="global.$GT_Ships.keys.list"/>
+          <set_value name="$totalGTShips" exact="$gtShipKeys.count"/>
+          <do_all exact="$gtShipKeys.count" counter="$gsi">
+            <set_value name="$gtShipRef" exact="$gtShipKeys.{$gsi}"/>
+            <do_if value="$gtShipRef? and $gtShipRef.exists and $gtShipRef != $ship">
+              <set_value name="$otherHome" exact="null"/>
+              <do_if value="global.$GT_Ships.{$gtShipRef}.$HomeSector?">
+                <set_value name="$otherHome" exact="global.$GT_Ships.{$gtShipRef}.$HomeSector"/>
+              </do_if>
+              <do_if value="$otherHome? and $homeSector? and $otherHome == $homeSector">
+                <set_value name="$sameHomeCount" operation="add"/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+        <append_to_list name="$sec9.$Rows" exact="table[$Check = 'Total GT Ships', $Status = 'INFO', $Detail = '' + $totalGTShips]"/>
+        <append_to_list name="$sec9.$Rows" exact="table[$Check = 'Ships In Same Home Sector', $Status = if $sameHomeCount gt 5 then 'WARN' else 'INFO', $Detail = '' + $sameHomeCount + ' (excl. this ship)']"/>
+
+        <append_to_list name="$report.$Sections" exact="$sec9"/>
+
+        <!-- ======================================================== -->
+        <!-- SECTION 10: Failed Sector Pairs                          -->
+        <!-- ======================================================== -->
+        <!-- ======================================================== -->
+        <!-- SECTION 10: Failed Sector Pairs                          -->
+        <!-- SKIPPED in clearance mode (not relevant for selling)     -->
+        <!-- ======================================================== -->
+        <do_if value="not $isClearanceMode">
+        <set_value name="$sec10" exact="table[]"/>
+        <set_value name="$sec10.$Name" exact="'Failed Sector Pairs'"/>
+        <set_value name="$sec10.$Rows" exact="[]"/>
+
+        <set_value name="$failedPairsCount" exact="0"/>
+        <do_if value="$ship.sector? and global.$GT_FailedSectorPairs? and global.$GT_FailedSectorPairs.{$ship.sector}?">
+          <set_value name="$fspData" exact="global.$GT_FailedSectorPairs.{$ship.sector}"/>
+          <set_value name="$fspBuySectors" exact="$fspData.keys.list"/>
+          <do_all exact="[$fspBuySectors.count, 10].min" counter="$fbi">
+            <set_value name="$fspBuySec" exact="$fspBuySectors.{$fbi}"/>
+            <do_if value="$fspData.{$fspBuySec}?">
+              <set_value name="$fspSellSectors" exact="$fspData.{$fspBuySec}.keys.list"/>
+              <do_all exact="[$fspSellSectors.count, 5].min" counter="$fsi">
+                <set_value name="$fspSellSec" exact="$fspSellSectors.{$fsi}"/>
+                <set_value name="$failedPairsCount" operation="add"/>
+                <set_value name="$fspAge" exact="0"/>
+                <do_if value="$fspData.{$fspBuySec}.{$fspSellSec}?">
+                  <set_value name="$fspAge" exact="player.age - $fspData.{$fspBuySec}.{$fspSellSec}"/>
+                </do_if>
+                <set_value name="$fspDetail" exact="$fspBuySec.knownname + ' -> ' + $fspSellSec.knownname + ' (age: ' + $fspAge + 's)'"/>
+                <append_to_list name="$sec10.$Rows" exact="table[$Check = 'Failed Pair #' + $failedPairsCount, $Status = 'WARN', $Detail = $fspDetail]"/>
+              </do_all>
+            </do_if>
+          </do_all>
+        </do_if>
+        <append_to_list name="$sec10.$Rows" exact="table[$Check = 'Total Failed Sector Pairs', $Status = if $failedPairsCount gt 0 then 'WARN' else 'PASS', $Detail = '' + $failedPairsCount + ' (for current sector)']"/>
+
+        <append_to_list name="$report.$Sections" exact="$sec10"/>
+        </do_if>
+
+        <!-- ======================================================== -->
+        <!-- SECTION 11: Verdict & Recommendations                    -->
+        <!-- ======================================================== -->
+        <!-- ======================================================== -->
+        <!-- VERDICT: Inserted at top of Ship State (sec1)             -->
+        <!-- ======================================================== -->
+        <set_value name="$verdictRows" exact="[]"/>
+
+        <!-- Determine root cause -->
+        <set_value name="$verdict" exact="'Unknown — no clear root cause identified'"/>
+        <set_value name="$suggestions" exact="[]"/>
+
+        <!-- ====== CLEARANCE MODE VERDICT ====== -->
+        <do_if value="$isClearanceMode">
+          <do_if value="$cargoUsed le 0">
+            <set_value name="$verdict" exact="'CLEARANCE: Ship is in clearance mode but has no cargo. This should not happen.'"/>
+            <append_to_list name="$suggestions" exact="'This may be a state inconsistency — try reassigning the GT order.'"/>
+          </do_if>
+          <do_elseif value="$clTotalIllegal gt 0 and $clTotalPass == 0">
+            <set_value name="$verdict" exact="'STUCK (ILLEGAL CARGO): All ' + $clTotalBuyers + ' potential buyers blocked because ware is illegal to a faction and AllowIllegal is disabled. Ship cannot sell its cargo and is stuck in an infinite retry loop.'"/>
+            <append_to_list name="$suggestions" exact="'Enable AllowIllegal on this ship/commander to allow selling the cargo.'"/>
+            <append_to_list name="$suggestions" exact="'Or: manually sell the cargo, then reassign the GT order.'"/>
+          </do_elseif>
+          <do_elseif value="$clTotalPass == 0 and $clTotalBuyers gt 0">
+            <set_value name="$verdict" exact="'STUCK (NO VIABLE BUYER): ' + $clTotalBuyers + ' potential buyers found but all rejected. Ship cannot sell its cargo.'"/>
+            <append_to_list name="$suggestions" exact="'Check the Clearance tab for specific rejection reasons per station.'"/>
+            <append_to_list name="$suggestions" exact="'Increase max sell distance or review blacklist settings.'"/>
+          </do_elseif>
+          <do_elseif value="$clTotalPass == 0 and $clTotalBuyers == 0">
+            <set_value name="$verdict" exact="'STUCK (NO BUYERS): No buy offers found for current cargo in ' + $searchSectors.count + ' sectors within range.'"/>
+            <append_to_list name="$suggestions" exact="'Increase max sell distance to expand search radius.'"/>
+            <append_to_list name="$suggestions" exact="'Check if any stations in range buy these wares.'"/>
+          </do_elseif>
+          <do_elseif value="$clTotalPass gt 0">
+            <set_value name="$verdict" exact="'CLEARANCE OK: ' + $clTotalPass + ' viable buyers found out of ' + $clTotalBuyers + ' total. Ship should be able to sell its cargo.'"/>
+            <append_to_list name="$suggestions" exact="'If the ship is not selling, check scheduler state and queue.'"/>
+          </do_elseif>
+        </do_if>
+        <!-- ====== NORMAL TRADING VERDICT ====== -->
+        <do_else>
+        <!-- Priority 1: No home sector -->
+        <do_if value="not $homeSector? or not $homeSector.exists">
+          <set_value name="$verdict" exact="'CRITICAL: No home sector — ship cannot search for trades'"/>
+          <append_to_list name="$suggestions" exact="'Assign ship to a commander or set a home sector'"/>
+        </do_if>
+        <!-- Priority 2: Money gate -->
+        <do_elseif value="$playerMoney le $moneyGateThreshold">
+          <set_value name="$verdict" exact="'BLOCKED: Money gate — player funds too low (' + ($playerMoney / 100) + ' Cr lt ' + ($moneyGateThreshold / 100) + ' Cr threshold)'"/>
+          <append_to_list name="$suggestions" exact="'Increase player funds or lower MinPlayerMoney setting'"/>
+        </do_elseif>
+        <!-- Priority 3: Money cap active -->
+        <do_elseif value="global.$GT_MoneyCapActive?">
+          <set_value name="$verdict" exact="'BLOCKED: Global money cap active — fleet budget exhausted'"/>
+          <append_to_list name="$suggestions" exact="'Earn more money to lift the money cap'"/>
+        </do_elseif>
+        <!-- Priority 4: No offers at all -->
+        <do_elseif value="$allSellOffers.count == 0 or $allBuyOffers.count == 0">
+          <set_value name="$verdict" exact="'NO OFFERS: ' + (if $allSellOffers.count == 0 then 'No sell offers' else 'No buy offers') + ' found in ' + $searchSectors.count + ' sectors'"/>
+          <append_to_list name="$suggestions" exact="'Increase max distance to expand search radius'"/>
+          <append_to_list name="$suggestions" exact="'Check if sectors have operational stations'"/>
+        </do_elseif>
+        <!-- Priority 5: Offers exist, but no valid pair candidates were formed -->
+        <do_elseif value="$pairCount == 0 and ($allSellOffers.count gt 0 and $allBuyOffers.count gt 0)">
+          <set_value name="$verdict" exact="'NO MATCHING PAIRS: Offers exist on both sides, but no tradable sell-buy pairs could be formed'"/>
+          <do_if value="$rejectSameStation gt 0">
+            <append_to_list name="$suggestions" exact="'Most matches were same-station loops (' + $rejectSameStation + ' skipped) — this is intentionally ignored.'"/>
+          </do_if>
+          <append_to_list name="$suggestions" exact="'Check ware overlap between sell and buy offers in Pair Details.'"/>
+          <append_to_list name="$suggestions" exact="'Increase max distance or review blacklist constraints to expose more counterpart stations.'"/>
+        </do_elseif>
+        <!-- Priority 6: All evaluated pairs fail -->
+        <do_elseif value="$passCount == 0 and $pairCount gt 0">
+          <!-- Find dominant rejection reason -->
+          <set_value name="$maxReject" exact="0"/>
+          <set_value name="$maxRejectName" exact="'unknown'"/>
+          <do_if value="$rejectNoProfit gt $maxReject">
+            <set_value name="$maxReject" exact="$rejectNoProfit"/>
+            <set_value name="$maxRejectName" exact="'no_profit (sell price le buy price)'"/>
+          </do_if>
+          <do_if value="$rejectBelowThreshold gt $maxReject">
+            <set_value name="$maxReject" exact="$rejectBelowThreshold"/>
+            <set_value name="$maxRejectName" exact="'below_profit_threshold (threshold: ' + ($finalProfitThreshold / 100) + ' Cr)'"/>
+          </do_if>
+          <do_if value="$rejectBelowROI gt $maxReject">
+            <set_value name="$maxReject" exact="$rejectBelowROI"/>
+            <set_value name="$maxRejectName" exact="'below_roi_threshold (threshold: ' + $effectiveROI + '%)'"/>
+          </do_if>
+          <do_if value="$rejectNotOperational gt $maxReject">
+            <set_value name="$maxReject" exact="$rejectNotOperational"/>
+            <set_value name="$maxRejectName" exact="'station_not_operational'"/>
+          </do_if>
+          <do_if value="$rejectDocking gt $maxReject">
+            <set_value name="$maxReject" exact="$rejectDocking"/>
+            <set_value name="$maxRejectName" exact="'docking_denied'"/>
+          </do_if>
+          <do_if value="$rejectIllegal gt $maxReject">
+            <set_value name="$maxReject" exact="$rejectIllegal"/>
+            <set_value name="$maxRejectName" exact="'ware_illegal (AllowIllegal=false)'"/>
+          </do_if>
+          <do_if value="$rejectCargoType gt $maxReject">
+            <set_value name="$maxReject" exact="$rejectCargoType"/>
+            <set_value name="$maxRejectName" exact="'cargo_incompatible'"/>
+          </do_if>
+          <do_if value="$rejectCargoUtil gt $maxReject">
+            <set_value name="$maxReject" exact="$rejectCargoUtil"/>
+            <set_value name="$maxRejectName" exact="'cargo_utilization_below_min (threshold: ' + $effectiveCargoTarget + '%)'"/>
+          </do_if>
+          <do_if value="$rejectZeroAmount gt $maxReject">
+            <set_value name="$maxReject" exact="$rejectZeroAmount"/>
+            <set_value name="$maxRejectName" exact="'zero_amount (cargo/money/offer limits)'"/>
+          </do_if>
+          <do_if value="$rejectPathBlocked gt $maxReject">
+            <set_value name="$maxReject" exact="$rejectPathBlocked"/>
+            <set_value name="$maxRejectName" exact="'path_blocked (blacklisted or unreachable)'"/>
+          </do_if>
+          <do_if value="$rejectCantAfford gt $maxReject">
+            <set_value name="$maxReject" exact="$rejectCantAfford"/>
+            <set_value name="$maxRejectName" exact="'cant_afford'"/>
+          </do_if>
+          <do_if value="$rejectDistance gt $maxReject">
+            <set_value name="$maxReject" exact="$rejectDistance"/>
+            <set_value name="$maxRejectName" exact="'distance_exceeded (maxDistance=' + $maxDistance + ')'"/>
+          </do_if>
+          <do_if value="$maxReject == 0">
+            <set_value name="$maxRejectName" exact="'mixed_or_unclassified_rejections (see Pair Details)'"/>
+          </do_if>
+
+          <set_value name="$verdict" exact="'ALL REJECTED: 0/' + $pairCount + ' pairs passed. Dominant reason: ' + $maxRejectName + ' (' + $maxReject + ' pairs)'"/>
+
+          <do_if value="$rejectBelowThreshold gt 0">
+            <append_to_list name="$suggestions" exact="'Lower profit threshold base (current effective: ' + ($finalProfitThreshold / 100) + ' Cr)'"/>
+          </do_if>
+          <do_if value="$rejectBelowROI gt 0">
+            <append_to_list name="$suggestions" exact="'Lower minimum ROI setting (current effective: ' + $effectiveROI + '%)'"/>
+          </do_if>
+          <do_if value="$rejectDocking gt 0">
+            <append_to_list name="$suggestions" exact="'Check dock size compatibility — ship is ' + $dockSize + '-class'"/>
+          </do_if>
+          <do_if value="$rejectNotOperational gt 0">
+            <append_to_list name="$suggestions" exact="'Some stations are not operational. Wait for production/storage recovery or pick other sectors.'"/>
+          </do_if>
+          <do_if value="$rejectIllegal gt 0">
+            <append_to_list name="$suggestions" exact="'Enable AllowIllegal if you want to include illegal wares.'"/>
+          </do_if>
+          <do_if value="$rejectCargoType gt 0">
+            <append_to_list name="$suggestions" exact="'Ship cargo type cannot carry some wares. Limit ware basket or use suitable ship class.'"/>
+          </do_if>
+          <do_if value="$rejectCargoUtil gt 0 and not $diagIsolatedForCargoFilter">
+            <append_to_list name="$suggestions" exact="'Lower minimum cargo utilization target (current: ' + $effectiveCargoTarget + '%) or increase trade volume options (distance/wares).'"/>
+          </do_if>
+          <do_if value="$rejectZeroAmount gt 0">
+            <append_to_list name="$suggestions" exact="'Offer amount/cargo free/money limits reduce tradable amount to zero for many pairs.'"/>
+          </do_if>
+          <do_if value="$rejectPathBlocked gt 0">
+            <append_to_list name="$suggestions" exact="'Review blacklist settings — some routes may be blocked'"/>
+          </do_if>
+        </do_elseif>
+        <!-- Priority 7: Trades found -->
+        <do_elseif value="$passCount gt 0">
+          <set_value name="$verdict" exact="'TRADES AVAILABLE: ' + $passCount + ' viable pairs found. Best: ' + $bestDiagPairDesc"/>
+          <append_to_list name="$suggestions" exact="'Ship should be able to find trades. If it is not trading, check scheduler state and queue.'"/>
+        </do_elseif>
+        </do_else>
+
+        <set_value name="$verdictStatus" exact="'FAIL'"/>
+        <do_if value="$isClearanceMode and $clTotalPass gt 0">
+          <set_value name="$verdictStatus" exact="'PASS'"/>
+        </do_if>
+        <do_elseif value="not $isClearanceMode and $passCount gt 0">
+          <set_value name="$verdictStatus" exact="'PASS'"/>
+        </do_elseif>
+        <!-- Build verdict rows -->
+        <append_to_list name="$verdictRows" exact="table[$Check = 'VERDICT', $Status = $verdictStatus, $Detail = $verdict]"/>
+        <do_all exact="$suggestions.count" counter="$si">
+          <append_to_list name="$verdictRows" exact="table[$Check = 'Suggestion #' + $si, $Status = 'INFO', $Detail = $suggestions.{$si}]"/>
+        </do_all>
+        <append_to_list name="$verdictRows" exact="table[$Check = '---', $Status = 'INFO', $Detail = '']"/>
+
+        <!-- Insert verdict rows at the TOP of sec1 (Ship State) -->
+        <!-- Build a new rows list: verdict first, then original sec1 rows -->
+        <set_value name="$originalSec1Rows" exact="$sec1.$Rows"/>
+        <set_value name="$sec1.$Rows" exact="[]"/>
+        <do_all exact="$verdictRows.count" counter="$vri">
+          <append_to_list name="$sec1.$Rows" exact="$verdictRows.{$vri}"/>
+        </do_all>
+        <do_all exact="$originalSec1Rows.count" counter="$ori">
+          <append_to_list name="$sec1.$Rows" exact="$originalSec1Rows.{$ori}"/>
+        </do_all>
+
+        <!-- ======================================================== -->
+        <!-- Serialize report to delimited string for Lua transfer    -->
+        <!-- Format: sections separated by "@@", rows by ";;",       -->
+        <!--         fields by "||" (SectionName;;Status||Check||Detail;;...) -->
+        <!-- GetNPCBlackboard cannot read complex tables, so we      -->
+        <!-- serialize everything as a flat string.                   -->
+        <!-- ======================================================== -->
+        <set_value name="$serialized" exact="''"/>
+        <do_all exact="$report.$Sections.count" counter="$secIdx">
+          <set_value name="$sec" exact="$report.$Sections.{$secIdx}"/>
+          <do_if value="$secIdx gt 1">
+            <set_value name="$serialized" exact="$serialized + '@@'"/>
+          </do_if>
+          <set_value name="$serialized" exact="$serialized + $sec.$Name"/>
+          <do_all exact="$sec.$Rows.count" counter="$rowIdx">
+            <set_value name="$row" exact="$sec.$Rows.{$rowIdx}"/>
+            <set_value name="$serialized" exact="$serialized + ';;' + $row.$Status + '||' + $row.$Check + '||' + $row.$Detail"/>
+            <!-- Append extra columns if present (for structured multi-column sections) -->
+            <do_if value="$row.$Col4?">
+              <set_value name="$serialized" exact="$serialized + '||' + $row.$Col4"/>
+            </do_if>
+            <do_if value="$row.$Col5?">
+              <set_value name="$serialized" exact="$serialized + '||' + $row.$Col5"/>
+            </do_if>
+            <do_if value="$row.$Col6?">
+              <set_value name="$serialized" exact="$serialized + '||' + $row.$Col6"/>
+            </do_if>
+          </do_all>
+        </do_all>
+
+        <!-- Store serialized report + metadata on player entity -->
+        <set_value name="player.entity.$GT_DiagReport" exact="$serialized"/>
+        <set_value name="player.entity.$GT_DiagShipId" exact="$ship.idcode"/>
+        <set_value name="player.entity.$GT_DiagShipName" exact="$ship.knownname"/>
+        <set_value name="player.entity.$GT_DiagTimestamp" exact="player.age"/>
+
+        <!-- Log full diagnostic report to debug log -->
+        <debug_text text="'[GT Diagnose] ================================================================'" chance="100"/>
+        <debug_text text="'[GT Diagnose] DIAGNOSTIC REPORT for ' + $ship.idcode + ' (' + $ship.knownname + ')'" chance="100"/>
+        <debug_text text="'[GT Diagnose] ================================================================'" chance="100"/>
+        <do_all exact="$report.$Sections.count" counter="$logSecIdx">
+          <set_value name="$logSec" exact="$report.$Sections.{$logSecIdx}"/>
+          <debug_text text="'[GT Diagnose] --- ' + $logSec.$Name + ' ---'" chance="100"/>
+          <do_all exact="$logSec.$Rows.count" counter="$logRowIdx">
+            <set_value name="$logRow" exact="$logSec.$Rows.{$logRowIdx}"/>
+            <set_value name="$logLine" exact="'[GT Diagnose]   [' + $logRow.$Status + '] ' + $logRow.$Check + ': ' + $logRow.$Detail"/>
+            <set_value name="$logCol4" exact="@$logRow.$Col4"/>
+            <do_if value="$logCol4?">
+              <set_value name="$logLine" exact="$logLine + ' | ' + $logCol4"/>
+            </do_if>
+            <set_value name="$logCol5" exact="@$logRow.$Col5"/>
+            <do_if value="$logCol5?">
+              <set_value name="$logLine" exact="$logLine + ' | ' + $logCol5"/>
+            </do_if>
+            <set_value name="$logCol6" exact="@$logRow.$Col6"/>
+            <do_if value="$logCol6? and $logCol6 != ''">
+              <set_value name="$logLine" exact="$logLine + ' | ' + $logCol6"/>
+            </do_if>
+            <debug_text text="$logLine" chance="100"/>
+          </do_all>
+        </do_all>
+        <debug_text text="'[GT Diagnose] ================================================================'" chance="100"/>
+        <debug_text text="'[GT Diagnose] VERDICT: ' + $verdict" chance="100"/>
+        <debug_text text="'[GT Diagnose] ================================================================'" chance="100"/>
+
+        <!-- Signal Lua to display report -->
+        <raise_lua_event name="'gt.openDiagnoseReport'" param="$ship"/>
+      </actions>
+    </cue>
+
+    <!-- Handle when user clicks "Promote" on a GT subordinate -->
+    <cue name="GT_PromoteSubordinateAction" instantiate="true" namespace="this">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$ship" exact="event.param.$object"/>
+        <set_value name="$canRun" exact="true"/>
+        <do_if value="not $ship? or not $ship.exists or not $ship.commander? or not $ship.commander.exists">
+          <show_notification text="'[GT] Promote unavailable: no valid commander found.'" timeout="5s" priority="6"/>
+          <set_value name="$canRun" exact="false"/>
+        </do_if>
+
+        <do_if value="$canRun and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT Promote] Requested for subordinate ' + $ship.idcode + ' under commander ' + $ship.commander.idcode" chance="100"/>
+        </do_if>
+
+        <do_if value="$canRun">
+          <!-- Lua promotes subordinate to commander -->
+          <raise_lua_event name="'gt.openPromoteContext'" param="$ship"/>
+        </do_if>
+      </actions>
+    </cue>
+  </cues>
+</mdscript>

@@ -4064,6 +4064,7 @@
       <set_value name="$tradesRejectedCargo" exact="0"/>
       <set_value name="$tradesRejectedProfit" exact="0"/>
       <set_value name="$tradesRejectedRestriction" exact="0"/>
+      <set_value name="$tradesRejectedDemandReserved" exact="0"/>
       <set_value name="$selectedTradeIdx" exact="0"/>
       
       <!-- Iterate through trade list and validate each one -->
@@ -4265,47 +4266,166 @@
         </do_if>
       </do_if>
 
-      <!-- Diversity-first front chunk:
-           Keep overall score ordering intact for most of the list, but diversify the first
-           validation chunk by ware so repeated high-volume wares do not monopolize top-N. -->
-      <set_value name="$mk4DiversityTarget" exact="if this.$effectiveMaxTrades? and this.$effectiveMaxTrades gt 0 then this.$effectiveMaxTrades else 3"/>
-      <do_if value="$tradeList? and $tradeList.count gt $mk4DiversityTarget and $mk4DiversityTarget gt 1">
-        <create_list name="$mk4DiversePrefix"/>
-        <create_list name="$mk4DiverseRemainder"/>
-        <create_list name="$mk4SeenWares"/>
-        <do_all exact="$tradeList.count" counter="$dvi">
-          <set_value name="$dvTrade" exact="$tradeList.{$dvi}"/>
-          <set_value name="$dvWare" exact="if $dvTrade.$Ware? then $dvTrade.$Ware else (if $dvTrade.$BuyOffer? then @$dvTrade.$BuyOffer.ware else null)"/>
-          <set_value name="$dvSeen" exact="false"/>
-          <do_if value="$dvWare? and $mk4SeenWares.count gt 0">
-            <do_all exact="$mk4SeenWares.count" counter="$dvs">
-              <set_value name="$dvSeenWare" exact="$mk4SeenWares.{$dvs}"/>
-              <do_if value="$dvSeenWare == $dvWare or ($dvSeenWare? and $dvWare? and $dvSeenWare.id? and $dvWare.id? and $dvSeenWare.id == $dvWare.id)">
-                <set_value name="$dvSeen" exact="true"/>
-                <break/>
+      <!-- Option A validation composition:
+           Keep global maxTrades cap, but build validation sequence round-robin by delivery
+           target (customer station). Enforce strict BuildStorage-first by consuming all
+           BuildStorage target buckets before non-BuildStorage buckets. -->
+      <do_if value="$tradeList? and $tradeList.count gt 1">
+        <create_list name="$optABuildTrades"/>
+        <create_list name="$optANonBuildTrades"/>
+        <do_all exact="$tradeList.count" counter="$optaSplitIdx">
+          <set_value name="$optaTrade" exact="$tradeList.{$optaSplitIdx}"/>
+          <set_value name="$optaBuyStation" exact="null"/>
+          <set_value name="$optaSellStation" exact="null"/>
+          <set_value name="$optaIsBuildStorageTrade" exact="false"/>
+
+          <do_if value="$optaTrade.$BuyStation?">
+            <set_value name="$optaBuyStation" exact="$optaTrade.$BuyStation"/>
+          </do_if>
+          <do_elseif value="$optaTrade.$BuyOffer? and $optaTrade.$BuyOffer.owner?">
+            <set_value name="$optaBuyStation" exact="$optaTrade.$BuyOffer.owner"/>
+          </do_elseif>
+
+          <do_if value="$optaTrade.$SellStation?">
+            <set_value name="$optaSellStation" exact="$optaTrade.$SellStation"/>
+          </do_if>
+          <do_elseif value="$optaTrade.$SellOffer? and $optaTrade.$SellOffer.owner?">
+            <set_value name="$optaSellStation" exact="$optaTrade.$SellOffer.owner"/>
+          </do_elseif>
+
+          <do_if value="$optaBuyStation? and $optaBuyStation.isclass.buildstorage">
+            <set_value name="$optaIsBuildStorageTrade" exact="true"/>
+          </do_if>
+          <do_if value="$optaSellStation? and $optaSellStation.isclass.buildstorage">
+            <set_value name="$optaIsBuildStorageTrade" exact="true"/>
+          </do_if>
+
+          <do_if value="$optaIsBuildStorageTrade">
+            <append_to_list name="$optABuildTrades" exact="$optaTrade"/>
+          </do_if>
+          <do_else>
+            <append_to_list name="$optANonBuildTrades" exact="$optaTrade"/>
+          </do_else>
+        </do_all>
+
+        <!-- BuildStorage proximity bias:
+             distance penalty is already part of score, but strict BuildStorage-first +
+             per-target round-robin can still surface remote targets early. Bias the
+             build-storage bucket toward local deliveries first (near -> mid -> far). -->
+        <do_if value="$optABuildTrades.count gt 1">
+          <set_value name="$optaHomeForDistance" exact="if $searchHomeSector? and $searchHomeSector.exists then $searchHomeSector else this.ship.sector"/>
+          <set_value name="$optaSellRange" exact="if this.$effectiveMaxSell? and this.$effectiveMaxSell gt 0 then this.$effectiveMaxSell else (if $maxsell? and $maxsell gt 0 then $maxsell else 25)"/>
+          <set_value name="$optaNearLimit" exact="[1, ($optaSellRange / 3)i].max"/>
+          <set_value name="$optaMidLimit" exact="[1, ((2 * $optaSellRange) / 3)i].max"/>
+          <create_list name="$optABuildNear"/>
+          <create_list name="$optABuildMid"/>
+          <create_list name="$optABuildFar"/>
+          <do_all exact="$optABuildTrades.count" counter="$optaBuildDistIdx">
+            <set_value name="$optaBuildDistTrade" exact="$optABuildTrades.{$optaBuildDistIdx}"/>
+            <set_value name="$optaBuildDistTarget" exact="if $optaBuildDistTrade.$SellStation? then $optaBuildDistTrade.$SellStation else (if $optaBuildDistTrade.$SellOffer? and $optaBuildDistTrade.$SellOffer.owner? then $optaBuildDistTrade.$SellOffer.owner else null)"/>
+            <set_value name="$optaBuildDist" exact="-1"/>
+            <do_if value="$optaHomeForDistance? and $optaBuildDistTarget? and $optaBuildDistTarget.exists">
+              <set_value name="$optaBuildDist" exact="$optaHomeForDistance.gatedistance.{$optaBuildDistTarget}"/>
+            </do_if>
+            <do_if value="$optaBuildDist ge 0 and $optaBuildDist le $optaNearLimit">
+              <append_to_list name="$optABuildNear" exact="$optaBuildDistTrade"/>
+            </do_if>
+            <do_elseif value="$optaBuildDist ge 0 and $optaBuildDist le $optaMidLimit">
+              <append_to_list name="$optABuildMid" exact="$optaBuildDistTrade"/>
+            </do_elseif>
+            <do_else>
+              <append_to_list name="$optABuildFar" exact="$optaBuildDistTrade"/>
+            </do_else>
+          </do_all>
+          <create_list name="$optABuildByDistance"/>
+          <do_all exact="$optABuildNear.count" counter="$optaBuildNearIdx">
+            <append_to_list name="$optABuildByDistance" exact="$optABuildNear.{$optaBuildNearIdx}"/>
+          </do_all>
+          <do_all exact="$optABuildMid.count" counter="$optaBuildMidIdx">
+            <append_to_list name="$optABuildByDistance" exact="$optABuildMid.{$optaBuildMidIdx}"/>
+          </do_all>
+          <do_all exact="$optABuildFar.count" counter="$optaBuildFarIdx">
+            <append_to_list name="$optABuildByDistance" exact="$optABuildFar.{$optaBuildFarIdx}"/>
+          </do_all>
+          <set_value name="$optABuildTrades" exact="$optABuildByDistance"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': BuildStorage proximity bias: near=' + $optABuildNear.count + ', mid=' + $optABuildMid.count + ', far=' + $optABuildFar.count + ' (range=' + $optaSellRange + ', near&lt;=' + $optaNearLimit + ', mid&lt;=' + $optaMidLimit + ')'" chance="100"/>
+          </do_if>
+        </do_if>
+
+        <create_list name="$optABuildOrdered"/>
+        <set_value name="$optABuildRemaining" exact="$optABuildTrades.count"/>
+        <set_value name="$optABuildPicked" exact="table[]"/>
+        <do_all exact="$optABuildTrades.count" counter="$optaBuildPass">
+          <do_if value="$optABuildRemaining gt 0">
+            <create_list name="$optaBuildRoundTargets"/>
+            <do_all exact="$optABuildTrades.count" counter="$optaBuildIdx">
+              <do_if value="$optABuildRemaining gt 0 and not $optABuildPicked.{$optaBuildIdx}">
+                <set_value name="$optaBuildTrade" exact="$optABuildTrades.{$optaBuildIdx}"/>
+                <set_value name="$optaBuildTarget" exact="if $optaBuildTrade.$SellStation? then $optaBuildTrade.$SellStation else (if $optaBuildTrade.$SellOffer? and $optaBuildTrade.$SellOffer.owner? then $optaBuildTrade.$SellOffer.owner else null)"/>
+                <set_value name="$optaBuildSeenTarget" exact="false"/>
+                <do_if value="$optaBuildRoundTargets.count gt 0">
+                  <do_all exact="$optaBuildRoundTargets.count" counter="$optaBuildTargetIdx">
+                    <set_value name="$optaBuildSeenTargetObj" exact="$optaBuildRoundTargets.{$optaBuildTargetIdx}"/>
+                    <do_if value="$optaBuildSeenTargetObj == $optaBuildTarget or ($optaBuildSeenTargetObj? and $optaBuildTarget? and $optaBuildSeenTargetObj.id? and $optaBuildTarget.id? and $optaBuildSeenTargetObj.id == $optaBuildTarget.id)">
+                      <set_value name="$optaBuildSeenTarget" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                </do_if>
+                <do_if value="not $optaBuildSeenTarget">
+                  <append_to_list name="$optABuildOrdered" exact="$optaBuildTrade"/>
+                  <append_to_list name="$optaBuildRoundTargets" exact="$optaBuildTarget"/>
+                  <set_value name="$optABuildPicked.{$optaBuildIdx}" exact="true"/>
+                  <set_value name="$optABuildRemaining" exact="$optABuildRemaining - 1"/>
+                </do_if>
               </do_if>
             </do_all>
           </do_if>
-          <do_if value="$dvWare? and (not $dvSeen) and $mk4DiversePrefix.count lt $mk4DiversityTarget">
-            <append_to_list name="$mk4DiversePrefix" exact="$dvTrade"/>
-            <append_to_list name="$mk4SeenWares" exact="$dvWare"/>
-          </do_if>
-          <do_else>
-            <append_to_list name="$mk4DiverseRemainder" exact="$dvTrade"/>
-          </do_else>
         </do_all>
-        <do_if value="$mk4DiversePrefix.count gt 0">
-          <create_list name="$mk4DiverseMerged"/>
-          <do_all exact="$mk4DiversePrefix.count" counter="$dvm1">
-            <append_to_list name="$mk4DiverseMerged" exact="$mk4DiversePrefix.{$dvm1}"/>
-          </do_all>
-          <do_all exact="$mk4DiverseRemainder.count" counter="$dvm2">
-            <append_to_list name="$mk4DiverseMerged" exact="$mk4DiverseRemainder.{$dvm2}"/>
-          </do_all>
-          <set_value name="$tradeList" exact="$mk4DiverseMerged"/>
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Diversity-first reorder: uniqueWaresInFront=' + $mk4DiversePrefix.count + '/' + $mk4DiversityTarget + ' across ' + $tradeList.count + ' trades'" chance="100"/>
+
+        <create_list name="$optANonBuildOrdered"/>
+        <set_value name="$optANonBuildRemaining" exact="$optANonBuildTrades.count"/>
+        <set_value name="$optANonBuildPicked" exact="table[]"/>
+        <do_all exact="$optANonBuildTrades.count" counter="$optaNonBuildPass">
+          <do_if value="$optANonBuildRemaining gt 0">
+            <create_list name="$optaNonBuildRoundTargets"/>
+            <do_all exact="$optANonBuildTrades.count" counter="$optaNonBuildIdx">
+              <do_if value="$optANonBuildRemaining gt 0 and not $optANonBuildPicked.{$optaNonBuildIdx}">
+                <set_value name="$optaNonBuildTrade" exact="$optANonBuildTrades.{$optaNonBuildIdx}"/>
+                <set_value name="$optaNonBuildTarget" exact="if $optaNonBuildTrade.$SellStation? then $optaNonBuildTrade.$SellStation else (if $optaNonBuildTrade.$SellOffer? and $optaNonBuildTrade.$SellOffer.owner? then $optaNonBuildTrade.$SellOffer.owner else null)"/>
+                <set_value name="$optaNonBuildSeenTarget" exact="false"/>
+                <do_if value="$optaNonBuildRoundTargets.count gt 0">
+                  <do_all exact="$optaNonBuildRoundTargets.count" counter="$optaNonBuildTargetIdx">
+                    <set_value name="$optaNonBuildSeenTargetObj" exact="$optaNonBuildRoundTargets.{$optaNonBuildTargetIdx}"/>
+                    <do_if value="$optaNonBuildSeenTargetObj == $optaNonBuildTarget or ($optaNonBuildSeenTargetObj? and $optaNonBuildTarget? and $optaNonBuildSeenTargetObj.id? and $optaNonBuildTarget.id? and $optaNonBuildSeenTargetObj.id == $optaNonBuildTarget.id)">
+                      <set_value name="$optaNonBuildSeenTarget" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                </do_if>
+                <do_if value="not $optaNonBuildSeenTarget">
+                  <append_to_list name="$optANonBuildOrdered" exact="$optaNonBuildTrade"/>
+                  <append_to_list name="$optaNonBuildRoundTargets" exact="$optaNonBuildTarget"/>
+                  <set_value name="$optANonBuildPicked.{$optaNonBuildIdx}" exact="true"/>
+                  <set_value name="$optANonBuildRemaining" exact="$optANonBuildRemaining - 1"/>
+                </do_if>
+              </do_if>
+            </do_all>
           </do_if>
+        </do_all>
+
+        <create_list name="$optAFinalTradeList"/>
+        <do_all exact="$optABuildOrdered.count" counter="$optaOutBuildIdx">
+          <append_to_list name="$optAFinalTradeList" exact="$optABuildOrdered.{$optaOutBuildIdx}"/>
+        </do_all>
+        <do_all exact="$optANonBuildOrdered.count" counter="$optaOutNonBuildIdx">
+          <append_to_list name="$optAFinalTradeList" exact="$optANonBuildOrdered.{$optaOutNonBuildIdx}"/>
+        </do_all>
+        <set_value name="$tradeList" exact="$optAFinalTradeList"/>
+
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': OptionA round-robin compose: buildTargets=' + $optABuildOrdered.count + ', nonBuildTargets=' + $optANonBuildOrdered.count + ', total=' + $tradeList.count + ' (strict build-storage-first)'" chance="100"/>
         </do_if>
       </do_if>
       
@@ -5193,6 +5313,7 @@
                 <do_if value="global.$GT_Reservations.{$resKey}?">
                   <set_value name="$resData" exact="global.$GT_Reservations.{$resKey}"/>
                   <do_if value="$resData.$Until? and player.age lt @$resData.$Until and $resData.$Ship? and @$resData.$Ship != this.ship">
+                    <set_value name="$tradesRejectedDemandReserved" operation="add"/>
                     <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                       <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdx + '/' + (if $tradeList != null then $tradeList.count else 0) + ' RESERVED by ' + @$resData.$Ship.idcode + ' (expires in ' + (@$resData.$Until - player.age) + ') - skipping'" chance="100"/>
                     </do_if>
@@ -5762,16 +5883,18 @@
                   <continue/>
                 </do_else>
                 
-                <!-- CRITICAL: Validate recalculated profit - reject negative or zero profit trades -->
-                <do_if value="not $finalProfitRAW? or $finalProfitRAW le 0">
+                <!-- MK4 supply price-cap validation:
+                     reject only when supplier price exceeds customer buy price (negative final profit).
+                     Zero-profit trades are valid for supply fulfillment. -->
+                <do_if value="not $finalProfitRAW? or $finalProfitRAW lt 0">
                   <set_value name="$tradesRejectedProfit" operation="add"/>
                   <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                     <set_value name="$wareName" exact="if $currentTrade.$BuyOffer? and $currentTrade.$BuyOffer.ware? then @$currentTrade.$BuyOffer.ware.name else (if $currentTrade.$SellOffer? and $currentTrade.$SellOffer.ware? then @$currentTrade.$SellOffer.ware.name else 'NULL')"/>
-                    <set_value name="$profitStatus" exact="if not $finalProfitRAW? then 'NULL' else if $finalProfitRAW == 0 then 'ZERO' else 'NEGATIVE (' + ($finalProfitRAW/100) + ' Cr)'"/>
+                    <set_value name="$profitStatus" exact="if not $finalProfitRAW? then 'NULL' else 'NEGATIVE (' + ($finalProfitRAW/100) + ' Cr)'"/>
                     <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' REJECTED: Profit validation failed' +
                       '\n  Ware: ' + $wareName +
                       '\n  Final Profit (recalculated): ' + $profitStatus +
-                      '\n  Reason: Trade is unprofitable (market prices changed or cached profit was wrong)' +
+                      '\n  Reason: MK4 price-cap exceeded (supplier price greater than customer buy price)' +
                       '\n  → Trying next trade in list...'" 
                       chance="100"/>
                   </do_if>
@@ -5946,7 +6069,8 @@
                 <do_if value="global.$GT_Reservations? and $currentTrade.$SellOffer?">
                   <set_value name="global.$GT_Reservations.{$currentTrade.$SellOffer}" exact="table[
                     $Ship = this.ship,
-                    $Until = player.age + 10s
+                    $Until = player.age + 10s,
+                    $Amount = if $finalSellAmount? and $finalSellAmount gt 0 then $finalSellAmount else (if $pendingTrade.$Amount? and $pendingTrade.$Amount gt 0 then $pendingTrade.$Amount else 1)
                   ]"/>
                   <!-- Store reservation key on instance for cleanup in on_abort -->
                   <set_value name="this.$activeReservationKey" exact="$currentTrade.$SellOffer"/>
@@ -6697,6 +6821,7 @@
           <set_value name="$tradesRejectedDistanceSafe" exact="if $tradesRejectedDistance? then $tradesRejectedDistance else 0"/>
           <set_value name="$tradesRejectedCargoSafe" exact="if $tradesRejectedCargo? then $tradesRejectedCargo else 0"/>
           <set_value name="$tradesRejectedRestrictionSafe" exact="if $tradesRejectedRestriction? then $tradesRejectedRestriction else 0"/>
+          <set_value name="$tradesRejectedDemandReservedSafe" exact="if $tradesRejectedDemandReserved? then $tradesRejectedDemandReserved else 0"/>
           <set_value name="$tradesBlacklistedSafe" exact="if $tradesBlacklisted? then $tradesBlacklisted else 0"/>
           <!-- Use safe access for $tradeList.count -->
           <set_value name="$tradeListCountSafe" exact="if $tradeList != null then $tradeList.count else 0"/>
@@ -6718,6 +6843,7 @@
               '\n  Distance unreachable: ' + $tradesRejectedDistanceSafe +
               '\n  Cargo insufficient: ' + $tradesRejectedCargoSafe +
               '\n  Restriction blocked: ' + $tradesRejectedRestrictionSafe +
+              '\n  Demand reserved exhausted: ' + $tradesRejectedDemandReservedSafe +
               '\n  Blacklisted: ' + $tradesBlacklistedSafe +
               '\n  Total rejected: ' + $tradeListCountSafe +
               (if $searchMethod == 'cache' then '\n  ⚠ CACHE STALE: All cached trades invalid - likely offers changed or stations became unreachable' else '') +
@@ -6885,7 +7011,7 @@
           <do_if value="$searchMethod == 'cache'">
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-AI] ' + this.ship.idcode + ': All cached trades rejected - triggering LIVE market search instead of retrying cache' +
-                '\n  Rejection breakdown: Path=' + $tradesRejectedPathSafe + ', Docking=' + $tradesRejectedDockingSafe + ', OfferInvalid=' + $tradesRejectedOfferInvalidSafe + ', Distance=' + $tradesRejectedDistanceSafe + ', Cargo=' + $tradesRejectedCargoSafe + ', Restriction=' + $tradesRejectedRestrictionSafe + ', Blacklist=' + $tradesBlacklistedSafe +
+                '\n  Rejection breakdown: Path=' + $tradesRejectedPathSafe + ', Docking=' + $tradesRejectedDockingSafe + ', OfferInvalid=' + $tradesRejectedOfferInvalidSafe + ', Distance=' + $tradesRejectedDistanceSafe + ', Cargo=' + $tradesRejectedCargoSafe + ', Restriction=' + $tradesRejectedRestrictionSafe + ', DemandReserved=' + $tradesRejectedDemandReservedSafe + ', Blacklist=' + $tradesBlacklistedSafe +
                 '\n  ⚠ CACHE STALE: All ' + $tradeListCountSafe + ' cached trades invalid - likely offers changed, stations became unreachable, or docking permissions revoked'" chance="100"/>
             </do_if>
             <!-- Send signal to force live search (bypass cache) -->
@@ -8702,20 +8828,11 @@
                   </do_if>
 
                   <do_if value="$isValid">
-                    <!-- Calculate ship-specific profit and ROI -->
-                    <set_value name="$shipMaxProfit" exact="$profitPerUnit * $shipMaxAmount"/>
-                    <set_value name="$shipROI" exact="0"/>
-                    <do_if value="$buyPrice gt 0 and $shipMaxAmount gt 0">
-                      <set_value name="$shipInvestment" exact="$buyPrice * $shipMaxAmount"/>
-                      <do_if value="$shipInvestment gt 0">
-                        <set_value name="$shipROI" exact="($shipMaxProfit * 100) / $shipInvestment"/>
-                      </do_if>
-                    </do_if>
-
-                    <!-- Profit thresholds: use ship-specific calculated values -->
-                    <do_if value="$shipMaxProfit lt $minAbsoluteProfit or $shipROI lt $minROI">
+                    <!-- MK4 supply price-cap check:
+                         allow equal price; reject only if source price is above customer buy price. -->
+                    <do_if value="$sellPrice lt $buyPrice">
                       <set_value name="$isValid" exact="false"/>
-                      <set_value name="$rejectReason" exact="'profit_too_low profit=' + $shipMaxProfit + ' min=' + $minAbsoluteProfit + ' roi=' + $shipROI + ' minROI=' + $minROI"/>
+                      <set_value name="$rejectReason" exact="'mk4_price_cap_exceeded source=' + $buyPrice + ' customer=' + $sellPrice"/>
                     </do_if>
                   </do_if>
                 </do_else>

@@ -48,6 +48,7 @@ local GT_ORDER_IDS = {
     GalaxyTraderMK1 = true,
     GalaxyTraderMK2 = true,
     GalaxyTraderMK3 = true,
+    GalaxyTraderMK4Supply = true,
     GalaxyMiner = true,
 }
 

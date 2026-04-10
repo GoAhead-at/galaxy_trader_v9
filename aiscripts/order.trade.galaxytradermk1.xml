@@ -1535,6 +1535,8 @@
       </do_all>
 
       <!-- Phase 2: create all LOAD orders (executed first due to LIFO immediate queue) -->
+      <set_value name="$mk1CycleProfitRaw" exact="0"/>
+      <set_value name="$mk1CycleLegCount" exact="0"/>
       <do_all exact="$queueableTrades.count" counter="$qli">
         <set_value name="$qt" exact="$queueableTrades.{$qli}"/>
         <create_trade_order object="this.ship" tradeoffer="$qt.$BuyOffer" amount="$qt.$QueuedAmount" immediate="true" internal="false"/>
@@ -1543,15 +1545,22 @@
           <!-- Mirror MK3 queued-trade logging payload for MK1 sell cycle. -->
           <set_value name="$mk1QueuedAmount" exact="if $qt.$QueuedAmount? and $qt.$QueuedAmount != null then $qt.$QueuedAmount else 0"/>
           <do_if value="$mk1QueuedAmount gt 0 and $qt.$SellOffer != null and $qt.$BuyOffer != null">
-            <set_value name="$mk1BuyPriceRaw" exact="if $qt.$BuyOffer.unitprice? and $qt.$BuyOffer.unitprice != null then $qt.$BuyOffer.unitprice else 0"/>
-            <set_value name="$mk1SellPriceRaw" exact="if $qt.$SellOffer.unitprice? and $qt.$SellOffer.unitprice != null then $qt.$SellOffer.unitprice else 0"/>
+            <!-- Use trade-match snapshot prices for stable per-leg P/L reporting.
+                 Live offers can move before queueing and would skew displayed profit. -->
+            <set_value name="$mk1BuyPriceRaw" exact="if $qt.$BuyPrice? and $qt.$BuyPrice != null then $qt.$BuyPrice else (if $qt.$BuyOffer.unitprice? and $qt.$BuyOffer.unitprice != null then $qt.$BuyOffer.unitprice else 0)"/>
+            <set_value name="$mk1SellPriceRaw" exact="if $qt.$SellPrice? and $qt.$SellPrice != null then $qt.$SellPrice else (if $qt.$SellOffer.unitprice? and $qt.$SellOffer.unitprice != null then $qt.$SellOffer.unitprice else 0)"/>
             <set_value name="$mk1ProfitRaw" exact="($mk1SellPriceRaw - $mk1BuyPriceRaw) * $mk1QueuedAmount"/>
+            <set_value name="$mk1CycleProfitRaw" exact="$mk1CycleProfitRaw + $mk1ProfitRaw"/>
+            <set_value name="$mk1CycleLegCount" exact="$mk1CycleLegCount + 1"/>
             <signal_objects object="player.galaxy" param="'GT_TradeLogging_LogTradeOrder'" param2="table[
               $Ship = this.ship,
               $BuyOffer = $qt.$BuyOffer,
               $SellOffer = $qt.$SellOffer,
               $Amount = $mk1QueuedAmount,
               $Profit = $mk1ProfitRaw,
+              $BuyPriceRaw = $mk1BuyPriceRaw,
+              $SellPriceRaw = $mk1SellPriceRaw,
+              $MoneyRaw = -($mk1BuyPriceRaw * $mk1QueuedAmount),
               $BuyPrice = $mk1BuyPriceRaw / 100,
               $SellPrice = $mk1SellPriceRaw / 100,
               $IsSellOnly = false,
@@ -1589,9 +1598,15 @@
 
       <!-- Logbook entry (via signal, same pattern as MK3) -->
       <do_if value="this.$logbookentries">
+        <set_value name="$mk1CycleLogProfitRaw" exact="0"/>
         <do_all exact="$deliveryRoute.count" counter="$ri">
           <set_value name="$rt" exact="$deliveryRoute.{$ri}"/>
-          <set_value name="$logMsg" exact="'Sold ' + $rt.$Amount + ' ' + $rt.$Ware.name + ' to ' + $rt.$BuyStation.knownname + ' (distance: ' + $rt.$Distance + ' jumps)'"/>
+          <set_value name="$mk1RouteAmount" exact="if $rt.$QueuedAmount? and $rt.$QueuedAmount != null then $rt.$QueuedAmount else $rt.$Amount"/>
+          <set_value name="$mk1RouteBuyPriceRaw" exact="if $rt.$BuyPrice? and $rt.$BuyPrice != null then $rt.$BuyPrice else (if $rt.$BuyOffer? and $rt.$BuyOffer.unitprice? and $rt.$BuyOffer.unitprice != null then $rt.$BuyOffer.unitprice else 0)"/>
+          <set_value name="$mk1RouteSellPriceRaw" exact="if $rt.$SellPrice? and $rt.$SellPrice != null then $rt.$SellPrice else (if $rt.$SellOffer? and $rt.$SellOffer.unitprice? and $rt.$SellOffer.unitprice != null then $rt.$SellOffer.unitprice else 0)"/>
+          <set_value name="$mk1RouteProfitRaw" exact="($mk1RouteSellPriceRaw - $mk1RouteBuyPriceRaw) * $mk1RouteAmount"/>
+          <set_value name="$mk1CycleLogProfitRaw" exact="$mk1CycleLogProfitRaw + $mk1RouteProfitRaw"/>
+          <set_value name="$logMsg" exact="'Trip ' + $ri + '/' + $deliveryRoute.count + ': ' + $mk1RouteAmount + ' ' + $rt.$Ware.name + ' ' + (if $rt.$BuyOffer? and $rt.$BuyOffer.owner? then 'from ' + $rt.$BuyOffer.owner.knownname + ' to ' else '') + $rt.$BuyStation.knownname + ' | buy ' + ($mk1RouteBuyPriceRaw / 100) + ' Cr -> sell ' + ($mk1RouteSellPriceRaw / 100) + ' Cr | profit ' + ($mk1RouteProfitRaw / 100) + ' Cr'"/>
           <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
             $Message = $logMsg,
             $Category = 'upkeep',
@@ -1600,6 +1615,13 @@
             $CheckGlobalSettings = false
           ]"/>
         </do_all>
+        <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
+          $Message = 'MK1 route summary: ' + $deliveryRoute.count + ' trips, total profit ' + ($mk1CycleLogProfitRaw / 100) + ' Cr',
+          $Category = 'upkeep',
+          $Title = 'MK1 Route Summary',
+          $Object = this.ship,
+          $CheckGlobalSettings = false
+        ]"/>
       </do_if>
 
       <!-- Signal XP update (one per completed cycle, same as MK3) -->
@@ -1613,7 +1635,8 @@
       <!-- Notification -->
       <do_if value="this.$notifications ge 1 and $deliveryRoute.count gt 0">
         <set_value name="$firstTrade" exact="$deliveryRoute.{1}"/>
-        <show_notification text="'MK1 ' + this.ship.knownname + ': ' + {77000, 30206}.[$firstTrade.$Amount, $firstTrade.$Ware.name, $firstTrade.$BuyStation.knownname, ($firstTrade.$UnitProfit * $firstTrade.$Amount), ($firstTrade.$UnitProfit * $firstTrade.$Amount)]" timeout="5s"/>
+        <set_value name="$mk1NotifyTotalProfitRaw" exact="if $mk1CycleProfitRaw? then $mk1CycleProfitRaw else 0"/>
+        <show_notification text="'MK1 ' + this.ship.knownname + ': ' + {77000, 30206}.[$firstTrade.$Amount, $firstTrade.$Ware.name, $firstTrade.$BuyStation.knownname, ($firstTrade.$UnitProfit * $firstTrade.$Amount), ($firstTrade.$UnitProfit * $firstTrade.$Amount)] + ' | trips=' + $deliveryRoute.count + ', total=' + ($mk1NotifyTotalProfitRaw / 100) + ' Cr'" timeout="5s"/>
       </do_if>
 
       <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': === SELL CYCLE COMPLETE === Delivered ' + $deliveryRoute.count + ' trades'" chance="this.$debugchance"/>

@@ -1433,66 +1433,159 @@
 
         <do_if value="not $denyTrade">
           <set_command_action commandaction="commandaction.flying"/>
-          <set_value name="$buyAmount" exact="[$bestTrade.$Amount, $bestSourceOfferAmount].min"/>
           <set_value name="$sellAmount" exact="0"/>
-          <do_if value="$buyAmount gt 0">
-            <!-- Queue buy and sell together so the order UI shows both planned legs. -->
-            <set_value name="$sourceOfferStillAmount" exact="if $bestSourceOffer? then $bestSourceOffer.offeramount.{this.ship} else 0"/>
-            <do_if value="$sourceOfferStillAmount == null and $bestSourceOffer?">
-              <set_value name="$sourceOfferStillAmount" exact="$bestSourceOffer.amount"/>
-            </do_if>
-            <do_if value="$sourceOfferStillAmount == null">
-              <set_value name="$sourceOfferStillAmount" exact="0"/>
-            </do_if>
-
-            <set_value name="$destOfferStillAmount" exact="if $bestDestOffer? then $bestDestOffer.offeramount.{this.ship} else 0"/>
-            <do_if value="($destOfferStillAmount == null or $destOfferStillAmount le 0) and this.$ignoretraderules and $bestDestOffer? and $bestDestOffer.owner? and $bestDestOffer.owner.isplayerowned">
-              <set_value name="$destOfferStillAmount" exact="[0, $bestDestOffer.owner.cargo.{$bestTrade.$Ware}.target - $bestDestOffer.owner.cargo.{$bestTrade.$Ware}.count].max"/>
-            </do_if>
-            <do_if value="$destOfferStillAmount == null">
-              <set_value name="$destOfferStillAmount" exact="0"/>
-            </do_if>
-
-            <do_if value="$bestSourceOffer == null or not $bestSourceOffer.available or $sourceOfferStillAmount le 0 or $bestDestOffer == null or not $bestDestOffer.available or $destOfferStillAmount le 0">
-              <set_value name="$denyTrade" exact="true"/>
-              <do_if value="this.$debuglevel ge 1">
-                <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': selected trade invalid before queueing (source/dest changed) srcAvail=' + (if $bestSourceOffer? then $bestSourceOffer.available else false) + ' srcAmt=' + $sourceOfferStillAmount + ' dstAvail=' + (if $bestDestOffer? then $bestDestOffer.available else false) + ' dstAmt=' + $destOfferStillAmount + ' -- retrying'" chance="this.$debugchance"/>
-              </do_if>
-            </do_if>
-            <do_else>
-              <set_value name="$buyAmount" exact="[$buyAmount, $sourceOfferStillAmount].min"/>
-              <set_value name="$sellAmount" exact="[$buyAmount, $bestDestOfferAmount, $destOfferStillAmount].min"/>
-              <do_if value="$buyAmount gt 0 and $sellAmount gt 0">
-                <wait exact="this.$gt_criticalYieldMs * 1ms" comment="Desync MK2 buy leg creation across ships"/>
-                <create_trade_order object="this.ship" tradeoffer="$bestSourceOffer" amount="$buyAmount" immediate="false" internal="$tradeOrderInternal"/>
-                <create_trade_order object="this.ship" tradeoffer="$bestDestOffer" amount="$sellAmount" immediate="false" internal="$tradeOrderInternal"/>
-                <!-- Mirror MK3 queued-trade logging payload for MK2. -->
-                <set_value name="$mk2QueuedAmount" exact="if $sellAmount? and $sellAmount != null then $sellAmount else 0"/>
-                <do_if value="$mk2QueuedAmount gt 0 and $bestSourceOffer != null and $bestDestOffer != null">
-                  <set_value name="$mk2QueuedBuyPriceRaw" exact="if $bestSourceOffer.unitprice? and $bestSourceOffer.unitprice != null then $bestSourceOffer.unitprice else 0"/>
-                  <set_value name="$mk2QueuedSellPriceRaw" exact="if $bestDestOffer.unitprice? and $bestDestOffer.unitprice != null then $bestDestOffer.unitprice else 0"/>
-                  <set_value name="$mk2QueuedProfitRaw" exact="($mk2QueuedSellPriceRaw - $mk2QueuedBuyPriceRaw) * $mk2QueuedAmount"/>
-                  <signal_objects object="player.galaxy" param="'GT_TradeLogging_LogTradeOrder'" param2="table[
-                    $Ship = this.ship,
-                    $BuyOffer = $bestSourceOffer,
-                    $SellOffer = $bestDestOffer,
-                    $Amount = $mk2QueuedAmount,
-                    $Profit = $mk2QueuedProfitRaw,
-                    $BuyPrice = $mk2QueuedBuyPriceRaw / 100,
-                    $SellPrice = $mk2QueuedSellPriceRaw / 100,
-                    $IsSellOnly = false,
-                    $SearchPipeline = 'normal'
-                  ]"/>
+          <set_value name="$mk2QueueTradeMax" exact="3"/>
+          <set_value name="$mk2QueueTrades" exact="[]"/>
+          <set_value name="$mk2PrimaryAmount" exact="[$bestTrade.$Amount, $bestSourceOfferAmount, $bestDestOfferAmount].min"/>
+          <do_if value="$mk2PrimaryAmount gt 0">
+            <append_to_list name="$mk2QueueTrades" exact="table[
+              $Ware = $bestTrade.$Ware,
+              $Source = $bestTrade.$Source,
+              $Destination = $bestTrade.$Destination,
+              $SourceOffer = $bestTrade.$SourceOffer,
+              $DestOffer = $bestTrade.$DestOffer,
+              $QueuedAmount = $mk2PrimaryAmount,
+              $Score = $bestTrade.$Score
+            ]"/>
+          </do_if>
+          <do_if value="$mk2QueueTrades.count gt 0 and $mk2TradeList.count gt 1">
+            <set_value name="$mk2RemainingVolume" exact="[0, this.ship.cargo.capacity.all - ($mk2PrimaryAmount * $bestTrade.$Ware.volume)].max"/>
+            <set_value name="$mk2AddedTrades" exact="0"/>
+            <do_while value="$mk2AddedTrades lt ($mk2QueueTradeMax - 1) and $mk2RemainingVolume gt 0">
+              <set_value name="$mk2BestSecondary" exact="null"/>
+              <set_value name="$mk2BestSecondaryVolume" exact="0"/>
+              <set_value name="$mk2BestSecondaryScore" exact="-999999"/>
+              <do_all exact="$mk2TradeList.count" counter="$m2i">
+                <set_value name="$mk2Candidate" exact="$mk2TradeList.{$m2i}"/>
+                <do_if value="$mk2Candidate == null or $mk2Candidate == $bestTrade">
+                  <continue/>
                 </do_if>
+                <!-- MK2 multi-ware batching: only same lane as primary trade -->
+                <do_if value="$mk2Candidate.$Source != $bestTrade.$Source or $mk2Candidate.$Destination != $bestTrade.$Destination">
+                  <continue/>
+                </do_if>
+                <set_value name="$mk2AlreadyQueued" exact="false"/>
+                <do_all exact="$mk2QueueTrades.count" counter="$m2qi">
+                  <set_value name="$mk2QueuedTrade" exact="$mk2QueueTrades.{$m2qi}"/>
+                  <do_if value="$mk2QueuedTrade.$SourceOffer == $mk2Candidate.$SourceOffer and $mk2QueuedTrade.$DestOffer == $mk2Candidate.$DestOffer">
+                    <set_value name="$mk2AlreadyQueued" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+                <do_if value="$mk2AlreadyQueued">
+                  <continue/>
+                </do_if>
+                <set_value name="$mk2CandNeedAmount" exact="if $mk2Candidate.$EffectiveDestOfferAmount? then $mk2Candidate.$EffectiveDestOfferAmount else $mk2Candidate.$DestOfferAmount"/>
+                <set_value name="$mk2CandAmount" exact="[$mk2Candidate.$Amount, $mk2Candidate.$SourceOfferAmount, $mk2CandNeedAmount, this.ship.cargo.{$mk2Candidate.$Ware}.max].min"/>
+                <do_if value="$mk2Candidate.$Ware.volume gt 0">
+                  <set_value name="$mk2CandMaxByVolume" exact="($mk2RemainingVolume / $mk2Candidate.$Ware.volume)i"/>
+                  <set_value name="$mk2CandAmount" exact="[$mk2CandAmount, $mk2CandMaxByVolume].min"/>
+                </do_if>
+                <do_if value="$mk2CandAmount le 0">
+                  <continue/>
+                </do_if>
+                <set_value name="$mk2CandVolume" exact="$mk2CandAmount * $mk2Candidate.$Ware.volume"/>
+                <do_if value="$mk2CandVolume gt $mk2BestSecondaryVolume or ($mk2CandVolume == $mk2BestSecondaryVolume and $mk2Candidate.$Score gt $mk2BestSecondaryScore)">
+                  <set_value name="$mk2BestSecondary" exact="$mk2Candidate"/>
+                  <set_value name="$mk2BestSecondaryVolume" exact="$mk2CandVolume"/>
+                  <set_value name="$mk2BestSecondaryScore" exact="$mk2Candidate.$Score"/>
+                  <set_value name="$mk2BestSecondaryAmount" exact="$mk2CandAmount"/>
+                </do_if>
+              </do_all>
+              <do_if value="$mk2BestSecondary == null or $mk2BestSecondaryAmount le 0">
+                <break/>
               </do_if>
-              <do_else>
+              <append_to_list name="$mk2QueueTrades" exact="table[
+                $Ware = $mk2BestSecondary.$Ware,
+                $Source = $mk2BestSecondary.$Source,
+                $Destination = $mk2BestSecondary.$Destination,
+                $SourceOffer = $mk2BestSecondary.$SourceOffer,
+                $DestOffer = $mk2BestSecondary.$DestOffer,
+                $QueuedAmount = $mk2BestSecondaryAmount,
+                $Score = $mk2BestSecondary.$Score
+              ]"/>
+              <set_value name="$mk2AddedTrades" operation="add"/>
+              <do_if value="$mk2BestSecondary.$Ware.volume gt 0">
+                <set_value name="$mk2RemainingVolume" exact="[0, $mk2RemainingVolume - ($mk2BestSecondaryAmount * $mk2BestSecondary.$Ware.volume)].max"/>
+              </do_if>
+            </do_while>
+          </do_if>
+
+          <set_value name="$mk2FinalQueueTrades" exact="[]"/>
+          <set_value name="$mk2RoutePlan" exact="''"/>
+          <set_value name="$mk2RoutePlanCount" exact="0"/>
+          <do_all exact="$mk2QueueTrades.count" counter="$mqvi">
+            <set_value name="$mk2QueuedTrade" exact="$mk2QueueTrades.{$mqvi}"/>
+            <set_value name="$mk2SourceOfferStillAmount" exact="if $mk2QueuedTrade.$SourceOffer? then $mk2QueuedTrade.$SourceOffer.offeramount.{this.ship} else 0"/>
+            <do_if value="$mk2SourceOfferStillAmount == null and $mk2QueuedTrade.$SourceOffer?">
+              <set_value name="$mk2SourceOfferStillAmount" exact="$mk2QueuedTrade.$SourceOffer.amount"/>
+            </do_if>
+            <do_if value="$mk2SourceOfferStillAmount == null">
+              <set_value name="$mk2SourceOfferStillAmount" exact="0"/>
+            </do_if>
+            <set_value name="$mk2DestOfferStillAmount" exact="if $mk2QueuedTrade.$DestOffer? then $mk2QueuedTrade.$DestOffer.offeramount.{this.ship} else 0"/>
+            <do_if value="($mk2DestOfferStillAmount == null or $mk2DestOfferStillAmount le 0) and this.$ignoretraderules and $mk2QueuedTrade.$DestOffer? and $mk2QueuedTrade.$DestOffer.owner? and $mk2QueuedTrade.$DestOffer.owner.isplayerowned">
+              <set_value name="$mk2DestOfferStillAmount" exact="[0, $mk2QueuedTrade.$DestOffer.owner.cargo.{$mk2QueuedTrade.$Ware}.target - $mk2QueuedTrade.$DestOffer.owner.cargo.{$mk2QueuedTrade.$Ware}.count].max"/>
+            </do_if>
+            <do_if value="$mk2DestOfferStillAmount == null">
+              <set_value name="$mk2DestOfferStillAmount" exact="0"/>
+            </do_if>
+            <set_value name="$mk2QueuedAmountClamped" exact="[$mk2QueuedTrade.$QueuedAmount, $mk2SourceOfferStillAmount, $mk2DestOfferStillAmount].min"/>
+            <do_if value="$mk2QueuedTrade.$SourceOffer == null or not $mk2QueuedTrade.$SourceOffer.available or $mk2QueuedTrade.$DestOffer == null or not $mk2QueuedTrade.$DestOffer.available or $mk2QueuedAmountClamped le 0">
+              <do_if value="$mqvi == 1">
                 <set_value name="$denyTrade" exact="true"/>
                 <do_if value="this.$debuglevel ge 1">
-                  <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': selected trade collapsed during pre-queue clamp (buy=' + $buyAmount + ', sell=' + $sellAmount + ') -- retrying'" chance="this.$debugchance"/>
+                  <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': selected primary trade invalid before queueing (source/dest changed) -- retrying'" chance="this.$debugchance"/>
                 </do_if>
-              </do_else>
-            </do_else>
+              </do_if>
+              <continue/>
+            </do_if>
+            <set_value name="$mk2QueuedTrade.$QueuedAmount" exact="$mk2QueuedAmountClamped"/>
+            <append_to_list name="$mk2FinalQueueTrades" exact="$mk2QueuedTrade"/>
+            <set_value name="$sellAmount" exact="$sellAmount + $mk2QueuedAmountClamped"/>
+            <set_value name="$mk2RoutePlan" exact="$mk2RoutePlan + (if $mk2RoutePlanCount gt 0 then ' | ' else '') + (if $mk2QueuedTrade.$Ware? and $mk2QueuedTrade.$Ware.name? then @$mk2QueuedTrade.$Ware.name else '?') + '(' + $mk2QueuedAmountClamped + ')'"/>
+            <set_value name="$mk2RoutePlanCount" exact="$mk2RoutePlanCount + 1"/>
+          </do_all>
+
+          <do_if value="not $denyTrade and $mk2FinalQueueTrades.count gt 0 and $sellAmount gt 0">
+            <do_if value="this.$debuglevel ge 1">
+              <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': queued multi-ware lane ' + $bestTrade.$Source.knownname + ' -> ' + $bestTrade.$Destination.knownname + ' trades=' + $mk2FinalQueueTrades.count + ' [' + $mk2RoutePlan + ']'" chance="this.$debugchance"/>
+            </do_if>
+            <wait exact="this.$gt_criticalYieldMs * 1ms" comment="Desync MK2 multi-ware queue creation across ships"/>
+            <!-- Phase 1: queue all buys first (avoid buy/sell alternation) -->
+            <do_all exact="$mk2FinalQueueTrades.count" counter="$mqbi">
+              <set_value name="$mk2QueuedTrade" exact="$mk2FinalQueueTrades.{$mqbi}"/>
+              <create_trade_order object="this.ship" tradeoffer="$mk2QueuedTrade.$SourceOffer" amount="$mk2QueuedTrade.$QueuedAmount" immediate="false" internal="$tradeOrderInternal"/>
+            </do_all>
+            <!-- Phase 2: queue all sells -->
+            <do_all exact="$mk2FinalQueueTrades.count" counter="$mqsi">
+              <set_value name="$mk2QueuedTrade" exact="$mk2FinalQueueTrades.{$mqsi}"/>
+              <create_trade_order object="this.ship" tradeoffer="$mk2QueuedTrade.$DestOffer" amount="$mk2QueuedTrade.$QueuedAmount" immediate="false" internal="$tradeOrderInternal"/>
+              <set_value name="$mk2QueuedAmount" exact="if $mk2QueuedTrade.$QueuedAmount? and $mk2QueuedTrade.$QueuedAmount != null then $mk2QueuedTrade.$QueuedAmount else 0"/>
+              <do_if value="$mk2QueuedAmount gt 0 and $mk2QueuedTrade.$SourceOffer != null and $mk2QueuedTrade.$DestOffer != null">
+                <set_value name="$mk2QueuedBuyPriceRaw" exact="if $mk2QueuedTrade.$SourceOffer.unitprice? and $mk2QueuedTrade.$SourceOffer.unitprice != null then $mk2QueuedTrade.$SourceOffer.unitprice else 0"/>
+                <set_value name="$mk2QueuedSellPriceRaw" exact="if $mk2QueuedTrade.$DestOffer.unitprice? and $mk2QueuedTrade.$DestOffer.unitprice != null then $mk2QueuedTrade.$DestOffer.unitprice else 0"/>
+                <set_value name="$mk2QueuedProfitRaw" exact="($mk2QueuedSellPriceRaw - $mk2QueuedBuyPriceRaw) * $mk2QueuedAmount"/>
+                <signal_objects object="player.galaxy" param="'GT_TradeLogging_LogTradeOrder'" param2="table[
+                  $Ship = this.ship,
+                  $BuyOffer = $mk2QueuedTrade.$SourceOffer,
+                  $SellOffer = $mk2QueuedTrade.$DestOffer,
+                  $Amount = $mk2QueuedAmount,
+                  $Profit = $mk2QueuedProfitRaw,
+                  $BuyPrice = $mk2QueuedBuyPriceRaw / 100,
+                  $SellPrice = $mk2QueuedSellPriceRaw / 100,
+                  $IsSellOnly = false,
+                  $SearchPipeline = 'normal'
+                ]"/>
+              </do_if>
+            </do_all>
           </do_if>
+          <do_else>
+            <set_value name="$denyTrade" exact="true"/>
+            <do_if value="this.$debuglevel ge 1">
+              <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': selected trade collapsed during pre-queue clamp -- retrying'" chance="this.$debugchance"/>
+            </do_if>
+          </do_else>
         </do_if>
         <do_while value="this.ship.orders.count gt 0">
           <wait exact="5s">

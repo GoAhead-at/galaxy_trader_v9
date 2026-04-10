@@ -1286,15 +1286,13 @@
           <do_all exact="$allTrades.count" counter="$ti">
             <set_value name="$candidateTrade" exact="$allTrades.{$ti}"/>
 
-            <!-- Skip the primary trade -->
-            <do_if value="$candidateTrade.$BuyStation == $bestTrade.$BuyStation and $candidateTrade.$Ware == $bestTrade.$Ware">
-              <continue/>
-            </do_if>
-
-            <!-- Skip same ware (already loading it) -->
+            <!-- Allow any ware combination (including repeated wares).
+                 Only skip exact duplicate offer-pairs already in the route,
+                 otherwise we can chain the same ware to different destinations. -->
             <set_value name="$alreadyInRoute" exact="false"/>
             <do_all exact="$deliveryRoute.count" counter="$ri">
-              <do_if value="$deliveryRoute.{$ri}.$Ware == $candidateTrade.$Ware">
+              <set_value name="$routeTrade" exact="$deliveryRoute.{$ri}"/>
+              <do_if value="$routeTrade.$BuyOffer == $candidateTrade.$BuyOffer and $routeTrade.$SellOffer == $candidateTrade.$SellOffer">
                 <set_value name="$alreadyInRoute" exact="true"/>
                 <break/>
               </do_if>
@@ -1303,10 +1301,11 @@
               <continue/>
             </do_if>
 
-            <!-- No-backtrack rule: is the secondary buyer "in line"? -->
-            <!-- Check: distance from last buyer to new buyer vs distance from last buyer to home -->
-            <set_value name="$lastBuyer" exact="$deliveryRoute.{$deliveryRoute.count}.$BuyStation"/>
-            <set_value name="$distLastToNew" exact="$lastBuyer.gatedistance.{$candidateTrade.$BuyStation}"/>
+            <!-- No-backtrack rule on SELL destinations (execution path):
+                 compare last selected destination to new destination and to home. -->
+            <set_value name="$lastBuyer" exact="$deliveryRoute.{$deliveryRoute.count}.$SellStation"/>
+            <set_value name="$candidateBuyer" exact="$candidateTrade.$SellStation"/>
+            <set_value name="$distLastToNew" exact="$lastBuyer.gatedistance.{$candidateBuyer}"/>
             <set_value name="$distLastToHome" exact="$lastBuyer.gatedistance.{this.$homeStation}"/>
 
             <do_if value="$distLastToNew lt 0 or $distLastToHome lt 0">
@@ -1315,7 +1314,7 @@
 
             <do_if value="$distLastToNew gt ($distLastToHome + this.$backtrackTolerance)">
               <!-- Backtracking too much — skip -->
-              <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Secondary ' + $candidateTrade.$Ware.name + ' → ' + $candidateTrade.$BuyStation.knownname + ' REJECTED (backtrack: ' + $distLastToNew + ' gt ' + ($distLastToHome + this.$backtrackTolerance) + ')'" chance="this.$debugchance"/>
+              <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Secondary ' + $candidateTrade.$Ware.name + ' → ' + $candidateTrade.$SellStation.knownname + ' REJECTED (backtrack: ' + $distLastToNew + ' gt ' + ($distLastToHome + this.$backtrackTolerance) + ')'" chance="this.$debugchance"/>
               <continue/>
             </do_if>
 
@@ -1330,8 +1329,9 @@
               <continue/>
             </do_if>
 
-            <!-- Cargo mode: select highest station fill % first; tie-break by score.
-                 Profit mode: keep legacy behavior and use first valid candidate. -->
+            <!-- Secondary selection:
+                 prioritize fill contribution (secondaryAmount) in both modes so the
+                 route can actually reach selltarget; then use mode-specific tie-breaks. -->
             <do_if value="this.$sellselectionmode == 1">
               <set_value name="$candidateTarget" exact="this.$homeStation.cargo.{$candidateTrade.$Ware}.target"/>
               <set_value name="$candidateCount" exact="this.$homeStation.cargo.{$candidateTrade.$Ware}.count"/>
@@ -1340,7 +1340,7 @@
               <set_value name="$candidateReservedOther" exact="[($candidateReservedTotal - $candidateReservedSelf), 0].max"/>
               <set_value name="$candidateEffectiveCount" exact="[($candidateCount - $candidateReservedOther), 0].max"/>
               <set_value name="$candidateFillPct" exact="if $candidateTarget gt 0 then (($candidateEffectiveCount * 100) / $candidateTarget) else 0"/>
-              <do_if value="$candidateFillPct gt $bestSecondaryFillPct or ($candidateFillPct == $bestSecondaryFillPct and $candidateTrade.$Score gt $bestSecondaryScore)">
+              <do_if value="$secondaryAmount gt $bestSecondaryAmount or ($secondaryAmount == $bestSecondaryAmount and ($candidateFillPct gt $bestSecondaryFillPct or ($candidateFillPct == $bestSecondaryFillPct and $candidateTrade.$Score gt $bestSecondaryScore)))">
                 <set_value name="$bestSecondaryTrade" exact="$candidateTrade"/>
                 <set_value name="$bestSecondaryAmount" exact="$secondaryAmount"/>
                 <set_value name="$bestSecondaryFillPct" exact="$candidateFillPct"/>
@@ -1348,9 +1348,14 @@
               </do_if>
             </do_if>
             <do_else>
-              <set_value name="$bestSecondaryTrade" exact="$candidateTrade"/>
-              <set_value name="$bestSecondaryAmount" exact="$secondaryAmount"/>
-              <break/>
+              <!-- Profit mode: choose the best secondary candidate by fill contribution
+                   (amount loaded), then tie-break by trade score.
+                   Using first-valid candidate can underfill cargo and fail hard selltarget. -->
+              <do_if value="$secondaryAmount gt $bestSecondaryAmount or ($secondaryAmount == $bestSecondaryAmount and $candidateTrade.$Score gt $bestSecondaryScore)">
+                <set_value name="$bestSecondaryTrade" exact="$candidateTrade"/>
+                <set_value name="$bestSecondaryAmount" exact="$secondaryAmount"/>
+                <set_value name="$bestSecondaryScore" exact="$candidateTrade.$Score"/>
+              </do_if>
             </do_else>
           </do_all>
 
@@ -1365,8 +1370,15 @@
           <do_if value="$bestSecondaryTrade.$Ware.volume gt 0">
             <set_value name="$remainingRouteVolume" exact="[0, $remainingRouteVolume - ($bestSecondaryAmount * $bestSecondaryTrade.$Ware.volume)].max"/>
           </do_if>
+          <set_value name="$currentRouteFillPct" exact="if $cargoCapacity gt 0 then ((($cargoCapacity - $remainingRouteVolume) * 100) / $cargoCapacity) else 100"/>
 
-          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Added secondary: ' + $bestSecondaryTrade.$Ware.name + ' → ' + $bestSecondaryTrade.$BuyStation.knownname + ' (amount: ' + $bestSecondaryAmount + ')'" chance="this.$debugchance"/>
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Added secondary: ' + $bestSecondaryTrade.$Ware.name + ' → ' + $bestSecondaryTrade.$SellStation.knownname + ' (amount: ' + $bestSecondaryAmount + ')'" chance="this.$debugchance"/>
+          <!-- Route builder is "up to 3 trades":
+               stop early once selltarget is reached, so 2 trades can be enough. -->
+          <do_if value="$currentRouteFillPct ge this.$selltarget">
+            <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Secondary route reached selltarget (' + $currentRouteFillPct + '% >= ' + this.$selltarget + '%) — stopping route expansion'" chance="this.$debugchance"/>
+            <break/>
+          </do_if>
         </do_while>
       </do_if>
 
@@ -1460,11 +1472,62 @@
         </do_if>
       </do_all>
 
+      <!-- Execution-order compaction by SELL destination sector:
+           candidate discovery may produce A->B->A. Before queueing, keep the
+           same trades but group them by first-seen sector blocks (A->A->B),
+           so ships do not zig-zag between sectors. -->
+      <create_list name="$mk1SectorOrder"/>
+      <do_all exact="$queueableTrades.count" counter="$qoi">
+        <set_value name="$qot" exact="$queueableTrades.{$qoi}"/>
+        <set_value name="$qos" exact="if $qot.$SellSector? then $qot.$SellSector else (if $qot.$SellStation? then $qot.$SellStation.sector else (if $qot.$SellOffer? and $qot.$SellOffer.owner? then $qot.$SellOffer.owner.sector else null))"/>
+        <do_if value="$qos?">
+          <set_value name="$mk1SeenSector" exact="false"/>
+          <do_all exact="$mk1SectorOrder.count" counter="$sci">
+            <do_if value="$mk1SectorOrder.{$sci} == $qos">
+              <set_value name="$mk1SeenSector" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+          <do_if value="not $mk1SeenSector">
+            <append_to_list name="$mk1SectorOrder" exact="$qos"/>
+          </do_if>
+        </do_if>
+      </do_all>
+
+      <create_list name="$mk1QueueCompacted"/>
+      <do_all exact="$mk1SectorOrder.count" counter="$soi">
+        <set_value name="$sectorKey" exact="$mk1SectorOrder.{$soi}"/>
+        <do_all exact="$queueableTrades.count" counter="$qci">
+          <set_value name="$qct" exact="$queueableTrades.{$qci}"/>
+          <set_value name="$qctSector" exact="if $qct.$SellSector? then $qct.$SellSector else (if $qct.$SellStation? then $qct.$SellStation.sector else (if $qct.$SellOffer? and $qct.$SellOffer.owner? then $qct.$SellOffer.owner.sector else null))"/>
+          <do_if value="$qctSector? and $qctSector == $sectorKey">
+            <append_to_list name="$mk1QueueCompacted" exact="$qct"/>
+          </do_if>
+        </do_all>
+      </do_all>
+      <do_if value="$mk1QueueCompacted.count == $queueableTrades.count">
+        <set_value name="$queueableTrades" exact="$mk1QueueCompacted"/>
+      </do_if>
+
+      <do_if value="this.$debuglevel ge 1">
+        <set_value name="$mk1RoutePlanStr" exact="''"/>
+        <set_value name="$mk1RoutePlanMax" exact="12"/>
+        <do_all exact="$queueableTrades.count" counter="$rpi">
+          <do_if value="$rpi gt $mk1RoutePlanMax">
+            <set_value name="$mk1RoutePlanStr" exact="$mk1RoutePlanStr + ' | ...+' + ($queueableTrades.count - $mk1RoutePlanMax)"/>
+            <break/>
+          </do_if>
+          <set_value name="$rpTrade" exact="$queueableTrades.{$rpi}"/>
+          <set_value name="$mk1RoutePlanStr" exact="$mk1RoutePlanStr + (if $rpi gt 1 then ' | ' else '') + (if $rpTrade.$Ware? and $rpTrade.$Ware.name? then @$rpTrade.$Ware.name else '?') + '->' + (if $rpTrade.$SellStation? and $rpTrade.$SellStation.knownname? then @$rpTrade.$SellStation.knownname else '?') + '(' + $rpTrade.$QueuedAmount + ')'"/>
+        </do_all>
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': ROUTE_PLAN count=' + $queueableTrades.count + ' [' + $mk1RoutePlanStr + ']'" chance="100"/>
+      </do_if>
+
       <!-- Phase 1: create all SELL orders -->
       <do_all exact="$queueableTrades.count" counter="$qsi">
         <set_value name="$qt" exact="$queueableTrades.{$qsi}"/>
         <create_trade_order object="this.ship" tradeoffer="$qt.$SellOffer" amount="$qt.$QueuedAmount" immediate="true" internal="false"/>
-        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Queued SELL ' + $qt.$QueuedAmount + ' ' + $qt.$Ware.name + ' to ' + $qt.$BuyStation.knownname" chance="this.$debugchance"/>
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Queued SELL ' + $qt.$QueuedAmount + ' ' + $qt.$Ware.name + ' to ' + $qt.$SellStation.knownname" chance="this.$debugchance"/>
       </do_all>
 
       <!-- Phase 2: create all LOAD orders (executed first due to LIFO immediate queue) -->

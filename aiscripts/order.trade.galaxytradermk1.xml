@@ -55,6 +55,9 @@
         <input_param name="step" value="1"/>
       </param>
 
+      <!-- Allow Multi-Trade chaining -->
+      <param name="allowmultitrade" default="true" type="bool" text="{77000, 30025}" comment="{77000, 30125}"/>
+
       <!-- Logbook Entries -->
       <param name="logbookentries" default="true" type="bool" text="{77000, 30017}" comment="{77000, 30117}"/>
 
@@ -209,6 +212,7 @@
     <set_value name="this.$sellselectionmode" exact="$sellselectionmode"/>
     <set_value name="this.$buytarget" exact="$buytarget"/>
     <set_value name="this.$backtrackTolerance" exact="$backtrackTolerance"/>
+    <set_value name="this.$allowmultitrade" exact="$allowmultitrade"/>
     <set_value name="this.$logbookentries" exact="$logbookentries"/>
     <set_value name="this.$notifications" exact="$notifications"/>
     <set_value name="this.$fleetcoordination" exact="$fleetcoordination"/>
@@ -355,6 +359,7 @@
         <set_value name="this.$sellselectionmode" exact="if $effectiveMK1Order.$sellselectionmode? then $effectiveMK1Order.$sellselectionmode else 2"/>
         <set_value name="this.$buytarget" exact="$effectiveMK1Order.$buytarget"/>
         <set_value name="this.$backtrackTolerance" exact="$effectiveMK1Order.$backtrackTolerance"/>
+        <set_value name="this.$allowmultitrade" exact="if $effectiveMK1Order.$allowmultitrade? then $effectiveMK1Order.$allowmultitrade else true"/>
         <set_value name="this.$logbookentries" exact="$effectiveMK1Order.$logbookentries"/>
         <set_value name="this.$notifications" exact="$effectiveMK1Order.$notifications"/>
         <set_value name="this.$fleetcoordination" exact="$effectiveMK1Order.$fleetcoordination"/>
@@ -1205,7 +1210,7 @@
       <set_value name="$fillPercent" exact="if $cargoCapacity gt 0 then ($primaryVolume * 100 / $cargoCapacity) else 100"/>
 
       <!-- Prefer a single full-cargo run over multi-ware chaining when possible. -->
-      <do_if value="$fillPercent lt this.$selltarget and $allTrades.count gt 1">
+      <do_if value="this.$allowmultitrade and $fillPercent lt this.$selltarget and $allTrades.count gt 1">
         <set_value name="$singleFullTrade" exact="null"/>
         <set_value name="$singleFullScore" exact="-1"/>
         <set_value name="$singleFullFillPct" exact="-1"/>
@@ -1275,7 +1280,7 @@
         </do_if>
       </do_if>
 
-      <do_if value="$fillPercent lt this.$selltarget and $allTrades.count gt 1">
+      <do_if value="this.$allowmultitrade and $fillPercent lt this.$selltarget and $allTrades.count gt 1">
         <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Cargo fill ' + $fillPercent + '% lt selltarget ' + this.$selltarget + '% — checking for secondary wares'" chance="this.$debugchance"/>
 
         <!-- Try to add up to 2 more wares (max 3 total) -->
@@ -1305,20 +1310,33 @@
               <continue/>
             </do_if>
 
-            <!-- No-backtrack rule on SELL destinations (execution path):
-                 compare last selected destination to new destination and to home. -->
-            <set_value name="$lastBuyer" exact="$deliveryRoute.{$deliveryRoute.count}.$SellStation"/>
-            <set_value name="$candidateBuyer" exact="$candidateTrade.$SellStation"/>
-            <set_value name="$distLastToNew" exact="$lastBuyer.gatedistance.{$candidateBuyer}"/>
-            <set_value name="$distLastToHome" exact="$lastBuyer.gatedistance.{this.$homeStation}"/>
-
-            <do_if value="$distLastToNew lt 0 or $distLastToHome lt 0">
+            <!-- SELL-destination cluster tolerance:
+                 candidate destination must be within backtrackTolerance jumps of
+                 every already selected SELL destination in the route. -->
+            <set_value name="$candidateSellSector" exact="if $candidateTrade.$SellSector? then $candidateTrade.$SellSector else (if $candidateTrade.$SellStation? then $candidateTrade.$SellStation.sector else null)"/>
+            <do_if value="not $candidateSellSector?">
               <continue/>
             </do_if>
-
-            <do_if value="$distLastToNew gt ($distLastToHome + this.$backtrackTolerance)">
-              <!-- Backtracking too much — skip -->
-              <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Secondary ' + $candidateTrade.$Ware.name + ' → ' + $candidateTrade.$SellStation.knownname + ' REJECTED (backtrack: ' + $distLastToNew + ' gt ' + ($distLastToHome + this.$backtrackTolerance) + ')'" chance="this.$debugchance"/>
+            <set_value name="$mk1ClusterReject" exact="false"/>
+            <set_value name="$mk1ClusterFailDistance" exact="-1"/>
+            <set_value name="$mk1ClusterFailRouteSector" exact="null"/>
+            <do_all exact="$deliveryRoute.count" counter="$cri">
+              <set_value name="$clusterRouteTrade" exact="$deliveryRoute.{$cri}"/>
+              <set_value name="$routeSellSector" exact="if $clusterRouteTrade.$SellSector? then $clusterRouteTrade.$SellSector else (if $clusterRouteTrade.$SellStation? then $clusterRouteTrade.$SellStation.sector else null)"/>
+              <do_if value="not $routeSellSector?">
+                <set_value name="$mk1ClusterReject" exact="true"/>
+                <break/>
+              </do_if>
+              <set_value name="$routeSectorDistance" exact="$routeSellSector.gatedistance.{$candidateSellSector}"/>
+              <do_if value="$routeSectorDistance lt 0 or $routeSectorDistance gt this.$backtrackTolerance">
+                <set_value name="$mk1ClusterReject" exact="true"/>
+                <set_value name="$mk1ClusterFailDistance" exact="$routeSectorDistance"/>
+                <set_value name="$mk1ClusterFailRouteSector" exact="$routeSellSector"/>
+                <break/>
+              </do_if>
+            </do_all>
+            <do_if value="$mk1ClusterReject">
+              <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Secondary ' + $candidateTrade.$Ware.name + ' → ' + $candidateTrade.$SellStation.knownname + ' REJECTED (cluster tolerance: ' + $mk1ClusterFailDistance + ' gt ' + this.$backtrackTolerance + ', routeSector=' + (if $mk1ClusterFailRouteSector? and $mk1ClusterFailRouteSector.knownname? then @$mk1ClusterFailRouteSector.knownname else '?') + ', candidateSector=' + (if $candidateSellSector? and $candidateSellSector.knownname? then @$candidateSellSector.knownname else '?') + ')'" chance="this.$debugchance"/>
               <continue/>
             </do_if>
 
@@ -1477,9 +1495,9 @@
       </do_all>
 
       <!-- Execution-order compaction by SELL destination sector:
-           candidate discovery may produce A->B->A. Before queueing, keep the
-           same trades but group them by first-seen sector blocks (A->A->B),
-           so ships do not zig-zag between sectors. -->
+           1) collapse A->B->A into grouped sector blocks
+           2) order sector blocks by increasing home->sector distance so routes
+              progress outward (e.g. C->D->E from home A), not E->C->D. -->
       <create_list name="$mk1SectorOrder"/>
       <do_all exact="$queueableTrades.count" counter="$qoi">
         <set_value name="$qot" exact="$queueableTrades.{$qoi}"/>
@@ -1498,9 +1516,48 @@
         </do_if>
       </do_all>
 
+      <set_value name="$mk1HomeSector" exact="if this.$homeStation? then this.$homeStation.sector else this.ship.sector"/>
+      <create_list name="$mk1SectorOrderSorted"/>
+      <do_if value="$mk1HomeSector? and $mk1SectorOrder.count gt 1">
+        <do_while value="$mk1SectorOrderSorted.count lt $mk1SectorOrder.count">
+          <set_value name="$mk1BestSector" exact="null"/>
+          <set_value name="$mk1BestDistance" exact="999999"/>
+          <do_all exact="$mk1SectorOrder.count" counter="$ssoi">
+            <set_value name="$mk1SectorCandidate" exact="$mk1SectorOrder.{$ssoi}"/>
+            <set_value name="$mk1AlreadySorted" exact="false"/>
+            <do_all exact="$mk1SectorOrderSorted.count" counter="$ssj">
+              <do_if value="$mk1SectorOrderSorted.{$ssj} == $mk1SectorCandidate">
+                <set_value name="$mk1AlreadySorted" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+            <do_if value="$mk1AlreadySorted">
+              <continue/>
+            </do_if>
+            <set_value name="$mk1SectorDistance" exact="$mk1HomeSector.gatedistance.{$mk1SectorCandidate}"/>
+            <do_if value="$mk1SectorDistance lt 0">
+              <set_value name="$mk1SectorDistance" exact="999999"/>
+            </do_if>
+            <do_if value="not $mk1BestSector? or $mk1SectorDistance lt $mk1BestDistance">
+              <set_value name="$mk1BestSector" exact="$mk1SectorCandidate"/>
+              <set_value name="$mk1BestDistance" exact="$mk1SectorDistance"/>
+            </do_if>
+          </do_all>
+          <do_if value="$mk1BestSector?">
+            <append_to_list name="$mk1SectorOrderSorted" exact="$mk1BestSector"/>
+          </do_if>
+          <do_else>
+            <break/>
+          </do_else>
+        </do_while>
+      </do_if>
+      <do_else>
+        <set_value name="$mk1SectorOrderSorted" exact="$mk1SectorOrder"/>
+      </do_else>
+
       <create_list name="$mk1QueueCompacted"/>
-      <do_all exact="$mk1SectorOrder.count" counter="$soi">
-        <set_value name="$sectorKey" exact="$mk1SectorOrder.{$soi}"/>
+      <do_all exact="$mk1SectorOrderSorted.count" counter="$soi">
+        <set_value name="$sectorKey" exact="$mk1SectorOrderSorted.{$soi}"/>
         <do_all exact="$queueableTrades.count" counter="$qci">
           <set_value name="$qct" exact="$queueableTrades.{$qci}"/>
           <set_value name="$qctSector" exact="if $qct.$SellSector? then $qct.$SellSector else (if $qct.$SellStation? then $qct.$SellStation.sector else (if $qct.$SellOffer? and $qct.$SellOffer.owner? then $qct.$SellOffer.owner.sector else null))"/>

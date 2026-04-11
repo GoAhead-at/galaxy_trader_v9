@@ -88,6 +88,9 @@
         <input_param name="max" value="90"/>
         <input_param name="step" value="5"/>
       </param>
+
+      <!-- Return Home Between Cycles -->
+      <param name="returnhome" default="false" type="bool" text="{77000, 30026}" comment="{77000, 30126}"/>
     </params>
     <requires>
       <match shiptype="shiptype.lasertower" negate="true"/>
@@ -220,6 +223,7 @@
     <set_value name="this.$debugchance" exact="$debugchance"/>
     <set_value name="this.$supply" exact="$supply"/>
     <set_value name="this.$minstorage" exact="$minstorage"/>
+    <set_value name="this.$returnhome" exact="$returnhome"/>
     <!-- Wait time when no trades found (from global settings or default 60s) -->
     <set_value name="this.$waitTimeNoTrades" exact="if global.$GT_MK1_GlobalSettings.$StationTrader.$WaitTimeNoTrades? then global.$GT_MK1_GlobalSettings.$StationTrader.$WaitTimeNoTrades else 60s"/>
 
@@ -367,6 +371,7 @@
         <set_value name="this.$debugchance" exact="if this.$debuglevel ge 1 and global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
         <set_value name="this.$supply" exact="$effectiveMK1Order.$supply"/>
         <set_value name="this.$minstorage" exact="$effectiveMK1Order.$minstorage"/>
+        <set_value name="this.$returnhome" exact="if $effectiveMK1Order.$returnhome? then $effectiveMK1Order.$returnhome else false"/>
 
         <!-- Update supply station registry if supply toggled -->
         <do_if value="not global.$GT_MK1SuppliedStations?">
@@ -397,6 +402,17 @@
           <set_value name="$mk1PilotMaxDistance" exact="1"/>
         </do_if>
         <set_value name="this.$maxsell" exact="[this.$maxsell, $mk1PilotMaxDistance].min"/>
+      </do_if>
+
+      <!-- ============================================================== -->
+      <!-- STEP 1b: Anchor loop at home dock before new search cycle      -->
+      <!-- ============================================================== -->
+      <!-- MK1 can be restarted by order transitions (e.g. after queued trades).
+           Enforce a home-docked start so new cycles do not begin from remote stations. -->
+      <set_value name="$mk1LoopDockedHome" exact="(this.ship.dock and this.ship.dock.container == this.$homeStation) or (this.ship.parkedat and ((this.ship.parkedat == this.$homeStation) or this.ship.parkedat.hascontext.{this.$homeStation}))"/>
+      <do_if value="this.$returnhome and not $mk1LoopDockedHome and this.ship.orders.count == 0 and this.ship.cargo.count == 0">
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Loop start away from home — docking at home before maintenance/search'" chance="this.$debugchance"/>
+        <resume label="return_home_and_dock"/>
       </do_if>
 
       <!-- ============================================================== -->
@@ -658,6 +674,9 @@
               <set_value name="$supBuyAmount" exact="[$supBuyAmount, $supAffordableAmount].min"/>
             </do_if>
             <do_if value="$supBuyAmount gt 0">
+              <do_if value="global.$GT_ReturnHomeHold? and global.$GT_ReturnHomeHold.{this.ship}?">
+                <remove_value name="global.$GT_ReturnHomeHold.{this.ship}"/>
+              </do_if>
               <!-- Queue delivery first, then buy. With immediate="true", later created orders execute first
                    (vanilla TradeRoutine: "sell first, buy displaces it" → buy runs first).
                    So create DELIVER (BuyOffer) first, BUY (SellOffer) second → BUY executes first. -->
@@ -746,6 +765,21 @@
       <!-- ============================================================== -->
       <set_value name="$hasLeftoverCargo" exact="this.ship.cargo.count gt 0"/>
       <do_if value="$hasLeftoverCargo">
+        <set_command_action commandaction="commandaction.executingtrade"/>
+        <!-- Mirror GT naming-state behavior: mark ship as being in clearance mode while disposing leftover cargo. -->
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}?">
+          <set_value name="global.$GT_Ships.{this.ship}.$CargoDisposal" exact="true"/>
+        </do_if>
+        <do_if value="@this.ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}?">
+          <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
+            $Ship = this.ship,
+            $pilot = this.ship.pilot,
+            $xp = global.$GT_Pilots.{this.ship.pilot}.$XP,
+            $level = global.$GT_Pilots.{this.ship.pilot}.$Level,
+            $rank = @global.$GT_Pilots.{this.ship.pilot}.$CurrentRank,
+            $nameType = 'trader'
+          ]"/>
+        </do_if>
         <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Leftover cargo detected — selling at nearest buyer'" chance="this.$debugchance"/>
 
         <!-- Build sector list for leftover cargo clearance -->
@@ -789,6 +823,9 @@
             </do_all>
             <do_if value="$clearBuyOffer? and $clearBuyOffer != null and $clearBuyOffer.available">
               <set_value name="$clearAmount" exact="[$cAmount, $clearBuyOffer.amount].min"/>
+              <do_if value="global.$GT_ReturnHomeHold? and global.$GT_ReturnHomeHold.{this.ship}?">
+                <remove_value name="global.$GT_ReturnHomeHold.{this.ship}"/>
+              </do_if>
               <create_trade_order object="this.ship" tradeoffer="$clearBuyOffer" amount="$clearAmount" immediate="true" internal="false"/>
               <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Clearing leftover ' + $clearAmount + ' ' + $cWare.name + ' at ' + $clearBuyOffer.owner.knownname" chance="this.$debugchance"/>
               <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield"/>
@@ -806,6 +843,21 @@
               </conditions>
             </interrupt>
           </wait>
+        </do_if>
+      </do_if>
+
+      <!-- Clear clearance flag as soon as cargo is empty so ship state/name reverts immediately. -->
+      <do_if value="this.ship.cargo.count == 0 and global.$GT_Ships? and global.$GT_Ships.{this.ship}? and global.$GT_Ships.{this.ship}.$CargoDisposal?">
+        <remove_value name="global.$GT_Ships.{this.ship}.$CargoDisposal"/>
+        <do_if value="@this.ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}?">
+          <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
+            $Ship = this.ship,
+            $pilot = this.ship.pilot,
+            $xp = global.$GT_Pilots.{this.ship.pilot}.$XP,
+            $level = global.$GT_Pilots.{this.ship.pilot}.$Level,
+            $rank = @global.$GT_Pilots.{this.ship.pilot}.$CurrentRank,
+            $nameType = 'trader'
+          ]"/>
         </do_if>
       </do_if>
 
@@ -953,9 +1005,16 @@
       <set_value name="this.$mk1_lastWaresSnapshotSig" exact="$mk1WaresSnapshotSig"/>
 
       <do_if value="$effectiveWares.count == 0">
-        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': No wares available from station — waiting ' + this.$waitTimeNoTrades" chance="this.$debugchance"/>
-        <wait exact="this.$waitTimeNoTrades"/>
-        <resume label="main_loop"/>
+        <do_if value="this.$returnhome">
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': No wares available from station — returning home to dock and waiting ' + this.$waitTimeNoTrades" chance="this.$debugchance"/>
+          <set_value name="this.$mk1_pendingRetryWait" exact="this.$waitTimeNoTrades"/>
+          <resume label="return_home_and_dock"/>
+        </do_if>
+        <do_else>
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': No wares available from station — waiting ' + this.$waitTimeNoTrades + ' (returnhome disabled)'" chance="this.$debugchance"/>
+          <wait exact="this.$waitTimeNoTrades"/>
+          <resume label="main_loop"/>
+        </do_else>
       </do_if>
 
       <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Effective ware basket: ' + $effectiveWares.count + ' wares'" chance="this.$debugchance"/>
@@ -1191,9 +1250,16 @@
         </do_if>
         <!-- Short retry when supply is active (trade offers may not be populated yet), full wait otherwise -->
         <set_value name="$retryWait" exact="if this.$supply then 10s else this.$waitTimeNoTrades"/>
-        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Waiting ' + $retryWait + ' before retry (supply=' + this.$supply + ')'" chance="this.$debugchance"/>
-        <wait exact="$retryWait"/>
-        <resume label="main_loop"/>
+        <do_if value="this.$returnhome">
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': No sells — returning home to dock, then waiting ' + $retryWait + ' before retry (supply=' + this.$supply + ')'" chance="this.$debugchance"/>
+          <set_value name="this.$mk1_pendingRetryWait" exact="$retryWait"/>
+          <resume label="return_home_and_dock"/>
+        </do_if>
+        <do_else>
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Waiting ' + $retryWait + ' before retry (returnhome disabled, supply=' + this.$supply + ')'" chance="this.$debugchance"/>
+          <wait exact="$retryWait"/>
+          <resume label="main_loop"/>
+        </do_else>
       </do_if>
 
       <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Best trade: ' + $bestTrade.$Ware.name + ' → ' + $bestTrade.$BuyStation.knownname + ' (score: ' + $bestTrade.$Score + ', amount: ' + $bestTrade.$Amount + ', dist: ' + $bestTrade.$Distance + ')'" chance="this.$debugchance"/>
@@ -1586,6 +1652,9 @@
       </do_if>
 
       <!-- Phase 1: create all SELL orders -->
+      <do_if value="global.$GT_ReturnHomeHold? and global.$GT_ReturnHomeHold.{this.ship}? and $queueableTrades.count gt 0">
+        <remove_value name="global.$GT_ReturnHomeHold.{this.ship}"/>
+      </do_if>
       <do_all exact="$queueableTrades.count" counter="$qsi">
         <set_value name="$qt" exact="$queueableTrades.{$qsi}"/>
         <create_trade_order object="this.ship" tradeoffer="$qt.$SellOffer" amount="$qt.$QueuedAmount" immediate="true" internal="false"/>
@@ -1725,15 +1794,51 @@
         </do_if>
       </do_if>
 
-      <!-- Short yield before next cycle -->
-      <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield before next cycle"/>
+      <do_if value="this.$returnhome">
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Post-cycle complete — returning to home station to dock'" chance="this.$debugchance"/>
+        <resume label="return_home_and_dock"/>
+      </do_if>
+      <do_else>
+        <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield before next cycle (returnhome disabled)"/>
+        <resume label="main_loop"/>
+      </do_else>
 
-      <!-- Loop back -->
+      <label name="return_home_and_dock"/>
+
+      <!-- Keep MK1 parked at home between cycles; trade orders will undock the ship naturally when needed.
+           Return-home is delegated to dedicated DockAndReturnHome order for visible queued pathing. -->
+      <set_value name="$mk1AlreadyDockedHome" exact="(this.ship.dock and this.ship.dock.container == this.$homeStation) or (this.ship.parkedat and ((this.ship.parkedat == this.$homeStation) or this.ship.parkedat.hascontext.{this.$homeStation}))"/>
+      <do_if value="not $mk1AlreadyDockedHome">
+        <create_order object="this.ship" id="'DockAndReturnHome'" immediate="true">
+          <param name="destination" value="this.$homeStation"/>
+          <param name="debugchance" value="this.$debugchance"/>
+        </create_order>
+        <return/>
+      </do_if>
+
+      <set_command_action commandaction="commandaction.searchingtrades"/>
+      <do_if value="this.$mk1_pendingRetryWait? and this.$mk1_pendingRetryWait gt 0s">
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Docked idle wait ' + this.$mk1_pendingRetryWait + ' before next search'" chance="this.$debugchance"/>
+        <wait exact="this.$mk1_pendingRetryWait"/>
+        <remove_value name="this.$mk1_pendingRetryWait"/>
+      </do_if>
+      <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield before next cycle"/>
       <resume label="main_loop"/>
 
     </actions>
   </attention>
   <on_abort>
+    <!-- Intentional handoff: MK1 can spawn DockAndReturnHome to get visible queued pathing.
+         Do not run GT cleanup/cancel bridge in this case. -->
+    <do_if value="this.ship.order? and @this.ship.order.id == 'DockAndReturnHome'">
+      <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': on_abort skipped (handoff to DockAndReturnHome)'" chance="100"/>
+      <return/>
+    </do_if>
+
+    <do_if value="global.$GT_ReturnHomeHold? and global.$GT_ReturnHomeHold.{this.ship}?">
+      <remove_value name="global.$GT_ReturnHomeHold.{this.ship}"/>
+    </do_if>
+
     <!-- Cleanup: unregister station from MK1 supply registry -->
     <do_if value="this.$homeStation? and global.$GT_MK1SuppliedStations? and global.$GT_MK1SuppliedStations.{this.$homeStation}? and global.$GT_MK1SuppliedStations.{this.$homeStation} == this.ship">
       <remove_value name="global.$GT_MK1SuppliedStations.{this.$homeStation}"/>

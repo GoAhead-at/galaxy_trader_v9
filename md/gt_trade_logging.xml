@@ -77,6 +77,14 @@
         <do_if value="event.param2.$SearchPipeline?">
           <set_value name="$searchPipeline" exact="event.param2.$SearchPipeline"/>
         </do_if>
+        <set_value name="$isMultiTrade" exact="false"/>
+        <do_if value="event.param2.$IsMultiTrade? and event.param2.$IsMultiTrade">
+          <set_value name="$isMultiTrade" exact="true"/>
+        </do_if>
+        <set_value name="$multiTradeSummary" exact="''"/>
+        <do_if value="event.param2.$MultiTradeSummary? and event.param2.$MultiTradeSummary != null">
+          <set_value name="$multiTradeSummary" exact="event.param2.$MultiTradeSummary"/>
+        </do_if>
         
         <!-- Validate trade offers before accessing properties (they may be invalid/expired) -->
         <set_value name="$buyOfferValid" exact="$buyOffer.exists"/>
@@ -122,8 +130,8 @@
         <!-- Only log if enabled -->
         <do_if value="global.$GT_TradeLogging.$Enabled">
           
-          <!-- Validate we have enough data to log (need at least one valid offer for ware info) -->
-          <do_if value="$buyOfferValid or $sellOfferValid">
+          <!-- Validate we have enough data to log (multi-trade uses aggregated summary text). -->
+          <do_if value="$isMultiTrade or $buyOfferValid or $sellOfferValid">
             
             <!-- Get ware info from valid offer (prefer buy offer) -->
             <set_value name="$wareInfo" exact="null"/>
@@ -136,7 +144,15 @@
             
             <!-- Build queued trade message from snapshot prices: 3100 for cargo sale, 3101 for normal trade. -->
             <set_value name="$logbookMessage" exact="null"/>
-            <do_if value="not $buyOfferValid">
+            <do_if value="$isMultiTrade">
+              <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$formattedProfit">
+                <param name="number" value="$profit/100"/>
+                <param name="suffix" value="' Cr'"/>
+              </run_actions>
+              <set_value name="$multiSummarySafe" exact="if $multiTradeSummary != '' then $multiTradeSummary else '-'"/>
+              <set_value name="$logbookMessage" exact="{77000,3107}.[$multiSummarySafe,$formattedProfit]"/>
+            </do_if>
+            <do_elseif value="not $buyOfferValid">
               <!-- Selling from cargo (no buy offer) - use translation ID 3100 -->
               <!-- Format profit with thousand separators and M suffix according to global settings -->
               <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$formattedProfit">
@@ -144,7 +160,7 @@
                 <param name="suffix" value="' Cr'"/>
               </run_actions>
               <set_value name="$logbookMessage" exact="{77000,3100}.[$amount,$wareInfo,$sellPrice,$formattedProfit]"/>
-            </do_if>
+            </do_elseif>
             <do_else>
               <!-- Normal trade (buy then sell) - use translation ID 3101 -->
               <!-- $buyPrice/$sellPrice are derived from RAW snapshot values for this created trade. -->
@@ -156,9 +172,12 @@
             </do_else>
             
             <set_value name="$msgType" exact="'3101 (normal trade)'"/>
-            <do_if value="not $buyOfferValid">
-              <set_value name="$msgType" exact="'3100 (cargo sale)'"/>
+            <do_if value="$isMultiTrade">
+              <set_value name="$msgType" exact="'3107 (multitrade queue summary)'"/>
             </do_if>
+            <do_elseif value="not $buyOfferValid">
+              <set_value name="$msgType" exact="'3100 (cargo sale)'"/>
+            </do_elseif>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <!-- Format numbers for debug output -->
               <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$debugProfit">
@@ -166,17 +185,18 @@
                 <param name="suffix" value="' Cr'"/>
               </run_actions>
               <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$debugMoney">
-                <param name="number" value="$amount * $buyPrice"/>
+                <param name="number" value="abs($moneyRawForDue) / 100"/>
                 <param name="suffix" value="' Cr'"/>
               </run_actions>
               
               <!-- PROFIT DEBUG: Enhanced logging for profit calculation investigation -->
               <set_value name="$buyStationName" exact="if $buyOfferValid and $buyOffer.owner? then @$buyOffer.owner.knownname else 'NULL'"/>
               <set_value name="$sellStationName" exact="if $sellOfferValid and $sellOffer.owner? then @$sellOffer.owner.knownname else 'NULL'"/>
+              <set_value name="$debugWareName" exact="if $isMultiTrade then 'MULTITRADE' else (if $wareInfo? and $wareInfo.name? then @$wareInfo.name else 'NULL')"/>
               <set_value name="$calculatedProfitCheck" exact="(($sellPrice - $buyPrice) * $amount)"/>
               <debug_text text="'[GT-TradeLogging-PROFIT] ========== LOGBOOK DATA BEING WRITTEN ==========' + 
                 '\nMessage type: ' + $msgType + 
-                '\nWare: ' + (if $wareInfo? then @$wareInfo.name else 'NULL') +
+                '\nWare: ' + $debugWareName +
                 '\nBuy Station: ' + $buyStationName + ' @ ' + $buyPrice + ' Cr (from snapshot)' +
                 '\nSell Station: ' + $sellStationName + ' @ ' + $sellPrice + ' Cr (from snapshot)' +
                 '\nAmount: ' + $amount + ' units (from param)' +
@@ -243,13 +263,14 @@
                 <param name="number" value="$profit/100"/>
                 <param name="suffix" value="' Cr'"/>
               </run_actions>
-              <debug_text text="'[GalaxyTrader MK3] Trade logged for ' + $ship.knownname + ' (' + $ship.idcode + '): ' + $amount + ' ' + $wareInfo.name + ' (Profit: ' + $debugProfit + ')'" chance="100"/>
+              <set_value name="$debugLoggedWare" exact="if $isMultiTrade then 'MULTITRADE' else (if $wareInfo? and $wareInfo.name? then @$wareInfo.name else 'Unknown')"/>
+              <debug_text text="'[GalaxyTrader MK3] Trade logged for ' + $ship.knownname + ' (' + $ship.idcode + '): ' + $amount + ' ' + $debugLoggedWare + ' (Profit: ' + $debugProfit + ')'" chance="100"/>
             </do_if>
           </do_if>
           <do_else>
             <!-- DEBUG MODE: Only log when debug is enabled -->
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GalaxyTrader MK3] WARNING: Cannot log trade - both buy and sell offers are invalid for ' + $ship.knownname" chance="100"/>
+              <debug_text text="'[GalaxyTrader MK3] WARNING: Cannot log trade - buy/sell offers invalid and no multitrade summary for ' + $ship.knownname" chance="100"/>
             </do_if>
           </do_else>
         </do_if>
@@ -344,34 +365,11 @@
         
         <!-- Only log if enabled -->
         <do_if value="global.$GT_TradeLogging.$Enabled">
-          
-          <!-- Write completion entry -->
-          <!-- Construct logbook message using TextDB syntax (vanilla pattern) -->
-          <!-- Format profit with thousand separators and M suffix according to global settings -->
-          <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$formattedProfit">
-            <param name="number" value="$totalProfit/100"/>
-            <param name="suffix" value="' Cr'"/>
-          </run_actions>
-          <set_value name="$logbookMessage" exact="{77000,3104}.[$amount,$ware,$formattedProfit]"/>
-          
-          <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
-            <param name="Message" value="$logbookMessage"/>
-            <param name="Category" value="'tips'"/>
-            <param name="Title" value="(if ($ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK4Supply') or ($ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.defaultorder? and @$ship.commander.defaultorder.id == 'GalaxyTraderMK4Supply') then 'GalaxyTrader MK4 Supply' else 'GalaxyTrader MK3') + ': ' + $ship.knownname + ' (' + $ship.idcode + ')'"/>
-            <param name="Object" value="$ship"/>
-            <param name="Interaction" value="'showonmap'"/>
-            <param name="Bonus" value="$totalProfit"/>
-            <param name="CheckGlobalSettings" value="false"/>
-          </run_actions>
+          <!-- Trade completion logbook message disabled by request. -->
           
           <!-- DEBUG MODE: Only log when debug is enabled -->
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <!-- Format profit for debug output -->
-            <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$debugProfit">
-              <param name="number" value="$totalProfit/100"/>
-              <param name="suffix" value="' Cr'"/>
-            </run_actions>
-            <debug_text text="'[GalaxyTrader MK3] Trade completion logged for ' + $ship.knownname + ': ' + $debugProfit + ' total profit'" chance="100"/>
+            <debug_text text="'[GalaxyTrader MK3] Trade completion logbook message disabled for ' + $ship.knownname + ' (' + $ship.idcode + ')'" chance="100"/>
           </do_if>
         </do_if>
       </actions>
@@ -488,20 +486,7 @@
             <set_value name="$costCr" exact="$data.$purchaseCost / 100"/>
           </do_if>
           
-          <!-- Reuse existing localized trade completion text (77000/3104) -->
-          <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$formattedProfitNoSuffix">
-            <param name="number" value="$profitCr"/>
-            <param name="suffix" value="''"/>
-          </run_actions>
-          <set_value name="$completionMessage" exact="{77000,3104}.[$data.$transferredAmount,$data.$ware,$formattedProfitNoSuffix]"/>
-          <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
-            <param name="Message" value="$completionMessage"/>
-            <param name="Category" value="'general'"/>
-            <param name="Title" value="(if ($ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK4Supply') or ($ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.defaultorder? and @$ship.commander.defaultorder.id == 'GalaxyTraderMK4Supply') then 'GalaxyTrader MK4 Supply' else 'GalaxyTrader MK3') + ': ' + $ship.knownname + ' (' + $ship.idcode + ')'"/>
-            <param name="Object" value="$ship"/>
-            <param name="Interaction" value="'showonmap'"/>
-            <param name="CheckGlobalSettings" value="false"/>
-          </run_actions>
+          <!-- Trade completed logbook message disabled by request. -->
           
           <!-- FIX: Defensive check for race condition (initialization might not have completed yet) -->
           <do_if value="not global.$GT_TradeStats?">

@@ -260,7 +260,7 @@ local function GT_DismantleMod(_, params)
         local shipWare = hasShip and SafeCString(shipBuf.Ware) or "none"
         if hasShip and IsGTShipModWareId(shipWare) then
             C.DismantleShipMod(shipId)
-            logDebug(string.format("Dismantled ship mod from %s ware=%s", shipIdCode, shipWare), "WARNING")
+            -- logDebug(string.format("Dismantled ship mod from %s ware=%s", shipIdCode, shipWare), "WARNING")
         end
     elseif type == "engine" then
         local engineBuf = ffi.new("UIEngineMod2")
@@ -268,7 +268,7 @@ local function GT_DismantleMod(_, params)
         local engineWare = hasEngine and SafeCString(engineBuf.Ware) or "none"
         if hasEngine and IsGTEngineModWareId(engineWare) then
             C.DismantleEngineMod(shipId)
-            logDebug(string.format("Dismantled engine mod from %s ware=%s", shipIdCode, engineWare), "WARNING")
+            -- logDebug(string.format("Dismantled engine mod from %s ware=%s", shipIdCode, engineWare), "WARNING")
         end
     elseif type == "shield" then
         local contextId = shipId
@@ -315,7 +315,7 @@ local function GT_InstallMod(_, params)
     local shipId = ToUniverseID(payload.component)
     local wareId = payload.wareId
 
-    logDebug(string.format("Install request type=%s shipId=%s ware=%s", tostring(type), tostring(shipIdStr), tostring(wareId)), "WARNING")
+    -- logDebug(string.format("Install request type=%s shipId=%s ware=%s", tostring(type), tostring(shipIdStr), tostring(wareId)), "WARNING")
 
     if type == "ship" then
         local ok, success = pcall(C.InstallShipMod, shipId, wareId)
@@ -329,7 +329,7 @@ local function GT_InstallMod(_, params)
             local shipBuf = ffi.new("UIShipMod2")
             local hasShip = C.GetInstalledShipMod2(shipId, shipBuf)
             local installedWare = hasShip and SafeCString(shipBuf.Ware) or "none"
-            logDebug(string.format("InstallShipMod observed ship ID %s requested=%s observed=%s hasShip=%s", shipIdStr, wareId, installedWare, tostring(hasShip)), "WARNING")
+            -- logDebug(string.format("InstallShipMod observed ship ID %s requested=%s observed=%s hasShip=%s", shipIdStr, wareId, installedWare, tostring(hasShip)), "WARNING")
             if installedWare ~= wareId then
                 logDebug(string.format("Ship mod install verification mismatch on ship ID %s: requested=%s, observed=%s", shipIdStr, wareId, installedWare), "WARNING")
             end
@@ -346,7 +346,7 @@ local function GT_InstallMod(_, params)
             local engineBuf = ffi.new("UIEngineMod2")
             local hasEngine = C.GetInstalledEngineMod2(shipId, engineBuf)
             local installedWare = hasEngine and SafeCString(engineBuf.Ware) or "none"
-            logDebug(string.format("InstallEngineMod observed ship ID %s requested=%s observed=%s hasEngine=%s", shipIdStr, wareId, installedWare, tostring(hasEngine)), "WARNING")
+            -- logDebug(string.format("InstallEngineMod observed ship ID %s requested=%s observed=%s hasEngine=%s", shipIdStr, wareId, installedWare, tostring(hasEngine)), "WARNING")
             if installedWare ~= wareId then
                 logDebug(string.format("Engine mod install verification mismatch on ship ID %s: requested=%s, observed=%s", shipIdStr, wareId, installedWare), "WARNING")
             end

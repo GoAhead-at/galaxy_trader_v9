@@ -15,14 +15,41 @@
         <set_value name="$result" exact="table[]"/>
         <set_value name="$result.$HasCommander" exact="false"/>
         <set_value name="$result.$CommanderHasGT" exact="false"/>
+        <set_value name="$result.$CommanderPromotionPending" exact="false"/>
         <set_value name="$result.$Commander" exact="null"/>
         
         <do_if value="$ship.commander? and $ship.commander.exists and $ship.commander != $ship">
           <set_value name="$result.$HasCommander" exact="true"/>
           <set_value name="$result.$Commander" exact="$ship.commander"/>
-          <do_if value="$ship.commander.defaultorder? and (@$ship.commander.defaultorder.id == 'GalaxyTraderMK4Supply' or @$ship.commander.defaultorder.id == 'GalaxyTraderMK3' or (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.commander.defaultorder.id}))">
-            <set_value name="$result.$CommanderHasGT" exact="true"/>
+
+          <set_value name="$directCommanderOrderId" exact="'NONE'"/>
+          <do_if value="$ship.commander.defaultorder? and @$ship.commander.defaultorder != null">
+            <set_value name="$directCommanderOrderId" exact="@$ship.commander.defaultorder.id"/>
           </do_if>
+          <do_if value="$directCommanderOrderId == 'Assist' and $ship.commander.isplayerowned and (not $ship.commander.orders? or $ship.commander.orders.count == 0)">
+            <set_value name="$result.$CommanderPromotionPending" exact="true"/>
+          </do_if>
+
+          <!-- Traverse Assist commander chain to detect GT control above a promoted interim commander.
+               This prevents false detach cleanup while hierarchy settles after commander loss/promotion. -->
+          <set_value name="$commanderCursor" exact="$ship.commander"/>
+          <set_value name="$chainDepth" exact="0"/>
+          <do_while value="not $result.$CommanderHasGT and $commanderCursor? and $commanderCursor.exists and $chainDepth lt 6">
+            <set_value name="$chainDepth" exact="$chainDepth + 1"/>
+            <set_value name="$cursorOrderId" exact="'NONE'"/>
+            <do_if value="$commanderCursor.defaultorder? and @$commanderCursor.defaultorder != null">
+              <set_value name="$cursorOrderId" exact="@$commanderCursor.defaultorder.id"/>
+            </do_if>
+            <do_if value="$cursorOrderId == 'GalaxyTraderMK4Supply' or $cursorOrderId == 'GalaxyTraderMK3' or (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{$cursorOrderId})">
+              <set_value name="$result.$CommanderHasGT" exact="true"/>
+            </do_if>
+            <do_elseif value="$cursorOrderId == 'Assist' and $commanderCursor.commander? and $commanderCursor.commander.exists and $commanderCursor.commander != $commanderCursor">
+              <set_value name="$commanderCursor" exact="$commanderCursor.commander"/>
+            </do_elseif>
+            <do_else>
+              <set_value name="$commanderCursor" exact="null"/>
+            </do_else>
+          </do_while>
         </do_if>
         
         <return value="$result"/>
@@ -206,6 +233,7 @@
         <set_value name="$result.$WasSubordinate" exact="false"/>
         <set_value name="$result.$StateSaysHasGTOrder" exact="false"/>
         <set_value name="$result.$PilotRegistryLinked" exact="false"/>
+        <set_value name="$result.$CommanderPromotionPending" exact="false"/>
         <set_value name="$result.$ShouldCleanup" exact="false"/>
         <set_value name="$result.$ShouldRestoreName" exact="false"/>
         <set_value name="$result.$IsPermanentRemoval" exact="false"/>
@@ -229,11 +257,14 @@
           <set_value name="$result.$CommanderExists" exact="$commanderStatus.$HasCommander"/>
           <set_value name="$result.$Commander" exact="$commanderStatus.$Commander"/>
           <set_value name="$result.$HasGTCommander" exact="$commanderStatus.$CommanderHasGT"/>
+          <set_value name="$result.$CommanderPromotionPending" exact="$commanderStatus.$CommanderPromotionPending"/>
           
           <!-- CHECK 3: Subordinate with Assist order AND GT commander -->
-          <do_if value="$currentDefaultOrder == 'Assist' and $result.$HasGTCommander">
+          <do_if value="$currentDefaultOrder == 'Assist' and ($result.$HasGTCommander or $result.$CommanderPromotionPending)">
             <set_value name="$result.$IsSubordinate" exact="true"/>
-            <set_value name="$result.$IsGTControlled" exact="true"/>
+            <do_if value="$result.$HasGTCommander">
+              <set_value name="$result.$IsGTControlled" exact="true"/>
+            </do_if>
           </do_if>
         </do_if>
         
@@ -281,26 +312,38 @@
         
         <!-- Cleanup needed if: was GT-controlled but now is NOT -->
         <do_if value="$wasGTControlled and not $result.$IsGTControlled">
-          <set_value name="$result.$ShouldCleanup" exact="true"/>
-          
-          <!-- Permanent removal if: no direct GT AND no GT commander -->
-          <do_if value="not $result.$HasDirectGTOrder and not $result.$HasGTCommander">
-            <set_value name="$result.$IsPermanentRemoval" exact="true"/>
+          <!-- Promotion handoff guard:
+               commander is temporarily Assist-only (no looped orders yet) after promotion.
+               Keep subordinate registered and let delayed checks/order-restore settle first. -->
+          <do_if value="$currentDefaultOrder == 'Assist' and $result.$CommanderPromotionPending">
+            <set_value name="$result.$ShouldCleanup" exact="false"/>
+            <set_value name="$result.$ShouldRestoreName" exact="false"/>
+            <set_value name="$result.$IsPermanentRemoval" exact="false"/>
           </do_if>
-          
-          <!-- Should restore name if: not subordinate to GT commander -->
-          <do_if value="not $result.$IsSubordinate and $ship.pilot?">
-            <set_value name="$result.$ShouldRestoreName" exact="true"/>
-          </do_if>
+          <do_else>
+            <set_value name="$result.$ShouldCleanup" exact="true"/>
+            
+            <!-- Permanent removal if: no direct GT AND no GT commander -->
+            <do_if value="not $result.$HasDirectGTOrder and not $result.$HasGTCommander">
+              <set_value name="$result.$IsPermanentRemoval" exact="true"/>
+            </do_if>
+            
+            <!-- Should restore name if: not subordinate to GT commander -->
+            <do_if value="not $result.$IsSubordinate and $ship.pilot?">
+              <set_value name="$result.$ShouldRestoreName" exact="true"/>
+            </do_if>
+          </do_else>
         </do_if>
         
         <!-- SPECIAL CASE: Subordinate with Assist order but commander check might fail due to timing -->
         <!-- If ship has Assist order, treat as active subordinate (even if commander check fails temporarily) -->
         <do_if value="$currentDefaultOrder == 'Assist' and $result.$CommanderExists">
           <!-- Commander exists - check if it has GT order -->
-          <do_if value="$result.$HasGTCommander">
+          <do_if value="$result.$HasGTCommander or $result.$CommanderPromotionPending">
             <set_value name="$result.$IsSubordinate" exact="true"/>
-            <set_value name="$result.$IsGTControlled" exact="true"/>
+            <do_if value="$result.$HasGTCommander">
+              <set_value name="$result.$IsGTControlled" exact="true"/>
+            </do_if>
             <set_value name="$result.$ShouldCleanup" exact="false"/>
             <set_value name="$result.$ShouldRestoreName" exact="false"/>
           </do_if>

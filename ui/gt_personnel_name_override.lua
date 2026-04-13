@@ -20,7 +20,19 @@ local function getPilotData()
     return Mods and Mods.GalaxyTrader and Mods.GalaxyTrader.PilotData
 end
 
+local function isPilotRenamingEnabled()
+    local pilotData = getPilotData()
+    if not pilotData or not pilotData.settings then
+        return false
+    end
+    return pilotData.settings.pilotRenamingEnabled == true
+end
+
 local function lookupTaggedName(personRef)
+    if not isPilotRenamingEnabled() then
+        return nil
+    end
+
     local pilotData = getPilotData()
     if not pilotData or not pilotData.getGTPilotIdMap or not pilotData.lookupPilotIdMapTaggedName then
         return nil
@@ -50,32 +62,49 @@ local function lookupTaggedName(personRef)
 end
 
 local function applyPersonnelTaggedNames(menu)
-    if not menu or not menu.empireData or not menu.empireData.employees then
+    if not menu or menu.mode ~= "personnel" or not menu.empireData or not menu.empireData.filteredemployees then
         return
     end
 
-    for _, employee in ipairs(menu.empireData.employees) do
+    if not isPilotRenamingEnabled() then
+        return
+    end
+
+    local curPage = tonumber(menu.personnelData and menu.personnelData.curPage) or 1
+    if curPage < 1 then
+        curPage = 1
+    end
+
+    -- Vanilla Personnel Management page size is 100 entries.
+    local pageSize = 100
+    local employees = menu.empireData.filteredemployees
+    local startIndex = ((curPage - 1) * pageSize) + 1
+    local endIndex = math.min(#employees, startIndex + pageSize - 1)
+    local taggedById = {}
+
+    for i = startIndex, endIndex do
+        local employee = employees[i]
         if employee and employee.type == "person" and employee.id then
-            local tagged = lookupTaggedName(employee.id)
+            local key = tostring(employee.id)
+            local tagged = taggedById[key]
+            if tagged == nil then
+                tagged = lookupTaggedName(employee.id) or false
+                taggedById[key] = tagged
+            end
             if tagged then
                 employee.name = tagged
             end
         end
     end
 
-    if menu.empireData.filteredemployees then
-        for _, employee in ipairs(menu.empireData.filteredemployees) do
-            if employee and employee.type == "person" and employee.id then
-                local tagged = lookupTaggedName(employee.id)
-                if tagged then
-                    employee.name = tagged
-                end
-            end
-        end
-    end
-
     if menu.personnelData and menu.personnelData.curEntry and menu.personnelData.curEntry.type == "person" and menu.personnelData.curEntry.id then
-        local tagged = lookupTaggedName(menu.personnelData.curEntry.id)
+        local curKey = tostring(menu.personnelData.curEntry.id)
+        local tagged = taggedById[curKey]
+        if tagged == nil then
+            tagged = lookupTaggedName(menu.personnelData.curEntry.id)
+        elseif tagged == false then
+            tagged = nil
+        end
         if tagged then
             menu.personnelData.curEntry.name = tagged
         end
@@ -94,14 +123,6 @@ local function install()
             local result = original(...)
             applyPersonnelTaggedNames(menu)
             return result
-        end
-    end
-
-    if type(menu.refreshInfoFrame) == "function" then
-        local originalRefresh = menu.refreshInfoFrame
-        menu.refreshInfoFrame = function(...)
-            applyPersonnelTaggedNames(menu)
-            return originalRefresh(...)
         end
     end
 

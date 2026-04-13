@@ -36,6 +36,13 @@ local function getGTPilotIdMap()
     return {}
 end
 
+local function isPilotRenamingEnabled()
+    if not (Mods and Mods.GalaxyTrader and Mods.GalaxyTrader.PilotData and Mods.GalaxyTrader.PilotData.settings) then
+        return false
+    end
+    return Mods.GalaxyTrader.PilotData.settings.pilotRenamingEnabled == true
+end
+
 local function getPersonIdCode(person)
     -- personentry.person in MapMenu is an NPCSeed, not a component.
     -- Calling GetComponentData(person, "idcode") causes runtime errors.
@@ -85,6 +92,10 @@ end
 function menu.infoSubmenuCombineCrewTables(instance)
     local result = orig_infoSubmenuCombineCrewTables(instance)
     if type(result) ~= "table" then
+        return result
+    end
+
+    if not isPilotRenamingEnabled() then
         return result
     end
 

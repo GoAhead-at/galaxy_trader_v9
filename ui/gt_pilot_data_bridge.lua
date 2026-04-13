@@ -45,6 +45,7 @@ local GT_PilotData = {
         autoTraining = true,    -- Default: automatic training enabled
         autoRepair = true,      -- Default: automatic repair enabled
         autoResupply = true,    -- Default: automatic resupply enabled
+        pilotRenamingEnabled = false, -- Default: pilot rename tags disabled until synced from MD
     },
     
     -- Pilot data storage (received from MD)
@@ -283,11 +284,13 @@ local function onReceivePilotData(_, param)
             GT_PilotData.settings.autoTraining = (tonumber(configFields[1]) or 1) ~= 0
             GT_PilotData.settings.autoRepair = (tonumber(configFields[2]) or 1) ~= 0
             GT_PilotData.settings.autoResupply = (tonumber(configFields[3]) or 1) ~= 0
+            GT_PilotData.settings.pilotRenamingEnabled = (tonumber(configFields[4]) or 0) ~= 0
             
-            debugLog(string.format("Config flags: AutoTraining=%s, AutoRepair=%s, AutoResupply=%s",
+            debugLog(string.format("Config flags: AutoTraining=%s, AutoRepair=%s, AutoResupply=%s, PilotRenamingEnabled=%s",
                 tostring(GT_PilotData.settings.autoTraining),
                 tostring(GT_PilotData.settings.autoRepair),
-                tostring(GT_PilotData.settings.autoResupply)))
+                tostring(GT_PilotData.settings.autoResupply),
+                tostring(GT_PilotData.settings.pilotRenamingEnabled)))
         end
         
         startIndex = 2  -- Skip config record, start parsing pilots from index 2

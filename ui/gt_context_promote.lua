@@ -69,6 +69,7 @@ end
 
 local pendingDefaultApplies = {}
 local pendingOldCommanderReattach = {}
+local pendingPromotedCommanderAttach = {}
 local pendingPromotionReassign = {}
 local orderAssignCommander -- forward declaration (used by deferred onUpdate path)
 local collectFleetSubordinatesRecursive -- forward declaration (used by onUpdate queue finalization)
@@ -375,6 +376,31 @@ local function enqueueOldCommanderReattach(oldCommander, newCommander, assignmen
     ))
 end
 
+local function enqueuePromotedCommanderAttach(promotedCommander, parentCommander, assignment, group)
+    promotedCommander = asComponentId(promotedCommander)
+    parentCommander = asComponentId(parentCommander)
+    if not promotedCommander or promotedCommander == 0 or not parentCommander or parentCommander == 0 then
+        return
+    end
+    pendingPromotedCommanderAttach[tostring(promotedCommander)] = {
+        ship = promotedCommander,
+        parent = parentCommander,
+        assignment = normalizeAssignment(assignment),
+        group = normalizeGroup(group),
+        checks = 0,
+        delayFrames = 0,
+        maxChecks = 80, -- ~1.3s at 60fps
+        forceIssued = false,
+    }
+    DebugError(string.format(
+        "[GT Promote] Deferred promoted commander attach queued ship=%s parent=%s assignment=%s group=%s",
+        formatComponentRef(promotedCommander),
+        formatComponentRef(parentCommander),
+        tostring(normalizeAssignment(assignment)),
+        tostring(normalizeGroup(group))
+    ))
+end
+
 local function pilotMaxJumps(level)
     if not level then return 25 end
     if level <= 2 then return 1 end
@@ -575,7 +601,7 @@ local function processPendingPromotionReassign()
                     logFleetSnapshot("POST_SUBORDINATE_REASSIGN_QUEUE_OLD_TREE", oldCommander)
                     logFleetSnapshot("POST_SUBORDINATE_REASSIGN_QUEUE_NEW_TREE", newCommander)
 
-                    enqueueOldCommanderReattach(oldCommander, newCommander, job.oldAssign, job.oldGroup, job.issuedShips)
+                    enqueueOldCommanderReattach(oldCommander, newCommander, job.promotedAssign, job.promotedGroup, job.issuedShips)
                     logFleetSnapshot("POST_OLD_COMMANDER_REASSIGN_DEFERRED_NEW_TREE", newCommander)
 
                     applyCapturedDefaultOrder(newCommander, job.defaultOrderSnapshot)
@@ -712,6 +738,58 @@ local function processPendingOldCommanderReattach()
     end
 end
 
+local function processPendingPromotedCommanderAttach()
+    for key, entry in pairs(pendingPromotedCommanderAttach) do
+        local ship = entry.ship
+        local parent = entry.parent
+        if (not ship) or ship == 0 or (not parent) or parent == 0
+            or (not C.IsComponentClass(ship, "controllable")) then
+            pendingPromotedCommanderAttach[key] = nil
+        else
+            if isShipAssignedToCommander(ship, parent) then
+                DebugError(string.format(
+                    "[GT Promote] Deferred promoted commander attach converged ship=%s parent=%s",
+                    formatComponentRef(ship),
+                    formatComponentRef(parent)
+                ))
+                pendingPromotedCommanderAttach[key] = nil
+            elseif (entry.delayFrames or 0) > 0 then
+                entry.delayFrames = entry.delayFrames - 1
+            else
+                entry.checks = (entry.checks or 0) + 1
+                local shouldForce = entry.checks >= (entry.maxChecks or 80)
+                local cancelOrders = shouldForce and (not entry.forceIssued) or false
+                local ok = orderAssignCommander(ship, parent, entry.assignment, entry.group, cancelOrders)
+                DebugError(string.format(
+                    "[GT Promote] Deferred promoted commander attach attempt ship=%s parent=%s ok=%s check=%d/%d force=%s cancelOrders=%s",
+                    formatComponentRef(ship),
+                    formatComponentRef(parent),
+                    tostring(ok),
+                    entry.checks,
+                    entry.maxChecks or 80,
+                    tostring(shouldForce),
+                    tostring(cancelOrders)
+                ))
+
+                if shouldForce then
+                    if entry.forceIssued then
+                        pendingPromotedCommanderAttach[key] = nil
+                    else
+                        entry.forceIssued = true
+                        entry.checks = 0
+                        entry.delayFrames = 10
+                        entry.maxChecks = 20
+                        pendingPromotedCommanderAttach[key] = entry
+                    end
+                else
+                    entry.delayFrames = 4
+                    pendingPromotedCommanderAttach[key] = entry
+                end
+            end
+        end
+    end
+end
+
 collectFleetSubordinatesRecursive = function(rootCommander)
     local result = {}
     local visited = {}
@@ -814,6 +892,18 @@ local function promoteSubordinateToCommander(subordinateComponent)
     logFleetSnapshot("PRE_OLD_COMMANDER_TREE", oldCommander)
     logFleetSnapshot("PRE_PROMOTED_SHIP_TREE", newCommander)
 
+    -- Capture old commander's parent attachment (e.g. station trader) so new commander can inherit it.
+    local oldCommanderParent = GetCommander(oldCommander)
+    oldCommanderParent = oldCommanderParent and ConvertIDTo64Bit(oldCommanderParent) or nil
+    local oldCommanderAssign, oldCommanderGroup = GetComponentData(oldCommander, "assignment", "subordinategroup")
+    oldCommanderAssign = normalizeAssignment(oldCommanderAssign)
+    oldCommanderGroup = normalizeGroup(oldCommanderGroup)
+
+    -- Capture promoted ship's own subordinate role before detach (typically assist/group).
+    local promotedAssign, promotedGroup = GetComponentData(newCommander, "assignment", "subordinategroup")
+    promotedAssign = normalizeAssignment(promotedAssign)
+    promotedGroup = normalizeGroup(promotedGroup)
+
     -- Get full subordinate tree so promotion can flatten hierarchy.
     -- Desired result after promotion:
     --   newCommander
@@ -840,6 +930,23 @@ local function promoteSubordinateToCommander(subordinateComponent)
     -- Prime promoted commander with captured commander default order as early as possible.
     applyCapturedDefaultOrder(newCommander, defaultOrderSnapshot)
     applyFleetName(newCommander, originalFleetName)
+
+    -- If old commander was attached to a parent (e.g. station), attach promoted commander immediately.
+    -- This avoids a detached-fleet window where promoted fleets temporarily lose station attachment.
+    if oldCommanderParent and oldCommanderParent ~= 0 and oldCommanderParent ~= newCommander then
+        local attached = orderAssignCommander(newCommander, oldCommanderParent, oldCommanderAssign, oldCommanderGroup, false)
+        DebugError(string.format(
+            "[GT Promote] Promoted commander parent attach ship=%s parent=%s assignment=%s group=%s ok=%s cancelOrders=false",
+            formatComponentRef(newCommander),
+            formatComponentRef(oldCommanderParent),
+            tostring(oldCommanderAssign),
+            tostring(oldCommanderGroup),
+            tostring(attached)
+        ))
+        if not attached then
+            enqueuePromotedCommanderAttach(newCommander, oldCommanderParent, oldCommanderAssign, oldCommanderGroup)
+        end
+    end
     logFleetSnapshot("POST_INITIAL_DEFAULT_APPLY_NEW_COMMANDER_TREE", newCommander)
 
     -- 2) Reassign all former subordinate ships directly under new commander (flatten tree),
@@ -857,7 +964,6 @@ local function promoteSubordinateToCommander(subordinateComponent)
         end
     end
 
-    local oldAssign, oldGroup = GetComponentData(oldCommander, "assignment", "subordinategroup")
     pendingPromotionReassign[tostring(newCommander)] = {
         newCommander = newCommander,
         oldCommander = oldCommander,
@@ -866,8 +972,8 @@ local function promoteSubordinateToCommander(subordinateComponent)
         moved = moved,
         failed = failed,
         delayFrames = 0,
-        oldAssign = normalizeAssignment(oldAssign),
-        oldGroup = normalizeGroup(oldGroup),
+        promotedAssign = promotedAssign,
+        promotedGroup = promotedGroup,
         defaultOrderSnapshot = defaultOrderSnapshot,
         issuedShips = {},
         originalFleetName = originalFleetName,
@@ -888,6 +994,7 @@ end)
 function onUpdate()
     processPendingPromotionReassign()
     processPendingDefaultApplies()
+    processPendingPromotedCommanderAttach()
     processPendingOldCommanderReattach()
 end
 SetScript("onUpdate", onUpdate)

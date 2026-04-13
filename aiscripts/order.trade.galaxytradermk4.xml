@@ -727,10 +727,6 @@
     </do_if>
     <set_value name="$maxsell" exact="[$maxsell, $jumpMaxPilot].min"/>
     <set_value name="$maxbuy" exact="[$maxbuy, $jumpMaxPilot].min"/>
-    <set_value name="$buyCap2x" exact="2 * $maxsell"/>
-    <do_if value="$maxbuy gt $buyCap2x">
-      <set_value name="$maxbuy" exact="$buyCap2x"/>
-    </do_if>
     
     <!-- Sector Whitelist -->
     <set_value name="$effectiveSectorWhitelist" exact="$sectorwhitelist"/>
@@ -908,10 +904,6 @@
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': jumpDistanceCoverage inherited: commander=' + $commanderMaxSell + ', pilot_cap=' + (if $pilotMaxJumps != null then $pilotMaxJumps else 'none') + ', vanilla_mode=' + $useVanillaXPOnly + ', effective=' + $effectiveMaxSell" chance="100"/>
       </do_if>
-    </do_if>
-    <set_value name="$buyCap2xSub" exact="2 * $effectiveMaxSell"/>
-    <do_if value="$effectiveMaxBuy gt $buyCap2xSub">
-      <set_value name="$effectiveMaxBuy" exact="$buyCap2xSub"/>
     </do_if>
 
     <!-- MK4: fixed trade-candidate cap (internal; not player-facing) -->
@@ -1621,10 +1613,6 @@
           </do_if>
           <do_if value="$commanderOrder.$jumpDistanceCoverage?">
             <set_value name="$effectiveMaxSell" exact="if $useVanillaXPOnly or $pilotMaxJumps == null then $commanderOrder.$jumpDistanceCoverage else [$commanderOrder.$jumpDistanceCoverage, $pilotMaxJumps].min"/>
-          </do_if>
-          <set_value name="$reinherBuyCap2x" exact="2 * $effectiveMaxSell"/>
-          <do_if value="$effectiveMaxBuy gt $reinherBuyCap2x">
-            <set_value name="$effectiveMaxBuy" exact="$reinherBuyCap2x"/>
           </do_if>
           <!-- Refresh derived variables used by the trading loop / MD requests -->
           <set_value name="$gt_allowillegal" exact="$effectiveAllowIllegal"/>
@@ -2871,11 +2859,6 @@
               <set_value name="$effectiveMaxSell" exact="if $useVanillaXPOnly or $_pilotMaxJumps == null then $_cmdMaxSell else [$_cmdMaxSell, $_pilotMaxJumps].min"/>
               <set_value name="this.$effectiveMaxSell" exact="$effectiveMaxSell"/>
             </do_if>
-            <set_value name="$_refreshBuyCap2x" exact="2 * $effectiveMaxSell"/>
-            <do_if value="$effectiveMaxBuy gt $_refreshBuyCap2x">
-              <set_value name="$effectiveMaxBuy" exact="$_refreshBuyCap2x"/>
-              <set_value name="this.$effectiveMaxBuy" exact="$effectiveMaxBuy"/>
-            </do_if>
 
             <!-- Persist updated effective settings (survive save/load resume) -->
             <set_value name="this.$effectiveIgnoreTradeRules" exact="$effectiveIgnoreTradeRules"/>
@@ -3195,7 +3178,8 @@
       </do_else>
       
       <!-- Wait for MD system response with interrupt -->
-      <!-- Under large fleets, serialized batch matching can exceed 90s. Use 60s timeout to balance reliability with responsiveness. -->
+      <!-- Under large fleets, queued MK4 live-slot dispatch can exceed 60s.
+           Use a wider timeout to avoid premature abort/requeue churn while still recovering from deadlocks. -->
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Entering wait state for MD response at game time ' + player.age" chance="100"/>
       </do_if>
@@ -3206,7 +3190,7 @@
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Wait interrupt handler ACTIVE at game time ' + player.age" chance="100"/>
       </do_if>
       <!-- IMPORTANT: In X4, wait without min is RANDOM (0..max). Use min=max to avoid instant timeouts. -->
-      <wait min="60s" max="60s" comment="Wait for MD system response (60s; interrupted immediately on response)">
+      <wait min="120s" max="120s" comment="Wait for MD system response (120s; interrupted immediately on response)">
         <interrupt>
           <conditions>
             <check_any>
@@ -3364,14 +3348,14 @@
       </wait>
 
       <!-- ═══════════════════════════════════════════════════════════════════════════
-           TIMEOUT GUARD: If execution reaches here, the 60s wait expired WITHOUT
+           TIMEOUT GUARD: If execution reaches here, the 120s wait expired WITHOUT
            any interrupt firing. The ship NEVER received GT_Search_Go from the
            semaphore. We MUST NOT fall through to run_search_pipeline — that would
            bypass the semaphore and allow unlimited concurrent live searches.
            Clean up the pending queue entry and retry with cooldown.
            ═══════════════════════════════════════════════════════════════════════════ -->
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': WAIT TIMEOUT: 60s expired without semaphore grant (GT_Search_Go) at game time ' + player.age + ' — cleaning up queue entry and retrying'" chance="100"/>
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': WAIT TIMEOUT: 120s expired without semaphore grant (GT_Search_Go) at game time ' + player.age + ' — cleaning up queue entry and retrying'" chance="100"/>
       </do_if>
       <!-- Remove this ship from the scheduler queue so it doesn't block the slot -->
       <signal_objects object="player.galaxy" param="'GT_Search_Abort'" param2="table[$Ship = this.ship]"/>
@@ -3599,6 +3583,7 @@
             <param name="ownerFilter" value="'any'"/>
             <param name="includePlayerBuyOffers" value="true"/>
             <param name="includePlayerSellOffers" value="true"/>
+            <param name="requirePlayerBuyOfferOwner" value="true"/>
             <param name="ignoreTradeRulesPlayerBuyOffersRequireCargoNeed" value="true"/>
             <param name="ignoreMK1Supply" value="$searchIgnoreMK1Supply"/>
             <param name="ignoreTradeRules" value="$searchIgnoreTradeRules"/>
@@ -3848,8 +3833,14 @@
               <set_value name="$mk4Mev" exact="if $matchResult? and $matchResult.$TradesEvaluated? then @$matchResult.$TradesEvaluated else -1"/>
               <set_value name="$mk4Mrj" exact="if $matchResult? and $matchResult.$TradesRejected? then @$matchResult.$TradesRejected else -1"/>
               <set_value name="$mk4Mri" exact="if $matchResult? and $matchResult.$TradesRejectedRouteIllegal? then @$matchResult.$TradesRejectedRouteIllegal else -1"/>
+              <set_value name="$mk4MrjCust" exact="if $matchResult? and $matchResult.$TradesRejectedMk4CustomerPolicy? then @$matchResult.$TradesRejectedMk4CustomerPolicy else -1"/>
+              <set_value name="$mk4MrjSupp" exact="if $matchResult? and $matchResult.$TradesRejectedMk4SupplierPolicy? then @$matchResult.$TradesRejectedMk4SupplierPolicy else -1"/>
+              <set_value name="$mk4MrjType" exact="if $matchResult? and $matchResult.$TradesRejectedMk4TypePolicy? then @$matchResult.$TradesRejectedMk4TypePolicy else -1"/>
+              <set_value name="$mk4MrjDem" exact="if $matchResult? and $matchResult.$TradesRejectedMk4DemandGate? then @$matchResult.$TradesRejectedMk4DemandGate else -1"/>
+              <set_value name="$mk4MrjPc" exact="if $matchResult? and $matchResult.$TradesRejectedMk4PriceCap? then @$matchResult.$TradesRejectedMk4PriceCap else -1"/>
+              <set_value name="$mk4MrjDist" exact="if $matchResult? and $matchResult.$TradesRejectedDistance? then @$matchResult.$TradesRejectedDistance else -1"/>
               <set_value name="$mk4Mfound" exact="if $matchResult? and $matchResult.$Found? then @$matchResult.$Found else false"/>
-              <debug_text text="'[GT-MK4-Supply] ' + this.ship.idcode + ': TRADEMATCH supply-mode rawListCount=' + $matchTradeList.count + ' bestFound=' + $mk4Mfound + ' pairsEvaluated=' + $mk4Mev + ' pairsRejected=' + $mk4Mrj + ' routeIllegalRejected=' + $mk4Mri" chance="100"/>
+              <debug_text text="'[GT-MK4-Supply] ' + this.ship.idcode + ': TRADEMATCH supply-mode rawListCount=' + $matchTradeList.count + ' bestFound=' + $mk4Mfound + ' pairsEvaluated=' + $mk4Mev + ' pairsRejected=' + $mk4Mrj + ' routeIllegalRejected=' + $mk4Mri + ' rej(customer/supplier/type/demand/pricecap/dist)=' + $mk4MrjCust + '/' + $mk4MrjSupp + '/' + $mk4MrjType + '/' + $mk4MrjDem + '/' + $mk4MrjPc + '/' + $mk4MrjDist" chance="100"/>
             </do_if>
             <run_script name="'lib.gt.score.trades'" result="$scoreResult">
               <param name="tradeList" value="$matchTradeList"/>
@@ -6111,7 +6102,17 @@
                 <set_value name="$currentTrade.$FinalSellAmount" exact="$finalSellAmount"/>
                 <!-- Keep a bounded, prevalidated candidate window (MK4 maxTrades) for immediate same-cycle retries. -->
                 <do_if value="$validatedTradeCandidates.count lt $validatedCandidateLimit">
-                  <append_to_list name="$validatedTradeCandidates" exact="$currentTrade"/>
+                  <set_value name="$mk4PairAlreadyInWindow" exact="false"/>
+                  <do_all exact="$validatedTradeCandidates.count" counter="$vdci">
+                    <set_value name="$vdc" exact="$validatedTradeCandidates.{$vdci}"/>
+                    <do_if value="$vdc.$BuyOffer == $currentTrade.$BuyOffer and $vdc.$SellOffer == $currentTrade.$SellOffer">
+                      <set_value name="$mk4PairAlreadyInWindow" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                  <do_if value="not $mk4PairAlreadyInWindow">
+                    <append_to_list name="$validatedTradeCandidates" exact="$currentTrade"/>
+                  </do_if>
                 </do_if>
 
                 <!-- Keep selection stable: first valid candidate in ordered list stays primary.
@@ -6436,91 +6437,484 @@
           <!-- This appears to be a vanilla design decision - subordinates' finances are part of commander's finances -->
           <set_value name="$tradeOrderInternal" exact="false"/>
 
-          <!-- AUTHORITATIVE MinPlayerMoney guard — BUDGET CLAMP (race-free) -->
-          <!-- This runs in the AI script with NO yield between check and create_trade_order,
-               so player.money is guaranteed to reflect all prior create_trade_order deductions.
-               Mechanic 1: If the full trade would drain below MinPlayerMoney, reduce volume
-               to fit (player.money - MinPlayerMoney). If even 1 unit is unaffordable, block
-               and back off via no_trade_retry with insufficient_funds. -->
-          <set_value name="$aiBuyPrice" exact="0"/>
-          <do_if value="$pendingTrade.$BuyOffer? and $pendingTrade.$BuyOffer.unitprice?">
-            <set_value name="$aiBuyPrice" exact="$pendingTrade.$BuyOffer.unitprice"/>
-          </do_if>
-          <set_value name="$aiPurchaseCost" exact="if $isSellOnlyTradeForPending then 0 else ($aiBuyPrice * $finalBuyAmount)"/>
-          <set_value name="$aiMinPlayerMoney" exact="if this.$minPlayerMoney? then this.$minPlayerMoney else 1000"/>
-          <do_if value="(player.money - $aiPurchaseCost) lt ($aiMinPlayerMoney)Cr">
-            <!-- Full clamped amount would drain below MinPlayerMoney.
-                 Try to reduce amount further to fit the available budget.
-                 availableBudget = player.money - MinPlayerMoney (in cents). -->
-            <do_if value="not $isSellOnlyTradeForPending and $aiBuyPrice gt 0">
-              <set_value name="$aiAvailableBudget" exact="player.money - ($aiMinPlayerMoney)Cr"/>
-              <set_value name="$aiAffordableUnits" exact="$aiAvailableBudget / $aiBuyPrice"/>
-              <do_if value="$aiAffordableUnits ge 1">
-                <!-- Player can afford a reduced amount - clamp and proceed -->
-                <set_value name="$finalBuyAmount" exact="$aiAffordableUnits"/>
-                <set_value name="$finalSellAmount" exact="$aiAffordableUnits"/>
-                <set_value name="$aiPurchaseCost" exact="$aiBuyPrice * $aiAffordableUnits"/>
-                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-AI] ' + this.ship.idcode + ': BUDGET CLAMP (authoritative guard): reduced from original to ' + $aiAffordableUnits + ' units, cost=' + ($aiPurchaseCost / 100) + ' Cr, player.money=' + (player.money / 100) + ' Cr, remaining=' + ((player.money - $aiPurchaseCost) / 100) + ' Cr (threshold: ' + $aiMinPlayerMoney + ' Cr)'" chance="100"/>
+          <!-- Phase 2 (MK4 multitrade):
+               Build route in MK1 style:
+               - prepare unique valid candidates
+               - prefer one full-threshold single trade when available
+               - otherwise expand secondaries iteratively with backtrack clustering
+                 and budget checks. -->
+          <create_list name="$mk4QueueableTrades"/>
+          <create_list name="$mk4PreparedCandidates"/>
+          <set_value name="$mk4QueueBudgetMoney" exact="player.money"/>
+          <set_value name="$mk4QueueMinMoney" exact="if this.$minPlayerMoney? then this.$minPlayerMoney else 1000"/>
+          <set_value name="$mk4QueueSourceCount" exact="0"/>
+          <set_value name="$mk4PrimaryBudgetBlocked" exact="false"/>
+          <set_value name="$mk4SecondaryBudgetSkipped" exact="0"/>
+          <set_value name="$mk4BacktrackSkipped" exact="0"/>
+          <set_value name="$mk4SinglePreferred" exact="false"/>
+          <set_value name="$mk4UseMinCargoThresholdForRoute" exact="if $gt_useMinCargoThreshold? then $gt_useMinCargoThreshold else (if this.$effectiveUseMinCargoThresholdFilter? then this.$effectiveUseMinCargoThresholdFilter else false)"/>
+          <set_value name="$mk4ThresholdPctForSingle" exact="[10,[(if $gt_cargotarget? then $gt_cargotarget else (if this.$effectiveCargoTarget? then this.$effectiveCargoTarget else 10)),100].min].max"/>
+          <set_value name="$mk4CargoCapacityVolForSingle" exact="if this.ship.cargo.capacity.all? then this.ship.cargo.capacity.all else 0"/>
+
+          <!-- Normalize candidates once (amount clamps + pair dedupe). -->
+          <do_if value="$validatedTradeCandidates? and $validatedTradeCandidates.count gt 0">
+            <do_all exact="$validatedTradeCandidates.count" counter="$qci">
+              <set_value name="$qt" exact="$validatedTradeCandidates.{$qci}"/>
+              <set_value name="$qtIsSellOnly" exact="$qt.$IsSellOnly? and $qt.$IsSellOnly"/>
+              <set_value name="$qtBuyAmount" exact="if $qt.$FinalBuyAmount? then $qt.$FinalBuyAmount else (if $qt.$Amount? then $qt.$Amount else 0)"/>
+              <set_value name="$qtSellAmount" exact="if $qt.$FinalSellAmount? then $qt.$FinalSellAmount else (if $qt.$Amount? then $qt.$Amount else 0)"/>
+
+              <set_value name="$qtSellOfferAmount" exact="0"/>
+              <do_if value="$qt.$SellOffer? and $qt.$SellOffer.exists">
+                <set_value name="$qtSellOfferAmount" exact="$qt.$SellOffer.offeramount.{this.assignedcontrolled}"/>
+                <do_if value="$qtSellOfferAmount == null">
+                  <set_value name="$qtSellOfferAmount" exact="0"/>
                 </do_if>
+                <set_value name="$qtSellAmount" exact="[$qtSellAmount, $qtSellOfferAmount].min"/>
               </do_if>
               <do_else>
-                <!-- Can't afford even 1 unit - truly insufficient funds -->
-                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-AI] ' + this.ship.idcode + ': BLOCKED trade (authoritative guard): player.money=' + (player.money / 100) + ' Cr, unitPrice=' + ($aiBuyPrice / 100) + ' Cr -- cannot afford even 1 unit above MinPlayerMoney threshold (' + $aiMinPlayerMoney + ' Cr)'" chance="100"/>
-                </do_if>
-                <!-- GLOBAL MONEY CAP: If even 1 unit is unaffordable, stop ALL ships from searching.
-                     Record player.money so the flag auto-clears when money increases from any source. -->
-                <set_value name="global.$GT_MoneyCapActive" exact="true"/>
-                <set_value name="global.$GT_MoneyCapMoney" exact="player.money"/>
-                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GLOBAL MONEY CAP SET: player.money=' + (player.money / 100) + ' Cr — all ships blocked until money increases'" chance="100"/>
-                <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
-                <resume label="no_trade_retry"/>
+                <continue/>
               </do_else>
-            </do_if>
-            <do_else>
-              <!-- Sell-only trade should never fail this check (cost=0), but block as safety -->
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': BLOCKED trade (authoritative guard, edge case): player.money=' + (player.money / 100) + ' Cr, purchaseCost=' + ($aiPurchaseCost / 100) + ' Cr -- below MinPlayerMoney threshold (' + $aiMinPlayerMoney + ' Cr)'" chance="100"/>
+
+              <do_if value="not $qtIsSellOnly">
+                <set_value name="$qtBuyOfferAmount" exact="0"/>
+                <do_if value="$qt.$BuyOffer? and $qt.$BuyOffer.exists">
+                  <set_value name="$qtBuyOfferAmount" exact="$qt.$BuyOffer.offeramount.{this.assignedcontrolled}"/>
+                  <do_if value="$qtBuyOfferAmount == null">
+                    <set_value name="$qtBuyOfferAmount" exact="0"/>
+                  </do_if>
+                  <set_value name="$qtBuyAmount" exact="[$qtBuyAmount, $qtBuyOfferAmount].min"/>
+                </do_if>
+                <do_else>
+                  <continue/>
+                </do_else>
+                <set_value name="$qtPairAmount" exact="[$qtBuyAmount, $qtSellAmount].min"/>
+                <set_value name="$qtBuyAmount" exact="$qtPairAmount"/>
+                <set_value name="$qtSellAmount" exact="$qtPairAmount"/>
               </do_if>
-              <set_value name="global.$GT_MoneyCapActive" exact="true"/>
-              <set_value name="global.$GT_MoneyCapMoney" exact="player.money"/>
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GLOBAL MONEY CAP SET: player.money=' + (player.money / 100) + ' Cr — all ships blocked until money increases'" chance="100"/>
-              <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
-              <resume label="no_trade_retry"/>
-            </do_else>
+              <do_else>
+                <set_value name="$qtPairAmount" exact="$qtSellAmount"/>
+              </do_else>
+
+              <do_if value="not $qtPairAmount? or $qtPairAmount le 0">
+                <continue/>
+              </do_if>
+
+              <set_value name="$mk4PrepPairDuplicate" exact="false"/>
+              <do_all exact="$mk4PreparedCandidates.count" counter="$ppi">
+                <set_value name="$ppTrade" exact="$mk4PreparedCandidates.{$ppi}"/>
+                <do_if value="$ppTrade.$BuyOffer == $qt.$BuyOffer and $ppTrade.$SellOffer == $qt.$SellOffer">
+                  <set_value name="$mk4PrepPairDuplicate" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+              <do_if value="$mk4PrepPairDuplicate">
+                <continue/>
+              </do_if>
+
+              <set_value name="$qt.$QueuedBuyAmount" exact="$qtBuyAmount"/>
+              <set_value name="$qt.$QueuedSellAmount" exact="$qtSellAmount"/>
+              <append_to_list name="$mk4PreparedCandidates" exact="$qt"/>
+            </do_all>
+          </do_if>
+          <do_else>
+            <set_value name="$pendingTrade.$QueuedBuyAmount" exact="$finalBuyAmount"/>
+            <set_value name="$pendingTrade.$QueuedSellAmount" exact="$finalSellAmount"/>
+            <append_to_list name="$mk4PreparedCandidates" exact="$pendingTrade"/>
+          </do_else>
+
+          <set_value name="$mk4QueueSourceCount" exact="if $mk4PreparedCandidates.count gt 0 then $mk4PreparedCandidates.count else 1"/>
+
+          <!-- Prefer a single trade if it alone reaches threshold (MK1 parity). -->
+          <set_value name="$mk4SingleThresholdCandidate" exact="null"/>
+          <set_value name="$mk4SingleThresholdBestScore" exact="-999999"/>
+          <set_value name="$mk4SingleThresholdFillPct" exact="0"/>
+          <set_value name="$mk4SingleThresholdFound" exact="false"/>
+          <do_if value="$mk4UseMinCargoThresholdForRoute and $mk4PreparedCandidates.count gt 1 and $mk4CargoCapacityVolForSingle gt 0">
+            <do_all exact="$mk4PreparedCandidates.count" counter="$stci">
+              <set_value name="$stTrade" exact="$mk4PreparedCandidates.{$stci}"/>
+              <set_value name="$stIsSellOnly" exact="$stTrade.$IsSellOnly? and $stTrade.$IsSellOnly"/>
+              <set_value name="$stBuyAmount" exact="if $stTrade.$QueuedBuyAmount? then $stTrade.$QueuedBuyAmount else (if $stTrade.$Amount? then $stTrade.$Amount else 0)"/>
+              <set_value name="$stSellAmount" exact="if $stTrade.$QueuedSellAmount? then $stTrade.$QueuedSellAmount else (if $stTrade.$Amount? then $stTrade.$Amount else 0)"/>
+              <set_value name="$stPairAmount" exact="if $stIsSellOnly then $stSellAmount else [$stBuyAmount, $stSellAmount].min"/>
+              <do_if value="$stPairAmount le 0">
+                <continue/>
+              </do_if>
+              <set_value name="$stBuyPrice" exact="if not $stIsSellOnly and $stTrade.$BuyOffer? and $stTrade.$BuyOffer.unitprice? then $stTrade.$BuyOffer.unitprice else 0"/>
+              <set_value name="$stPurchaseCost" exact="if $stIsSellOnly then 0 else ($stBuyPrice * $stPairAmount)"/>
+              <do_if value="($mk4QueueBudgetMoney - $stPurchaseCost) lt ($mk4QueueMinMoney)Cr">
+                <do_if value="not $stIsSellOnly and $stBuyPrice gt 0">
+                  <set_value name="$stAvailableBudget" exact="$mk4QueueBudgetMoney - ($mk4QueueMinMoney)Cr"/>
+                  <set_value name="$stAffordableUnits" exact="$stAvailableBudget / $stBuyPrice"/>
+                  <do_if value="$stAffordableUnits ge 1">
+                    <set_value name="$stPairAmount" exact="[$stPairAmount, $stAffordableUnits].min"/>
+                  </do_if>
+                  <do_else>
+                    <continue/>
+                  </do_else>
+                </do_if>
+                <do_else>
+                  <continue/>
+                </do_else>
+              </do_if>
+              <set_value name="$stVolumePerUnit" exact="if $stTrade.$Ware? and $stTrade.$Ware.volume? then $stTrade.$Ware.volume else 1"/>
+              <set_value name="$stFillPct" exact="if $mk4CargoCapacityVolForSingle gt 0 then (($stPairAmount * $stVolumePerUnit * 100) / $mk4CargoCapacityVolForSingle) else 100"/>
+              <set_value name="$stScore" exact="if $stTrade.$Score? then $stTrade.$Score else 0"/>
+              <do_if value="$stFillPct ge $mk4ThresholdPctForSingle and (not $mk4SingleThresholdCandidate? or $stScore gt $mk4SingleThresholdBestScore)">
+                <set_value name="$mk4SingleThresholdCandidate" exact="$stTrade"/>
+                <set_value name="$mk4SingleThresholdBestScore" exact="$stScore"/>
+                <set_value name="$mk4SingleThresholdFillPct" exact="$stFillPct"/>
+                <set_value name="$mk4SingleThresholdFound" exact="true"/>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="$mk4SingleThresholdFound and $mk4SingleThresholdCandidate? and $mk4PreparedCandidates.count gt 1">
+            <set_value name="$mk4SinglePreferred" exact="true"/>
+            <create_list name="$mk4SinglePreferredTrades"/>
+            <append_to_list name="$mk4SinglePreferredTrades" exact="$mk4SingleThresholdCandidate"/>
+            <set_value name="$mk4PreparedCandidates" exact="$mk4SinglePreferredTrades"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': MK4 single-trade preference applied: fill=' + $mk4SingleThresholdFillPct + '% threshold=' + $mk4ThresholdPctForSingle + '% (multitrade deferred)'" chance="100"/>
+            </do_if>
           </do_if>
 
-          <!-- Vanilla pattern (order.trade.routine): queue SELL first as immediate,
-               then queue BUY as immediate so BUY displaces SELL and runs first. -->
-          <do_if value="$pendingTrade.$SellOffer?">
-            <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$SellOffer" amount="$finalSellAmount" immediate="true" internal="$tradeOrderInternal"/>
-            <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <set_value name="$sellOfferAmountAfterOrder" exact="@$pendingTrade.$SellOffer.offeramount.{this.assignedcontrolled}"/>
-              <set_value name="$sellDesiredAfterOrder" exact="@$pendingTrade.$SellOffer.desiredamount"/>
-              <debug_text text="'[GT-Reserve] ' + this.ship.idcode + ': after create_trade_order SELL' +
-                '\n  orderAmount=' + $finalSellAmount +
-                '\n  sell offeramount(ship)=' + (if $sellOfferAmountAfterOrder? then $sellOfferAmountAfterOrder else 'null') +
-                '\n  sell desiredamount=' + (if $sellDesiredAfterOrder? then $sellDesiredAfterOrder else 'null')"
-                chance="100"/>
+          <set_value name="$mk4CargoCapacityVol" exact="if this.ship.cargo.capacity.all? then this.ship.cargo.capacity.all else 0"/>
+          <set_value name="$mk4RemainingVolume" exact="$mk4CargoCapacityVol"/>
+          <set_value name="$mk4CurrentFillPct" exact="0"/>
+          <set_value name="$mk4PrimaryTrade" exact="if $mk4PreparedCandidates.count gt 0 then $mk4PreparedCandidates.{1} else null"/>
+
+          <!-- Add primary trade with authoritative budget clamp. -->
+          <do_if value="$mk4PrimaryTrade?">
+            <set_value name="$pIsSellOnly" exact="$mk4PrimaryTrade.$IsSellOnly? and $mk4PrimaryTrade.$IsSellOnly"/>
+            <set_value name="$pBuyAmount" exact="if $mk4PrimaryTrade.$QueuedBuyAmount? then $mk4PrimaryTrade.$QueuedBuyAmount else (if $mk4PrimaryTrade.$Amount? then $mk4PrimaryTrade.$Amount else 0)"/>
+            <set_value name="$pSellAmount" exact="if $mk4PrimaryTrade.$QueuedSellAmount? then $mk4PrimaryTrade.$QueuedSellAmount else (if $mk4PrimaryTrade.$Amount? then $mk4PrimaryTrade.$Amount else 0)"/>
+            <set_value name="$pPairAmount" exact="if $pIsSellOnly then $pSellAmount else [$pBuyAmount, $pSellAmount].min"/>
+            <set_value name="$pBuyPrice" exact="if not $pIsSellOnly and $mk4PrimaryTrade.$BuyOffer? and $mk4PrimaryTrade.$BuyOffer.unitprice? then $mk4PrimaryTrade.$BuyOffer.unitprice else 0"/>
+            <set_value name="$pPurchaseCost" exact="if $pIsSellOnly then 0 else ($pBuyPrice * $pPairAmount)"/>
+            <do_if value="$pPairAmount le 0">
+              <set_value name="$mk4PrimaryBudgetBlocked" exact="true"/>
             </do_if>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Created SELL trade order (internal=' + $tradeOrderInternal + ', isSubordinate=' + $isSubordinate + ', hasCommander=' + (if this.ship.commander? and this.ship.commander.exists then 'true' else 'false') + ')'" chance="100"/>
+            <do_elseif value="($mk4QueueBudgetMoney - $pPurchaseCost) lt ($mk4QueueMinMoney)Cr">
+              <do_if value="not $pIsSellOnly and $pBuyPrice gt 0">
+                <set_value name="$pAvailableBudget" exact="$mk4QueueBudgetMoney - ($mk4QueueMinMoney)Cr"/>
+                <set_value name="$pAffordableUnits" exact="$pAvailableBudget / $pBuyPrice"/>
+                <do_if value="$pAffordableUnits ge 1">
+                  <set_value name="$pPairAmount" exact="[$pPairAmount, $pAffordableUnits].min"/>
+                  <set_value name="$pBuyAmount" exact="$pPairAmount"/>
+                  <set_value name="$pSellAmount" exact="$pPairAmount"/>
+                  <set_value name="$pPurchaseCost" exact="$pBuyPrice * $pBuyAmount"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$mk4PrimaryBudgetBlocked" exact="true"/>
+                </do_else>
+              </do_if>
+              <do_else>
+                <set_value name="$mk4PrimaryBudgetBlocked" exact="true"/>
+              </do_else>
+            </do_elseif>
+            <do_if value="not $mk4PrimaryBudgetBlocked and $pPairAmount gt 0">
+              <set_value name="$mk4PrimaryTrade.$QueuedBuyAmount" exact="$pBuyAmount"/>
+              <set_value name="$mk4PrimaryTrade.$QueuedSellAmount" exact="$pSellAmount"/>
+              <append_to_list name="$mk4QueueableTrades" exact="$mk4PrimaryTrade"/>
+              <set_value name="$mk4QueueBudgetMoney" exact="$mk4QueueBudgetMoney - $pPurchaseCost"/>
+              <set_value name="$pVolumePerUnit" exact="if $mk4PrimaryTrade.$Ware? and $mk4PrimaryTrade.$Ware.volume? then $mk4PrimaryTrade.$Ware.volume else 1"/>
+              <set_value name="$mk4RemainingVolume" exact="[0, $mk4RemainingVolume - ($pPairAmount * $pVolumePerUnit)].max"/>
+              <set_value name="$mk4CurrentFillPct" exact="if $mk4CargoCapacityVol gt 0 then ((($mk4CargoCapacityVol - $mk4RemainingVolume) * 100) / $mk4CargoCapacityVol) else 100"/>
             </do_if>
           </do_if>
-          <do_if value="not $isSellOnlyTradeForPending and $pendingTrade.$BuyOffer?">
-            <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$BuyOffer" amount="$finalBuyAmount" immediate="true" internal="$tradeOrderInternal"/>
-            <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <set_value name="$buyOfferAmountAfterOrder" exact="@$pendingTrade.$BuyOffer.offeramount.{this.assignedcontrolled}"/>
-              <set_value name="$buyDesiredAfterOrder" exact="@$pendingTrade.$BuyOffer.desiredamount"/>
-              <debug_text text="'[GT-Reserve] ' + this.ship.idcode + ': after create_trade_order BUY' +
-                '\n  orderAmount=' + $finalBuyAmount +
-                '\n  buy offeramount(ship)=' + (if $buyOfferAmountAfterOrder? then $buyOfferAmountAfterOrder else 'null') +
-                '\n  buy desiredamount=' + (if $buyDesiredAfterOrder? then $buyDesiredAfterOrder else 'null')"
-                chance="100"/>
-            </do_if>
+          <do_else>
+            <set_value name="$mk4PrimaryBudgetBlocked" exact="true"/>
+          </do_else>
+
+          <!-- Iteratively add secondary legs (MK1 style) until threshold is reached
+               or no valid secondary remains. -->
+          <do_if value="not $mk4PrimaryBudgetBlocked and not $mk4SinglePreferred and $mk4PreparedCandidates.count gt 1 and $mk4QueueableTrades.count gt 0">
+            <set_value name="$mk4SecondaryBudgetBlocked" exact="table[]"/>
+            <do_while value="$mk4QueueableTrades.count lt $validatedCandidateLimit and $mk4RemainingVolume gt 0 and ((not $mk4UseMinCargoThresholdForRoute) or ($mk4CurrentFillPct lt $mk4ThresholdPctForSingle))">
+              <set_value name="$mk4BestSecondaryTrade" exact="null"/>
+              <set_value name="$mk4BestSecondaryAmount" exact="0"/>
+              <set_value name="$mk4BestSecondaryScore" exact="-1"/>
+
+              <do_all exact="$mk4PreparedCandidates.count" counter="$sci">
+                <set_value name="$scTrade" exact="$mk4PreparedCandidates.{$sci}"/>
+                <do_if value="$mk4SecondaryBudgetBlocked.{$scTrade}?">
+                  <continue/>
+                </do_if>
+
+                <!-- Skip exact duplicate offer-pairs already selected (MK1 parity). -->
+                <set_value name="$mk4SecondaryAlreadySelected" exact="false"/>
+                <do_all exact="$mk4QueueableTrades.count" counter="$qdupi">
+                  <set_value name="$mk4DupTrade" exact="$mk4QueueableTrades.{$qdupi}"/>
+                  <do_if value="$mk4DupTrade.$BuyOffer == $scTrade.$BuyOffer and $mk4DupTrade.$SellOffer == $scTrade.$SellOffer">
+                    <set_value name="$mk4SecondaryAlreadySelected" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+                <do_if value="$mk4SecondaryAlreadySelected">
+                  <continue/>
+                </do_if>
+
+                <!-- Backtrack cluster on supplier sectors. -->
+                <set_value name="$mk4SecondaryBacktrackReject" exact="false"/>
+                <set_value name="$scBuySector" exact="if $scTrade.$BuySector? then $scTrade.$BuySector else (if $scTrade.$BuyStation? then $scTrade.$BuyStation.sector else (if $scTrade.$BuyOffer? and $scTrade.$BuyOffer.owner? then $scTrade.$BuyOffer.owner.sector else null))"/>
+                <do_if value="this.$effectiveBacktrackTolerance? and this.$effectiveBacktrackTolerance ge 0 and $scBuySector?">
+                  <do_all exact="$mk4QueueableTrades.count" counter="$qbi">
+                    <set_value name="$qTrade" exact="$mk4QueueableTrades.{$qbi}"/>
+                    <set_value name="$qBuySector" exact="if $qTrade.$BuySector? then $qTrade.$BuySector else (if $qTrade.$BuyStation? then $qTrade.$BuyStation.sector else (if $qTrade.$BuyOffer? and $qTrade.$BuyOffer.owner? then $qTrade.$BuyOffer.owner.sector else null))"/>
+                    <do_if value="not $qBuySector?">
+                      <continue/>
+                    </do_if>
+                    <set_value name="$qBuyDist" exact="$qBuySector.gatedistance.{$scBuySector}"/>
+                    <do_if value="$qBuyDist lt 0 or $qBuyDist gt this.$effectiveBacktrackTolerance">
+                      <set_value name="$mk4SecondaryBacktrackReject" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                </do_if>
+                <do_if value="$mk4SecondaryBacktrackReject">
+                  <set_value name="$mk4BacktrackSkipped" operation="add"/>
+                  <continue/>
+                </do_if>
+
+                <set_value name="$scIsSellOnly" exact="$scTrade.$IsSellOnly? and $scTrade.$IsSellOnly"/>
+                <set_value name="$scBuyAmount" exact="if $scTrade.$QueuedBuyAmount? then $scTrade.$QueuedBuyAmount else (if $scTrade.$Amount? then $scTrade.$Amount else 0)"/>
+                <set_value name="$scSellAmount" exact="if $scTrade.$QueuedSellAmount? then $scTrade.$QueuedSellAmount else (if $scTrade.$Amount? then $scTrade.$Amount else 0)"/>
+                <set_value name="$scPairAmount" exact="if $scIsSellOnly then $scSellAmount else [$scBuyAmount, $scSellAmount].min"/>
+                <set_value name="$scVolumePerUnit" exact="if $scTrade.$Ware? and $scTrade.$Ware.volume? then $scTrade.$Ware.volume else 1"/>
+                <do_if value="$scVolumePerUnit gt 0">
+                  <set_value name="$scMaxByVolume" exact="($mk4RemainingVolume / $scVolumePerUnit)i"/>
+                  <set_value name="$scPairAmount" exact="[$scPairAmount, $scMaxByVolume].min"/>
+                </do_if>
+                <do_if value="$scPairAmount le 0">
+                  <continue/>
+                </do_if>
+
+                <set_value name="$scScore" exact="if $scTrade.$Score? then $scTrade.$Score else 0"/>
+                <do_if value="$scPairAmount gt $mk4BestSecondaryAmount or ($scPairAmount == $mk4BestSecondaryAmount and $scScore gt $mk4BestSecondaryScore)">
+                  <set_value name="$mk4BestSecondaryTrade" exact="$scTrade"/>
+                  <set_value name="$mk4BestSecondaryAmount" exact="$scPairAmount"/>
+                  <set_value name="$mk4BestSecondaryScore" exact="$scScore"/>
+                </do_if>
+              </do_all>
+
+              <do_if value="not $mk4BestSecondaryTrade? or $mk4BestSecondaryAmount le 0">
+                <break/>
+              </do_if>
+
+              <set_value name="$bsIsSellOnly" exact="$mk4BestSecondaryTrade.$IsSellOnly? and $mk4BestSecondaryTrade.$IsSellOnly"/>
+              <set_value name="$bsBuyPrice" exact="if not $bsIsSellOnly and $mk4BestSecondaryTrade.$BuyOffer? and $mk4BestSecondaryTrade.$BuyOffer.unitprice? then $mk4BestSecondaryTrade.$BuyOffer.unitprice else 0"/>
+              <set_value name="$bsPurchaseCost" exact="if $bsIsSellOnly then 0 else ($bsBuyPrice * $mk4BestSecondaryAmount)"/>
+              <do_if value="($mk4QueueBudgetMoney - $bsPurchaseCost) lt ($mk4QueueMinMoney)Cr">
+                <do_if value="not $bsIsSellOnly and $bsBuyPrice gt 0">
+                  <set_value name="$bsAvailableBudget" exact="$mk4QueueBudgetMoney - ($mk4QueueMinMoney)Cr"/>
+                  <set_value name="$bsAffordableUnits" exact="$bsAvailableBudget / $bsBuyPrice"/>
+                  <do_if value="$bsAffordableUnits ge 1">
+                    <set_value name="$mk4BestSecondaryAmount" exact="[$mk4BestSecondaryAmount, $bsAffordableUnits].min"/>
+                    <set_value name="$bsPurchaseCost" exact="$bsBuyPrice * $mk4BestSecondaryAmount"/>
+                  </do_if>
+                  <do_else>
+                    <set_value name="$mk4SecondaryBudgetBlocked.{$mk4BestSecondaryTrade}" exact="true"/>
+                    <set_value name="$mk4SecondaryBudgetSkipped" operation="add"/>
+                    <continue/>
+                  </do_else>
+                </do_if>
+                <do_else>
+                  <set_value name="$mk4SecondaryBudgetBlocked.{$mk4BestSecondaryTrade}" exact="true"/>
+                  <set_value name="$mk4SecondaryBudgetSkipped" operation="add"/>
+                  <continue/>
+                </do_else>
+              </do_if>
+
+              <do_if value="$mk4BestSecondaryAmount le 0">
+                <set_value name="$mk4SecondaryBudgetBlocked.{$mk4BestSecondaryTrade}" exact="true"/>
+                <set_value name="$mk4SecondaryBudgetSkipped" operation="add"/>
+                <continue/>
+              </do_if>
+
+              <set_value name="$mk4BestSecondaryTrade.$QueuedBuyAmount" exact="if $bsIsSellOnly then 0 else $mk4BestSecondaryAmount"/>
+              <set_value name="$mk4BestSecondaryTrade.$QueuedSellAmount" exact="$mk4BestSecondaryAmount"/>
+              <append_to_list name="$mk4QueueableTrades" exact="$mk4BestSecondaryTrade"/>
+              <set_value name="$mk4QueueBudgetMoney" exact="$mk4QueueBudgetMoney - $bsPurchaseCost"/>
+              <set_value name="$bsVolumePerUnit" exact="if $mk4BestSecondaryTrade.$Ware? and $mk4BestSecondaryTrade.$Ware.volume? then $mk4BestSecondaryTrade.$Ware.volume else 1"/>
+              <set_value name="$mk4RemainingVolume" exact="[0, $mk4RemainingVolume - ($mk4BestSecondaryAmount * $bsVolumePerUnit)].max"/>
+              <set_value name="$mk4CurrentFillPct" exact="if $mk4CargoCapacityVol gt 0 then ((($mk4CargoCapacityVol - $mk4RemainingVolume) * 100) / $mk4CargoCapacityVol) else 100"/>
+            </do_while>
+          </do_if>
+
+          <do_if value="$mk4PrimaryBudgetBlocked or $mk4QueueableTrades.count == 0">
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Created BUY trade order (internal=' + $tradeOrderInternal + ', isSubordinate=' + $isSubordinate + ', hasCommander=' + (if this.ship.commander? and this.ship.commander.exists then 'true' else 'false') + ')'" chance="100"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': BLOCKED trade (multitrade budget guard): player.money=' + (player.money / 100) + ' Cr — cannot queue primary leg above MinPlayerMoney threshold (' + $mk4QueueMinMoney + ' Cr)'" chance="100"/>
+            </do_if>
+            <set_value name="global.$GT_MoneyCapActive" exact="true"/>
+            <set_value name="global.$GT_MoneyCapMoney" exact="player.money"/>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GLOBAL MONEY CAP SET: player.money=' + (player.money / 100) + ' Cr — all ships blocked until money increases'" chance="100"/>
+            <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
+            <resume label="no_trade_retry"/>
+          </do_if>
+
+          <do_if value="$mk4QueueableTrades.count gt 0">
+            <!-- Optional compaction: keep primary leg fixed, then order remaining legs by
+                 nearest sell-destination sector to reduce zig-zag routes (MK1 parity). -->
+            <do_if value="$mk4QueueableTrades.count gt 2">
+              <create_list name="$mk4CompactedTrades"/>
+              <append_to_list name="$mk4CompactedTrades" exact="$mk4QueueableTrades.{1}"/>
+              <set_value name="$mk4CompactionPicked" exact="table[]"/>
+              <set_value name="$mk4CompactionPicked.{1}" exact="true"/>
+              <set_value name="$mk4CompactionAnchorSector" exact="if $mk4QueueableTrades.{1}.$SellStation? then $mk4QueueableTrades.{1}.$SellStation.sector else (if $mk4QueueableTrades.{1}.$SellOffer? and $mk4QueueableTrades.{1}.$SellOffer.owner? then $mk4QueueableTrades.{1}.$SellOffer.owner.sector else null)"/>
+              <do_while value="$mk4CompactedTrades.count lt $mk4QueueableTrades.count">
+                <set_value name="$mk4CompactionBestIdx" exact="0"/>
+                <set_value name="$mk4CompactionBestDist" exact="999999"/>
+                <do_all exact="$mk4QueueableTrades.count" counter="$mci">
+                  <do_if value="$mk4CompactionPicked.{$mci}?">
+                    <continue/>
+                  </do_if>
+                  <set_value name="$mk4CompactionCandidate" exact="$mk4QueueableTrades.{$mci}"/>
+                  <set_value name="$mk4CandidateSellSector" exact="if $mk4CompactionCandidate.$SellStation? then $mk4CompactionCandidate.$SellStation.sector else (if $mk4CompactionCandidate.$SellOffer? and $mk4CompactionCandidate.$SellOffer.owner? then $mk4CompactionCandidate.$SellOffer.owner.sector else null)"/>
+                  <set_value name="$mk4CompactionDistance" exact="if $mk4CompactionAnchorSector? and $mk4CandidateSellSector? then $mk4CompactionAnchorSector.gatedistance.{$mk4CandidateSellSector} else 0"/>
+                  <do_if value="$mk4CompactionDistance lt 0">
+                    <set_value name="$mk4CompactionDistance" exact="999999"/>
+                  </do_if>
+                  <do_if value="$mk4CompactionBestIdx == 0 or $mk4CompactionDistance lt $mk4CompactionBestDist">
+                    <set_value name="$mk4CompactionBestIdx" exact="$mci"/>
+                    <set_value name="$mk4CompactionBestDist" exact="$mk4CompactionDistance"/>
+                  </do_if>
+                </do_all>
+                <do_if value="$mk4CompactionBestIdx gt 0">
+                  <set_value name="$mk4CompactionBestTrade" exact="$mk4QueueableTrades.{$mk4CompactionBestIdx}"/>
+                  <append_to_list name="$mk4CompactedTrades" exact="$mk4CompactionBestTrade"/>
+                  <set_value name="$mk4CompactionPicked.{$mk4CompactionBestIdx}" exact="true"/>
+                  <set_value name="$mk4CompactionAnchorSector" exact="if $mk4CompactionBestTrade.$SellStation? then $mk4CompactionBestTrade.$SellStation.sector else (if $mk4CompactionBestTrade.$SellOffer? and $mk4CompactionBestTrade.$SellOffer.owner? then $mk4CompactionBestTrade.$SellOffer.owner.sector else $mk4CompactionAnchorSector)"/>
+                </do_if>
+                <do_else>
+                  <break/>
+                </do_else>
+              </do_while>
+              <do_if value="$mk4CompactedTrades.count == $mk4QueueableTrades.count">
+                <set_value name="$mk4QueueableTrades" exact="$mk4CompactedTrades"/>
+              </do_if>
+            </do_if>
+
+            <!-- Canonical trade context for follow-up logging/UI remains first selected leg. -->
+            <set_value name="$pendingTrade" exact="$mk4QueueableTrades.{1}"/>
+            <set_value name="$isSellOnlyTradeForPending" exact="$pendingTrade.$IsSellOnly? and $pendingTrade.$IsSellOnly"/>
+            <set_value name="$finalBuyAmount" exact="if $pendingTrade.$QueuedBuyAmount? then $pendingTrade.$QueuedBuyAmount else (if $pendingTrade.$FinalBuyAmount? then $pendingTrade.$FinalBuyAmount else $pendingTrade.$Amount)"/>
+            <set_value name="$finalSellAmount" exact="if $pendingTrade.$QueuedSellAmount? then $pendingTrade.$QueuedSellAmount else (if $pendingTrade.$FinalSellAmount? then $pendingTrade.$FinalSellAmount else $pendingTrade.$Amount)"/>
+
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': MK4 multitrade execution set: queued=' + $mk4QueueableTrades.count + '/' + $mk4QueueSourceCount + ' (maxTrades=' + $validatedCandidateLimit + ', secondaryBudgetSkipped=' + $mk4SecondaryBudgetSkipped + ', backtrackSkipped=' + $mk4BacktrackSkipped + ', singlePreferred=' + $mk4SinglePreferred + ')'" chance="100"/>
+            </do_if>
+
+            <set_value name="$mk4CycleLegCount" exact="0"/>
+            <set_value name="$mk4CycleAmountTotal" exact="0"/>
+            <set_value name="$mk4CycleProfitRaw" exact="0"/>
+            <set_value name="$mk4CycleMoneyRawTotal" exact="0"/>
+            <set_value name="$mk4MultiTradeSummary" exact="''"/>
+            <set_value name="$mk4MultiTradeSummaryCount" exact="0"/>
+            <set_value name="$mk4MultiTradeSummaryMax" exact="6"/>
+
+            <!-- MK1 parity: two-phase queueing (all SELL first, then all BUY).
+                 Use reverse candidate iteration so first selected candidate executes first under LIFO. -->
+            <do_all exact="$mk4QueueableTrades.count" counter="$qri">
+              <set_value name="$qidx" exact="$mk4QueueableTrades.count - $qri + 1"/>
+              <set_value name="$qt" exact="$mk4QueueableTrades.{$qidx}"/>
+              <set_value name="$qtIsSellOnlyExec" exact="$qt.$IsSellOnly? and $qt.$IsSellOnly"/>
+              <set_value name="$qtExecBuyAmount" exact="if $qt.$QueuedBuyAmount? then $qt.$QueuedBuyAmount else (if $qt.$FinalBuyAmount? then $qt.$FinalBuyAmount else $qt.$Amount)"/>
+              <set_value name="$qtExecSellAmount" exact="if $qt.$QueuedSellAmount? then $qt.$QueuedSellAmount else (if $qt.$FinalSellAmount? then $qt.$FinalSellAmount else $qt.$Amount)"/>
+              <set_value name="$qtLogAmount" exact="if $qtIsSellOnlyExec then $qtExecSellAmount else $qtExecBuyAmount"/>
+              <set_value name="$qtBuyPriceRaw" exact="if $qt.$BuyPrice? then $qt.$BuyPrice else (if $qt.$BuyOffer? and $qt.$BuyOffer.unitprice? then $qt.$BuyOffer.unitprice else 0)"/>
+              <set_value name="$qtSellPriceRaw" exact="if $qt.$SellPrice? then $qt.$SellPrice else (if $qt.$SellOffer? and $qt.$SellOffer.unitprice? then $qt.$SellOffer.unitprice else 0)"/>
+              <set_value name="$qtProfitRaw" exact="($qtSellPriceRaw - $qtBuyPriceRaw) * $qtLogAmount"/>
+              <set_value name="$qtMoneyRaw" exact="-($qtBuyPriceRaw * $qtLogAmount)"/>
+              <set_value name="$mk4CycleLegCount" exact="$mk4CycleLegCount + 1"/>
+              <set_value name="$mk4CycleAmountTotal" exact="$mk4CycleAmountTotal + $qtLogAmount"/>
+              <set_value name="$mk4CycleProfitRaw" exact="$mk4CycleProfitRaw + $qtProfitRaw"/>
+              <set_value name="$mk4CycleMoneyRawTotal" exact="$mk4CycleMoneyRawTotal + $qtMoneyRaw"/>
+              <do_if value="$mk4MultiTradeSummaryCount lt $mk4MultiTradeSummaryMax">
+                <set_value name="$mk4SummaryItem" exact="$qtLogAmount + ' ' + (if $qt.$Ware? and $qt.$Ware.name? then $qt.$Ware.name else '?') + ' @ ' + ($qtBuyPriceRaw / 100) + '->' + ($qtSellPriceRaw / 100) + ' Cr'"/>
+                <set_value name="$mk4MultiTradeSummary" exact="$mk4MultiTradeSummary + (if $mk4MultiTradeSummary != '' then ', ' else '') + $mk4SummaryItem"/>
+                <set_value name="$mk4MultiTradeSummaryCount" exact="$mk4MultiTradeSummaryCount + 1"/>
+              </do_if>
+
+              <do_if value="$qt.$SellOffer? and $qtExecSellAmount gt 0">
+                <create_trade_order object="this.ship" tradeoffer="$qt.$SellOffer" amount="$qtExecSellAmount" immediate="true" internal="$tradeOrderInternal"/>
+                <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <set_value name="$sellOfferAmountAfterOrder" exact="@$qt.$SellOffer.offeramount.{this.assignedcontrolled}"/>
+                  <set_value name="$sellDesiredAfterOrder" exact="@$qt.$SellOffer.desiredamount"/>
+                  <debug_text text="'[GT-Reserve] ' + this.ship.idcode + ': after create_trade_order SELL (phase=SELL, leg ' + $qidx + '/' + $mk4QueueableTrades.count + ')' +
+                    '\n  orderAmount=' + $qtExecSellAmount +
+                    '\n  sell offeramount(ship)=' + (if $sellOfferAmountAfterOrder? then $sellOfferAmountAfterOrder else 'null') +
+                    '\n  sell desiredamount=' + (if $sellDesiredAfterOrder? then $sellDesiredAfterOrder else 'null')"
+                    chance="100"/>
+                </do_if>
+              </do_if>
+            </do_all>
+
+            <!-- BUY-phase anti-zigzag compaction (MK1 parity intent):
+                 group buy legs by supplier sector blocks so load execution does not
+                 bounce A->B->A. Either A->A->B or B->B->A is acceptable. -->
+            <set_value name="$mk4BuyPhaseTrades" exact="$mk4QueueableTrades"/>
+            <do_if value="$mk4QueueableTrades.count gt 2">
+              <create_list name="$mk4BuySectorOrder"/>
+              <do_all exact="$mk4QueueableTrades.count" counter="$bsoi">
+                <set_value name="$bst" exact="$mk4QueueableTrades.{$bsoi}"/>
+                <set_value name="$bsSector" exact="if $bst.$BuySector? then $bst.$BuySector else (if $bst.$BuyStation? then $bst.$BuyStation.sector else (if $bst.$BuyOffer? and $bst.$BuyOffer.owner? then $bst.$BuyOffer.owner.sector else null))"/>
+                <do_if value="$bsSector?">
+                  <set_value name="$mk4SeenBuySector" exact="false"/>
+                  <do_all exact="$mk4BuySectorOrder.count" counter="$bssj">
+                    <do_if value="$mk4BuySectorOrder.{$bssj} == $bsSector">
+                      <set_value name="$mk4SeenBuySector" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                  <do_if value="not $mk4SeenBuySector">
+                    <append_to_list name="$mk4BuySectorOrder" exact="$bsSector"/>
+                  </do_if>
+                </do_if>
+              </do_all>
+              <create_list name="$mk4BuyPhaseCompacted"/>
+              <do_all exact="$mk4BuySectorOrder.count" counter="$bsi">
+                <set_value name="$buySectorKey" exact="$mk4BuySectorOrder.{$bsi}"/>
+                <do_all exact="$mk4QueueableTrades.count" counter="$bci">
+                  <set_value name="$bct" exact="$mk4QueueableTrades.{$bci}"/>
+                  <set_value name="$bctSector" exact="if $bct.$BuySector? then $bct.$BuySector else (if $bct.$BuyStation? then $bct.$BuyStation.sector else (if $bct.$BuyOffer? and $bct.$BuyOffer.owner? then $bct.$BuyOffer.owner.sector else null))"/>
+                  <do_if value="$bctSector? and $bctSector == $buySectorKey">
+                    <append_to_list name="$mk4BuyPhaseCompacted" exact="$bct"/>
+                  </do_if>
+                </do_all>
+              </do_all>
+              <!-- Keep sell-only/no-buy-sector legs stable after clustered buy legs. -->
+              <do_all exact="$mk4QueueableTrades.count" counter="$bni">
+                <set_value name="$bnt" exact="$mk4QueueableTrades.{$bni}"/>
+                <set_value name="$bntSector" exact="if $bnt.$BuySector? then $bnt.$BuySector else (if $bnt.$BuyStation? then $bnt.$BuyStation.sector else (if $bnt.$BuyOffer? and $bnt.$BuyOffer.owner? then $bnt.$BuyOffer.owner.sector else null))"/>
+                <do_if value="not $bntSector?">
+                  <append_to_list name="$mk4BuyPhaseCompacted" exact="$bnt"/>
+                </do_if>
+              </do_all>
+              <do_if value="$mk4BuyPhaseCompacted.count == $mk4QueueableTrades.count">
+                <set_value name="$mk4BuyPhaseTrades" exact="$mk4BuyPhaseCompacted"/>
+              </do_if>
+            </do_if>
+
+            <do_all exact="$mk4BuyPhaseTrades.count" counter="$qri2">
+              <set_value name="$qidx" exact="$mk4BuyPhaseTrades.count - $qri2 + 1"/>
+              <set_value name="$qt" exact="$mk4BuyPhaseTrades.{$qidx}"/>
+              <set_value name="$qtIsSellOnlyExec" exact="$qt.$IsSellOnly? and $qt.$IsSellOnly"/>
+              <set_value name="$qtExecBuyAmount" exact="if $qt.$QueuedBuyAmount? then $qt.$QueuedBuyAmount else (if $qt.$FinalBuyAmount? then $qt.$FinalBuyAmount else $qt.$Amount)"/>
+              <do_if value="not $qtIsSellOnlyExec and $qt.$BuyOffer? and $qtExecBuyAmount gt 0">
+                <create_trade_order object="this.ship" tradeoffer="$qt.$BuyOffer" amount="$qtExecBuyAmount" immediate="true" internal="$tradeOrderInternal"/>
+                <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <set_value name="$buyOfferAmountAfterOrder" exact="@$qt.$BuyOffer.offeramount.{this.assignedcontrolled}"/>
+                  <set_value name="$buyDesiredAfterOrder" exact="@$qt.$BuyOffer.desiredamount"/>
+                  <debug_text text="'[GT-Reserve] ' + this.ship.idcode + ': after create_trade_order BUY (phase=BUY, leg ' + $qidx + '/' + $mk4BuyPhaseTrades.count + ')' +
+                    '\n  orderAmount=' + $qtExecBuyAmount +
+                    '\n  buy offeramount(ship)=' + (if $buyOfferAmountAfterOrder? then $buyOfferAmountAfterOrder else 'null') +
+                    '\n  buy desiredamount=' + (if $buyDesiredAfterOrder? then $buyDesiredAfterOrder else 'null')"
+                    chance="100"/>
+                </do_if>
+              </do_if>
+            </do_all>
+            <do_if value="$mk4QueueableTrades.count gt $mk4MultiTradeSummaryMax">
+              <set_value name="$mk4MultiTradeSummary" exact="$mk4MultiTradeSummary + ', ...+' + ($mk4QueueableTrades.count - $mk4MultiTradeSummaryMax) + ' more legs'"/>
             </do_if>
           </do_if>
 
@@ -6581,13 +6975,27 @@
           
           <!-- Scenario 2: Purge consumed trade from cache so other ships don't pick it -->
           <do_if value="$searchMethod == 'cache'">
-            <signal_objects object="player.galaxy" param="'GT_Cache_Purge'" param2="table[
-              $Ship = this.ship,
-              $BuyOffer = @$pendingTrade.$BuyOffer,
-              $SellOffer = @$pendingTrade.$SellOffer,
-              $HomeSector = $searchHomeSector,
-              $Reason = 'consumed'
-            ]"/>
+            <do_if value="$mk4QueueableTrades? and $mk4QueueableTrades.count gt 0">
+              <do_all exact="$mk4QueueableTrades.count" counter="$cpIdx">
+                <set_value name="$cpTrade" exact="$mk4QueueableTrades.{$cpIdx}"/>
+                <signal_objects object="player.galaxy" param="'GT_Cache_Purge'" param2="table[
+                  $Ship = this.ship,
+                  $BuyOffer = @$cpTrade.$BuyOffer,
+                  $SellOffer = @$cpTrade.$SellOffer,
+                  $HomeSector = $searchHomeSector,
+                  $Reason = 'consumed'
+                ]"/>
+              </do_all>
+            </do_if>
+            <do_else>
+              <signal_objects object="player.galaxy" param="'GT_Cache_Purge'" param2="table[
+                $Ship = this.ship,
+                $BuyOffer = @$pendingTrade.$BuyOffer,
+                $SellOffer = @$pendingTrade.$SellOffer,
+                $HomeSector = $searchHomeSector,
+                $Reason = 'consumed'
+              ]"/>
+            </do_else>
           </do_if>
           
           <!-- Purge trades awaiting validation after we successfully queued trade orders.
@@ -6777,19 +7185,22 @@
           <!-- Canonical queued trade prices in RAW: use pendingTrade snapshot first (real created-trade values). -->
           <set_value name="$buyPriceRawCanonical" exact="if $pendingTrade.$BuyPrice? then $pendingTrade.$BuyPrice else (if $pendingTrade.$BuyOffer? and $pendingTrade.$BuyOffer.unitprice? then $pendingTrade.$BuyOffer.unitprice else 0)"/>
           <set_value name="$sellPriceRawCanonical" exact="if $pendingTrade.$SellPrice? then $pendingTrade.$SellPrice else (if $pendingTrade.$SellOffer? and $pendingTrade.$SellOffer.unitprice? then $pendingTrade.$SellOffer.unitprice else 0)"/>
+          <set_value name="$isMultiTradeSignal" exact="$mk4CycleLegCount gt 1"/>
+          <set_value name="$uiProfitRawForSignal" exact="if $isMultiTradeSignal then $mk4CycleProfitRaw else (if $pendingTrade.$Profit? then $pendingTrade.$Profit else 0)"/>
 
           <!-- UI bridge: always publish queued-trade values (independent of per-ship logbook setting). -->
-          <set_value name="$uiLogAmount" exact="if $isSellOnlyTradeForPending then $finalSellAmount else $finalBuyAmount"/>
-          <set_value name="$uiBuyPriceRawForSignal" exact="$buyPriceRawCanonical"/>
-          <set_value name="$uiMoneyRawForSignal" exact="-$uiLogAmount * $uiBuyPriceRawForSignal"/>
+          <set_value name="$uiLogAmount" exact="if $isMultiTradeSignal then $mk4CycleAmountTotal else (if $isSellOnlyTradeForPending then $finalSellAmount else $finalBuyAmount)"/>
+          <set_value name="$uiBuyPriceRawForSignal" exact="if $isMultiTradeSignal then 0 else $buyPriceRawCanonical"/>
+          <set_value name="$uiMoneyRawForSignal" exact="if $isMultiTradeSignal then $mk4CycleMoneyRawTotal else (-$uiLogAmount * $uiBuyPriceRawForSignal)"/>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <set_value name="$rawBuyOfferUnitPrice" exact="if $pendingTrade.$BuyOffer? and $pendingTrade.$BuyOffer.unitprice? then $pendingTrade.$BuyOffer.unitprice else -1"/>
             <set_value name="$rawSellOfferUnitPrice" exact="if $pendingTrade.$SellOffer? and $pendingTrade.$SellOffer.unitprice? then $pendingTrade.$SellOffer.unitprice else -1"/>
             <set_value name="$rawPendingTradeBuyPrice" exact="if $pendingTrade.$BuyPrice? then $pendingTrade.$BuyPrice else -1"/>
             <set_value name="$rawPendingTradeSellPrice" exact="if $pendingTrade.$SellPrice? then $pendingTrade.$SellPrice else -1"/>
-            <set_value name="$rawPendingTradeProfit" exact="if $pendingTrade.$Profit? then $pendingTrade.$Profit else 0"/>
+            <set_value name="$rawPendingTradeProfit" exact="$uiProfitRawForSignal"/>
             <set_value name="$rawSignalSum" exact="abs($uiMoneyRawForSignal) + $rawPendingTradeProfit"/>
             <debug_text text="'[GT-AI-UI-DUE] ' + this.ship.idcode +
+              '\n  MultiTrade: ' + $isMultiTradeSignal + ' (legs=' + $mk4CycleLegCount + ')' +
               '\n  Amount: ' + $uiLogAmount +
               '\n  BuyOffer.unitprice (RAW): ' + $rawBuyOfferUnitPrice +
               '\n  SellOffer.unitprice (RAW): ' + $rawSellOfferUnitPrice +
@@ -6804,12 +7215,14 @@
           <signal_objects object="player.galaxy" param="'GT_UICreditsDue_TradeOrder'" param2="table[
             $Ship = this.ship,
             $MoneyRaw = $uiMoneyRawForSignal,
-            $Profit = if $pendingTrade.$Profit? then $pendingTrade.$Profit else 0,
+            $Profit = $uiProfitRawForSignal,
             $Amount = $uiLogAmount
           ]"/>
           
           <do_if value="$logbookEnabled">
-            <set_value name="$logAmount" exact="if $isSellOnlyTradeForPending then $finalSellAmount else $finalBuyAmount"/>
+            <set_value name="$logAmount" exact="if $isMultiTradeSignal then $mk4CycleAmountTotal else (if $isSellOnlyTradeForPending then $finalSellAmount else $finalBuyAmount)"/>
+            <set_value name="$logProfitRawForSignal" exact="if $isMultiTradeSignal then $mk4CycleProfitRaw else (if $pendingTrade.$Profit? then $pendingTrade.$Profit else 0)"/>
+            <set_value name="$logMoneyRawForSignal" exact="if $isMultiTradeSignal then $mk4CycleMoneyRawTotal else (-$logAmount * $buyPriceRawCanonical)"/>
             
             <!-- PROFIT DEBUG: Log trade data before sending to logbook -->
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -6834,8 +7247,10 @@
             </do_if>
             
             <!-- Use canonical raw snapshot prices for queued trade message. -->
-            <set_value name="$buyPriceForSignal" exact="$buyPriceRawCanonical / 100"/>
-            <set_value name="$sellPriceForSignal" exact="$sellPriceRawCanonical / 100"/>
+            <set_value name="$buyPriceForSignal" exact="if $isMultiTradeSignal then 0 else ($buyPriceRawCanonical / 100)"/>
+            <set_value name="$sellPriceForSignal" exact="if $isMultiTradeSignal then 0 else ($sellPriceRawCanonical / 100)"/>
+            <set_value name="$buyPriceRawForSignal" exact="if $isMultiTradeSignal then 0 else $buyPriceRawCanonical"/>
+            <set_value name="$sellPriceRawForSignal" exact="if $isMultiTradeSignal then 0 else $sellPriceRawCanonical"/>
             
             <!-- Determine search pipeline type for logbook display -->
             <set_value name="$logSearchPipeline" exact="'normal'"/>
@@ -6850,25 +7265,28 @@
               $BuyOffer = if $pendingTrade.$BuyOffer? then $pendingTrade.$BuyOffer else null,
               $SellOffer = if $pendingTrade.$SellOffer? then $pendingTrade.$SellOffer else null,
               $Amount = $logAmount,
-              $Profit = if $pendingTrade.$Profit? then $pendingTrade.$Profit else 0,
+              $Profit = $logProfitRawForSignal,
               $BuyPrice = $buyPriceForSignal,
               $SellPrice = $sellPriceForSignal,
-              $BuyPriceRaw = $buyPriceRawCanonical,
-              $SellPriceRaw = $sellPriceRawCanonical,
-              $MoneyRaw = -$logAmount * $buyPriceRawCanonical,
+              $BuyPriceRaw = $buyPriceRawForSignal,
+              $SellPriceRaw = $sellPriceRawForSignal,
+              $MoneyRaw = $logMoneyRawForSignal,
               $IsSellOnly = $isSellOnlyTradeForPending,
+              $IsMultiTrade = $isMultiTradeSignal,
+              $MultiTradeSummary = if $isMultiTradeSignal then $mk4MultiTradeSummary else '',
               $SearchPipeline = $logSearchPipeline
             ]"/>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-AI-LOG-SIGNAL] ' + this.ship.idcode +
-                '\n  sell-only: ' + $isSellOnlyTradeForPending + ', pipeline: ' + $logSearchPipeline +
+                '\n  sell-only: ' + $isSellOnlyTradeForPending + ', multitrade: ' + $isMultiTradeSignal + ' (legs=' + $mk4CycleLegCount + '), pipeline: ' + $logSearchPipeline +
                 '\n  Amount sent: ' + $logAmount +
                 '\n  BuyPrice sent (Cr): ' + $buyPriceForSignal +
                 '\n  SellPrice sent (Cr): ' + $sellPriceForSignal +
-                '\n  BuyPrice sent (RAW): ' + $buyPriceRawCanonical +
-                '\n  SellPrice sent (RAW): ' + $sellPriceRawCanonical +
-                '\n  Profit sent (RAW): ' + (if $pendingTrade.$Profit? then $pendingTrade.$Profit else 0) +
-                '\n  MoneyRaw sent: ' + (-$logAmount * $buyPriceRawCanonical) + ' (' + ((-$logAmount * $buyPriceRawCanonical) / 100) + ' Cr)'" chance="100"/>
+                '\n  BuyPrice sent (RAW): ' + $buyPriceRawForSignal +
+                '\n  SellPrice sent (RAW): ' + $sellPriceRawForSignal +
+                '\n  Profit sent (RAW): ' + $logProfitRawForSignal +
+                '\n  MoneyRaw sent: ' + $logMoneyRawForSignal + ' (' + ($logMoneyRawForSignal / 100) + ' Cr)' +
+                (if $isMultiTradeSignal then '\n  Summary: ' + $mk4MultiTradeSummary else '')" chance="100"/>
             </do_if>
           </do_if>
         </do_if>

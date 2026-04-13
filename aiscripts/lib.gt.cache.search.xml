@@ -60,6 +60,8 @@
       <set_value name="$wareBasketCount" exact="if $wareBasket? and typeof $wareBasket == datatype.list then $wareBasket.count else 0"/>
       <set_value name="$isIsolatedMode" exact="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?"/>
       <set_value name="$cargoUtilThresholdPct" exact="[10,[$minCargoUtilPercent,100].min].max"/>
+      <set_value name="$maxDistanceBuyLeg" exact="if $maxDistanceBuy? and $maxDistanceBuy gt 0 then $maxDistanceBuy else $maxDistance"/>
+      <set_value name="$maxDistanceSellLeg" exact="if $maxDistanceSell? and $maxDistanceSell gt 0 then $maxDistanceSell else $maxDistance"/>
       <!-- Iterate start-to-end (cache is sorted by Score descending via lib.gt.cache.write).
            Best trades are at the front — first $maxEntries that pass filters are the best available.
            Stop when we've found $maxEntries valid trades OR exhausted all entries. -->
@@ -74,6 +76,8 @@
         <!-- Initialize per-entry offer capacities to avoid undefined-variable lookups -->
         <set_value name="$preCheckBuyAmt" exact="0"/>
         <set_value name="$preCheckSellAmt" exact="0"/>
+        <set_value name="$entryBuyStation" exact="if $entry.$BuyStation? then @$entry.$BuyStation else null"/>
+        <set_value name="$entrySellStation" exact="if $entry.$SellStation? then @$entry.$SellStation else null"/>
 
         <!-- Basic validity -->
         <do_if value="not $entry? or not $entry.$Score? or $entry.$Score le 0">
@@ -123,21 +127,68 @@
           <continue/>
         </do_if>
 
-        <!-- Distance check (both buy and sell station) -->
-        <do_if value="$maxDistance gt 0">
-          <set_value name="$entryBuyStation" exact="@$entry.$BuyStation"/>
-          <set_value name="$entrySellStation" exact="@$entry.$SellStation"/>
-          <do_if value="$entryBuyStation?">
-            <set_value name="$distBuy" exact="$homeSector.gatedistance.{$entryBuyStation}"/>
-            <do_if value="$distBuy lt 0 or $distBuy gt $maxDistance">
+        <!-- MK4 policy filters (no-op for callers that don't pass these flags). -->
+        <do_if value="not $entry.$IsSellOnly?">
+          <do_if value="$requirePlayerDeliveryStation and (not $entrySellStation? or not @$entrySellStation.isplayerowned)">
+            <continue/>
+          </do_if>
+          <do_if value="$requirePlayerSupplierStation and (not $entryBuyStation? or not @$entryBuyStation.isplayerowned)">
+            <continue/>
+          </do_if>
+          <do_if value="$requireNonPlayerSupplierStation and (not $entryBuyStation? or @$entryBuyStation.isplayerowned)">
+            <continue/>
+          </do_if>
+        </do_if>
+        <!-- MK4 ware-type policy filter (cache-phase parity with match-phase). -->
+        <do_if value="not $entry.$IsSellOnly? and $entrySellStation?">
+          <set_value name="$entryTypeWare" exact="if $entry.$Ware? then $entry.$Ware else null"/>
+          <do_if value="$entryTypeWare == null and $entry.$BuyOffer? and @$entry.$BuyOffer.exists and @$entry.$BuyOffer.ware != null">
+            <set_value name="$entryTypeWare" exact="@$entry.$BuyOffer.ware"/>
+          </do_if>
+          <do_if value="$entryTypeWare == null and $entry.$SellOffer? and @$entry.$SellOffer.exists and @$entry.$SellOffer.ware != null">
+            <set_value name="$entryTypeWare" exact="@$entry.$SellOffer.ware"/>
+          </do_if>
+          <do_if value="$entryTypeWare?">
+            <set_value name="$mk4IsTradeWare" exact="$entrySellStation.tradewares.{$entryTypeWare}.exists"/>
+            <set_value name="$mk4IsResource" exact="$entrySellStation.resources.{$entryTypeWare}.exists"/>
+            <set_value name="$mk4IsProduct" exact="$entrySellStation.products.{$entryTypeWare}.exists"/>
+            <set_value name="$mk4IsIntermediate" exact="false"/>
+            <do_if value="$entrySellStation.resources.{$entryTypeWare}.exists and @$entrySellStation.resources.{$entryTypeWare}.intermediate">
+              <set_value name="$mk4IsIntermediate" exact="true"/>
+            </do_if>
+            <do_if value="$entrySellStation.products.{$entryTypeWare}.exists and @$entrySellStation.products.{$entryTypeWare}.intermediate">
+              <set_value name="$mk4IsIntermediate" exact="true"/>
+            </do_if>
+            <set_value name="$mk4IsPureResource" exact="$mk4IsResource and not $mk4IsIntermediate"/>
+            <set_value name="$mk4IsIntermediateOrProduct" exact="$mk4IsIntermediate or $mk4IsProduct"/>
+            <set_value name="$mk4HasKnownType" exact="$mk4IsTradeWare or $mk4IsResource or $mk4IsProduct"/>
+            <set_value name="$mk4AllowedByType" exact="false"/>
+            <do_if value="$mk4IsTradeWare and $mk4AllowTradewares">
+              <set_value name="$mk4AllowedByType" exact="true"/>
+            </do_if>
+            <do_if value="not $mk4AllowedByType and $mk4IsPureResource and $mk4AllowResources">
+              <set_value name="$mk4AllowedByType" exact="true"/>
+            </do_if>
+            <do_if value="not $mk4AllowedByType and $mk4IsIntermediateOrProduct and $mk4AllowIntermediates">
+              <set_value name="$mk4AllowedByType" exact="true"/>
+            </do_if>
+            <do_if value="$mk4HasKnownType and not $mk4AllowedByType">
               <continue/>
             </do_if>
           </do_if>
-          <do_if value="$entrySellStation?">
-            <set_value name="$distSell" exact="$homeSector.gatedistance.{$entrySellStation}"/>
-            <do_if value="$distSell lt 0 or $distSell gt $maxDistance">
-              <continue/>
-            </do_if>
+        </do_if>
+
+        <!-- Distance check with per-leg limits (fallback to generic maxDistance). -->
+        <do_if value="$maxDistanceBuyLeg gt 0 and $entryBuyStation?">
+          <set_value name="$distBuy" exact="$homeSector.gatedistance.{$entryBuyStation}"/>
+          <do_if value="$distBuy lt 0 or $distBuy gt $maxDistanceBuyLeg">
+            <continue/>
+          </do_if>
+        </do_if>
+        <do_if value="$maxDistanceSellLeg gt 0 and $entrySellStation?">
+          <set_value name="$distSell" exact="$homeSector.gatedistance.{$entrySellStation}"/>
+          <do_if value="$distSell lt 0 or $distSell gt $maxDistanceSellLeg">
+            <continue/>
           </do_if>
         </do_if>
 
@@ -177,23 +228,23 @@
 
         <!-- Build storage exclusion -->
         <do_if value="$ignoreBuildStorage">
-          <do_if value="@$entry.$BuyStation.isbuildstorage or @$entry.$SellStation.isbuildstorage">
+          <do_if value="($entryBuyStation? and @$entryBuyStation.isbuildstorage) or ($entrySellStation? and @$entrySellStation.isbuildstorage)">
             <continue/>
           </do_if>
         </do_if>
 
         <!-- Carrier / auxiliary exclusion (stations are never carriers/auxiliaries, only ships can be) -->
         <do_if value="$ignoreCarrierAux">
-          <do_if value="(@$entry.$BuyStation.isclass.ship and (@$entry.$BuyStation.type == shiptype.carrier or @$entry.$BuyStation.type == shiptype.resupplier)) or (@$entry.$SellStation.isclass.ship and (@$entry.$SellStation.type == shiptype.carrier or @$entry.$SellStation.type == shiptype.resupplier))">
+          <do_if value="($entryBuyStation? and @$entryBuyStation.isclass.ship and (@$entryBuyStation.type == shiptype.carrier or @$entryBuyStation.type == shiptype.resupplier)) or ($entrySellStation? and @$entrySellStation.isclass.ship and (@$entrySellStation.type == shiptype.carrier or @$entrySellStation.type == shiptype.resupplier))">
             <continue/>
           </do_if>
         </do_if>
 
         <!-- Station existence check -->
-        <do_if value="$entry.$BuyStation? and not @$entry.$BuyStation.exists">
+        <do_if value="$entryBuyStation? and not @$entryBuyStation.exists">
           <continue/>
         </do_if>
-        <do_if value="$entry.$SellStation? and not @$entry.$SellStation.exists">
+        <do_if value="$entrySellStation? and not @$entrySellStation.exists">
           <continue/>
         </do_if>
 

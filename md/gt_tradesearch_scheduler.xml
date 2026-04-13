@@ -64,7 +64,7 @@
         <set_value name="global.$GT_SearchSemaphore.$MK4LiveQueued" exact="table[]"/>
         <set_value name="global.$GT_SearchSemaphore.$MK4LiveActiveShips" exact="table[]"/>
         <set_value name="global.$GT_SearchSemaphore.$MK4LiveActive" exact="0"/>
-        <set_value name="global.$GT_SearchSemaphore.$MaxConcurrentMK4Live" exact="1"/>
+        <set_value name="global.$GT_SearchSemaphore.$MaxConcurrentMK4Live" exact="2"/>
         <set_value name="global.$GT_SearchSemaphore.$MK4LiveDispatchScheduled" exact="false"/>
 
         <!-- Clearance pool (dedicated sell-only live slot) -->
@@ -223,6 +223,89 @@
             </do_if>
             <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-Scheduler] HandleSearchRequest: Cleared stale live-active state for ' + $ship.idcode + ' (startedAt=' + (if $liveStartedAt? then $liveStartedAt else 'null') + ', age=' + player.age + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        <!-- Self-heal stale MK4 per-ship state before dedup checks.
+             Prevents permanent "REJECTED reason=MK4LiveActiveShips/MK4LiveQueued" when legacy entries remain. -->
+        <do_if value="$enqueueAllowed and $ship? and $ship.exists and global.$GT_SearchSemaphore?">
+          <set_value name="$mk4LiveActiveEntry" exact="if global.$GT_SearchSemaphore.$MK4LiveActiveShips? and global.$GT_SearchSemaphore.$MK4LiveActiveShips.{$ship}? then @global.$GT_SearchSemaphore.$MK4LiveActiveShips.{$ship} else null"/>
+          <set_value name="$mk4LiveStartedAt" exact="if $mk4LiveActiveEntry? and $mk4LiveActiveEntry.$StartedAt? then @$mk4LiveActiveEntry.$StartedAt else null"/>
+          <set_value name="$staleMK4LiveActive" exact="false"/>
+          <do_if value="$mk4LiveActiveEntry? and ($mk4LiveStartedAt == null or (player.age - $mk4LiveStartedAt) gt 60s)">
+            <set_value name="$staleMK4LiveActive" exact="true"/>
+          </do_if>
+          <do_if value="$staleMK4LiveActive">
+            <do_if value="global.$GT_SearchSemaphore.$MK4LiveActiveShips? and global.$GT_SearchSemaphore.$MK4LiveActiveShips.{$ship}?">
+              <remove_value name="global.$GT_SearchSemaphore.$MK4LiveActiveShips.{$ship}"/>
+              <do_if value="global.$GT_SearchSemaphore.$MK4LiveActive gt 0">
+                <set_value name="global.$GT_SearchSemaphore.$MK4LiveActive" operation="subtract"/>
+              </do_if>
+            </do_if>
+            <do_if value="global.$GT_SearchSemaphore.$PhaseStateByShip? and global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}? and (@global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship} == 'mk4live_active' or @global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship} == 'mk4live_queued')">
+              <remove_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}"/>
+            </do_if>
+            <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Scheduler] HandleSearchRequest: Cleared stale MK4 live-active state for ' + $ship.idcode + ' (startedAt=' + (if $mk4LiveStartedAt? then $mk4LiveStartedAt else 'null') + ', age=' + player.age + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+          <set_value name="$staleMK4Queued" exact="false"/>
+          <do_if value="global.$GT_SearchSemaphore.$MK4LiveQueued? and global.$GT_SearchSemaphore.$MK4LiveQueued.{$ship}?">
+            <set_value name="$mk4StillQueued" exact="false"/>
+            <do_if value="global.$GT_SearchSemaphore.$MK4LiveQueue? and global.$GT_SearchSemaphore.$MK4LiveQueue.count gt 0">
+              <do_all exact="global.$GT_SearchSemaphore.$MK4LiveQueue.count" counter="$mk4qi">
+                <do_if value="@global.$GT_SearchSemaphore.$MK4LiveQueue.{$mk4qi}.$Ship == $ship">
+                  <set_value name="$mk4StillQueued" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <do_if value="not $mk4StillQueued">
+              <set_value name="$staleMK4Queued" exact="true"/>
+            </do_if>
+          </do_if>
+          <do_if value="$staleMK4Queued">
+            <remove_value name="global.$GT_SearchSemaphore.$MK4LiveQueued.{$ship}"/>
+            <do_if value="global.$GT_SearchSemaphore.$PhaseStateByShip? and global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}? and @global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship} == 'mk4live_queued'">
+              <remove_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}"/>
+            </do_if>
+            <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Scheduler] HandleSearchRequest: Cleared stale MK4 queued marker for ' + $ship.idcode + ' (age=' + player.age + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        <!-- Self-heal orphaned phase state markers when ship is not present in any queue/active table.
+             Prevents permanent dedup rejection caused by stale PhaseStateByShip entries. -->
+        <do_if value="$enqueueAllowed and $ship? and $ship.exists and global.$GT_SearchSemaphore? and global.$GT_SearchSemaphore.$PhaseStateByShip? and global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}?">
+          <set_value name="$phaseHasBackingState" exact="false"/>
+          <do_if value="global.$GT_SearchSemaphore.$CacheQueued? and global.$GT_SearchSemaphore.$CacheQueued.{$ship}?">
+            <set_value name="$phaseHasBackingState" exact="true"/>
+          </do_if>
+          <do_if value="not $phaseHasBackingState and global.$GT_SearchSemaphore.$CacheActiveShips? and global.$GT_SearchSemaphore.$CacheActiveShips.{$ship}?">
+            <set_value name="$phaseHasBackingState" exact="true"/>
+          </do_if>
+          <do_if value="not $phaseHasBackingState and global.$GT_SearchSemaphore.$LiveQueued? and global.$GT_SearchSemaphore.$LiveQueued.{$ship}?">
+            <set_value name="$phaseHasBackingState" exact="true"/>
+          </do_if>
+          <do_if value="not $phaseHasBackingState and global.$GT_SearchSemaphore.$LiveActiveShips? and global.$GT_SearchSemaphore.$LiveActiveShips.{$ship}?">
+            <set_value name="$phaseHasBackingState" exact="true"/>
+          </do_if>
+          <do_if value="not $phaseHasBackingState and global.$GT_SearchSemaphore.$MK4LiveQueued? and global.$GT_SearchSemaphore.$MK4LiveQueued.{$ship}?">
+            <set_value name="$phaseHasBackingState" exact="true"/>
+          </do_if>
+          <do_if value="not $phaseHasBackingState and global.$GT_SearchSemaphore.$MK4LiveActiveShips? and global.$GT_SearchSemaphore.$MK4LiveActiveShips.{$ship}?">
+            <set_value name="$phaseHasBackingState" exact="true"/>
+          </do_if>
+          <do_if value="not $phaseHasBackingState and global.$GT_SearchSemaphore.$ClearanceQueued? and global.$GT_SearchSemaphore.$ClearanceQueued.{$ship}?">
+            <set_value name="$phaseHasBackingState" exact="true"/>
+          </do_if>
+          <do_if value="not $phaseHasBackingState and global.$GT_SearchSemaphore.$ClearanceActiveShips? and global.$GT_SearchSemaphore.$ClearanceActiveShips.{$ship}?">
+            <set_value name="$phaseHasBackingState" exact="true"/>
+          </do_if>
+          <do_if value="not $phaseHasBackingState">
+            <remove_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}"/>
+            <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Scheduler] HandleSearchRequest: Cleared orphaned phase-state marker for ' + $ship.idcode + ' (age=' + player.age + ')'" chance="100"/>
             </do_if>
           </do_if>
         </do_if>
@@ -433,6 +516,37 @@
       <actions>
         <do_if value="not global.$GT_SearchSemaphore?">
           <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.InitSearchSemaphore"/>
+        </do_if>
+        <!-- Global self-heal for stale MK4 live-active slots.
+             Needed when legacy/aborted entries keep MK4LiveActive at capacity and block all new dispatches. -->
+        <do_if value="global.$GT_SearchSemaphore.$MK4LiveActiveShips? and global.$GT_SearchSemaphore.$MK4LiveActiveShips.keys.count gt 0">
+          <set_value name="$mk4ActiveKeys" exact="global.$GT_SearchSemaphore.$MK4LiveActiveShips.keys.list"/>
+          <do_all exact="$mk4ActiveKeys.count" counter="$maki">
+            <set_value name="$mk4ActiveShip" exact="$mk4ActiveKeys.{$maki}"/>
+            <set_value name="$mk4ActiveEntry" exact="if $mk4ActiveShip? and global.$GT_SearchSemaphore.$MK4LiveActiveShips.{$mk4ActiveShip}? then @global.$GT_SearchSemaphore.$MK4LiveActiveShips.{$mk4ActiveShip} else null"/>
+            <set_value name="$mk4ActiveStartedAt" exact="if $mk4ActiveEntry? and $mk4ActiveEntry.$StartedAt? then @$mk4ActiveEntry.$StartedAt else null"/>
+            <set_value name="$mk4ActiveStale" exact="false"/>
+            <do_if value="not $mk4ActiveShip? or ($mk4ActiveShip? and not $mk4ActiveShip.exists)">
+              <set_value name="$mk4ActiveStale" exact="true"/>
+            </do_if>
+            <do_if value="not $mk4ActiveStale and ($mk4ActiveStartedAt == null or (player.age - $mk4ActiveStartedAt) gt 60s)">
+              <set_value name="$mk4ActiveStale" exact="true"/>
+            </do_if>
+            <do_if value="$mk4ActiveStale">
+              <do_if value="$mk4ActiveShip? and global.$GT_SearchSemaphore.$MK4LiveActiveShips.{$mk4ActiveShip}?">
+                <remove_value name="global.$GT_SearchSemaphore.$MK4LiveActiveShips.{$mk4ActiveShip}"/>
+              </do_if>
+              <do_if value="global.$GT_SearchSemaphore.$MK4LiveActive gt 0">
+                <set_value name="global.$GT_SearchSemaphore.$MK4LiveActive" operation="subtract"/>
+              </do_if>
+              <do_if value="$mk4ActiveShip? and global.$GT_SearchSemaphore.$PhaseStateByShip? and global.$GT_SearchSemaphore.$PhaseStateByShip.{$mk4ActiveShip}? and @global.$GT_SearchSemaphore.$PhaseStateByShip.{$mk4ActiveShip} == 'mk4live_active'">
+                <remove_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$mk4ActiveShip}"/>
+              </do_if>
+              <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Scheduler] DispatchMK4LiveSearchGo: Cleared stale MK4 active slot owner=' + (if $mk4ActiveShip? then $mk4ActiveShip.idcode else 'null') + ' startedAt=' + (if $mk4ActiveStartedAt? then $mk4ActiveStartedAt else 'null') + ' age=' + player.age" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_all>
         </do_if>
 
         <do_if value="global.$GT_SearchSemaphore.$MK4LiveQueue.count gt 0 and global.$GT_SearchSemaphore.$MK4LiveActive ge global.$GT_SearchSemaphore.$MaxConcurrentMK4Live">

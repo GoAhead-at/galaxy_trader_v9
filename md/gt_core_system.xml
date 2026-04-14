@@ -229,14 +229,19 @@
         
         <!-- Validate ship -->
         <do_if value="$ship.isplayerowned and $ship.primarypurpose == purpose.trade">
+          <run_actions ref="md.GT_CoreSystem.IsShipInRegistry" result="$shipInRegistry">
+            <param name="ship" value="$ship"/>
+          </run_actions>
           <!-- Check if already registered -->
-          <do_if value="not global.$GT_Ships.{$ship}?">
+          <do_if value="not $shipInRegistry">
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GalaxyTrader MK3] Registering new trading ship: ' + $ship.knownname" chance="100"/>
             </do_if>
             
             <!-- Create ship data structure -->
-            <set_value name="global.$GT_Ships.{$ship}" exact="table[]"/>
+            <run_actions ref="md.GT_CoreSystem.EnsureShipRegistryEntry">
+              <param name="ship" value="$ship"/>
+            </run_actions>
             <set_value name="global.$GT_Ships.{$ship}.$RegisterTime" exact="player.age"/>
             <set_value name="global.$GT_Ships.{$ship}.$Level" exact="1"/>
             <set_value name="global.$GT_Ships.{$ship}.$XP" exact="0"/>
@@ -249,7 +254,9 @@
             <set_value name="global.$GT_Ships.{$ship}.$ThreatReports" exact="0"/>
             <set_value name="global.$GT_Ships.{$ship}.$LastThreatTime" exact="0"/>
             <set_value name="global.$GT_Ships.{$ship}.$Territory" exact="null"/>
-            <set_value name="global.$GT_Ships.{$ship}.$LastUpdate" exact="player.age"/>
+            <run_actions ref="md.GT_CoreSystem.TouchShipRegistryLastUpdate">
+              <param name="ship" value="$ship"/>
+            </run_actions>
             
             <!-- Notify player (respect FleetUpdates setting) -->
             <do_if value="global.$GT_Config? and global.$GT_Config.$Notifications? and global.$GT_Config.$Notifications.$FleetUpdates">
@@ -375,17 +382,17 @@
           
           <!-- Retry a few times while relationships/pilot bindings settle. -->
           <do_if value="$unresolvedSubs.count gt 0 and $attempt lt 5">
-            <signal_cue_instantly cue="md.GT_CoreSystem.ProcessCommanderGTReactivation" param="table[
-              $Commander = $commander,
-              $Attempt = $attempt + 1,
-              $PendingSubs = $unresolvedSubs
-            ]"/>
+            <run_actions ref="md.GT_CoreSystem.QueueProcessCommanderGTReactivation">
+              <param name="commander" value="$commander"/>
+              <param name="attempt" value="$attempt + 1"/>
+              <param name="pendingSubs" value="$unresolvedSubs"/>
+            </run_actions>
           </do_if>
           <do_elseif value="$retryAll and $attempt lt 5">
-            <signal_cue_instantly cue="md.GT_CoreSystem.ProcessCommanderGTReactivation" param="table[
-              $Commander = $commander,
-              $Attempt = $attempt + 1
-            ]"/>
+            <run_actions ref="md.GT_CoreSystem.QueueProcessCommanderGTReactivation">
+              <param name="commander" value="$commander"/>
+              <param name="attempt" value="$attempt + 1"/>
+            </run_actions>
           </do_elseif>
         </do_if>
       </actions>
@@ -443,18 +450,18 @@
           <!-- Process transitions for known commanders (current or historical). -->
           <do_if value="$isCommanderNow or $wasCommanderKnown">
             <do_if value="$isGTActive and not $prevActive">
-              <signal_cue_instantly cue="md.GT_CoreSystem.ProcessCommanderGTReactivation" param="table[
-                $Commander = $commander,
-                $Attempt = 1
-              ]"/>
+              <run_actions ref="md.GT_CoreSystem.QueueProcessCommanderGTReactivation">
+                <param name="commander" value="$commander"/>
+                <param name="attempt" value="1"/>
+              </run_actions>
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <debug_text text="'[GT-Core] Commander GT state transition: ACTIVE for ' + $commander.idcode + ' (source=' + (if $payload.$Source? then $payload.$Source else 'unknown') + ', subCount=' + $reportedSubCount + ')'" chance="100"/>
               </do_if>
             </do_if>
             <do_elseif value="not $isGTActive and $prevActive">
-              <signal_cue_instantly cue="md.GT_CoreSystem.VerifyCommanderSubordinateCleanup" param="table[
-                $Commander = $commander
-              ]"/>
+              <run_actions ref="md.GT_CoreSystem.QueueVerifyCommanderSubordinateCleanup">
+                <param name="commander" value="$commander"/>
+              </run_actions>
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <debug_text text="'[GT-Core] Commander GT state transition: INACTIVE for ' + $commander.idcode + ' (source=' + (if $payload.$Source? then $payload.$Source else 'unknown') + ', subCount=' + $reportedSubCount + ')'" chance="100"/>
               </do_if>
@@ -466,6 +473,563 @@
         </do_if>
       </actions>
     </cue>
+
+    <!-- Shared scheduler for commander GT reactivation processing. -->
+    <library name="QueueProcessCommanderGTReactivation" purpose="run_actions">
+      <params>
+        <param name="commander"/>
+        <param name="attempt" default="1"/>
+        <param name="pendingSubs" default="null"/>
+      </params>
+      <actions>
+        <signal_cue_instantly cue="md.GT_CoreSystem.ProcessCommanderGTReactivation" param="table[
+          $Commander = $commander,
+          $Attempt = $attempt,
+          $PendingSubs = $pendingSubs
+        ]"/>
+      </actions>
+    </library>
+
+    <!-- Shared scheduler for delayed commander subordinate cleanup verification. -->
+    <library name="QueueVerifyCommanderSubordinateCleanup" purpose="run_actions">
+      <params>
+        <param name="commander"/>
+      </params>
+      <actions>
+        <signal_cue_instantly cue="md.GT_CoreSystem.VerifyCommanderSubordinateCleanup" param="table[
+          $Commander = $commander
+        ]"/>
+      </actions>
+    </library>
+
+    <!-- Shared GT-control checker for vanilla pilot assignment/finalize flows. -->
+    <library name="DeterminePilotAssignmentHasGTOrder" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+      </params>
+      <actions>
+        <set_value name="$hasGTOrder" exact="false"/>
+        <run_actions ref="md.GT_Ship_State_Utilities.GT_CheckGTOrderStatus" result="$gtStatus">
+          <param name="ship" value="$ship"/>
+          <param name="checkRegistry" value="false"/>
+          <param name="checkState" value="false"/>
+        </run_actions>
+        <do_if value="$gtStatus.$IsGTControlled">
+          <set_value name="$hasGTOrder" exact="true"/>
+        </do_if>
+        <!-- Pilot-exchange flow can be active while defaultorder is not yet a GT order. -->
+        <do_if value="not $hasGTOrder and $ship.order? and @$ship.order.id == 'DockAndPilotExchange' and global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$PilotExchange? and global.$GT_Ships.{$ship}.$PilotExchange">
+          <set_value name="$hasGTOrder" exact="true"/>
+        </do_if>
+        <return value="$hasGTOrder"/>
+      </actions>
+    </library>
+
+    <!-- Guarded pilot-registration helper for call sites that already check availability. -->
+    <library name="TryRegisterPilotForShip" purpose="run_actions">
+      <params>
+        <param name="pilot"/>
+        <param name="ship"/>
+      </params>
+      <actions>
+        <set_value name="$didRegister" exact="false"/>
+        <do_if value="md.GT_Ship_Management.Register_Pilot?">
+          <run_actions ref="md.GT_Ship_Management.Register_Pilot">
+            <param name="pilot" value="$pilot"/>
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          <set_value name="$didRegister" exact="true"/>
+        </do_if>
+        <return value="$didRegister"/>
+      </actions>
+    </library>
+
+    <!-- Guarded pilot-tag updater (optionally with explicit level override). -->
+    <library name="TryUpdatePilotNameTag" purpose="run_actions">
+      <params>
+        <param name="pilot"/>
+        <param name="level" default="null"/>
+      </params>
+      <actions>
+        <do_if value="md.GT_Ship_Management.Update_Pilot_Name_Tag?">
+          <do_if value="$level? and $level != null">
+            <run_actions ref="md.GT_Ship_Management.Update_Pilot_Name_Tag">
+              <param name="pilot" value="$pilot"/>
+              <param name="level" value="$level"/>
+            </run_actions>
+          </do_if>
+          <do_else>
+            <run_actions ref="md.GT_Ship_Management.Update_Pilot_Name_Tag">
+              <param name="pilot" value="$pilot"/>
+            </run_actions>
+          </do_else>
+        </do_if>
+      </actions>
+    </library>
+
+    <!-- Shared scheduler for delayed orphan verification checks. -->
+    <library name="QueueVerifyShipOrphaned" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="source" default="'unknown'"/>
+        <param name="traceId" default="'NONE'"/>
+      </params>
+      <actions>
+        <signal_cue_instantly cue="md.GT_CoreSystem.VerifyShipOrphaned" param="table[
+          $Ship = $ship,
+          $Source = $source,
+          $TraceId = $traceId
+        ]"/>
+      </actions>
+    </library>
+
+    <!-- Shared event emitter: request orphan check with basic payload. -->
+    <library name="QueueCheckShipOrphaned" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+      </params>
+      <actions>
+        <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[
+          $Ship = $ship
+        ]"/>
+      </actions>
+    </library>
+
+    <!-- Shared event emitter: request orphan check with full trace payload. -->
+    <library name="QueueCheckShipOrphanedDetailed" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="force" default="true"/>
+        <param name="source" default="'unknown'"/>
+        <param name="traceId" default="'NONE'"/>
+      </params>
+      <actions>
+        <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[
+          $Ship = $ship,
+          $Force = $force,
+          $Source = $source,
+          $TraceId = $traceId
+        ]"/>
+      </actions>
+    </library>
+
+    <!-- Build normalized orphan-check context from defaults + optional payload overrides. -->
+    <library name="BuildOrphanCheckContext" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="payload" default="null"/>
+        <param name="defaultSource" default="'UNKNOWN'"/>
+        <param name="defaultTraceTag" default="'CHECK_ORPHANED'"/>
+      </params>
+      <actions>
+        <set_value name="$context" exact="table[
+          $Source = $defaultSource,
+          $TraceId = if $ship? and $ship.exists then $ship.idcode + '|' + $defaultTraceTag + '|' + (player.age / 1s)i else 'UNKNOWN|' + $defaultTraceTag + '|' + (player.age / 1s)i,
+          $Force = false
+        ]"/>
+        <do_if value="$payload? and $payload.$Force? and $payload.$Force">
+          <set_value name="$context.$Force" exact="true"/>
+        </do_if>
+        <do_if value="$payload? and $payload.$Source?">
+          <set_value name="$context.$Source" exact="$payload.$Source"/>
+        </do_if>
+        <do_if value="$payload? and $payload.$TraceId?">
+          <set_value name="$context.$TraceId" exact="$payload.$TraceId"/>
+        </do_if>
+        <return value="$context"/>
+      </actions>
+    </library>
+
+    <!-- Shared GT ship-registry membership checker. -->
+    <library name="IsShipInRegistry" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+      </params>
+      <actions>
+        <set_value name="$inRegistry" exact="false"/>
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
+          <set_value name="$inRegistry" exact="true"/>
+        </do_if>
+        <return value="$inRegistry"/>
+      </actions>
+    </library>
+
+    <!-- Ensure GT ship-registry root + per-ship entry table exist. -->
+    <library name="EnsureShipRegistryEntry" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+      </params>
+      <actions>
+        <do_if value="not global.$GT_Ships?">
+          <set_value name="global.$GT_Ships" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_Ships.{$ship}?">
+          <set_value name="global.$GT_Ships.{$ship}" exact="table[]"/>
+        </do_if>
+      </actions>
+    </library>
+
+    <!-- Shared ship-registry timestamp touch helper. -->
+    <library name="TouchShipRegistryLastUpdate" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+      </params>
+      <actions>
+        <set_value name="global.$GT_Ships.{$ship}.$LastUpdate" exact="player.age"/>
+      </actions>
+    </library>
+
+    <!-- Shared wrapper for ship-name refresh scheduling. -->
+    <library name="RequestShipNameRefresh" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="pilot"/>
+        <param name="reason" default="'unknown'"/>
+      </params>
+      <actions>
+        <run_actions ref="md.GT_Ship_State_Utilities.GT_RequestShipNameRefresh">
+          <param name="ship" value="$ship"/>
+          <param name="pilot" value="$pilot"/>
+          <param name="reason" value="$reason"/>
+        </run_actions>
+      </actions>
+    </library>
+
+    <!-- Guarded helper: request ship-name refresh only for known pilot records. -->
+    <library name="MaybeRequestShipNameRefreshForPilot" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="reason" default="'unknown'"/>
+      </params>
+      <actions>
+        <do_if value="$ship.pilot and global.$GT_Pilots.{$ship.pilot}? and md.GT_Ship_Management.Update_Pilot_Ship_Name?">
+          <run_actions ref="md.GT_CoreSystem.RequestShipNameRefresh">
+            <param name="ship" value="$ship"/>
+            <param name="pilot" value="$ship.pilot"/>
+            <param name="reason" value="$reason"/>
+          </run_actions>
+        </do_if>
+      </actions>
+    </library>
+
+    <!-- Shared event emit for fleet blacklist application refresh. -->
+    <library name="QueueApplyBlacklistToFleet" purpose="run_actions">
+      <actions>
+        <signal_cue_instantly cue="md.GT_ThreatIntelligence.ApplyBlacklistToFleet"/>
+      </actions>
+    </library>
+
+    <!-- Shared post-registration side-effects for both registration paths. -->
+    <library name="FinalizeShipRegistrationSideEffects" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="nameRefreshReason" default="'unknown'"/>
+      </params>
+      <actions>
+        <run_actions ref="md.GT_CoreSystem.MaybeRequestShipNameRefreshForPilot">
+          <param name="ship" value="$ship"/>
+          <param name="reason" value="$nameRefreshReason"/>
+        </run_actions>
+        <run_actions ref="md.GT_CoreSystem.QueueApplyBlacklistToFleet"/>
+      </actions>
+    </library>
+
+    <!-- Restore paused training requirements after temporary pilot pause/resume flows. -->
+    <library name="RestorePausedTrainingStateIfNeeded" purpose="run_actions">
+      <params>
+        <param name="pilot"/>
+        <param name="debugLabel" default="'TRAINING STATE RESTORED'"/>
+      </params>
+      <actions>
+        <do_if value="$pilot and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}? and global.$GT_Pilots.{$pilot}.$PausedWithTrainingNeeded?">
+          <set_value name="global.$GT_Pilots.{$pilot}.$XPBlocked" exact="true"/>
+          <set_value name="global.$GT_Pilots.{$pilot}.$BlockedLevel" exact="global.$GT_Pilots.{$pilot}.$PausedBlockedLevel"/>
+          <remove_value name="global.$GT_Pilots.{$pilot}.$PausedWithTrainingNeeded"/>
+          <remove_value name="global.$GT_Pilots.{$pilot}.$PausedBlockedLevel"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GalaxyTrader MK3] ' + $debugLabel + ': Pilot ' + $pilot.name + ' still needs level ' + global.$GT_Pilots.{$pilot}.$BlockedLevel + ' training'" chance="100"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </library>
+
+    <!-- Mark orphan verify pending once and queue delayed verification. -->
+    <library name="QueueOrphanVerifyIfNotPending" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="source" default="'unknown'"/>
+        <param name="traceId" default="'NONE'"/>
+      </params>
+      <actions>
+        <do_if value="not global.$GT_OrphanVerifyPending?">
+          <set_value name="global.$GT_OrphanVerifyPending" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_OrphanVerifyPending.{$ship}?">
+          <set_value name="global.$GT_OrphanVerifyPending.{$ship}" exact="player.age"/>
+          <run_actions ref="md.GT_CoreSystem.QueueVerifyShipOrphaned">
+            <param name="ship" value="$ship"/>
+            <param name="source" value="$source"/>
+            <param name="traceId" value="$traceId"/>
+          </run_actions>
+        </do_if>
+      </actions>
+    </library>
+
+    <!-- Shared original-name resolver for cleanup payloads. -->
+    <library name="GetOriginalShipNameForCleanup" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+      </params>
+      <actions>
+        <set_value name="$originalName" exact="null"/>
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$OriginalShipName?">
+          <set_value name="$originalName" exact="global.$GT_Ships.{$ship}.$OriginalShipName"/>
+        </do_if>
+        <do_elseif value="$ship.pilot? and global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$OriginalShipName?">
+          <set_value name="$originalName" exact="global.$GT_Pilots.{$ship.pilot}.$OriginalShipName"/>
+        </do_elseif>
+        <do_elseif value="$ship.macro?">
+          <set_value name="$originalName" exact="@$ship.macro.name"/>
+        </do_elseif>
+        <return value="$originalName"/>
+      </actions>
+    </library>
+
+    <!-- Return original ship name from ship registry only (no pilot/macro fallback). -->
+    <library name="GetShipRegistryOriginalName" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+      </params>
+      <actions>
+        <set_value name="$originalName" exact="null"/>
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$OriginalShipName?">
+          <set_value name="$originalName" exact="global.$GT_Ships.{$ship}.$OriginalShipName"/>
+        </do_if>
+        <return value="$originalName"/>
+      </actions>
+    </library>
+
+    <!-- Shared cleanup signal emitter for standard order-aborted payloads. -->
+    <library name="EmitShipOrderAborted" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="pilot" default="null"/>
+        <param name="reason" default="'unknown'"/>
+        <param name="originalName" default="null"/>
+      </params>
+      <actions>
+        <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
+          $Ship = $ship,
+          $Pilot = $pilot,
+          $Reason = $reason,
+          $OriginalName = $originalName
+        ]"/>
+      </actions>
+    </library>
+
+    <!-- Resolve cleanup original-name chain and emit standard order-aborted payload. -->
+    <library name="EmitShipOrderAbortedWithResolvedName" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="pilot" default="null"/>
+        <param name="reason" default="'unknown'"/>
+      </params>
+      <actions>
+        <run_actions ref="md.GT_CoreSystem.GetOriginalShipNameForCleanup" result="$originalName">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        <run_actions ref="md.GT_CoreSystem.EmitShipOrderAborted">
+          <param name="ship" value="$ship"/>
+          <param name="pilot" value="$pilot"/>
+          <param name="reason" value="$reason"/>
+          <param name="originalName" value="$originalName"/>
+        </run_actions>
+      </actions>
+    </library>
+
+    <!-- Shared pilot-link synchronizer for vanilla reassignment/finalize flows.
+         clearPausedFields is explicit because some paths intentionally keep pause metadata. -->
+    <library name="SyncPilotShipLinkState" purpose="run_actions">
+      <params>
+        <param name="pilot"/>
+        <param name="ship"/>
+        <param name="hasGTOrder" default="false"/>
+        <param name="clearPausedFields" default="false"/>
+      </params>
+      <actions>
+        <do_if value="$pilot and $ship and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}?">
+          <set_value name="global.$GT_Pilots.{$pilot}.$ShipID" exact="$ship.idcode"/>
+          <do_if value="$pilot.idcode?">
+            <set_value name="global.$GT_Pilots.{$pilot}.$PilotID" exact="$pilot.idcode"/>
+          </do_if>
+          <do_elseif value="not global.$GT_Pilots.{$pilot}.$PilotID?">
+            <set_value name="global.$GT_Pilots.{$pilot}.$PilotID" exact="''"/>
+          </do_elseif>
+          <do_if value="$hasGTOrder">
+            <set_value name="global.$GT_Pilots.{$pilot}.$Status" exact="'active'"/>
+            <set_value name="global.$GT_Pilots.{$pilot}.$AssociatedShip" exact="$ship"/>
+            <set_value name="global.$GT_Pilots.{$pilot}.$Ship" exact="$ship"/>
+            <set_value name="global.$GT_Pilots.{$pilot}.$ResumedTime" exact="player.age"/>
+          </do_if>
+          <do_else>
+            <set_value name="global.$GT_Pilots.{$pilot}.$Status" exact="'paused'"/>
+            <remove_value name="global.$GT_Pilots.{$pilot}.$AssociatedShip"/>
+            <remove_value name="global.$GT_Pilots.{$pilot}.$Ship"/>
+          </do_else>
+          <do_if value="$clearPausedFields">
+            <remove_value name="global.$GT_Pilots.{$pilot}.$PausedTime"/>
+            <remove_value name="global.$GT_Pilots.{$pilot}.$PausedReason"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </library>
+
+    <!-- Shared scheduler for delayed vanilla pilot finalize retries/deferrals. -->
+    <library name="QueueFinalizeVanillaPilotAssignment" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="source" default="'unknown'"/>
+        <param name="newPilot" default="null"/>
+        <param name="newPilotTemplate" default="null"/>
+        <param name="attempt" default="1"/>
+      </params>
+      <actions>
+        <signal_cue_instantly cue="md.GT_CoreSystem.FinalizeVanillaPilotAssignmentForGT" param="table[
+          $Ship = $ship,
+          $source = $source,
+          $newPilot = $newPilot,
+          $newPilotTemplate = $newPilotTemplate,
+          $attempt = $attempt
+        ]"/>
+      </actions>
+    </library>
+
+    <!-- Shared bounded retry helper for delayed vanilla pilot finalize. -->
+    <library name="MaybeRetryFinalizeVanillaPilotAssignment" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="source" default="'unknown'"/>
+        <param name="newPilot" default="null"/>
+        <param name="newPilotTemplate" default="null"/>
+        <param name="attempt" default="1"/>
+        <param name="maxAttempts" default="5"/>
+      </params>
+      <actions>
+        <do_if value="$attempt lt $maxAttempts">
+          <run_actions ref="md.GT_CoreSystem.QueueFinalizeVanillaPilotAssignment">
+            <param name="ship" value="$ship"/>
+            <param name="source" value="$source"/>
+            <param name="newPilot" value="$newPilot"/>
+            <param name="newPilotTemplate" value="$newPilotTemplate"/>
+            <param name="attempt" value="$attempt + 1"/>
+          </run_actions>
+        </do_if>
+      </actions>
+    </library>
+
+    <!-- Shared deferred pilot-tag refresh scheduler. -->
+    <library name="QueueDeferredPilotTagRefresh" purpose="run_actions">
+      <params>
+        <param name="pilot"/>
+        <param name="source" default="'unknown'"/>
+      </params>
+      <actions>
+        <signal_cue_instantly cue="DeferredPilotTagRefresh" param="table[
+          $pilot = $pilot,
+          $source = $source
+        ]"/>
+      </actions>
+    </library>
+
+    <!-- Shared scheduler for stable-key identity resolution cues. -->
+    <library name="QueueResolvePilotIdentityByStable" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="stable" default="''"/>
+        <param name="template" default="null"/>
+        <param name="source" default="'unknown'"/>
+        <param name="attempt" default="1"/>
+      </params>
+      <actions>
+        <signal_cue_instantly cue="ResolvePilotIdentityByStable" param="table[
+          $Ship = $ship,
+          $stable = $stable,
+          $template = $template,
+          $source = $source,
+          $attempt = $attempt
+        ]"/>
+      </actions>
+    </library>
+
+    <!-- Shared scheduler for demoted-pilot identity resolution cues. -->
+    <library name="QueueResolveDemotedPilotIdentity" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="oldPilot" default="null"/>
+        <param name="baseName" default="''"/>
+        <param name="oldStable" default="''"/>
+        <param name="oldTemplate" default="null"/>
+        <param name="attempt" default="1"/>
+      </params>
+      <actions>
+        <signal_cue_instantly cue="md.GT_CoreSystem.ResolveDemotedPilotIdentity" param="table[
+          $Ship = $ship,
+          $oldPilot = $oldPilot,
+          $baseName = $baseName,
+          $oldStable = $oldStable,
+          $oldTemplate = $oldTemplate,
+          $attempt = $attempt
+        ]"/>
+      </actions>
+    </library>
+
+    <!-- Shared bounded retry helper for ResolveDemotedPilotIdentity. -->
+    <library name="MaybeRetryResolveDemotedPilotIdentity" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="oldPilot" default="null"/>
+        <param name="baseName" default="''"/>
+        <param name="oldStable" default="''"/>
+        <param name="oldTemplate" default="null"/>
+        <param name="attempt" default="1"/>
+        <param name="maxAttempts" default="31"/>
+      </params>
+      <actions>
+        <do_if value="$attempt lt $maxAttempts">
+          <run_actions ref="md.GT_CoreSystem.QueueResolveDemotedPilotIdentity">
+            <param name="ship" value="$ship"/>
+            <param name="oldPilot" value="$oldPilot"/>
+            <param name="baseName" value="$baseName"/>
+            <param name="oldStable" value="$oldStable"/>
+            <param name="oldTemplate" value="$oldTemplate"/>
+            <param name="attempt" value="$attempt + 1"/>
+          </run_actions>
+        </do_if>
+      </actions>
+    </library>
+
+    <!-- Shared bounded retry helper for ResolvePilotIdentityByStable. -->
+    <library name="MaybeRetryResolvePilotIdentityByStable" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="stable" default="''"/>
+        <param name="template" default="null"/>
+        <param name="source" default="'unknown'"/>
+        <param name="attempt" default="1"/>
+        <param name="maxAttempts" default="31"/>
+      </params>
+      <actions>
+        <do_if value="$attempt lt $maxAttempts">
+          <run_actions ref="md.GT_CoreSystem.QueueResolvePilotIdentityByStable">
+            <param name="ship" value="$ship"/>
+            <param name="stable" value="$stable"/>
+            <param name="template" value="$template"/>
+            <param name="source" value="$source"/>
+            <param name="attempt" value="$attempt + 1"/>
+          </run_actions>
+        </do_if>
+      </actions>
+    </library>
     
     <!-- Global vanilla crew assignment hook.
          Tracks pilot swaps even when no GT order is currently running. -->
@@ -514,19 +1078,9 @@
             <set_value name="$newPilotName" exact="$newPilotRaw.name"/>
           </do_elseif>
           
-          <set_value name="$hasGTOrder" exact="false"/>
-          <do_if value="$ship.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.defaultorder.id})">
-            <set_value name="$hasGTOrder" exact="true"/>
-          </do_if>
-          <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.exists and $ship.commander.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.commander.defaultorder.id})">
-            <set_value name="$hasGTOrder" exact="true"/>
-          </do_elseif>
-          <do_elseif value="$ship.commander? and $ship.commander.exists and $ship.commander.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.commander.defaultorder.id})">
-            <set_value name="$hasGTOrder" exact="true"/>
-          </do_elseif>
-          <do_elseif value="$ship.order? and @$ship.order.id == 'DockAndPilotExchange' and global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$PilotExchange? and global.$GT_Ships.{$ship}.$PilotExchange">
-            <set_value name="$hasGTOrder" exact="true"/>
-          </do_elseif>
+          <run_actions ref="md.GT_CoreSystem.DeterminePilotAssignmentHasGTOrder" result="$hasGTOrder">
+            <param name="ship" value="$ship"/>
+          </run_actions>
           
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-Core] Vanilla pilot assignment detected: ship=' + $ship.idcode + ', old=' + $oldPilotName + (if $oldPilot and $oldPilot.idcode? then ' [' + $oldPilot.idcode + ']' else '') + ', oldTpl=' + (if $oldPilotTemplate? then $oldPilotTemplate else 'NONE') + ', new=' + $newPilotName + (if $newPilot and $newPilot.idcode? then ' [' + $newPilot.idcode + ']' else '') + ', newTpl=' + (if $newPilotTemplate? then $newPilotTemplate else 'NONE') + ', hasGTOrder=' + $hasGTOrder" chance="100"/>
@@ -535,57 +1089,60 @@
           <!-- Re-check after vanilla settles to reliably capture final promoted pilot entity.
                Run regardless of current GT order so delayed vanilla pilot binding is still reconciled
                before the player assigns a fresh GT order to the ship. -->
-          <signal_cue_instantly cue="md.GT_CoreSystem.FinalizeVanillaPilotAssignmentForGT" param="table[
-            $Ship = $ship,
-            $source = 'vanilla_assignment_event',
-            $newPilot = $newPilot,
-            $newPilotTemplate = $newPilotTemplate,
-            $attempt = 1
-          ]"/>
+          <run_actions ref="md.GT_CoreSystem.QueueFinalizeVanillaPilotAssignment">
+            <param name="ship" value="$ship"/>
+            <param name="source" value="'vanilla_assignment_event'"/>
+            <param name="newPilot" value="$newPilot"/>
+            <param name="newPilotTemplate" value="$newPilotTemplate"/>
+            <param name="attempt" value="1"/>
+          </run_actions>
           
           <!-- Preserve outgoing GT pilot progression even without active GT order. -->
           <do_if value="$oldPilot and $oldPilot.exists and global.$GT_Pilots? and global.$GT_Pilots.{$oldPilot}? and $oldPilot != $newPilot">
-            <set_value name="global.$GT_Pilots.{$oldPilot}.$Status" exact="'paused'"/>
+            <run_actions ref="md.GT_CoreSystem.SyncPilotShipLinkState">
+              <param name="pilot" value="$oldPilot"/>
+              <param name="ship" value="$ship"/>
+              <param name="hasGTOrder" value="false"/>
+              <param name="clearPausedFields" value="false"/>
+            </run_actions>
             <set_value name="global.$GT_Pilots.{$oldPilot}.$PausedTime" exact="player.age"/>
             <set_value name="global.$GT_Pilots.{$oldPilot}.$PausedReason" exact="'Vanilla pilot reassignment - preserving GT XP data'"/>
-            <set_value name="global.$GT_Pilots.{$oldPilot}.$ShipID" exact="$ship.idcode"/>
-            <remove_value name="global.$GT_Pilots.{$oldPilot}.$AssociatedShip"/>
-            <remove_value name="global.$GT_Pilots.{$oldPilot}.$Ship"/>
             <!-- Ensure outgoing GT pilot keeps the (T:xx) prefix after being moved to crew. -->
-            <signal_cue_instantly cue="DeferredPilotTagRefresh" param="table[
-              $pilot = $oldPilot,
-              $source = 'vanilla_reassignment_oldpilot'
-            ]"/>
+            <run_actions ref="md.GT_CoreSystem.QueueDeferredPilotTagRefresh">
+              <param name="pilot" value="$oldPilot"/>
+              <param name="source" value="'vanilla_reassignment_oldpilot'"/>
+            </run_actions>
             <!-- Vanilla may rebind demoted pilot to a new crew actor id.
                  Resolve identity to the service-crew actor so UI and GT data stay aligned. -->
             <set_value name="$oldPilotBaseName" exact="if global.$GT_Pilots.{$oldPilot}.$OriginalPilotName? then global.$GT_Pilots.{$oldPilot}.$OriginalPilotName else $oldPilotName"/>
             <set_value name="$oldPilotStable" exact="if global.$GT_Pilots.{$oldPilot}.$StableIdentity? then global.$GT_Pilots.{$oldPilot}.$StableIdentity else ''"/>
-            <signal_cue_instantly cue="ResolveDemotedPilotIdentity" param="table[
-              $Ship = $ship,
-              $oldPilot = $oldPilot,
-              $baseName = $oldPilotBaseName,
-              $oldStable = $oldPilotStable,
-              $oldTemplate = $oldPilotTemplate
-            ]"/>
+            <run_actions ref="md.GT_CoreSystem.QueueResolveDemotedPilotIdentity">
+              <param name="ship" value="$ship"/>
+              <param name="oldPilot" value="$oldPilot"/>
+              <param name="baseName" value="$oldPilotBaseName"/>
+              <param name="oldStable" value="$oldPilotStable"/>
+              <param name="oldTemplate" value="$oldPilotTemplate"/>
+              <param name="attempt" value="1"/>
+            </run_actions>
             <do_if value="$oldPilotStable != ''">
-              <signal_cue_instantly cue="ResolvePilotIdentityByStable" param="table[
-                $Ship = $ship,
-                $stable = $oldPilotStable,
-                $template = $oldPilotTemplate,
-                $source = 'vanilla_reassignment_oldpilot_stable'
-              ]"/>
+              <run_actions ref="md.GT_CoreSystem.QueueResolvePilotIdentityByStable">
+                <param name="ship" value="$ship"/>
+                <param name="stable" value="$oldPilotStable"/>
+                <param name="template" value="$oldPilotTemplate"/>
+                <param name="source" value="'vanilla_reassignment_oldpilot_stable'"/>
+              </run_actions>
             </do_if>
           </do_if>
           <!-- Fallback: some vanilla sequences report oldPilot as NONE while still exposing a
                replacement template. Rebind paused GT records by stable identity early so tag loss
                windows are minimized. -->
           <do_if value="$hasGTOrder and $newPilotTemplate? and $newPilotTemplate != null">
-            <signal_cue_instantly cue="ResolvePilotIdentityByStable" param="table[
-              $Ship = $ship,
-              $stable = 's:' + $newPilotTemplate,
-              $template = $newPilotTemplate,
-              $source = 'vanilla_assignment_template_only'
-            ]"/>
+            <run_actions ref="md.GT_CoreSystem.QueueResolvePilotIdentityByStable">
+              <param name="ship" value="$ship"/>
+              <param name="stable" value="'s:' + $newPilotTemplate"/>
+              <param name="template" value="$newPilotTemplate"/>
+              <param name="source" value="'vanilla_assignment_template_only'"/>
+            </run_actions>
           </do_if>
           
           <!-- Handle incoming pilot identity:
@@ -593,29 +1150,16 @@
                - If unregistered (e.g. object id changed), recover from paused record. -->
           <do_if value="$newPilot and $newPilot.exists? and $newPilot.exists">
             <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{$newPilot}?">
-              <set_value name="global.$GT_Pilots.{$newPilot}.$ShipID" exact="$ship.idcode"/>
-              <do_if value="$newPilot.idcode?">
-                <set_value name="global.$GT_Pilots.{$newPilot}.$PilotID" exact="$newPilot.idcode"/>
-              </do_if>
-              <do_elseif value="not global.$GT_Pilots.{$newPilot}.$PilotID?">
-                <set_value name="global.$GT_Pilots.{$newPilot}.$PilotID" exact="''"/>
-              </do_elseif>
-              <set_value name="global.$GT_Pilots.{$newPilot}.$Status" exact="if $hasGTOrder then 'active' else 'paused'"/>
-              <do_if value="$hasGTOrder">
-                <set_value name="global.$GT_Pilots.{$newPilot}.$AssociatedShip" exact="$ship"/>
-                <set_value name="global.$GT_Pilots.{$newPilot}.$Ship" exact="$ship"/>
-                <set_value name="global.$GT_Pilots.{$newPilot}.$ResumedTime" exact="player.age"/>
-              </do_if>
-              <do_else>
-                <remove_value name="global.$GT_Pilots.{$newPilot}.$AssociatedShip"/>
-                <remove_value name="global.$GT_Pilots.{$newPilot}.$Ship"/>
-              </do_else>
+              <run_actions ref="md.GT_CoreSystem.SyncPilotShipLinkState">
+                <param name="pilot" value="$newPilot"/>
+                <param name="ship" value="$ship"/>
+                <param name="hasGTOrder" value="$hasGTOrder"/>
+                <param name="clearPausedFields" value="false"/>
+              </run_actions>
               <!-- Ensure pilot tag is refreshed when vanilla reassignment changes actor identity/state. -->
-              <do_if value="md.GT_Ship_Management.Update_Pilot_Name_Tag?">
-                <run_actions ref="md.GT_Ship_Management.Update_Pilot_Name_Tag">
-                  <param name="pilot" value="$newPilot"/>
-                </run_actions>
-              </do_if>
+              <run_actions ref="md.GT_CoreSystem.TryUpdatePilotNameTag">
+                <param name="pilot" value="$newPilot"/>
+              </run_actions>
             </do_if>
             <do_elseif value="global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
               <set_value name="$incomingName" exact="$newPilotName"/>
@@ -670,25 +1214,12 @@
               <do_if value="$bestCandidate and $bestScoreCount == 1 and $bestScore ge 8">
                 <set_value name="global.$GT_Pilots.{$newPilot}" exact="global.$GT_Pilots.{$bestCandidate}"/>
                 <remove_value name="global.$GT_Pilots.{$bestCandidate}"/>
-                <set_value name="global.$GT_Pilots.{$newPilot}.$ShipID" exact="$ship.idcode"/>
-                <do_if value="$newPilot.idcode?">
-                  <set_value name="global.$GT_Pilots.{$newPilot}.$PilotID" exact="$newPilot.idcode"/>
-                </do_if>
-                <do_elseif value="not global.$GT_Pilots.{$newPilot}.$PilotID?">
-                  <set_value name="global.$GT_Pilots.{$newPilot}.$PilotID" exact="''"/>
-                </do_elseif>
-                <set_value name="global.$GT_Pilots.{$newPilot}.$Status" exact="if $hasGTOrder then 'active' else 'paused'"/>
-                <do_if value="$hasGTOrder">
-                  <set_value name="global.$GT_Pilots.{$newPilot}.$AssociatedShip" exact="$ship"/>
-                  <set_value name="global.$GT_Pilots.{$newPilot}.$Ship" exact="$ship"/>
-                  <set_value name="global.$GT_Pilots.{$newPilot}.$ResumedTime" exact="player.age"/>
-                </do_if>
-                <do_else>
-                  <remove_value name="global.$GT_Pilots.{$newPilot}.$AssociatedShip"/>
-                  <remove_value name="global.$GT_Pilots.{$newPilot}.$Ship"/>
-                </do_else>
-                <remove_value name="global.$GT_Pilots.{$newPilot}.$PausedTime"/>
-                <remove_value name="global.$GT_Pilots.{$newPilot}.$PausedReason"/>
+                <run_actions ref="md.GT_CoreSystem.SyncPilotShipLinkState">
+                  <param name="pilot" value="$newPilot"/>
+                  <param name="ship" value="$ship"/>
+                  <param name="hasGTOrder" value="$hasGTOrder"/>
+                  <param name="clearPausedFields" value="true"/>
+                </run_actions>
                 
                 <!-- Keep vanilla skill aligned with recovered GT XP so stars are not lost. -->
                 <set_value name="$xp" exact="if global.$GT_Pilots.{$newPilot}.$XP? then global.$GT_Pilots.{$newPilot}.$XP else 0"/>
@@ -704,16 +1235,14 @@
                   <set_skill entity="$newPilot" type="skilltype.management" exact="$level"/>
                 </do_if>
                 <set_value name="global.$GT_Pilots.{$newPilot}.$Level" exact="$level"/>
-                <do_if value="md.GT_Ship_Management.Update_Pilot_Name_Tag?">
-                  <run_actions ref="md.GT_Ship_Management.Update_Pilot_Name_Tag">
-                    <param name="pilot" value="$newPilot"/>
-                    <param name="level" value="$level"/>
-                  </run_actions>
-                </do_if>
-                <signal_cue_instantly cue="DeferredPilotTagRefresh" param="table[
-                  $pilot = $newPilot,
-                  $source = 'vanilla_reassignment_recovered'
-                ]"/>
+                <run_actions ref="md.GT_CoreSystem.TryUpdatePilotNameTag">
+                  <param name="pilot" value="$newPilot"/>
+                  <param name="level" value="$level"/>
+                </run_actions>
+                <run_actions ref="md.GT_CoreSystem.QueueDeferredPilotTagRefresh">
+                  <param name="pilot" value="$newPilot"/>
+                  <param name="source" value="'vanilla_reassignment_recovered'"/>
+                </run_actions>
                 
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                   <debug_text text="'[GT-Core] Reattached GT pilot after vanilla reassignment: new=' + $newPilot.name + (if $newPilot.idcode? then ' [' + $newPilot.idcode + ']' else '') + ', recoveredFrom=' + $bestCandidate.name + (if $bestCandidate.idcode? then ' [' + $bestCandidate.idcode + ']' else '') + ', XP=' + $xp + ', level=' + $level + ', hasGTOrder=' + $hasGTOrder" chance="100"/>
@@ -741,90 +1270,68 @@
         <set_value name="$attempt" exact="if $data.$attempt? then $data.$attempt else 1"/>
         
         <do_if value="$ship and $ship.exists and $ship.isplayerowned">
-          <set_value name="$hasGTOrder" exact="false"/>
-          <do_if value="$ship.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.defaultorder.id})">
-            <set_value name="$hasGTOrder" exact="true"/>
+          <run_actions ref="md.GT_CoreSystem.DeterminePilotAssignmentHasGTOrder" result="$hasGTOrder">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+
+          <!-- Resolve promoted pilot once and reuse for both GT/non-GT branches. -->
+          <set_value name="$pilot" exact="null"/>
+          <do_if value="$ship.pilot? and $ship.pilot.exists? and $ship.pilot.exists">
+            <set_value name="$pilot" exact="$ship.pilot"/>
           </do_if>
-          <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.exists and $ship.commander.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.commander.defaultorder.id})">
-            <set_value name="$hasGTOrder" exact="true"/>
+          <do_elseif value="$newPilot and $newPilot.exists? and $newPilot.exists">
+            <set_value name="$pilot" exact="$newPilot"/>
           </do_elseif>
-          <do_elseif value="$ship.commander? and $ship.commander.exists and $ship.commander.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.commander.defaultorder.id})">
-            <set_value name="$hasGTOrder" exact="true"/>
+          <do_elseif value="$newPilotTemplate? and $ship.roleentity? and $ship.roleentity.{$newPilotTemplate}? and $ship.roleentity.{$newPilotTemplate}.exists">
+            <set_value name="$pilot" exact="$ship.roleentity.{$newPilotTemplate}"/>
           </do_elseif>
-          <do_elseif value="$ship.order? and @$ship.order.id == 'DockAndPilotExchange' and global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$PilotExchange? and global.$GT_Ships.{$ship}.$PilotExchange">
-            <set_value name="$hasGTOrder" exact="true"/>
+          <do_elseif value="$newPilotTemplate? and $ship.people? and $ship.people.list?">
+            <!-- Fallback: resolve by template from full onboard roster if direct lookup is not populated yet. -->
+            <set_value name="$crewPool" exact="$ship.people.list"/>
+            <do_all exact="$crewPool.count" counter="$i">
+              <set_value name="$crew" exact="$crewPool.{$i}"/>
+              <do_if value="$crew and (($crew.seed? and $crew.seed == $newPilotTemplate) or $crew == $newPilotTemplate) and $ship.roleentity? and $ship.roleentity.{$crew}? and $ship.roleentity.{$crew}.exists">
+                <set_value name="$pilot" exact="$ship.roleentity.{$crew}"/>
+              </do_if>
+            </do_all>
           </do_elseif>
           
           <do_if value="$hasGTOrder">
-            <!-- Resolve promoted pilot robustly: ship.pilot may lag behind the assignment event. -->
-            <set_value name="$pilot" exact="null"/>
-            <do_if value="$ship.pilot? and $ship.pilot.exists? and $ship.pilot.exists">
-              <set_value name="$pilot" exact="$ship.pilot"/>
-            </do_if>
-            <do_elseif value="$newPilot and $newPilot.exists? and $newPilot.exists">
-              <set_value name="$pilot" exact="$newPilot"/>
-            </do_elseif>
-            <do_elseif value="$newPilotTemplate? and $ship.roleentity? and $ship.roleentity.{$newPilotTemplate}? and $ship.roleentity.{$newPilotTemplate}.exists">
-              <set_value name="$pilot" exact="$ship.roleentity.{$newPilotTemplate}"/>
-            </do_elseif>
-            <do_elseif value="$newPilotTemplate? and $ship.people? and $ship.people.list?">
-              <!-- Fallback: resolve by template from full onboard roster if direct lookup is not populated yet. -->
-              <set_value name="$crewPool" exact="$ship.people.list"/>
-              <do_all exact="$crewPool.count" counter="$i">
-                <set_value name="$crew" exact="$crewPool.{$i}"/>
-                <do_if value="$crew and (($crew.seed? and $crew.seed == $newPilotTemplate) or $crew == $newPilotTemplate) and $ship.roleentity? and $ship.roleentity.{$crew}? and $ship.roleentity.{$crew}.exists">
-                  <set_value name="$pilot" exact="$ship.roleentity.{$crew}"/>
-                </do_if>
-              </do_all>
-            </do_elseif>
-            
             <do_if value="$pilot and $pilot.exists? and $pilot.exists">
               <set_value name="$pilotName" exact="if $pilot.name? then $pilot.name else 'NONE'"/>
               
               <do_if value="not global.$GT_Pilots? or not global.$GT_Pilots.{$pilot}?">
-                <do_if value="md.GT_Ship_Management.Register_Pilot?">
-                  <run_actions ref="md.GT_Ship_Management.Register_Pilot">
-                    <param name="pilot" value="$pilot"/>
-                    <param name="ship" value="$ship"/>
-                  </run_actions>
-                </do_if>
+                <run_actions ref="md.GT_CoreSystem.TryRegisterPilotForShip">
+                  <param name="pilot" value="$pilot"/>
+                  <param name="ship" value="$ship"/>
+                </run_actions>
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                   <debug_text text="'[GT-Core] FinalizeVanillaPilotAssignmentForGT: registered promoted pilot for active GT order: ship=' + $ship.idcode + ', pilot=' + $pilotName + ', source=' + $source + ', attempt=' + $attempt" chance="100"/>
                 </do_if>
               </do_if>
               <do_else>
-                <set_value name="global.$GT_Pilots.{$pilot}.$Status" exact="'active'"/>
-                <set_value name="global.$GT_Pilots.{$pilot}.$ShipID" exact="$ship.idcode"/>
-                <do_if value="$pilot.idcode?">
-                  <set_value name="global.$GT_Pilots.{$pilot}.$PilotID" exact="$pilot.idcode"/>
-                </do_if>
-                <do_elseif value="not global.$GT_Pilots.{$pilot}.$PilotID?">
-                  <set_value name="global.$GT_Pilots.{$pilot}.$PilotID" exact="''"/>
-                </do_elseif>
-                <set_value name="global.$GT_Pilots.{$pilot}.$AssociatedShip" exact="$ship"/>
-                <set_value name="global.$GT_Pilots.{$pilot}.$Ship" exact="$ship"/>
-                <set_value name="global.$GT_Pilots.{$pilot}.$ResumedTime" exact="player.age"/>
-                <remove_value name="global.$GT_Pilots.{$pilot}.$PausedTime"/>
-                <remove_value name="global.$GT_Pilots.{$pilot}.$PausedReason"/>
-                <do_if value="md.GT_Ship_Management.Update_Pilot_Name_Tag?">
-                  <run_actions ref="md.GT_Ship_Management.Update_Pilot_Name_Tag">
-                    <param name="pilot" value="$pilot"/>
-                  </run_actions>
-                </do_if>
+                <run_actions ref="md.GT_CoreSystem.SyncPilotShipLinkState">
+                  <param name="pilot" value="$pilot"/>
+                  <param name="ship" value="$ship"/>
+                  <param name="hasGTOrder" value="true"/>
+                  <param name="clearPausedFields" value="true"/>
+                </run_actions>
+                <run_actions ref="md.GT_CoreSystem.TryUpdatePilotNameTag">
+                  <param name="pilot" value="$pilot"/>
+                </run_actions>
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                   <debug_text text="'[GT-Core] FinalizeVanillaPilotAssignmentForGT: refreshed existing GT pilot for active GT order: ship=' + $ship.idcode + ', pilot=' + $pilotName + ', source=' + $source + ', attempt=' + $attempt" chance="100"/>
                 </do_if>
               </do_else>
               
-              <do_if value="not global.$GT_Ships?">
-                <set_value name="global.$GT_Ships" exact="table[]"/>
-              </do_if>
-              <do_if value="not global.$GT_Ships.{$ship}?">
-                <set_value name="global.$GT_Ships.{$ship}" exact="table[]"/>
-              </do_if>
+              <run_actions ref="md.GT_CoreSystem.EnsureShipRegistryEntry">
+                <param name="ship" value="$ship"/>
+              </run_actions>
               <set_value name="global.$GT_Ships.{$ship}.$Pilot" exact="$pilot"/>
-              <set_value name="global.$GT_Ships.{$ship}.$LastUpdate" exact="player.age"/>
-              <run_actions ref="md.GT_Ship_State_Utilities.GT_RequestShipNameRefresh">
+              <run_actions ref="md.GT_CoreSystem.TouchShipRegistryLastUpdate">
+                <param name="ship" value="$ship"/>
+              </run_actions>
+              <run_actions ref="md.GT_CoreSystem.RequestShipNameRefresh">
                 <param name="ship" value="$ship"/>
                 <param name="pilot" value="$pilot"/>
                 <param name="reason" value="'finalize_vanilla_pilot_assignment'"/>
@@ -847,78 +1354,54 @@
                 <debug_text text="'[GT-Core] FinalizeVanillaPilotAssignmentForGT: unresolved promoted pilot (ship=' + $ship.idcode + ', source=' + $source + ', tpl=' + (if $newPilotTemplate? then $newPilotTemplate else 'NONE') + ', attempt=' + $attempt + ')'" chance="100"/>
               </do_if>
               <!-- One bounded retry for late vanilla pilot binding. -->
-              <do_if value="$attempt lt 5">
-                <signal_cue_instantly cue="md.GT_CoreSystem.FinalizeVanillaPilotAssignmentForGT" param="table[
-                  $Ship = $ship,
-                  $source = $source,
-                  $newPilot = $newPilot,
-                  $newPilotTemplate = $newPilotTemplate,
-                  $attempt = $attempt + 1
-                ]"/>
-              </do_if>
+              <run_actions ref="md.GT_CoreSystem.MaybeRetryFinalizeVanillaPilotAssignment">
+                <param name="ship" value="$ship"/>
+                <param name="source" value="$source"/>
+                <param name="newPilot" value="$newPilot"/>
+                <param name="newPilotTemplate" value="$newPilotTemplate"/>
+                <param name="attempt" value="$attempt"/>
+                <param name="maxAttempts" value="5"/>
+              </run_actions>
             </do_else>
           </do_if>
           <do_else>
             <!-- No GT order yet: still reconcile pilot identity after delayed vanilla binding so
                  transferred GT pilots are ready for a fresh GT order assignment. -->
-            <set_value name="$pilot" exact="null"/>
-            <do_if value="$ship.pilot? and $ship.pilot.exists? and $ship.pilot.exists">
-              <set_value name="$pilot" exact="$ship.pilot"/>
-            </do_if>
-            <do_elseif value="$newPilot and $newPilot.exists? and $newPilot.exists">
-              <set_value name="$pilot" exact="$newPilot"/>
-            </do_elseif>
-            <do_elseif value="$newPilotTemplate? and $ship.roleentity? and $ship.roleentity.{$newPilotTemplate}? and $ship.roleentity.{$newPilotTemplate}.exists">
-              <set_value name="$pilot" exact="$ship.roleentity.{$newPilotTemplate}"/>
-            </do_elseif>
-            <do_elseif value="$newPilotTemplate? and $ship.people? and $ship.people.list?">
-              <set_value name="$crewPool" exact="$ship.people.list"/>
-              <do_all exact="$crewPool.count" counter="$i">
-                <set_value name="$crew" exact="$crewPool.{$i}"/>
-                <do_if value="$crew and (($crew.seed? and $crew.seed == $newPilotTemplate) or $crew == $newPilotTemplate) and $ship.roleentity? and $ship.roleentity.{$crew}? and $ship.roleentity.{$crew}.exists">
-                  <set_value name="$pilot" exact="$ship.roleentity.{$crew}"/>
-                </do_if>
-              </do_all>
-            </do_elseif>
-
             <do_if value="$pilot and $pilot.exists? and $pilot.exists and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}?">
-              <set_value name="global.$GT_Pilots.{$pilot}.$Status" exact="'paused'"/>
-              <set_value name="global.$GT_Pilots.{$pilot}.$ShipID" exact="$ship.idcode"/>
-              <do_if value="$pilot.idcode?">
-                <set_value name="global.$GT_Pilots.{$pilot}.$PilotID" exact="$pilot.idcode"/>
-              </do_if>
-              <do_elseif value="not global.$GT_Pilots.{$pilot}.$PilotID?">
-                <set_value name="global.$GT_Pilots.{$pilot}.$PilotID" exact="''"/>
-              </do_elseif>
-              <remove_value name="global.$GT_Pilots.{$pilot}.$AssociatedShip"/>
-              <remove_value name="global.$GT_Pilots.{$pilot}.$Ship"/>
+              <run_actions ref="md.GT_CoreSystem.SyncPilotShipLinkState">
+                <param name="pilot" value="$pilot"/>
+                <param name="ship" value="$ship"/>
+                <param name="hasGTOrder" value="false"/>
+                <param name="clearPausedFields" value="false"/>
+              </run_actions>
 
-              <signal_cue_instantly cue="DeferredPilotTagRefresh" param="table[
-                $pilot = $pilot,
-                $source = 'finalize_vanilla_assignment_no_gt'
-              ]"/>
+              <run_actions ref="md.GT_CoreSystem.QueueDeferredPilotTagRefresh">
+                <param name="pilot" value="$pilot"/>
+                <param name="source" value="'finalize_vanilla_assignment_no_gt'"/>
+              </run_actions>
 
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <debug_text text="'[GT-Core] FinalizeVanillaPilotAssignmentForGT: synchronized GT pilot without active GT order: ship=' + $ship.idcode + ', pilot=' + (if $pilot.name? then $pilot.name else 'NONE') + ', source=' + $source + ', attempt=' + $attempt" chance="100"/>
               </do_if>
             </do_if>
             <do_elseif value="$newPilotTemplate? and $newPilotTemplate != null">
-              <signal_cue_instantly cue="ResolvePilotIdentityByStable" param="table[
-                $Ship = $ship,
-                $stable = 's:' + $newPilotTemplate,
-                $template = $newPilotTemplate,
-                $source = 'finalize_vanilla_assignment_no_gt_template'
-              ]"/>
+              <run_actions ref="md.GT_CoreSystem.QueueResolvePilotIdentityByStable">
+                <param name="ship" value="$ship"/>
+                <param name="stable" value="'s:' + $newPilotTemplate"/>
+                <param name="template" value="$newPilotTemplate"/>
+                <param name="source" value="'finalize_vanilla_assignment_no_gt_template'"/>
+              </run_actions>
             </do_elseif>
-            <do_elseif value="$attempt lt 5">
-              <signal_cue_instantly cue="md.GT_CoreSystem.FinalizeVanillaPilotAssignmentForGT" param="table[
-                $Ship = $ship,
-                $source = $source,
-                $newPilot = $newPilot,
-                $newPilotTemplate = $newPilotTemplate,
-                $attempt = $attempt + 1
-              ]"/>
-            </do_elseif>
+            <do_else>
+              <run_actions ref="md.GT_CoreSystem.MaybeRetryFinalizeVanillaPilotAssignment">
+                <param name="ship" value="$ship"/>
+                <param name="source" value="$source"/>
+                <param name="newPilot" value="$newPilot"/>
+                <param name="newPilotTemplate" value="$newPilotTemplate"/>
+                <param name="attempt" value="$attempt"/>
+                <param name="maxAttempts" value="5"/>
+              </run_actions>
+            </do_else>
           </do_else>
         </do_if>
       </actions>
@@ -1005,21 +1488,17 @@
           <do_if value="$candidate and $matchCount == 1 and not global.$GT_Pilots.{$candidate}?">
             <set_value name="global.$GT_Pilots.{$candidate}" exact="global.$GT_Pilots.{$registryPilot}"/>
             <remove_value name="global.$GT_Pilots.{$registryPilot}"/>
-            <set_value name="global.$GT_Pilots.{$candidate}.$Status" exact="'paused'"/>
-            <set_value name="global.$GT_Pilots.{$candidate}.$ShipID" exact="$ship.idcode"/>
-            <do_if value="$candidate.idcode?">
-              <set_value name="global.$GT_Pilots.{$candidate}.$PilotID" exact="$candidate.idcode"/>
-            </do_if>
-            <do_elseif value="not global.$GT_Pilots.{$candidate}.$PilotID?">
-              <set_value name="global.$GT_Pilots.{$candidate}.$PilotID" exact="''"/>
-            </do_elseif>
-            <remove_value name="global.$GT_Pilots.{$candidate}.$AssociatedShip"/>
-            <remove_value name="global.$GT_Pilots.{$candidate}.$Ship"/>
+            <run_actions ref="md.GT_CoreSystem.SyncPilotShipLinkState">
+              <param name="pilot" value="$candidate"/>
+              <param name="ship" value="$ship"/>
+              <param name="hasGTOrder" value="false"/>
+              <param name="clearPausedFields" value="false"/>
+            </run_actions>
             
-            <signal_cue_instantly cue="DeferredPilotTagRefresh" param="table[
-              $pilot = $candidate,
-              $source = 'resolve_demoted_identity'
-            ]"/>
+            <run_actions ref="md.GT_CoreSystem.QueueDeferredPilotTagRefresh">
+              <param name="pilot" value="$candidate"/>
+              <param name="source" value="'resolve_demoted_identity'"/>
+            </run_actions>
             
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <set_value name="$oldPilotNameDbg" exact="if $oldPilot and $oldPilot.exists and $oldPilot.name? then $oldPilot.name else 'NONE'"/>
@@ -1028,32 +1507,35 @@
             </do_if>
           </do_if>
           <do_elseif value="$candidate and $matchCount == 1 and global.$GT_Pilots.{$candidate}?">
-            <set_value name="global.$GT_Pilots.{$candidate}.$Status" exact="'paused'"/>
-            <set_value name="global.$GT_Pilots.{$candidate}.$ShipID" exact="$ship.idcode"/>
-            <remove_value name="global.$GT_Pilots.{$candidate}.$AssociatedShip"/>
-            <remove_value name="global.$GT_Pilots.{$candidate}.$Ship"/>
-            <signal_cue_instantly cue="DeferredPilotTagRefresh" param="table[
-              $pilot = $candidate,
-              $source = 'resolve_demoted_identity_existing'
-            ]"/>
+            <run_actions ref="md.GT_CoreSystem.SyncPilotShipLinkState">
+              <param name="pilot" value="$candidate"/>
+              <param name="ship" value="$ship"/>
+              <param name="hasGTOrder" value="false"/>
+              <param name="clearPausedFields" value="false"/>
+            </run_actions>
+            <run_actions ref="md.GT_CoreSystem.QueueDeferredPilotTagRefresh">
+              <param name="pilot" value="$candidate"/>
+              <param name="source" value="'resolve_demoted_identity_existing'"/>
+            </run_actions>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <set_value name="$candidateNameDbg" exact="if $candidate and $candidate.name? then $candidate.name else 'NONE'"/>
               <debug_text text="'[GT-Core] Resolved demoted GT pilot identity (existing key): ship=' + $ship.idcode + ', stable=' + (if $oldStable != '' then $oldStable else 'NONE') + ', pilot=' + $candidateNameDbg" chance="100"/>
             </do_if>
           </do_elseif>
-          <do_elseif value="not $candidate and $attempt lt 31">
+          <do_elseif value="not $candidate">
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <set_value name="$oldPilotNameDbg" exact="if $oldPilot and $oldPilot.exists and $oldPilot.name? then $oldPilot.name else 'NONE'"/>
               <debug_text text="'[GT-Core] ResolveDemotedPilotIdentity retry: ship=' + $ship.idcode + ', old=' + $oldPilotNameDbg + ', stable=' + (if $oldStable != '' then $oldStable else 'NONE') + ', attempt=' + $attempt" chance="100"/>
             </do_if>
-            <signal_cue_instantly cue="md.GT_CoreSystem.ResolveDemotedPilotIdentity" param="table[
-              $Ship = $ship,
-              $oldPilot = $oldPilot,
-              $baseName = $baseName,
-              $oldStable = $oldStable,
-              $oldTemplate = $oldTemplate,
-              $attempt = $attempt + 1
-            ]"/>
+            <run_actions ref="md.GT_CoreSystem.MaybeRetryResolveDemotedPilotIdentity">
+              <param name="ship" value="$ship"/>
+              <param name="oldPilot" value="$oldPilot"/>
+              <param name="baseName" value="$baseName"/>
+              <param name="oldStable" value="$oldStable"/>
+              <param name="oldTemplate" value="$oldTemplate"/>
+              <param name="attempt" value="$attempt"/>
+              <param name="maxAttempts" value="31"/>
+            </run_actions>
           </do_elseif>
           </do_if>
         </do_if>
@@ -1119,42 +1601,42 @@
 
           <do_if value="$crewCandidate and $crewMatchCount == 1">
             <do_if value="global.$GT_Pilots.{$crewCandidate}?">
-              <signal_cue_instantly cue="DeferredPilotTagRefresh" param="table[
-                $pilot = $crewCandidate,
-                $source = 'resolve_stable_existing'
-              ]"/>
+              <run_actions ref="md.GT_CoreSystem.QueueDeferredPilotTagRefresh">
+                <param name="pilot" value="$crewCandidate"/>
+                <param name="source" value="'resolve_stable_existing'"/>
+              </run_actions>
             </do_if>
             <do_elseif value="$registryPilot and $registryMatchCount == 1 and not global.$GT_Pilots.{$crewCandidate}?">
               <set_value name="global.$GT_Pilots.{$crewCandidate}" exact="global.$GT_Pilots.{$registryPilot}"/>
               <remove_value name="global.$GT_Pilots.{$registryPilot}"/>
-              <set_value name="global.$GT_Pilots.{$crewCandidate}.$Status" exact="'paused'"/>
-              <set_value name="global.$GT_Pilots.{$crewCandidate}.$ShipID" exact="$ship.idcode"/>
-              <do_if value="$crewCandidate.idcode?">
-                <set_value name="global.$GT_Pilots.{$crewCandidate}.$PilotID" exact="$crewCandidate.idcode"/>
-              </do_if>
-              <remove_value name="global.$GT_Pilots.{$crewCandidate}.$AssociatedShip"/>
-              <remove_value name="global.$GT_Pilots.{$crewCandidate}.$Ship"/>
-              <signal_cue_instantly cue="DeferredPilotTagRefresh" param="table[
-                $pilot = $crewCandidate,
-                $source = 'resolve_stable_rebind'
-              ]"/>
+              <run_actions ref="md.GT_CoreSystem.SyncPilotShipLinkState">
+                <param name="pilot" value="$crewCandidate"/>
+                <param name="ship" value="$ship"/>
+                <param name="hasGTOrder" value="false"/>
+                <param name="clearPausedFields" value="false"/>
+              </run_actions>
+              <run_actions ref="md.GT_CoreSystem.QueueDeferredPilotTagRefresh">
+                <param name="pilot" value="$crewCandidate"/>
+                <param name="source" value="'resolve_stable_rebind'"/>
+              </run_actions>
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <set_value name="$registryPilotNameDbg" exact="if $registryPilot and $registryPilot.exists and $registryPilot.name? then $registryPilot.name else 'NONE'"/>
                 <debug_text text="'[GT-Core] ResolvePilotIdentityByStable: rebound pilot stable=' + $stable + ' source=' + $source + ' ship=' + $ship.idcode + ', new=' + $crewCandidate.name + ', old=' + $registryPilotNameDbg" chance="100"/>
               </do_if>
             </do_elseif>
           </do_if>
-          <do_elseif value="not $crewCandidate and $attempt lt 31">
+          <do_elseif value="not $crewCandidate">
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-Core] ResolvePilotIdentityByStable retry: ship=' + $ship.idcode + ', stable=' + $stable + ', source=' + $source + ', attempt=' + $attempt" chance="100"/>
             </do_if>
-            <signal_cue_instantly cue="md.GT_CoreSystem.ResolvePilotIdentityByStable" param="table[
-              $Ship = $ship,
-              $stable = $stable,
-              $template = $template,
-              $source = $source,
-              $attempt = $attempt + 1
-            ]"/>
+            <run_actions ref="md.GT_CoreSystem.MaybeRetryResolvePilotIdentityByStable">
+              <param name="ship" value="$ship"/>
+              <param name="stable" value="$stable"/>
+              <param name="template" value="$template"/>
+              <param name="source" value="$source"/>
+              <param name="attempt" value="$attempt"/>
+              <param name="maxAttempts" value="31"/>
+            </run_actions>
           </do_elseif>
         </do_if>
       </actions>
@@ -1171,8 +1653,8 @@
         <set_value name="$pilot" exact="$data.$pilot"/>
         <set_value name="$source" exact="if $data.$source? then $data.$source else 'unknown'"/>
         
-        <do_if value="$pilot and $pilot.exists? and $pilot.exists and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}? and md.GT_Ship_Management.Update_Pilot_Name_Tag?">
-          <run_actions ref="md.GT_Ship_Management.Update_Pilot_Name_Tag">
+        <do_if value="$pilot and $pilot.exists? and $pilot.exists and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}?">
+          <run_actions ref="md.GT_CoreSystem.TryUpdatePilotNameTag">
             <param name="pilot" value="$pilot"/>
           </run_actions>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -1423,25 +1905,12 @@
                       <debug_text text="'[GT-Core] Subordinate ' + $subordinate.idcode + ' lost GT commander (destroyed) - triggering cleanup'" chance="100"/>
                     </do_if>
                     
-                    <!-- Get original name for cleanup -->
-                    <set_value name="$originalName" exact="null"/>
-                    <do_if value="global.$GT_Ships.{$subordinate}? and global.$GT_Ships.{$subordinate}.$OriginalShipName?">
-                      <set_value name="$originalName" exact="global.$GT_Ships.{$subordinate}.$OriginalShipName"/>
-                    </do_if>
-                    <do_elseif value="$subordinate.pilot? and global.$GT_Pilots.{$subordinate.pilot}? and global.$GT_Pilots.{$subordinate.pilot}.$OriginalShipName?">
-                      <set_value name="$originalName" exact="global.$GT_Pilots.{$subordinate.pilot}.$OriginalShipName"/>
-                    </do_elseif>
-                    <do_elseif value="$subordinate.macro?">
-                      <set_value name="$originalName" exact="@$subordinate.macro.name"/>
-                    </do_elseif>
-                    
                     <!-- Trigger cleanup -->
-                    <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
-                      $Ship = $subordinate,
-                      $Pilot = $subordinate.pilot,
-                      $Reason = 'Commander destroyed (no new GT commander)',
-                      $OriginalName = $originalName
-                    ]"/>
+                    <run_actions ref="md.GT_CoreSystem.EmitShipOrderAbortedWithResolvedName">
+                      <param name="ship" value="$subordinate"/>
+                      <param name="pilot" value="$subordinate.pilot"/>
+                      <param name="reason" value="'Commander destroyed (no new GT commander)'"/>
+                    </run_actions>
                   </do_else>
                 </do_else>
               </do_if>
@@ -1536,32 +2005,17 @@
             </do_if>
 
             <!-- Restore paused training state if it was preserved during order replacement -->
-            <do_if value="$ship.pilot and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$PausedWithTrainingNeeded?">
-              <set_value name="global.$GT_Pilots.{$ship.pilot}.$XPBlocked" exact="true"/>
-              <set_value name="global.$GT_Pilots.{$ship.pilot}.$BlockedLevel" exact="global.$GT_Pilots.{$ship.pilot}.$PausedBlockedLevel"/>
-
-              <!-- Clean up paused training placeholders -->
-              <remove_value name="global.$GT_Pilots.{$ship.pilot}.$PausedWithTrainingNeeded"/>
-              <remove_value name="global.$GT_Pilots.{$ship.pilot}.$PausedBlockedLevel"/>
-
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GalaxyTrader MK3] TRAINING STATE RESTORED (library path): Pilot ' + $ship.pilot.name + ' still needs level ' + global.$GT_Pilots.{$ship.pilot}.$BlockedLevel + ' training'" chance="100"/>
-              </do_if>
-            </do_if>
+            <run_actions ref="md.GT_CoreSystem.RestorePausedTrainingStateIfNeeded">
+              <param name="pilot" value="$ship.pilot"/>
+              <param name="debugLabel" value="'TRAINING STATE RESTORED (library path)'"/>
+            </run_actions>
             
             <!-- Ensure ship name update happens (deferred to prevent stutter during registration) -->
             <!-- Register_Pilot sends GT_Update_Ship_Name signal, but we ensure it happens here too -->
-            <do_if value="$ship.pilot and global.$GT_Pilots.{$ship.pilot}? and md.GT_Ship_Management.Update_Pilot_Ship_Name?">
-              <!-- Defer name update slightly to spread load -->
-              <run_actions ref="md.GT_Ship_State_Utilities.GT_RequestShipNameRefresh">
-                <param name="ship" value="$ship"/>
-                <param name="pilot" value="$ship.pilot"/>
-                <param name="reason" value="'register_ship_sync_library_path'"/>
-              </run_actions>
-            </do_if>
-            
-            <!-- Trigger blacklist application for newly registered ship (event-driven) -->
-            <signal_cue_instantly cue="md.GT_ThreatIntelligence.ApplyBlacklistToFleet"/>
+            <run_actions ref="md.GT_CoreSystem.FinalizeShipRegistrationSideEffects">
+              <param name="ship" value="$ship"/>
+              <param name="nameRefreshReason" value="'register_ship_sync_library_path'"/>
+            </run_actions>
           </do_if>
           <do_else>
             <!-- Fallback registration if library not available -->
@@ -1570,11 +2024,18 @@
             </do_if>
             
             <!-- Register ship if not already registered -->
-            <do_if value="not global.$GT_Ships.{$ship}?">
-              <set_value name="global.$GT_Ships.{$ship}" exact="table[]"/>
+            <run_actions ref="md.GT_CoreSystem.IsShipInRegistry" result="$shipInRegistryFallback">
+              <param name="ship" value="$ship"/>
+            </run_actions>
+            <do_if value="not $shipInRegistryFallback">
+              <run_actions ref="md.GT_CoreSystem.EnsureShipRegistryEntry">
+                <param name="ship" value="$ship"/>
+              </run_actions>
               <set_value name="global.$GT_Ships.{$ship}.$RegisterTime" exact="player.age"/>
               <set_value name="global.$GT_Ships.{$ship}.$Config" exact="$config"/>
-              <set_value name="global.$GT_Ships.{$ship}.$LastUpdate" exact="player.age"/>
+              <run_actions ref="md.GT_CoreSystem.TouchShipRegistryLastUpdate">
+                <param name="ship" value="$ship"/>
+              </run_actions>
               <set_value name="global.$GT_Ships.{$ship}.$Status" exact="'active'"/>
               
               <!-- Register pilot if provided and trigger ship renaming -->
@@ -1602,18 +2063,10 @@
                   </do_if>
                   
                   <!-- RESTORE TRAINING STATE if it was preserved -->
-                  <do_if value="global.$GT_Pilots.{$ship.pilot}.$PausedWithTrainingNeeded?">
-                    <set_value name="global.$GT_Pilots.{$ship.pilot}.$XPBlocked" exact="true"/>
-                    <set_value name="global.$GT_Pilots.{$ship.pilot}.$BlockedLevel" exact="global.$GT_Pilots.{$ship.pilot}.$PausedBlockedLevel"/>
-                    
-                    <!-- Clean up paused training state -->
-                    <remove_value name="global.$GT_Pilots.{$ship.pilot}.$PausedWithTrainingNeeded"/>
-                    <remove_value name="global.$GT_Pilots.{$ship.pilot}.$PausedBlockedLevel"/>
-                    
-                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                      <debug_text text="'[GalaxyTrader MK3] TRAINING STATE RESTORED: Pilot ' + $ship.pilot.name + ' still needs level ' + global.$GT_Pilots.{$ship.pilot}.$BlockedLevel + ' training'" chance="100"/>
-                    </do_if>
-                  </do_if>
+                  <run_actions ref="md.GT_CoreSystem.RestorePausedTrainingStateIfNeeded">
+                    <param name="pilot" value="$ship.pilot"/>
+                    <param name="debugLabel" value="'TRAINING STATE RESTORED'"/>
+                  </run_actions>
                   
                   <!-- Restore pilot to active status -->
                   <set_value name="global.$GT_Pilots.{$ship.pilot}.$Status" exact="'active'"/>
@@ -1655,17 +2108,10 @@
             </do_if>
             
             <!-- Ensure ship name update happens (deferred to prevent stutter during registration) -->
-            <do_if value="$ship.pilot and global.$GT_Pilots.{$ship.pilot}? and md.GT_Ship_Management.Update_Pilot_Ship_Name?">
-              <!-- Defer name update slightly to spread load -->
-              <run_actions ref="md.GT_Ship_State_Utilities.GT_RequestShipNameRefresh">
-                <param name="ship" value="$ship"/>
-                <param name="pilot" value="$ship.pilot"/>
-                <param name="reason" value="'register_ship_sync_fallback_path'"/>
-              </run_actions>
-            </do_if>
-            
-            <!-- Trigger blacklist application for newly registered ship (event-driven) -->
-            <signal_cue_instantly cue="md.GT_ThreatIntelligence.ApplyBlacklistToFleet"/>
+            <run_actions ref="md.GT_CoreSystem.FinalizeShipRegistrationSideEffects">
+              <param name="ship" value="$ship"/>
+              <param name="nameRefreshReason" value="'register_ship_sync_fallback_path'"/>
+            </run_actions>
           </do_else>
         </do_if>
         
@@ -1742,7 +2188,14 @@
         <set_value name="$abortData" exact="event.param2"/>
         <set_value name="$ship" exact="$abortData.$Ship"/>
         <set_value name="$pilot" exact="$abortData.$Pilot"/>
-        <set_value name="$cleanupSource" exact="'UNKNOWN'"/>
+        <run_actions ref="md.GT_CoreSystem.BuildOrphanCheckContext" result="$context">
+          <param name="ship" value="$ship"/>
+          <param name="payload" value="$abortData"/>
+          <param name="defaultSource" value="'UNKNOWN'"/>
+          <param name="defaultTraceTag" value="'HANDLE_ABORT'"/>
+        </run_actions>
+        <set_value name="$cleanupSource" exact="$context.$Source"/>
+        <set_value name="$cleanupTraceId" exact="$context.$TraceId"/>
         <!-- Normalize pilot source: some callers omit $Pilot even when ship still has one. -->
         <do_if value="not $pilot and $ship? and $ship.exists and $ship.pilot? and @$ship.pilot.exists">
           <set_value name="$pilot" exact="@$ship.pilot"/>
@@ -1753,7 +2206,6 @@
         <do_if value="$ship? and $ship.exists">
           <signal_objects object="player.galaxy" param="'GT_Search_Abort'" param2="table[$Ship = $ship]"/>
         </do_if>
-        <set_value name="$cleanupTraceId" exact="if $ship? and $ship.exists then $ship.idcode + '|HANDLE_ABORT|' + (player.age / 1s)i else 'UNKNOWN|HANDLE_ABORT|' + (player.age / 1s)i"/>
         <!-- Ensure $reason is always a string -->
         <!-- Default to empty string, then set from signal if present -->
         <set_value name="$reason" exact="''"/>
@@ -1766,12 +2218,6 @@
           </do_if>
         </do_if>
         <set_value name="$originalName" exact="$abortData.$OriginalName"/>
-        <do_if value="$abortData.$Source?">
-          <set_value name="$cleanupSource" exact="$abortData.$Source"/>
-        </do_if>
-        <do_if value="$abortData.$TraceId?">
-          <set_value name="$cleanupTraceId" exact="$abortData.$TraceId"/>
-        </do_if>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <set_value name="$dbgDefaultOrder" exact="'NONE'"/>
           <do_if value="$ship.defaultorder?">
@@ -2319,18 +2765,15 @@
       </conditions>
       <actions>
         <set_value name="$ship" exact="event.param2.$Ship"/>
-        <set_value name="$force" exact="false"/>
-        <set_value name="$cleanupSource" exact="'UNKNOWN'"/>
-        <set_value name="$cleanupTraceId" exact="if $ship? and $ship.exists then $ship.idcode + '|CHECK_ORPHANED|' + (player.age / 1s)i else 'UNKNOWN|CHECK_ORPHANED|' + (player.age / 1s)i"/>
-        <do_if value="event.param2? and event.param2.$Force? and event.param2.$Force">
-          <set_value name="$force" exact="true"/>
-        </do_if>
-        <do_if value="event.param2? and event.param2.$Source?">
-          <set_value name="$cleanupSource" exact="event.param2.$Source"/>
-        </do_if>
-        <do_if value="event.param2? and event.param2.$TraceId?">
-          <set_value name="$cleanupTraceId" exact="event.param2.$TraceId"/>
-        </do_if>
+        <run_actions ref="md.GT_CoreSystem.BuildOrphanCheckContext" result="$context">
+          <param name="ship" value="$ship"/>
+          <param name="payload" value="event.param2"/>
+          <param name="defaultSource" value="'UNKNOWN'"/>
+          <param name="defaultTraceTag" value="'CHECK_ORPHANED'"/>
+        </run_actions>
+        <set_value name="$force" exact="$context.$Force"/>
+        <set_value name="$cleanupSource" exact="$context.$Source"/>
+        <set_value name="$cleanupTraceId" exact="$context.$TraceId"/>
         
         <!-- Skip if ship doesn't exist -->
         <do_if value="not $ship.exists">
@@ -2340,10 +2783,9 @@
         </do_if>
         <do_else>
           <!-- Check if ship is in registry -->
-          <set_value name="$shipInRegistry" exact="false"/>
-          <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
-            <set_value name="$shipInRegistry" exact="true"/>
-          </do_if>
+          <run_actions ref="md.GT_CoreSystem.IsShipInRegistry" result="$shipInRegistry">
+            <param name="ship" value="$ship"/>
+          </run_actions>
           <!-- Pilot registry link survives some detach races after GT_Ships cleanup. -->
           <set_value name="$pilotRegistryLinked" exact="false"/>
           <do_if value="$ship.pilot? and global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$OriginalShipName?">
@@ -2410,20 +2852,16 @@
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <debug_text text="'[GT-CleanupTrace] trace=' + $cleanupTraceId + ' source=' + $cleanupSource + ' cue=CheckShipOrphaned ship=' + $ship.idcode + ' action=FILTERED_PROMOTION_WINDOW default=' + (if $defaultOrderId then $defaultOrderId else 'NONE') + ' commanderExists=' + $commanderExists + ' commanderDefaultNull=' + $commanderDefaultNull + ' force=' + $force" chance="100"/>
               </do_if>
-              <do_if value="not global.$GT_OrphanVerifyPending?">
-                <set_value name="global.$GT_OrphanVerifyPending" exact="table[]"/>
-              </do_if>
-              <do_if value="not global.$GT_OrphanVerifyPending.{$ship}?">
-                <set_value name="global.$GT_OrphanVerifyPending.{$ship}" exact="player.age"/>
+              <do_if value="not global.$GT_OrphanVerifyPending? or not global.$GT_OrphanVerifyPending.{$ship}?">
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                   <debug_text text="'[GT-Cleanup] Deferring orphan cleanup (promotion window): ' + $ship.idcode + ' (defaultOrder=' + (if $defaultOrderId then $defaultOrderId else 'null') + ', commanderExists=' + $commanderExists + ', commanderDefaultNull=' + $commanderDefaultNull + ')'" chance="100"/>
                 </do_if>
-                <signal_cue_instantly cue="md.GT_CoreSystem.VerifyShipOrphaned" param="table[
-                  $Ship = $ship,
-                  $Source = $cleanupSource,
-                  $TraceId = $cleanupTraceId
-                ]"/>
               </do_if>
+              <run_actions ref="md.GT_CoreSystem.QueueOrphanVerifyIfNotPending">
+                <param name="ship" value="$ship"/>
+                <param name="source" value="$cleanupSource"/>
+                <param name="traceId" value="$cleanupTraceId"/>
+              </run_actions>
             </do_if>
             
             <do_if value="not $exitEarly">
@@ -2518,20 +2956,10 @@
             <debug_text text="'[GT-Cleanup] Cleaning up detached ship: ' + $ship.knownname + ' (ID: ' + $ship.idcode + ')'" chance="100"/>
           </do_if>
           
-          <!-- Get original ship name from ship registry (try multiple sources) -->
-          <set_value name="$originalName" exact="null"/>
-          <!-- Try ship registry first -->
-          <do_if value="global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$OriginalShipName?">
-            <set_value name="$originalName" exact="global.$GT_Ships.{$ship}.$OriginalShipName"/>
-          </do_if>
-          <!-- Fallback: Try pilot registry -->
-          <do_elseif value="$ship.pilot? and global.$GT_Pilots.{$ship.pilot}? and global.$GT_Pilots.{$ship.pilot}.$OriginalShipName?">
-            <set_value name="$originalName" exact="global.$GT_Pilots.{$ship.pilot}.$OriginalShipName"/>
-          </do_elseif>
-          <!-- Last resort: Use macro name (unformatted) -->
-          <do_elseif value="$ship.macro?">
-            <set_value name="$originalName" exact="@$ship.macro.name"/>
-          </do_elseif>
+          <!-- Get original ship name from shared cleanup resolver. -->
+          <run_actions ref="md.GT_CoreSystem.GetOriginalShipNameForCleanup" result="$originalName">
+            <param name="ship" value="$ship"/>
+          </run_actions>
           
           <!-- Idempotency guard: suppress duplicate detached-cleanup signals per ship/time bucket -->
           <set_value name="$cleanupSignalType" exact="'DETACHED_CLEANUP_REQUIRED'"/>
@@ -2569,17 +2997,11 @@
         </do_if>
         <do_elseif value="$cleanupDecision == 'TRANSIENT_RECHECK_REQUIRED'">
           <!-- Schedule forced re-check while detach intent is active. -->
-          <do_if value="not global.$GT_OrphanVerifyPending?">
-            <set_value name="global.$GT_OrphanVerifyPending" exact="table[]"/>
-          </do_if>
-          <do_if value="not global.$GT_OrphanVerifyPending.{$ship}?">
-            <set_value name="global.$GT_OrphanVerifyPending.{$ship}" exact="player.age"/>
-            <signal_cue_instantly cue="md.GT_CoreSystem.VerifyShipOrphaned" param="table[
-              $Ship = $ship,
-              $Source = $cleanupSource,
-              $TraceId = $cleanupTraceId
-            ]"/>
-          </do_if>
+          <run_actions ref="md.GT_CoreSystem.QueueOrphanVerifyIfNotPending">
+            <param name="ship" value="$ship"/>
+            <param name="source" value="$cleanupSource"/>
+            <param name="traceId" value="$cleanupTraceId"/>
+          </run_actions>
         </do_elseif>
         
         <!-- Check for missing pilot (ship has GT order but no pilot) -->
@@ -2598,18 +3020,17 @@
           </do_if>
           
           <!-- Get original ship name from ship registry -->
-          <set_value name="$originalName" exact="null"/>
-          <do_if value="global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$OriginalShipName?">
-            <set_value name="$originalName" exact="global.$GT_Ships.{$ship}.$OriginalShipName"/>
-          </do_if>
+          <run_actions ref="md.GT_CoreSystem.GetShipRegistryOriginalName" result="$originalName">
+            <param name="ship" value="$ship"/>
+          </run_actions>
           
           <!-- Send cleanup signal -->
-          <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
-            $Ship = $ship,
-            $Pilot = null,
-            $Reason = 'Pilot transferred away - GT order cannot run without pilot (event-driven check)',
-            $OriginalName = $originalName
-          ]"/>
+          <run_actions ref="md.GT_CoreSystem.EmitShipOrderAborted">
+            <param name="ship" value="$ship"/>
+            <param name="pilot" value="null"/>
+            <param name="reason" value="'Pilot transferred away - GT order cannot run without pilot (event-driven check)'"/>
+            <param name="originalName" value="$originalName"/>
+          </run_actions>
         </do_elseif>
         
             </do_if>
@@ -2626,24 +3047,24 @@
       <delay exact="3s"/>
       <actions>
         <set_value name="$ship" exact="event.param.$Ship"/>
-        <set_value name="$cleanupSource" exact="'VERIFY_ORPHANED'"/>
-        <set_value name="$cleanupTraceId" exact="if $ship? and $ship.exists then $ship.idcode + '|VERIFY_ORPHANED|' + (player.age / 1s)i else 'UNKNOWN|VERIFY_ORPHANED|' + (player.age / 1s)i"/>
-        <do_if value="event.param.$Source?">
-          <set_value name="$cleanupSource" exact="event.param.$Source"/>
-        </do_if>
-        <do_if value="event.param.$TraceId?">
-          <set_value name="$cleanupTraceId" exact="event.param.$TraceId"/>
-        </do_if>
+        <run_actions ref="md.GT_CoreSystem.BuildOrphanCheckContext" result="$context">
+          <param name="ship" value="$ship"/>
+          <param name="payload" value="event.param"/>
+          <param name="defaultSource" value="'VERIFY_ORPHANED'"/>
+          <param name="defaultTraceTag" value="'VERIFY_ORPHANED'"/>
+        </run_actions>
+        <set_value name="$cleanupSource" exact="$context.$Source"/>
+        <set_value name="$cleanupTraceId" exact="$context.$TraceId"/>
         <do_if value="$ship? and $ship.exists">
           <do_if value="global.$GT_OrphanVerifyPending? and global.$GT_OrphanVerifyPending.{$ship}?">
             <remove_value name="global.$GT_OrphanVerifyPending.{$ship}"/>
           </do_if>
-          <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[
-            $Ship = $ship,
-            $Force = true,
-            $Source = $cleanupSource,
-            $TraceId = $cleanupTraceId
-          ]"/>
+          <run_actions ref="md.GT_CoreSystem.QueueCheckShipOrphanedDetailed">
+            <param name="ship" value="$ship"/>
+            <param name="force" value="true"/>
+            <param name="source" value="$cleanupSource"/>
+            <param name="traceId" value="$cleanupTraceId"/>
+          </run_actions>
         </do_if>
       </actions>
     </cue>
@@ -2683,9 +3104,9 @@
               <set_value name="$ship" exact="$pilotData.$Ship"/>
               
               <!-- Initialize ship registry entry if needed -->
-              <do_if value="not global.$GT_Ships.{$ship}?">
-                <set_value name="global.$GT_Ships.{$ship}" exact="table[]"/>
-              </do_if>
+              <run_actions ref="md.GT_CoreSystem.EnsureShipRegistryEntry">
+                <param name="ship" value="$ship"/>
+              </run_actions>
               
               <!-- Migrate OriginalShipName to ship registry (only if not already set) -->
               <!-- Note: If pilot was transferred, their OriginalShipName might be for old ship -->
@@ -2737,13 +3158,20 @@
         
         <!-- Trigger orphaned check when GT order is cancelled -->
         <do_if value="$updateType == 'GT_Order_Cancelled' and $ship.exists">
-          <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
-            <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[$Ship = $ship]"/>
+          <run_actions ref="md.GT_CoreSystem.IsShipInRegistry" result="$shipInRegistry">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          <do_if value="$shipInRegistry">
+            <run_actions ref="md.GT_CoreSystem.QueueCheckShipOrphaned">
+              <param name="ship" value="$ship"/>
+            </run_actions>
           </do_if>
           
           <!-- EVENT-DRIVEN: Defer subordinate cleanup verification to avoid transient false positives
                during commander order transitions (e.g. promotion/station-assignment handover). -->
-          <signal_cue_instantly cue="md.GT_CoreSystem.VerifyCommanderSubordinateCleanup" param="table[$Commander = $ship]"/>
+          <run_actions ref="md.GT_CoreSystem.QueueVerifyCommanderSubordinateCleanup">
+            <param name="commander" value="$ship"/>
+          </run_actions>
         </do_if>
       </actions>
     </cue>
@@ -2792,23 +3220,11 @@
                   <set_value name="$subHasDirectGT" exact="true"/>
                 </do_if>
                 <do_if value="not $subHasDirectGT">
-                  <set_value name="$originalName" exact="null"/>
-                  <do_if value="global.$GT_Ships? and global.$GT_Ships.{$potentialSubordinate}? and global.$GT_Ships.{$potentialSubordinate}.$OriginalShipName?">
-                    <set_value name="$originalName" exact="global.$GT_Ships.{$potentialSubordinate}.$OriginalShipName"/>
-                  </do_if>
-                  <do_elseif value="$potentialSubordinate.pilot? and global.$GT_Pilots? and global.$GT_Pilots.{$potentialSubordinate.pilot}? and global.$GT_Pilots.{$potentialSubordinate.pilot}.$OriginalShipName?">
-                    <set_value name="$originalName" exact="global.$GT_Pilots.{$potentialSubordinate.pilot}.$OriginalShipName"/>
-                  </do_elseif>
-                  <do_elseif value="$potentialSubordinate.macro?">
-                    <set_value name="$originalName" exact="@$potentialSubordinate.macro.name"/>
-                  </do_elseif>
-                  
-                  <signal_objects object="player.galaxy" param="'GT_Ship_Order_Aborted'" param2="table[
-                    $Ship = $potentialSubordinate,
-                    $Pilot = $potentialSubordinate.pilot,
-                    $Reason = 'Commander lost GT order',
-                    $OriginalName = $originalName
-                  ]"/>
+                  <run_actions ref="md.GT_CoreSystem.EmitShipOrderAbortedWithResolvedName">
+                    <param name="ship" value="$potentialSubordinate"/>
+                    <param name="pilot" value="$potentialSubordinate.pilot"/>
+                    <param name="reason" value="'Commander lost GT order'"/>
+                  </run_actions>
                 </do_if>
               </do_if>
             </do_all>
@@ -3251,11 +3667,11 @@
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-Core] Pilot change deferred: ship=' + $ship.idcode + ' has no bound pilot yet - delegating to FinalizeVanillaPilotAssignmentForGT'" chance="100"/>
             </do_if>
-            <signal_cue_instantly cue="md.GT_CoreSystem.FinalizeVanillaPilotAssignmentForGT" param="table[
-              $Ship = $ship,
-              $source = 'pilot_change_missing_pilot',
-              $attempt = 1
-            ]"/>
+            <run_actions ref="md.GT_CoreSystem.QueueFinalizeVanillaPilotAssignment">
+              <param name="ship" value="$ship"/>
+              <param name="source" value="'pilot_change_missing_pilot'"/>
+              <param name="attempt" value="1"/>
+            </run_actions>
           </do_if>
           <do_else>
           
@@ -3265,14 +3681,15 @@
           <do_if value="$oldPilot and $oldPilot.exists and $oldPilot.ship? and $oldPilot.ship.exists and $oldPilot.ship != $ship">
             <set_value name="$oldShip" exact="$oldPilot.ship"/>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <set_value name="$oldShipInRegistry" exact="false"/>
-              <do_if value="global.$GT_Ships? and global.$GT_Ships.{$oldShip}?">
-                <set_value name="$oldShipInRegistry" exact="true"/>
-              </do_if>
+              <run_actions ref="md.GT_CoreSystem.IsShipInRegistry" result="$oldShipInRegistry">
+                <param name="ship" value="$oldShip"/>
+              </run_actions>
               <debug_text text="'[GT-Core] Pilot change: Checking old ship ' + $oldShip.idcode + ' (inRegistry=' + (if $oldShipInRegistry then 'YES' else 'NO') + ')'" chance="100"/>
             </do_if>
             <!-- Always trigger check - CheckShipOrphaned will handle registry membership internally -->
-            <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[$Ship = $oldShip]"/>
+            <run_actions ref="md.GT_CoreSystem.QueueCheckShipOrphaned">
+              <param name="ship" value="$oldShip"/>
+            </run_actions>
           </do_if>
           
           <!-- Check if new pilot is a registered GT pilot -->
@@ -3283,12 +3700,10 @@
             </do_if>
             
             <!-- Register new pilot for this ship -->
-            <do_if value="md.GT_Ship_Management.Register_Pilot?">
-              <run_actions ref="md.GT_Ship_Management.Register_Pilot">
-                <param name="pilot" value="$pilot"/>
-                <param name="ship" value="$ship"/>
-              </run_actions>
-            </do_if>
+            <run_actions ref="md.GT_CoreSystem.TryRegisterPilotForShip">
+              <param name="pilot" value="$pilot"/>
+              <param name="ship" value="$ship"/>
+            </run_actions>
           </do_if>
           <do_elseif value="$pilot">
             <!-- New pilot is NOT registered - restore original ship name and clean up old pilot -->
@@ -3297,14 +3712,13 @@
             </do_if>
             
             <!-- Get original name from ship registry (per ship, not per pilot) -->
-            <set_value name="$originalName" exact="null"/>
-            <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$OriginalShipName?">
-              <set_value name="$originalName" exact="global.$GT_Ships.{$ship}.$OriginalShipName"/>
-            </do_if>
-            <do_elseif value="$ship.knownname?">
+            <run_actions ref="md.GT_CoreSystem.GetShipRegistryOriginalName" result="$originalName">
+              <param name="ship" value="$ship"/>
+            </run_actions>
+            <do_if value="not $originalName and $ship.knownname?">
               <!-- Fallback: use current name if ship registry doesn't have original name -->
               <set_value name="$originalName" exact="$ship.knownname"/>
-            </do_elseif>
+            </do_if>
             
             <!-- Restore original ship name -->
             <do_if value="$originalName">
@@ -3316,11 +3730,11 @@
             
             <!-- CRITICAL FIX: Register the new unregistered pilot -->
             <!-- This ensures unregistered pilots get registered when swapped in -->
-            <do_if value="md.GT_Ship_Management.Register_Pilot?">
-              <run_actions ref="md.GT_Ship_Management.Register_Pilot">
-                <param name="pilot" value="$pilot"/>
-                <param name="ship" value="$ship"/>
-              </run_actions>
+            <run_actions ref="md.GT_CoreSystem.TryRegisterPilotForShip" result="$didRegisterNewPilot">
+              <param name="pilot" value="$pilot"/>
+              <param name="ship" value="$ship"/>
+            </run_actions>
+            <do_if value="$didRegisterNewPilot">
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <debug_text text="'[GT-Core] Registered new unregistered pilot: ' + $pilot.name" chance="100"/>
               </do_if>

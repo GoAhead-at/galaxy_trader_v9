@@ -69,6 +69,11 @@ local completedSwapByPair = {}
 local pendingDockAssignmentsByPair = {}
 local pendingReleaseRetries = {}
 local pendingPostSwapRefreshRetries = {}
+local pilotIndexCacheByShipId = nil
+
+local function invalidatePilotIndexCache()
+    pilotIndexCacheByShipId = nil
+end
 
 local function isShipInPendingRedistribution(ship, idcode)
     local shipKey = tostring(ship or "")
@@ -206,6 +211,7 @@ local function publishPostSwapNameRefresh(leftCode, rightCode, leftShip, rightSh
         .. " leftShip=" .. tostring(leftShip or 0)
         .. " rightShip=" .. tostring(rightShip or 0))
     if Mods and Mods.GalaxyTrader and Mods.GalaxyTrader.PilotData and type(Mods.GalaxyTrader.PilotData.requestRefresh) == "function" then
+        invalidatePilotIndexCache()
         Mods.GalaxyTrader.PilotData.requestRefresh()
         debugLog("PostSwapNameRefresh requested GT pilot data refresh left=" .. tostring(leftCode or "")
             .. " right=" .. tostring(rightCode or ""))
@@ -437,11 +443,7 @@ local function classRank(ship)
     return 0, "UNK"
 end
 
-local function getGTLevelByShip(ship)
-    local shipIdCode = GetComponentData(ship, "idcode")
-    if not shipIdCode or shipIdCode == "" then
-        return nil
-    end
+local function getGTPilotBridge()
     if not Mods or not Mods.GalaxyTrader or not Mods.GalaxyTrader.PilotData then
         return nil
     end
@@ -449,34 +451,43 @@ local function getGTLevelByShip(ship)
     if type(bridge.getPilots) ~= "function" then
         return nil
     end
-    local pilots = bridge.getPilots() or {}
-    for _, p in ipairs(pilots) do
-        if p and p.shipId == shipIdCode and p.level ~= nil then
-            local lvl = tonumber(p.level)
-            if lvl then
-                return math.max(1, math.min(15, math.floor(lvl)))
-            end
-        end
-    end
-    return nil
+    return bridge
 end
 
-local function getGTPilotDataByShip(ship)
+local function getGTPilotIndexByShipId()
+    if pilotIndexCacheByShipId then
+        return pilotIndexCacheByShipId
+    end
+    local bridge = getGTPilotBridge()
+    if not bridge then
+        return nil
+    end
+    local pilots = bridge.getPilots() or {}
+    local index = {}
+    for _, p in ipairs(pilots) do
+        if p and p.shipId and p.shipId ~= "" then
+            index[tostring(p.shipId)] = p
+        end
+    end
+    pilotIndexCacheByShipId = index
+    return pilotIndexCacheByShipId
+end
+
+local function getGTPilotDataByShip(ship, pilotIndex)
     local shipIdCode = GetComponentData(ship, "idcode")
     if not shipIdCode or shipIdCode == "" then
         return nil
     end
-    if not Mods or not Mods.GalaxyTrader or not Mods.GalaxyTrader.PilotData then
-        return nil
-    end
-    local bridge = Mods.GalaxyTrader.PilotData
-    if type(bridge.getPilots) ~= "function" then
-        return nil
-    end
-    local pilots = bridge.getPilots() or {}
-    for _, p in ipairs(pilots) do
-        if p and p.shipId == shipIdCode then
-            return p
+    local index = pilotIndex or getGTPilotIndexByShipId()
+    return index and index[tostring(shipIdCode)] or nil
+end
+
+local function getGTLevelByShip(ship, pilotIndex)
+    local pilotData = getGTPilotDataByShip(ship, pilotIndex)
+    if pilotData and pilotData.level ~= nil then
+        local lvl = tonumber(pilotData.level)
+        if lvl then
+            return math.max(1, math.min(15, math.floor(lvl)))
         end
     end
     return nil
@@ -569,6 +580,7 @@ local function collectFleetShips(commanderComponent)
     local commander = ConvertIDTo64Bit(commanderComponent)
     local ships = {}
     local seen = {}
+    local pilotIndex = getGTPilotIndexByShipId()
 
     local function addShip(ship)
         ship = asComponentId(ship)
@@ -599,13 +611,13 @@ local function collectFleetShips(commanderComponent)
                         debugLog("Fleet ship ignored: " .. tostring(idcode) .. " reason=pending_pilot_exchange")
                         return
                     end
-                    local pilotData = getGTPilotDataByShip(ship)
+                    local pilotData = getGTPilotDataByShip(ship, pilotIndex)
                     local isBlocked, blockedReason = isShipPilotBlocked(pilotData)
                     if isBlocked then
                         debugLog("Fleet ship ignored: " .. tostring(idcode) .. " reason=pilot_blocked detail=" .. tostring(blockedReason or "unknown"))
                         return
                     end
-                    local gtLevel = getGTLevelByShip(ship)
+                    local gtLevel = getGTLevelByShip(ship, pilotIndex)
                     if gtLevel then
                         table.insert(ships, {
                             ship = ship,
@@ -994,6 +1006,7 @@ local function requestFreshPilotDataAndRedistribute(commanderComponent)
 
     pendingRedistributeCommander = commander
     pilotDataRefreshRequestedAt = getElapsedTime()
+    invalidatePilotIndexCache()
     Mods.GalaxyTrader.PilotData.requestRefresh()
     debugLog("Requested fresh GT pilot data for redistribution commander " .. tostring(GetComponentData(commander, "idcode") or "UNKNOWN"))
 end
@@ -1069,6 +1082,7 @@ RegisterEvent("gt.redistributePilots", function(_, commanderComponent)
 end)
 
 RegisterEvent("GT_PilotData.Update", function()
+    invalidatePilotIndexCache()
     if pendingRedistributeCommander and pendingRedistributeCommander ~= 0 then
         local commander = pendingRedistributeCommander
         pendingRedistributeCommander = nil

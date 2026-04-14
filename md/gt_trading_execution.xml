@@ -19,7 +19,39 @@
         <set_value name="$tradeKey" exact="@$params.$TradeKey"/> <!-- Trade key for reservation cleanup (Phase 3) -->
         <set_value name="$traceId" exact="@$params.$TraceId"/> <!-- Trace ID for logging -->
         <set_value name="$abort" exact="false"/>
-        
+        <set_value name="$legacyBridged" exact="false"/>
+
+        <!-- Legacy decommission bridge:
+             Keep stale callers functional, but force all execution onto the active GT_Trade_Found / GT_No_Trade_Found flow. -->
+        <do_if value="$tradeList == null">
+          <set_value name="$tradeList" exact="[]"/>
+        </do_if>
+        <do_if value="$trade != null and $tradeList.count == 0">
+          <append_to_list name="$tradeList" exact="$trade"/>
+        </do_if>
+        <do_if value="$ship? and $ship.exists">
+          <do_if value="$tradeList.count gt 0">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Execution] ExecuteTrade bridged to GT_Trade_Found for ' + $ship.idcode + ' (trades=' + $tradeList.count + ')'" chance="100"/>
+            </do_if>
+            <signal_objects object="$ship" param="'GT_Trade_Found'" param2="table[
+              $TradeList = $tradeList,
+              $SearchMethod = 'legacy_execute_trade_bridge',
+              $SignalDelayMs = 0,
+              $Timestamp = player.age
+            ]" delay="1ms"/>
+          </do_if>
+          <do_else>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Execution] ExecuteTrade bridged to GT_No_Trade_Found for ' + $ship.idcode + ' (empty payload)'" chance="100"/>
+            </do_if>
+            <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'legacy_execute_trade_no_payload'" delay="1ms"/>
+          </do_else>
+        </do_if>
+        <set_value name="$legacyBridged" exact="true"/>
+        <cancel_cue cue="this"/>
+
+        <do_if value="not $legacyBridged">
         <!-- DIAGNOSTIC: Log ExecuteTrade entry -->
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-Execution] ExecuteTrade CALLED for ' + $ship.idcode + ' (Trade: ' + (if $trade != null then 'exists' else 'null') + ', TradeList count: ' + (if $tradeList != null then $tradeList.count else 'null') + ')'" chance="100"/>
@@ -255,6 +287,10 @@
             <set_value name="$foundValidTrade" exact="false"/>
             <set_value name="$fallbackTrade" exact="null"/>
             <do_if value="$tradeList.count gt 0">
+              <do_if value="not global.$GT_FallbackActivations?">
+                <set_value name="global.$GT_FallbackActivations" exact="table[]"/>
+              </do_if>
+              <set_value name="global.$GT_FallbackActivations.{'Execution.TradeListFallbackAttempt'}" exact="if global.$GT_FallbackActivations.{'Execution.TradeListFallbackAttempt'}? then global.$GT_FallbackActivations.{'Execution.TradeListFallbackAttempt'} + 1 else 1"/>
               <do_all exact="$tradeList.count" counter="$i">
                 <do_if value="not $foundValidTrade">
                   <set_value name="$candidateTrade" exact="$tradeList.{$i}"/>
@@ -263,10 +299,18 @@
                     <set_value name="$candidateSellOffer" exact="@$candidateTrade.$SellOffer"/>
                     <set_value name="$candidateBuyValid" exact="false"/>
                     <set_value name="$candidateSellValid" exact="false"/>
-                    <do_if value="$candidateBuyOffer != null and $candidateSellOffer != null">
-                      <set_value name="$candidateBuyValid" exact="$candidateBuyOffer.available and $candidateBuyOffer.amount gt 0"/>
+                    <set_value name="$candidateIsSellOnly" exact="$candidateBuyOffer == null and $candidateSellOffer != null"/>
+                    <do_if value="$candidateIsSellOnly">
+                      <!-- Sell-only fallback: only SellOffer must be valid. -->
+                      <set_value name="$candidateBuyValid" exact="true"/>
                       <set_value name="$candidateSellValid" exact="$candidateSellOffer.available and $candidateSellOffer.amount gt 0"/>
                     </do_if>
+                    <do_else>
+                      <do_if value="$candidateBuyOffer != null and $candidateSellOffer != null">
+                        <set_value name="$candidateBuyValid" exact="$candidateBuyOffer.available and $candidateBuyOffer.amount gt 0"/>
+                        <set_value name="$candidateSellValid" exact="$candidateSellOffer.available and $candidateSellOffer.amount gt 0"/>
+                      </do_if>
+                    </do_else>
                     <do_if value="$candidateBuyValid and $candidateSellValid">
                       <set_value name="$foundValidTrade" exact="true"/>
                       <set_value name="$fallbackTrade" exact="$candidateTrade"/>
@@ -282,11 +326,17 @@
                       <set_value name="$buyPrice" exact="@$candidateTrade.$BuyPrice"/>
                       <set_value name="$sellPrice" exact="@$candidateTrade.$SellPrice"/>
                       <set_value name="$distance" exact="@$candidateTrade.$Distance"/>
-                      <set_value name="$wareName" exact="@$candidateBuyOffer.ware.name"/>
-                      <set_value name="$buyStationName" exact="@$candidateBuyOffer.owner.knownname"/>
+                      <set_value name="$wareName" exact="if $candidateIsSellOnly then @$candidateSellOffer.ware.name else @$candidateBuyOffer.ware.name"/>
+                      <set_value name="$buyStationName" exact="if $candidateIsSellOnly then 'Ship cargo (sell-only)' else @$candidateBuyOffer.owner.knownname"/>
                       <set_value name="$sellStationName" exact="@$candidateSellOffer.owner.knownname"/>
+                      <do_if value="$candidateIsSellOnly">
+                        <do_if value="not global.$GT_FallbackActivations?">
+                          <set_value name="global.$GT_FallbackActivations" exact="table[]"/>
+                        </do_if>
+                        <set_value name="global.$GT_FallbackActivations.{'Execution.SellOnlyFallbackAccepted'}" exact="if global.$GT_FallbackActivations.{'Execution.SellOnlyFallbackAccepted'}? then global.$GT_FallbackActivations.{'Execution.SellOnlyFallbackAccepted'} + 1 else 1"/>
+                      </do_if>
                       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                        <debug_text text="'[GT-Execution] Found valid fallback trade #' + ($i + 1) + ' for ' + $ship.idcode + ': ' + $wareName + ' (Profit: ' + ($profit / 100) + ' Cr)'" chance="100"/>
+                        <debug_text text="'[GT-Execution] Found valid fallback trade #' + ($i + 1) + ' for ' + $ship.idcode + ': ' + $wareName + ' (Profit: ' + ($profit / 100) + ' Cr, sellOnly=' + $candidateIsSellOnly + ')'" chance="100"/>
                       </do_if>
                       <break/>
                     </do_if>
@@ -294,9 +344,19 @@
                 </do_if>
               </do_all>
             </do_if>
+            <do_if value="$foundValidTrade">
+              <do_if value="not global.$GT_FallbackActivations?">
+                <set_value name="global.$GT_FallbackActivations" exact="table[]"/>
+              </do_if>
+              <set_value name="global.$GT_FallbackActivations.{'Execution.TradeListFallbackSuccess'}" exact="if global.$GT_FallbackActivations.{'Execution.TradeListFallbackSuccess'}? then global.$GT_FallbackActivations.{'Execution.TradeListFallbackSuccess'} + 1 else 1"/>
+            </do_if>
             
             <!-- If no valid fallback trade found, signal no trade found -->
             <do_if value="not $foundValidTrade">
+              <do_if value="not global.$GT_FallbackActivations?">
+                <set_value name="global.$GT_FallbackActivations" exact="table[]"/>
+              </do_if>
+              <set_value name="global.$GT_FallbackActivations.{'Execution.TradeListFallbackMiss'}" exact="if global.$GT_FallbackActivations.{'Execution.TradeListFallbackMiss'}? then global.$GT_FallbackActivations.{'Execution.TradeListFallbackMiss'} + 1 else 1"/>
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <debug_text text="'[GT-Execution] No valid trades found in fallback list for ' + $ship.idcode + ' - restarting search'" chance="100"/>
               </do_if>
@@ -987,6 +1047,7 @@
         <!-- Close $tradeValid block -->
       </do_if>
       </do_if> <!-- close outer $abort gate -->
+      </do_if>
       </actions>
     </cue>
     
@@ -1067,6 +1128,7 @@
         <!-- P6 fix: Restructured to avoid cancel_cue fallthrough.
              Uses nested positive-flow checks; single cancel_cue at the very end (fallthrough-safe). -->
         <set_value name="$proceed" exact="false"/>
+        <set_value name="this.$TradeFoundPhase2Proceed" exact="false"/>
         <set_value name="this.$DelayTime" exact="0ms"/>
         
         <do_if value="global.$GT_TS_OutputQueue? and global.$GT_TS_OutputQueue.$TradeFoundQueue?">
@@ -1086,6 +1148,7 @@
                 <set_value name="this.$DelayTime" exact="$readyAt - player.age"/>
               </do_if>
               <set_value name="$proceed" exact="true"/>
+              <set_value name="this.$TradeFoundPhase2Proceed" exact="true"/>
             </do_if>
             
             <do_if value="not $proceed">
@@ -1097,53 +1160,64 @@
         
         <!-- Single cancel_cue as LAST statement — fallthrough is harmless (nothing after it) -->
         <do_if value="not $proceed">
+          <set_value name="this.$TradeFoundPhase2Proceed" exact="false"/>
           <cancel_cue cue="this"/>
         </do_if>
       </actions>
       <delay exact="this.$DelayTime"/>
       <actions>
+        <set_value name="$phase2Proceed" exact="this.$TradeFoundPhase2Proceed and global.$GT_TS_OutputQueue? and global.$GT_TS_OutputQueue.$TradeFoundQueue? and global.$GT_TS_OutputQueue.$TradeFoundQueue.count gt 0"/>
+        <do_if value="not $phase2Proceed">
+          <do_if value="global.$GT_TS_OutputQueue? and global.$GT_TS_OutputQueue.$TradeFoundProcessing?">
+            <set_value name="global.$GT_TS_OutputQueue.$TradeFoundProcessing" exact="false"/>
+          </do_if>
+          <cancel_cue cue="this"/>
+        </do_if>
+
         <!-- Pop after waiting -->
-        <set_value name="$entry" exact="global.$GT_TS_OutputQueue.$TradeFoundQueue.{1}"/>
-        <remove_from_list name="global.$GT_TS_OutputQueue.$TradeFoundQueue" exact="$entry"/>
-        <set_value name="$ship" exact="@$entry.$Ship"/>
-        <do_if value="$ship?">
-          <remove_value name="global.$GT_TS_OutputQueue.$TradeFoundQueued.{$ship}"/>
-        </do_if>
+        <do_if value="$phase2Proceed">
+          <set_value name="$entry" exact="global.$GT_TS_OutputQueue.$TradeFoundQueue.{1}"/>
+          <remove_from_list name="global.$GT_TS_OutputQueue.$TradeFoundQueue" exact="$entry"/>
+          <set_value name="$ship" exact="@$entry.$Ship"/>
+          <do_if value="$ship?">
+            <remove_value name="global.$GT_TS_OutputQueue.$TradeFoundQueued.{$ship}"/>
+          </do_if>
 
-        <do_if value="$ship? and $ship.exists">
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Execution] SENDING GT_Trade_Found (queued) to ' + $ship.idcode + ' at ' + player.age" chance="100"/>
-          </do_if>
+          <do_if value="$ship? and $ship.exists">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Execution] SENDING GT_Trade_Found (queued) to ' + $ship.idcode + ' at ' + player.age" chance="100"/>
+            </do_if>
           
-          <!-- Read trade data from global storage (stored by ExecuteTrade cue) -->
-          <set_value name="$tradeList" exact="[]"/>
-          <set_value name="$searchMethod" exact="''"/>
-          <do_if value="global.$GT_TradesAwaitingValidation? and global.$GT_TradesAwaitingValidation.{$ship}?">
-            <set_value name="$tradeList" exact="global.$GT_TradesAwaitingValidation.{$ship}"/>
-          </do_if>
-          <do_if value="global.$GT_TradesAwaitingValidationSearchMethod? and global.$GT_TradesAwaitingValidationSearchMethod.{$ship}?">
-            <set_value name="$searchMethod" exact="@global.$GT_TradesAwaitingValidationSearchMethod.{$ship}"/>
-          </do_if>
+            <!-- Read trade data from global storage (stored by ExecuteTrade cue) -->
+            <set_value name="$tradeList" exact="[]"/>
+            <set_value name="$searchMethod" exact="''"/>
+            <do_if value="global.$GT_TradesAwaitingValidation? and global.$GT_TradesAwaitingValidation.{$ship}?">
+              <set_value name="$tradeList" exact="global.$GT_TradesAwaitingValidation.{$ship}"/>
+            </do_if>
+            <do_if value="global.$GT_TradesAwaitingValidationSearchMethod? and global.$GT_TradesAwaitingValidationSearchMethod.{$ship}?">
+              <set_value name="$searchMethod" exact="@global.$GT_TradesAwaitingValidationSearchMethod.{$ship}"/>
+            </do_if>
           
-          <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
-            <param name="ship" value="$ship"/>
-            <param name="stage" value="'result'"/>
-            <param name="state" value="'trade_found'"/>
-            <param name="reason" value="''"/>
-            <param name="traceId" value="if global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$TraceId? then global.$GT_AIParameters.{$ship}.$TraceId else ''"/>
-            <param name="extra" value="table[$PendingTrades = (if $tradeList != null then $tradeList.count else 0)]"/>
-          </run_actions>
-          <!-- Pass trade data directly in signal param2 (like GT_Training_Station_Found) -->
-          <signal_objects object="$ship" param="'GT_Trade_Found'" param2="table[
-            $TradeList = $tradeList,
-            $SearchMethod = $searchMethod
-          ]" delay="1ms"/>
-        </do_if>
+            <run_actions ref="md.GT_Libraries_General.GT_RequestStatus_Update">
+              <param name="ship" value="$ship"/>
+              <param name="stage" value="'result'"/>
+              <param name="state" value="'trade_found'"/>
+              <param name="reason" value="''"/>
+              <param name="traceId" value="if global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$TraceId? then global.$GT_AIParameters.{$ship}.$TraceId else ''"/>
+              <param name="extra" value="table[$PendingTrades = (if $tradeList != null then $tradeList.count else 0)]"/>
+            </run_actions>
+            <!-- Pass trade data directly in signal param2 (like GT_Training_Station_Found) -->
+            <signal_objects object="$ship" param="'GT_Trade_Found'" param2="table[
+              $TradeList = $tradeList,
+              $SearchMethod = $searchMethod
+            ]" delay="1ms"/>
+          </do_if>
 
-        <!-- Yield between signals to smooth FPS (hardcoded for now) -->
-        <set_value name="global.$GT_TS_OutputQueue.$TradeFoundProcessing" exact="false"/>
-        <do_if value="global.$GT_TS_OutputQueue.$TradeFoundQueue.count gt 0">
-          <signal_cue_instantly cue="md.GT_Trading_Execution.ProcessTradeFoundSignalQueue"/>
+          <!-- Yield between signals to smooth FPS (hardcoded for now) -->
+          <set_value name="global.$GT_TS_OutputQueue.$TradeFoundProcessing" exact="false"/>
+          <do_if value="global.$GT_TS_OutputQueue.$TradeFoundQueue.count gt 0">
+            <signal_cue_instantly cue="md.GT_Trading_Execution.ProcessTradeFoundSignalQueue"/>
+          </do_if>
         </do_if>
       </actions>
     </cue>

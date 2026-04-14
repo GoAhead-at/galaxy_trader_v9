@@ -219,6 +219,8 @@
     <set_value name="this.$minSwitchCooldown" exact="[30s, [600s, $minSwitchCooldown].min].max"/>
     <set_value name="this.$minCargoCommitPercent" exact="[0, [100, $minCargoCommitPercent].min].max"/>
     <set_value name="this.$hardEmergencyDelta" exact="[20, [100, $hardEmergencyDelta].min].max"/>
+    <!-- Keep ware preselection aligned with mining routine expectations (minrating defaults to 3). -->
+    <set_value name="this.$minReachableYieldRating" exact="3"/>
     <do_if value="this.$hardEmergencyDelta lt this.$criticalDemandDelta">
       <set_value name="this.$hardEmergencyDelta" exact="this.$criticalDemandDelta"/>
     </do_if>
@@ -257,6 +259,20 @@
     </do_if>
     <do_if value="not global.$GT_MinerIntents?">
       <set_value name="global.$GT_MinerIntents" exact="table[]"/>
+    </do_if>
+    <!-- Self-heal on (re)assignment: clear stale detached-cleanup tracking that can
+         survive older abort storms and keep ships in pseudo-orphan state. -->
+    <do_if value="global.$GT_CleanupIntent? and global.$GT_CleanupIntent.{this.ship}?">
+      <remove_value name="global.$GT_CleanupIntent.{this.ship}"/>
+    </do_if>
+    <do_if value="global.$GT_OrphanVerifyPending? and global.$GT_OrphanVerifyPending.{this.ship}?">
+      <remove_value name="global.$GT_OrphanVerifyPending.{this.ship}"/>
+    </do_if>
+    <do_if value="global.$GT_DelayedVerificationState? and global.$GT_DelayedVerificationState.{this.ship}?">
+      <remove_value name="global.$GT_DelayedVerificationState.{this.ship}"/>
+    </do_if>
+    <do_if value="global.$GT_CleanupSignalState? and global.$GT_CleanupSignalState.{this.ship}?">
+      <remove_value name="global.$GT_CleanupSignalState.{this.ship}"/>
     </do_if>
 
     <!-- Register with GT lifecycle -->
@@ -515,7 +531,11 @@
         <set_value name="$wareIsReachable" exact="false"/>
         <do_all exact="$wareReachabilityGatherSpaces.count" counter="$gsi">
           <set_value name="$gatherSectorEval" exact="$wareReachabilityGatherSpaces.{$gsi}"/>
-          <do_if value="$gatherSectorEval? and $gatherSectorEval.exists and $gatherSectorEval.isclass.sector and $gatherSectorEval.resources.{$wareEval}.exists">
+          <set_value name="$sectorYieldRating" exact="-1"/>
+          <do_if value="$gatherSectorEval? and $gatherSectorEval.exists and $gatherSectorEval.isclass.sector and $gatherSectorEval.yieldrating.{$wareEval}?">
+            <set_value name="$sectorYieldRating" exact="@$gatherSectorEval.yieldrating.{$wareEval}"/>
+          </do_if>
+          <do_if value="$gatherSectorEval? and $gatherSectorEval.exists and $gatherSectorEval.isclass.sector and $gatherSectorEval.resources.{$wareEval}.exists and $sectorYieldRating ge this.$minReachableYieldRating">
             <set_value name="$wareIsReachable" exact="true"/>
             <break/>
           </do_if>
@@ -1086,16 +1106,39 @@
         <remove_value name="global.$GT_MinerIntents.{$intentStation}.{this.$minerIntentWare}.{this.ship}"/>
       </do_all>
     </do_if>
-    <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
-      $Ship = this.ship,
-      $UpdateType = 'GT_Order_Cancelled'
-    ]"/>
+    <!-- Abort can happen during subordinate Assist restarts while GT control is still valid.
+         Only emit cancellation/orphan checks when GT control is really gone. -->
+    <set_value name="$abortDefaultOrder" exact="if this.ship.defaultorder? then @this.ship.defaultorder.id else null"/>
+    <set_value name="$abortHasDirectGTOrder" exact="false"/>
+    <set_value name="$abortHasGTCommander" exact="false"/>
+    <do_if value="$abortDefaultOrder? and global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{$abortDefaultOrder}">
+      <set_value name="$abortHasDirectGTOrder" exact="true"/>
+    </do_if>
+    <do_elseif value="$abortDefaultOrder == 'Assist' and this.ship.defaultorder? and this.ship.defaultorder.$baseorder? and global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@this.ship.defaultorder.$baseorder.id}">
+      <set_value name="$abortHasDirectGTOrder" exact="true"/>
+    </do_elseif>
+    <do_if value="not $abortHasDirectGTOrder and this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship and this.ship.commander.defaultorder? and global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@this.ship.commander.defaultorder.id}">
+      <set_value name="$abortHasGTCommander" exact="true"/>
+    </do_if>
+    <do_elseif value="not $abortHasDirectGTOrder and this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship and this.ship.commander.defaultorder? and @this.ship.commander.defaultorder.id == 'Assist' and this.ship.commander.defaultorder.$baseorder? and global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@this.ship.commander.defaultorder.$baseorder.id}">
+      <set_value name="$abortHasGTCommander" exact="true"/>
+    </do_elseif>
+    <debug_text text="'[GT-Miner-DIAG] ON_ABORT ship=' + this.ship.idcode + ', default=' + (if $abortDefaultOrder? then $abortDefaultOrder else 'NONE') + ', current=' + (if this.ship.order? then @this.ship.order.id else 'NONE') + ', hasDirectGT=' + $abortHasDirectGTOrder + ', hasGTCommander=' + $abortHasGTCommander + ', commander=' + (if this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship then this.ship.commander.idcode else 'NONE') + ', orders=' + (if this.ship.orders? then this.ship.orders.count else 0)" chance="100" filter="error"/>
+    <do_if value="not $abortHasDirectGTOrder and not $abortHasGTCommander">
+      <signal_objects object="player.galaxy" param="'GT_Ship_State_Update'" param2="table[
+        $Ship = this.ship,
+        $UpdateType = 'GT_Order_Cancelled'
+      ]"/>
+      <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[$Ship = this.ship]"/>
+    </do_if>
+    <do_else>
+      <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': on_abort detected active GT control (default=' + (if $abortDefaultOrder? then $abortDefaultOrder else 'NONE') + ', hasDirect=' + $abortHasDirectGTOrder + ', hasGTCommander=' + $abortHasGTCommander + ') - skipping GT_Order_Cancelled'" chance="this.$debugchance"/>
+    </do_else>
     <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{this.ship}?">
       <remove_value name="global.$GT_AIParameters.{this.ship}"/>
     </do_if>
     <do_if value="global.$GT_MinerDiag? and global.$GT_MinerDiag.{this.ship}?">
       <remove_value name="global.$GT_MinerDiag.{this.ship}"/>
     </do_if>
-    <signal_objects object="player.galaxy" param="'GT_Check_Ship_Orphaned'" param2="table[$Ship = this.ship]"/>
   </on_abort>
 </aiscript>

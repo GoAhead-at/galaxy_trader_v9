@@ -313,14 +313,15 @@ function gtDiagnose.populateFrame(frame)
                 "Reason",
             })
         elseif isMinerScan then
-            -- Miner Resource Scan: Status=6%, Ware=18%, Urgency=10%, Reachable=10%, Primary Cap=14%, Notes=flexible
-            GT_UI.setColPercents(contentTable, { 6, 18, 10, 10, 14 })
+            -- Miner Resource Scan (dedicated self-scan):
+            -- Status=6%, Ware=20%, Best Yield=10%, Reachable=10%, Sectors=10%, Notes=flexible
+            GT_UI.setColPercents(contentTable, { 6, 20, 10, 10, 10 })
             GT_UI.addHeaderRow(contentTable, {
                 { text = "Status", halign = "center" },
                 "Ware (* = active)",
-                { text = "Urgency", halign = "right" },
+                { text = "Best Yield", halign = "right" },
                 { text = "Reachable", halign = "center" },
-                { text = "Primary Cap.", halign = "center" },
+                { text = "Sectors", halign = "right" },
                 "Notes",
             })
         else
@@ -374,10 +375,10 @@ function gtDiagnose.populateFrame(frame)
                     elseif isPairDetails then
                         col4Align = "right"
                     elseif isMinerScan then
-                        -- Miner Resource Scan: Urgency right, Reachable + Primary Cap centered
+                        -- Miner Resource Scan: Best Yield right, Reachable centered, Sectors right
                         detailAlign = "right"
                         col4Align   = "center"
-                        col5Align   = "center"
+                        col5Align   = "right"
                     end
 
                     GT_UI.addDataRow(contentTable, {

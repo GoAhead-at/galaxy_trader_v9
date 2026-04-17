@@ -852,12 +852,179 @@
           <append_to_list name="$sec2.$Rows" exact="table[$Check = 'Last Snapshot Update', $Status = 'INFO', $Detail = $lastUpdateText]"/>
 
           <append_to_list name="$report.$Sections" exact="$sec2"/>
+
+          <!-- ======================================================== -->
+          <!-- SECTION 2b: Miner Resource Scan                          -->
+          <!-- Surfaces the per-ware scoring data the miner AI computes -->
+          <!-- in its main loop ($candidateWares -> $wareUrgency /      -->
+          <!-- $wareReachable / $wareHasPrimaryCapacity), plus the      -->
+          <!-- gather sectors kept by the A4 safety/ownership pre-      -->
+          <!-- filter ($wareReachabilityGatherSpaces). Rendered as a    -->
+          <!-- 6-column structured row block: header context first,     -->
+          <!-- then one row per candidate ware (top-N by urgency).      -->
+          <!-- Data source: GT_Miner_Diag_Update payload, fields        -->
+          <!-- $ResourceScanRows / $GatherSectorNames / $CandidateWare- -->
+          <!-- Count / $GatherBlacklistGroup / $MinReachableYield-      -->
+          <!-- Rating / $BestUrgency / $RestrictToShipBasket added in   -->
+          <!-- order.trade.galaxyminer.xml at the existing diag-emit.   -->
+          <!-- ======================================================== -->
+          <do_if value="$minerDiag?">
+            <set_value name="$sec2b" exact="table[]"/>
+            <set_value name="$sec2b.$Name" exact="'Miner Resource Scan'"/>
+            <set_value name="$sec2b.$Rows" exact="[]"/>
+
+            <set_value name="$scanCandidateCount" exact="if $minerDiag.$CandidateWareCount? then $minerDiag.$CandidateWareCount else 0"/>
+            <set_value name="$scanGatherCount" exact="if $minerDiag.$GatherSectorCount? then $minerDiag.$GatherSectorCount else 0"/>
+            <set_value name="$scanGatherNames" exact="if $minerDiag.$GatherSectorNames? then $minerDiag.$GatherSectorNames else []"/>
+            <set_value name="$scanBlacklistGroup" exact="if $minerDiag.$GatherBlacklistGroup? then $minerDiag.$GatherBlacklistGroup else 'NONE'"/>
+            <set_value name="$scanMinYield" exact="if $minerDiag.$MinReachableYieldRating? then $minerDiag.$MinReachableYieldRating else 1"/>
+            <set_value name="$scanBestUrgency" exact="if $minerDiag.$BestUrgency? then $minerDiag.$BestUrgency else -1"/>
+            <set_value name="$scanRestrictToBasket" exact="if $minerDiag.$RestrictToShipBasket? then $minerDiag.$RestrictToShipBasket else false"/>
+            <set_value name="$scanRows" exact="if $minerDiag.$ResourceScanRows? then $minerDiag.$ResourceScanRows else []"/>
+
+            <!-- Count reachable wares for header summary -->
+            <set_value name="$scanReachableCount" exact="0"/>
+            <do_all exact="$scanRows.count" counter="$srci">
+              <set_value name="$scanRowEntry" exact="$scanRows.{$srci}"/>
+              <do_if value="$scanRowEntry? and $scanRowEntry.$Reachable? and $scanRowEntry.$Reachable">
+                <set_value name="$scanReachableCount" exact="$scanReachableCount + 1"/>
+              </do_if>
+            </do_all>
+
+            <!-- Header context rows (3-col rows render as Status | Check | Detail spanning to col6) -->
+            <append_to_list name="$sec2b.$Rows" exact="table[$Check = '--- Scan Context ---', $Status = 'INFO', $Detail = '']"/>
+            <append_to_list name="$sec2b.$Rows" exact="table[$Check = 'Candidate Wares', $Status = if $scanCandidateCount gt 0 then 'PASS' else 'WARN', $Detail = '' + $scanCandidateCount + ' wares (basket-restricted: ' + (if $scanRestrictToBasket then 'yes' else 'no') + ')']"/>
+            <append_to_list name="$sec2b.$Rows" exact="table[$Check = 'Reachable Wares', $Status = if $scanReachableCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $scanReachableCount + ' / ' + $scanCandidateCount + ' candidates have a kept gather sector at min yield ' + $scanMinYield]"/>
+            <append_to_list name="$sec2b.$Rows" exact="table[$Check = 'Best Urgency', $Status = if $scanBestUrgency gt 0 then 'PASS' else 'INFO', $Detail = '' + $scanBestUrgency + (if $scanBestUrgency le 0 then ' (no station deficit detected — ship will idle/wait)' else ' (sum of (deficit/target)*100 across demand stations)')]"/>
+            <append_to_list name="$sec2b.$Rows" exact="table[$Check = 'Min Yield Rating', $Status = 'INFO', $Detail = '' + $scanMinYield + ' (sectors below this are pruned by the reachability check)']"/>
+            <append_to_list name="$sec2b.$Rows" exact="table[$Check = 'Gather Sectors Kept', $Status = if $scanGatherCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $scanGatherCount + ' kept after A4 safety/ownership pre-filter (hostile / hazardous / contested / sector-blacklisted excluded)']"/>
+            <set_value name="$scanGatherNamesText" exact="''"/>
+            <do_all exact="$scanGatherNames.count" counter="$sgni">
+              <do_if value="$scanGatherNamesText != ''">
+                <set_value name="$scanGatherNamesText" exact="$scanGatherNamesText + ', '"/>
+              </do_if>
+              <set_value name="$scanGatherNamesText" exact="$scanGatherNamesText + $scanGatherNames.{$sgni}"/>
+            </do_all>
+            <do_if value="$scanGatherNamesText == ''">
+              <set_value name="$scanGatherNamesText" exact="'(none)'"/>
+            </do_if>
+            <do_if value="$scanGatherCount gt $scanGatherNames.count">
+              <set_value name="$scanGatherNamesText" exact="$scanGatherNamesText + ' (+' + ($scanGatherCount - $scanGatherNames.count) + ' more)'"/>
+            </do_if>
+            <append_to_list name="$sec2b.$Rows" exact="table[$Check = 'Gather Sector Names', $Status = 'INFO', $Detail = $scanGatherNamesText]"/>
+            <append_to_list name="$sec2b.$Rows" exact="table[$Check = 'Sector Blacklist Group', $Status = 'INFO', $Detail = $scanBlacklistGroup]"/>
+
+            <!-- Per-ware structured rows: Status | Ware | Urgency | Reachable | Primary Cap | Notes
+                 Sort by urgency descending so the highest-priority candidates are at the top. -->
+            <append_to_list name="$sec2b.$Rows" exact="table[$Check = '--- Wares (sorted by urgency desc, top 12) ---', $Status = 'INFO', $Detail = '']"/>
+            <do_if value="$scanRows.count == 0">
+              <append_to_list name="$sec2b.$Rows" exact="table[$Check = 'No data', $Status = 'WARN', $Detail = 'No candidate wares in last miner snapshot — ship may not have run a scoring cycle yet, or ship.warebasket / configured demand stations produced an empty pool.']"/>
+            </do_if>
+            <do_if value="$scanRows.count gt 0">
+              <!-- Selection-sort top-N by $Urgency desc (small N <= 16; cost is fine for diagnose).
+                   X4 MD has no insert_in_list, so we walk the source list once per output row
+                   picking the highest-urgency entry that has not been claimed yet. A boolean list
+                   $scanClaimed mirrors the source indices to mark already-emitted rows. -->
+              <set_value name="$scanRenderCap" exact="[$scanRows.count, 12].min"/>
+              <set_value name="$scanSorted" exact="[]"/>
+              <set_value name="$scanClaimed" exact="[]"/>
+              <do_all exact="$scanRows.count" counter="$scii">
+                <append_to_list name="$scanClaimed" exact="false"/>
+              </do_all>
+              <do_all exact="$scanRenderCap" counter="$srj">
+                <set_value name="$scanBestIdx" exact="0"/>
+                <!-- Sentinel below any plausible urgency ($urgency = sum of (deficit/target)*100;
+                     even a 50-station fleet with 100% deficit per station tops out around 5000). -->
+                <set_value name="$scanBestUrgencyVal" exact="-1000000"/>
+                <do_all exact="$scanRows.count" counter="$ssk">
+                  <do_if value="not $scanClaimed.{$ssk}">
+                    <set_value name="$scanCandRow" exact="$scanRows.{$ssk}"/>
+                    <set_value name="$scanCandUrgency" exact="if $scanCandRow? and $scanCandRow.$Urgency? then $scanCandRow.$Urgency else 0"/>
+                    <do_if value="$scanCandUrgency gt $scanBestUrgencyVal">
+                      <set_value name="$scanBestUrgencyVal" exact="$scanCandUrgency"/>
+                      <set_value name="$scanBestIdx" exact="$ssk"/>
+                    </do_if>
+                  </do_if>
+                </do_all>
+                <do_if value="$scanBestIdx gt 0">
+                  <append_to_list name="$scanSorted" exact="$scanRows.{$scanBestIdx}"/>
+                  <set_value name="$scanClaimed.{$scanBestIdx}" exact="true"/>
+                </do_if>
+              </do_all>
+              <set_value name="$scanRenderCount" exact="$scanSorted.count"/>
+              <do_all exact="$scanRenderCount" counter="$sri">
+                <set_value name="$scanRowOut" exact="$scanSorted.{$sri}"/>
+                <set_value name="$scanWareName" exact="if $scanRowOut.$WareName? then $scanRowOut.$WareName else '?'"/>
+                <set_value name="$scanIsSelected" exact="$scanRowOut.$IsSelected? and $scanRowOut.$IsSelected"/>
+                <set_value name="$scanUrgencyVal" exact="if $scanRowOut.$Urgency? then $scanRowOut.$Urgency else 0"/>
+                <set_value name="$scanReachable" exact="$scanRowOut.$Reachable? and $scanRowOut.$Reachable"/>
+                <set_value name="$scanHasPrimary" exact="$scanRowOut.$HasPrimaryCapacity? and $scanRowOut.$HasPrimaryCapacity"/>
+                <set_value name="$scanCargoCnt" exact="if $scanRowOut.$CargoCount? then $scanRowOut.$CargoCount else 0"/>
+                <set_value name="$scanCargoCap" exact="if $scanRowOut.$CargoMax? then $scanRowOut.$CargoMax else 0"/>
+                <set_value name="$scanRowStatus" exact="'INFO'"/>
+                <do_if value="$scanIsSelected">
+                  <set_value name="$scanRowStatus" exact="'PASS'"/>
+                </do_if>
+                <do_elseif value="not $scanReachable">
+                  <set_value name="$scanRowStatus" exact="'WARN'"/>
+                </do_elseif>
+                <do_elseif value="$scanReachable and $scanUrgencyVal le 0">
+                  <set_value name="$scanRowStatus" exact="'WARN'"/>
+                </do_elseif>
+                <set_value name="$scanWareLabel" exact="$scanWareName"/>
+                <do_if value="$scanIsSelected">
+                  <set_value name="$scanWareLabel" exact="'* ' + $scanWareName"/>
+                </do_if>
+                <set_value name="$scanReachableText" exact="if $scanReachable then 'yes' else 'no'"/>
+                <set_value name="$scanPrimaryText" exact="if $scanHasPrimary then 'yes' else (if $scanReachable then 'no (overflow only)' else 'n/a')"/>
+                <set_value name="$scanNotesText" exact="''"/>
+                <do_if value="$scanIsSelected">
+                  <set_value name="$scanNotesText" exact="'active mining ware'"/>
+                </do_if>
+                <do_if value="$scanCargoCap gt 0">
+                  <set_value name="$scanNotesText" exact="(if $scanNotesText != '' then $scanNotesText + ' | ' else '') + 'cargo ' + $scanCargoCnt + '/' + $scanCargoCap"/>
+                </do_if>
+                <do_if value="not $scanReachable">
+                  <set_value name="$scanNotesText" exact="(if $scanNotesText != '' then $scanNotesText + ' | ' else '') + 'no kept gather sector with yield >= ' + $scanMinYield"/>
+                </do_if>
+                <append_to_list name="$sec2b.$Rows" exact="table[
+                  $Status = $scanRowStatus,
+                  $Check = $scanWareLabel,
+                  $Detail = '' + $scanUrgencyVal,
+                  $Col4 = $scanReachableText,
+                  $Col5 = $scanPrimaryText,
+                  $Col6 = $scanNotesText
+                ]"/>
+              </do_all>
+              <do_if value="$scanRows.count gt $scanRenderCount">
+                <append_to_list name="$sec2b.$Rows" exact="table[$Check = '... (' + ($scanRows.count - $scanRenderCount) + ' more wares not shown)', $Status = 'INFO', $Detail = '']"/>
+              </do_if>
+            </do_if>
+
+            <append_to_list name="$report.$Sections" exact="$sec2b"/>
+          </do_if>
         </do_if>
 
-        <!-- Player economy variables (needed for pair evaluation + VERDICT) -->
+        <!-- Player economy variables (needed for pair evaluation + VERDICT).
+             Mirror the read order used by the AI-side helper lib.gt.attention.min_player_money:
+               1) global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney (when present and gt 0)
+               2) Fallback to 1000 (historical default if settings have not populated yet)
+             Previously read from global.$GT_AIParameters.{ship}.$MinPlayerMoney, which was never
+             populated for MK3/MK4/Miner — only $IgnoreBuildStorage / $IgnoreCarrierAux / $HomeBase
+             / $TraceId / $DistancePenalty / $AutoDeployResourceProbes / $MaxDistance keys are written
+             into $GT_AIParameters by GT_RequestRegistry_Acquire — so the gate threshold defaulted
+             to 100000 Cr regardless of the user's actual fleet setting and made the "money gate"
+             verdict misleading. The legacy read is kept as an upper-bound fallback for the rare
+             case a future writer puts a per-ship override there. -->
         <set_value name="$playerMoney" exact="player.money"/>
-        <set_value name="$minPlayerMoney" exact="0"/>
-        <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$MinPlayerMoney?">
+        <set_value name="$minPlayerMoney" exact="1000"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney?">
+          <set_value name="$tmpMinMoney" exact="@global.$GT_GlobalSettings.$Fleet.$MinPlayerMoney"/>
+          <do_if value="$tmpMinMoney? and $tmpMinMoney != null and $tmpMinMoney gt 0">
+            <set_value name="$minPlayerMoney" exact="$tmpMinMoney"/>
+          </do_if>
+        </do_if>
+        <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$MinPlayerMoney? and global.$GT_AIParameters.{$ship}.$MinPlayerMoney gt $minPlayerMoney">
           <set_value name="$minPlayerMoney" exact="global.$GT_AIParameters.{$ship}.$MinPlayerMoney"/>
         </do_if>
         <set_value name="$moneyGateThreshold" exact="$minPlayerMoney + 100000"/>

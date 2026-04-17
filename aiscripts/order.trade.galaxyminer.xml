@@ -219,8 +219,11 @@
     <set_value name="this.$minSwitchCooldown" exact="[30s, [600s, $minSwitchCooldown].min].max"/>
     <set_value name="this.$minCargoCommitPercent" exact="[0, [100, $minCargoCommitPercent].min].max"/>
     <set_value name="this.$hardEmergencyDelta" exact="[20, [100, $hardEmergencyDelta].min].max"/>
-    <!-- Keep ware preselection aligned with mining routine expectations (minrating defaults to 3). -->
-    <set_value name="this.$minReachableYieldRating" exact="3"/>
+    <!-- A3: minrating=1 (any non-zero yield) so low-yield-but-actually-mineable wares are not pre-filtered.
+         The mining routine itself adapts the per-sector rating threshold (see order.mining.routine.gt.xml ~1064)
+         so a yield-rating-1 sector can still produce a successful find_resource. Keeping the order's pre-filter
+         at 3 prevented low-pilot-level / single-sector miners from ever picking valid low-yield wares. -->
+    <set_value name="this.$minReachableYieldRating" exact="1"/>
     <do_if value="this.$hardEmergencyDelta lt this.$criticalDemandDelta">
       <set_value name="this.$hardEmergencyDelta" exact="this.$criticalDemandDelta"/>
     </do_if>
@@ -387,8 +390,16 @@
             <do_if value="this.$playerStationsOnly and $stationCandidate.owner != this.owner">
               <set_value name="$allowStation" exact="false"/>
             </do_if>
-            <do_if value="this.$homeSector? and this.$homeSector.exists and $stationCandidate.sector != this.$homeSector">
-              <set_value name="$allowStation" exact="false"/>
+            <!-- B2: do not silently drop user-supplied stations just because they're outside the home sector.
+                 Use $maxSellDistance (computed from homeSector if set, else from the ship's current sector) as the real cap.
+                 gatedistance == -1 means "unreachable / not connected"; gatedistance is unitless jumps. -->
+            <do_if value="$allowStation and $stationCandidate.sector?">
+              <set_value name="$stationListRefSector" exact="if this.$homeSector? and this.$homeSector.exists then this.$homeSector else this.ship.sector"/>
+              <set_value name="$stationListGateDistance" exact="$stationListRefSector.gatedistance.{$stationCandidate.sector}"/>
+              <do_if value="$stationListGateDistance lt 0 or $stationListGateDistance gt this.$maxSellDistance">
+                <set_value name="$allowStation" exact="false"/>
+                <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': stationList drop ' + $stationCandidate.idcode + ' sector=' + $stationCandidate.sector.knownname + ' dist=' + $stationListGateDistance + ' maxSell=' + this.$maxSellDistance" chance="this.$debugchance"/>
+              </do_if>
             </do_if>
             <do_if value="$allowStation and not $targetStations.indexof.{$stationCandidate}">
               <append_to_list name="$targetStations" exact="$stationCandidate"/>
@@ -411,7 +422,7 @@
           <set_value name="this.$minerDemandSectorsScanList" exact="$demandSectors"/>
           <set_value name="this.$minerDemandSectorsScanIndex" exact="1"/>
           <do_while value="this.$minerDemandSectorsScanIndex le this.$minerDemandSectorsScanList.count">
-            <set_value name="$chunkEnd" exact="[this.$minerDemandSectorsScanIndex + 2, this.$minerDemandSectorsScanList.count].min"/>
+            <set_value name="$chunkEnd" exact="[this.$minerDemandSectorsScanIndex + 4, this.$minerDemandSectorsScanList.count].min"/>
             <do_all exact="$chunkEnd - this.$minerDemandSectorsScanIndex + 1" counter="$chunkOffset">
               <set_value name="$dsi" exact="this.$minerDemandSectorsScanIndex + $chunkOffset - 1"/>
               <set_value name="$demandSector" exact="this.$minerDemandSectorsScanList.{$dsi}"/>
@@ -496,14 +507,15 @@
         <set_value name="this.$minerCandidateScanDemandStations" exact="$demandStations"/>
         <set_value name="this.$minerCandidateScanIndex" exact="1"/>
         <do_while value="this.$minerCandidateScanIndex le this.$minerCandidateScanDemandStations.count">
-          <set_value name="$chunkEnd" exact="[this.$minerCandidateScanIndex + 4, this.$minerCandidateScanDemandStations.count].min"/>
+          <set_value name="$chunkEnd" exact="[this.$minerCandidateScanIndex + 9, this.$minerCandidateScanDemandStations.count].min"/>
           <do_all exact="$chunkEnd - this.$minerCandidateScanIndex + 1" counter="$chunkOffset">
             <set_value name="$tsi" exact="this.$minerCandidateScanIndex + $chunkOffset - 1"/>
             <set_value name="$stationCandidate" exact="this.$minerCandidateScanDemandStations.{$tsi}"/>
             <set_value name="$stationCargoList" exact="$stationCandidate.cargo.list"/>
             <do_all exact="$stationCargoList.count" counter="$sci">
               <set_value name="$candidateWare" exact="$stationCargoList.{$sci}"/>
-              <do_if value="$candidateWare? and ($candidateWare.waretransport == waretransport.solid or $candidateWare.waretransport == waretransport.liquid) and this.ship.cargo.{$candidateWare}.max gt 0 and (($restrictToShipBasket and $shipMineableBasket.indexof.{$candidateWare}) or (not $restrictToShipBasket)) and not $candidateWares.indexof.{$candidateWare}">
+              <!-- A1: require hastag.minable so non-mineable solids/liquids (food, hull parts, ...) cannot enter the ware pool when shipMineableBasket is empty. -->
+              <do_if value="$candidateWare? and $candidateWare.hastag.minable and ($candidateWare.waretransport == waretransport.solid or $candidateWare.waretransport == waretransport.liquid) and this.ship.cargo.{$candidateWare}.max gt 0 and (($restrictToShipBasket and $shipMineableBasket.indexof.{$candidateWare}) or (not $restrictToShipBasket)) and not $candidateWares.indexof.{$candidateWare}">
                 <append_to_list name="$candidateWares" exact="$candidateWare"/>
               </do_if>
             </do_all>
@@ -621,6 +633,64 @@
       <do_if value="this.ship.isplayerowned and (if this.$stayAtHome then 0 else this.$maxGatherDistance) le 0 and $wareReachabilityRefSector.isclass.sector and not $wareReachabilityGatherSpaces.indexof.{$wareReachabilityRefSector}">
         <append_to_list name="$wareReachabilityGatherSpaces" exact="$wareReachabilityRefSector"/>
       </do_if>
+      <!-- A4: Pre-filter gather sectors so wares whose only reachable resource sector is hostile, hazardous,
+           contested-by-attackers, or sector-activity-blacklisted are not promoted to "reachable".
+           Mirrors the checks the routine itself applies (order.mining.routine.gt.xml ~942 and ~1115).
+           Always keep the ship's current sector and the commander's sector regardless, matching routine behavior. -->
+      <include_interrupt_actions ref="GetBlacklistgroup"/>
+      <!-- GetBlacklistgroup only sets $blacklistgroup if $loctarget is operational; guard the capture so
+           a momentary non-operational ship state doesn't cause a property lookup error in the filter below. -->
+      <set_value name="$gatherSectorBlacklistGroup" exact="if $blacklistgroup? then $blacklistgroup else null"/>
+      <do_if value="$blacklistgroup?">
+        <remove_value name="$blacklistgroup"/>
+      </do_if>
+      <set_value name="this.$minerGatherFilterIn" exact="$wareReachabilityGatherSpaces"/>
+      <set_value name="this.$minerGatherFilterOut" exact="[]"/>
+      <set_value name="this.$minerGatherFilterIndex" exact="1"/>
+      <do_while value="this.$minerGatherFilterIndex le this.$minerGatherFilterIn.count">
+        <set_value name="$chunkEnd" exact="[this.$minerGatherFilterIndex + 5, this.$minerGatherFilterIn.count].min"/>
+        <do_all exact="$chunkEnd - this.$minerGatherFilterIndex + 1" counter="$chunkOffset">
+          <set_value name="$gfi" exact="this.$minerGatherFilterIndex + $chunkOffset - 1"/>
+          <set_value name="$gatherSpaceFilter" exact="this.$minerGatherFilterIn.{$gfi}"/>
+          <do_if value="$gatherSpaceFilter? and $gatherSpaceFilter.exists and $gatherSpaceFilter.isclass.sector">
+            <set_value name="$keepGatherSector" exact="true"/>
+            <do_if value="$gatherSpaceFilter == this.ship.sector or (this.ship.commander? and this.ship.commander.exists and this.ship.commander.sector? and $gatherSpaceFilter == @this.ship.commander.sector)">
+              <!-- always keep current/commander sector -->
+            </do_if>
+            <do_else>
+              <do_if value="$gatherSpaceFilter.owner? and this.hasrelation.enemy.{$gatherSpaceFilter.owner}">
+                <set_value name="$keepGatherSector" exact="false"/>
+              </do_if>
+              <do_if value="$keepGatherSector and $gatherSpaceFilter.hashazardousregion and not $gatherSpaceFilter.containsthewave and this.ship.takesregiondamage">
+                <set_value name="$keepGatherSector" exact="false"/>
+              </do_if>
+              <do_if value="$keepGatherSector and $gatherSpaceFilter.iscontested and not $gatherSpaceFilter.contestingfactions.indexof.{this.owner}">
+                <do_for_each name="$contestingFaction" in="$gatherSpaceFilter.contestingfactions">
+                  <do_if value="$contestingFaction.mayattack.{this.ship}">
+                    <set_value name="$keepGatherSector" exact="false"/>
+                    <break/>
+                  </do_if>
+                </do_for_each>
+              </do_if>
+              <do_if value="$keepGatherSector and this.ship.isplayerowned and $gatherSectorBlacklistGroup? and this.ship.hasblacklist.{blacklisttype.sectoractivity}.{$gatherSectorBlacklistGroup} and $gatherSpaceFilter.isblacklisted.{blacklisttype.sectoractivity}.{$gatherSectorBlacklistGroup}.{this.ship}">
+                <set_value name="$keepGatherSector" exact="false"/>
+              </do_if>
+            </do_else>
+            <do_if value="$keepGatherSector">
+              <append_to_list name="this.$minerGatherFilterOut" exact="$gatherSpaceFilter"/>
+            </do_if>
+          </do_if>
+        </do_all>
+        <set_value name="this.$minerGatherFilterIndex" exact="$chunkEnd + 1"/>
+        <do_if value="this.$minerGatherFilterIndex le this.$minerGatherFilterIn.count">
+          <wait exact="1ms"/>
+        </do_if>
+      </do_while>
+      <set_value name="$wareReachabilityGatherSpaces" exact="this.$minerGatherFilterOut"/>
+      <remove_value name="this.$minerGatherFilterIn"/>
+      <remove_value name="this.$minerGatherFilterOut"/>
+      <remove_value name="this.$minerGatherFilterIndex"/>
+      <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Gather sector filter kept=' + $wareReachabilityGatherSpaces.count + ', blacklistGroup=' + (if $gatherSectorBlacklistGroup? then $gatherSectorBlacklistGroup else 'NONE')" chance="this.$debugchance"/>
       <!-- Chunked ware scoring with cooperative yields between chunks.
            Uses persisted state because AI locals do not survive across wait yields. -->
       <set_value name="this.$minerScoreCandidateWares" exact="$candidateWares"/>
@@ -633,7 +703,7 @@
       <set_value name="this.$minerScoreBestWares" exact="[]"/>
       <set_value name="this.$minerScoreIndex" exact="1"/>
       <do_while value="this.$minerScoreIndex le this.$minerScoreCandidateWares.count">
-        <set_value name="$chunkEnd" exact="[this.$minerScoreIndex + 3, this.$minerScoreCandidateWares.count].min"/>
+        <set_value name="$chunkEnd" exact="[this.$minerScoreIndex + 9, this.$minerScoreCandidateWares.count].min"/>
         <do_all exact="$chunkEnd - this.$minerScoreIndex + 1" counter="$chunkOffset">
           <set_value name="$wi" exact="this.$minerScoreIndex + $chunkOffset - 1"/>
           <set_value name="$wareEval" exact="this.$minerScoreCandidateWares.{$wi}"/>
@@ -748,14 +818,23 @@
       <do_if value="this.ship.pilot? and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}? and global.$GT_Pilots.{this.ship.pilot}.$Level?">
         <set_value name="$pilotLevel" exact="global.$GT_Pilots.{this.ship.pilot}.$Level"/>
       </do_if>
-      <do_if value="$pilotLevel ge 9 and $bestWare? and $selectedWare? and $bestWare != $selectedWare">
+      <!-- C1: previously gated by $pilotLevel ge 9. Pilots below level 9 are now allowed to switch as well,
+           but only on a hard-emergency delta (and respecting the switch cooldown). High-level pilots keep the
+           regular two-tier behavior (critical delta + cargo-commit gate, or hard-emergency overrides cargo). -->
+      <do_if value="$bestWare? and $selectedWare? and $bestWare != $selectedWare">
         <set_value name="$switchDelta" exact="$bestUrgency - $selectedUrgency"/>
         <set_value name="$cooldownReady" exact="(this.$lastWareSwitchAt == 0s) or ((player.age - this.$lastWareSwitchAt) ge this.$minSwitchCooldown)"/>
         <set_value name="$cargoCommitPercent" exact="0"/>
         <do_if value="this.ship.cargo.{$selectedWare}.max gt 0">
           <set_value name="$cargoCommitPercent" exact="(this.ship.cargo.{$selectedWare}.count * 100) / [this.ship.cargo.{$selectedWare}.max, 1].max"/>
         </do_if>
-        <set_value name="$canSwitchNow" exact="$switchDelta ge this.$criticalDemandDelta and $cooldownReady and (($cargoCommitPercent lt this.$minCargoCommitPercent) or ($switchDelta ge this.$hardEmergencyDelta))"/>
+        <set_value name="$canSwitchNow" exact="false"/>
+        <do_if value="$pilotLevel ge 9">
+          <set_value name="$canSwitchNow" exact="$switchDelta ge this.$criticalDemandDelta and $cooldownReady and (($cargoCommitPercent lt this.$minCargoCommitPercent) or ($switchDelta ge this.$hardEmergencyDelta))"/>
+        </do_if>
+        <do_else>
+          <set_value name="$canSwitchNow" exact="$switchDelta ge this.$hardEmergencyDelta and $cooldownReady"/>
+        </do_else>
         <do_if value="$canSwitchNow">
           <set_value name="$selectedWare" exact="$bestWare"/>
           <set_value name="this.$lastWareSwitchAt" exact="player.age"/>
@@ -869,7 +948,7 @@
         <set_value name="this.$minerPrimaryDeliveryStation" exact="null"/>
         <set_value name="this.$minerPrimaryIndex" exact="1"/>
         <do_while value="this.$minerPrimaryIndex le this.$minerPrimaryDemandStations.count">
-          <set_value name="$chunkEnd" exact="[this.$minerPrimaryIndex + 5, this.$minerPrimaryDemandStations.count].min"/>
+          <set_value name="$chunkEnd" exact="[this.$minerPrimaryIndex + 9, this.$minerPrimaryDemandStations.count].min"/>
           <do_all exact="$chunkEnd - this.$minerPrimaryIndex + 1" counter="$chunkOffset">
             <set_value name="$tsi" exact="this.$minerPrimaryIndex + $chunkOffset - 1"/>
             <set_value name="$stationEval" exact="this.$minerPrimaryDemandStations.{$tsi}"/>
@@ -944,7 +1023,7 @@
         <set_value name="this.$minerAssignSelectedWare" exact="$selectedWare"/>
         <set_value name="this.$minerAssignIndex" exact="1"/>
         <do_while value="this.$minerAssignIndex le this.$minerAssignDemandStations.count">
-          <set_value name="$chunkEnd" exact="[this.$minerAssignIndex + 5, this.$minerAssignDemandStations.count].min"/>
+          <set_value name="$chunkEnd" exact="[this.$minerAssignIndex + 9, this.$minerAssignDemandStations.count].min"/>
           <do_all exact="$chunkEnd - this.$minerAssignIndex + 1" counter="$chunkOffset">
             <set_value name="$tsi" exact="this.$minerAssignIndex + $chunkOffset - 1"/>
             <set_value name="$stationEval" exact="this.$minerAssignDemandStations.{$tsi}"/>
@@ -972,7 +1051,7 @@
           <set_value name="this.$minerIntentBuildSelectedWare" exact="$selectedWare"/>
           <set_value name="this.$minerIntentBuildIndex" exact="1"/>
           <do_while value="this.$minerIntentBuildIndex le this.$minerIntentBuildDemandStations.count">
-            <set_value name="$chunkEnd" exact="[this.$minerIntentBuildIndex + 5, this.$minerIntentBuildDemandStations.count].min"/>
+            <set_value name="$chunkEnd" exact="[this.$minerIntentBuildIndex + 9, this.$minerIntentBuildDemandStations.count].min"/>
             <do_all exact="$chunkEnd - this.$minerIntentBuildIndex + 1" counter="$chunkOffset">
               <set_value name="$tsi" exact="this.$minerIntentBuildIndex + $chunkOffset - 1"/>
               <set_value name="$stationEval" exact="this.$minerIntentBuildDemandStations.{$tsi}"/>
@@ -1265,12 +1344,21 @@
       <do_if value="$deliveredAmount gt 0">
         <set_value name="$intentPhaseAfterRun" exact="'delivering'"/>
       </do_if>
+      <!-- B5: After a slice, drop intents whose phase reached 'delivering' (cargo already on the station, no more incoming
+           from this ship for this cycle) so they stop inflating $projectedIncoming for everyone else.
+           For 'mining' / 'hauling' phases, refresh the ETA to one full demand-recheck interval forward — long enough to stay
+           in-horizon for the next scoring pass, short enough that abandoned intents naturally fall out without a janitor. -->
       <do_if value="$hasIntentWareAfterRun and this.$minerIntentStations? and this.$minerIntentStations.count gt 0">
         <do_all exact="this.$minerIntentStations.count" counter="$isi">
           <set_value name="$intentStation" exact="this.$minerIntentStations.{$isi}"/>
           <do_if value="global.$GT_MinerIntents? and global.$GT_MinerIntents.{$intentStation}? and global.$GT_MinerIntents.{$intentStation}.{this.$minerIntentWare}? and global.$GT_MinerIntents.{$intentStation}.{this.$minerIntentWare}.{this.ship}?">
-            <set_value name="global.$GT_MinerIntents.{$intentStation}.{this.$minerIntentWare}.{this.ship}.$phase" exact="$intentPhaseAfterRun"/>
-            <set_value name="global.$GT_MinerIntents.{$intentStation}.{this.$minerIntentWare}.{this.ship}.$eta" exact="player.age + 15s"/>
+            <do_if value="$intentPhaseAfterRun == 'delivering'">
+              <remove_value name="global.$GT_MinerIntents.{$intentStation}.{this.$minerIntentWare}.{this.ship}"/>
+            </do_if>
+            <do_else>
+              <set_value name="global.$GT_MinerIntents.{$intentStation}.{this.$minerIntentWare}.{this.ship}.$phase" exact="$intentPhaseAfterRun"/>
+              <set_value name="global.$GT_MinerIntents.{$intentStation}.{this.$minerIntentWare}.{this.ship}.$eta" exact="player.age + this.$demandRecheckInterval"/>
+            </do_else>
           </do_if>
         </do_all>
       </do_if>
@@ -1392,5 +1480,54 @@
     <do_if value="global.$GT_MinerDiag? and global.$GT_MinerDiag.{this.ship}?">
       <remove_value name="global.$GT_MinerDiag.{this.ship}"/>
     </do_if>
+    <!-- E1: drop persisted chunked-loop scratch state so an abort mid-scan does not leak entries on the ship blackboard. -->
+    <do_if value="this.$minerDemandSectorsScanList?"><remove_value name="this.$minerDemandSectorsScanList"/></do_if>
+    <do_if value="this.$minerDemandSectorsScanIndex?"><remove_value name="this.$minerDemandSectorsScanIndex"/></do_if>
+    <do_if value="this.$minerSectorStationsScanList?"><remove_value name="this.$minerSectorStationsScanList"/></do_if>
+    <do_if value="this.$minerSectorStationsScanIndex?"><remove_value name="this.$minerSectorStationsScanIndex"/></do_if>
+    <do_if value="this.$minerDemandStationsBuildTargetStations?"><remove_value name="this.$minerDemandStationsBuildTargetStations"/></do_if>
+    <do_if value="this.$minerDemandStationsBuildIndex?"><remove_value name="this.$minerDemandStationsBuildIndex"/></do_if>
+    <do_if value="this.$minerCandidateScanDemandStations?"><remove_value name="this.$minerCandidateScanDemandStations"/></do_if>
+    <do_if value="this.$minerCandidateScanIndex?"><remove_value name="this.$minerCandidateScanIndex"/></do_if>
+    <do_if value="this.$minerBuyOfferScanDemandStations?"><remove_value name="this.$minerBuyOfferScanDemandStations"/></do_if>
+    <do_if value="this.$minerBuyOfferScanIndex?"><remove_value name="this.$minerBuyOfferScanIndex"/></do_if>
+    <do_if value="this.$minerCleanupAssignedIndex?"><remove_value name="this.$minerCleanupAssignedIndex"/></do_if>
+    <do_if value="this.$minerCleanupIntentIndex?"><remove_value name="this.$minerCleanupIntentIndex"/></do_if>
+    <do_if value="this.$minerGatherFilterIn?"><remove_value name="this.$minerGatherFilterIn"/></do_if>
+    <do_if value="this.$minerGatherFilterOut?"><remove_value name="this.$minerGatherFilterOut"/></do_if>
+    <do_if value="this.$minerGatherFilterIndex?"><remove_value name="this.$minerGatherFilterIndex"/></do_if>
+    <do_if value="this.$minerScoreCandidateWares?"><remove_value name="this.$minerScoreCandidateWares"/></do_if>
+    <do_if value="this.$minerScoreGatherSpaces?"><remove_value name="this.$minerScoreGatherSpaces"/></do_if>
+    <do_if value="this.$minerScoreDemandStations?"><remove_value name="this.$minerScoreDemandStations"/></do_if>
+    <do_if value="this.$minerScoreWareUrgency?"><remove_value name="this.$minerScoreWareUrgency"/></do_if>
+    <do_if value="this.$minerScoreWareHasPrimaryCapacity?"><remove_value name="this.$minerScoreWareHasPrimaryCapacity"/></do_if>
+    <do_if value="this.$minerScoreWareReachable?"><remove_value name="this.$minerScoreWareReachable"/></do_if>
+    <do_if value="this.$minerScoreBestUrgency?"><remove_value name="this.$minerScoreBestUrgency"/></do_if>
+    <do_if value="this.$minerScoreBestWares?"><remove_value name="this.$minerScoreBestWares"/></do_if>
+    <do_if value="this.$minerScoreIndex?"><remove_value name="this.$minerScoreIndex"/></do_if>
+    <do_if value="this.$minerOverflowCandidateWares?"><remove_value name="this.$minerOverflowCandidateWares"/></do_if>
+    <do_if value="this.$minerOverflowBestWare?"><remove_value name="this.$minerOverflowBestWare"/></do_if>
+    <do_if value="this.$minerOverflowBestOffers?"><remove_value name="this.$minerOverflowBestOffers"/></do_if>
+    <do_if value="this.$minerOverflowIndex?"><remove_value name="this.$minerOverflowIndex"/></do_if>
+    <do_if value="this.$minerPrimaryDemandStations?"><remove_value name="this.$minerPrimaryDemandStations"/></do_if>
+    <do_if value="this.$minerPrimarySelectedWare?"><remove_value name="this.$minerPrimarySelectedWare"/></do_if>
+    <do_if value="this.$minerPrimaryBestDeficit?"><remove_value name="this.$minerPrimaryBestDeficit"/></do_if>
+    <do_if value="this.$minerPrimaryDeliveryStation?"><remove_value name="this.$minerPrimaryDeliveryStation"/></do_if>
+    <do_if value="this.$minerPrimaryIndex?"><remove_value name="this.$minerPrimaryIndex"/></do_if>
+    <do_if value="this.$minerAssignDemandStations?"><remove_value name="this.$minerAssignDemandStations"/></do_if>
+    <do_if value="this.$minerAssignSelectedWare?"><remove_value name="this.$minerAssignSelectedWare"/></do_if>
+    <do_if value="this.$minerAssignIndex?"><remove_value name="this.$minerAssignIndex"/></do_if>
+    <do_if value="this.$minerIntentBuildDemandStations?"><remove_value name="this.$minerIntentBuildDemandStations"/></do_if>
+    <do_if value="this.$minerIntentBuildSelectedWare?"><remove_value name="this.$minerIntentBuildSelectedWare"/></do_if>
+    <do_if value="this.$minerIntentBuildIndex?"><remove_value name="this.$minerIntentBuildIndex"/></do_if>
+    <do_if value="this.$minerIntentPhaseIndex?"><remove_value name="this.$minerIntentPhaseIndex"/></do_if>
+    <do_if value="this.$minerDiagDemandStations?"><remove_value name="this.$minerDiagDemandStations"/></do_if>
+    <do_if value="this.$minerDiagSelectedWare?"><remove_value name="this.$minerDiagSelectedWare"/></do_if>
+    <do_if value="this.$minerDiagIndex?"><remove_value name="this.$minerDiagIndex"/></do_if>
+    <do_if value="this.$minerDiagSupplierCount?"><remove_value name="this.$minerDiagSupplierCount"/></do_if>
+    <do_if value="this.$minerDiagIntentCount?"><remove_value name="this.$minerDiagIntentCount"/></do_if>
+    <do_if value="this.$minerPrevStationDemandStations?"><remove_value name="this.$minerPrevStationDemandStations"/></do_if>
+    <do_if value="this.$minerPrevStationSelectedWare?"><remove_value name="this.$minerPrevStationSelectedWare"/></do_if>
+    <do_if value="this.$minerPrevStationIndex?"><remove_value name="this.$minerPrevStationIndex"/></do_if>
   </on_abort>
 </aiscript>

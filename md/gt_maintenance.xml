@@ -14,33 +14,74 @@
       </conditions>
       <actions>
         <set_value name="$ship" exact="event.param2"/>
+        <!-- MD cue actions do not allow <return/> (only <library>/<run_actions>-callable lists do),
+             so the re-entry guards below set $abortEarly=true and the entire rest of the cue is
+             wrapped in <do_if value="not $abortEarly"> at line ~78. -->
+        <set_value name="$abortEarly" exact="false"/>
         
-        <!-- Check if there's an existing maintenance order -->
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <do_if value="global.$GT_MaintenanceOrders?">
-            <set_value name="$existingOrderCheck" exact="@global.$GT_MaintenanceOrders.{$ship}"/>
-            <do_if value="$existingOrderCheck?">
-              <set_value name="$existingWaitingForEquipmentCheck" exact="@$existingOrderCheck.$WaitingForEquipment"/>
-              <set_value name="$existingWaitingForRepairCheck" exact="@$existingOrderCheck.$WaitingForRepair"/>
-              <set_value name="$existingNeededCMCheck" exact="@$existingOrderCheck.$NeededCM"/>
-              <set_value name="$existingNeededUnitsCheck" exact="@$existingOrderCheck.$NeededUnits"/>
-              <set_value name="$isValidCheck" exact="$existingWaitingForEquipmentCheck or $existingWaitingForRepairCheck"/>
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Maintenance]  WARNING: ' + $ship.idcode + ' has existing maintenance order: WaitingForEquipment=' + $existingWaitingForEquipmentCheck + ', WaitingForRepair=' + $existingWaitingForRepairCheck + ', NeededCM=' + $existingNeededCMCheck + ', NeededUnits=' + $existingNeededUnitsCheck + ' (Valid=' + $isValidCheck + ')'" chance="100"/>
-              </do_if>
-              <do_if value="not $isValidCheck">
-                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-Maintenance] Clearing stale maintenance order with null values for ' + $ship.idcode" chance="100"/>
-                </do_if>
-                <remove_value name="global.$GT_MaintenanceOrders.{$ship}"/>
-              </do_if>
+        <!-- ===================================================================== -->
+        <!-- RE-ENTRY GUARDS                                                       -->
+        <!--                                                                       -->
+        <!-- 1. In-flight order short-circuit: if we've already issued an          -->
+        <!--    add_build_to_modify_ship for this ship and are tracking it in      -->
+        <!--    $GT_MaintenanceOrders with WaitingForEquipment/WaitingForRepair    -->
+        <!--    set true, ignore further GT_DoMaintenance signals until the order  -->
+        <!--    completes (which clears the entry via ProcessResupplyComplete /    -->
+        <!--    ProcessRepairComplete). Without this, every miner-order restart    -->
+        <!--    (which fires GT_DoMaintenance from order.trade.galaxyminer.xml's   -->
+        <!--    init at ~403) would re-run ExecuteMaintenance, re-enumerate all    -->
+        <!--    51 equipment stations, rebuild the shopping list, and re-issue     -->
+        <!--    add_build_to_modify_ship - which in X4 RESETS the build queue,     -->
+        <!--    meaning the ship never sees a stable enough target to undock and  -->
+        <!--    travel to a wharf.                                                 -->
+        <!--                                                                       -->
+        <!-- 2. Signal-rate throttle: even before an order is created, back-to-   -->
+        <!--    back GT_DoMaintenance signals (e.g. AI init -> ship modification  -->
+        <!--    refresh -> order restart -> AI init again, all within seconds)    -->
+        <!--    can pile up multiple ExecuteMaintenance instances racing on the    -->
+        <!--    same ship. A 30s minimum gap between accepted signals per ship     -->
+        <!--    bounds this without delaying legitimate maintenance (the smallest  -->
+        <!--    real-world cycle is "scout fallback every 5min" or "ship docks     -->
+        <!--    + completes restock + needs more probes" which is minutes apart).  -->
+        <!-- ===================================================================== -->
+        <do_if value="global.$GT_MaintenanceOrders? and global.$GT_MaintenanceOrders.{$ship}?">
+          <set_value name="$inFlightWaitingEquipment" exact="@global.$GT_MaintenanceOrders.{$ship}.$WaitingForEquipment"/>
+          <set_value name="$inFlightWaitingRepair" exact="@global.$GT_MaintenanceOrders.{$ship}.$WaitingForRepair"/>
+          <do_if value="$inFlightWaitingEquipment or $inFlightWaitingRepair">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] ' + $ship.idcode + ' already has maintenance order in flight (WaitingForEquipment=' + $inFlightWaitingEquipment + ', WaitingForRepair=' + $inFlightWaitingRepair + ') - ignoring duplicate GT_DoMaintenance signal'" chance="100"/>
             </do_if>
+            <set_value name="$abortEarly" exact="true"/>
+          </do_if>
+          <do_if value="not $abortEarly">
+            <!-- Entry exists but both Waiting flags are false: stale (e.g. order was created but
+                 never reached add_build_to_modify_ship, or completion handler missed clearing it).
+                 Drop it so this cycle can re-issue cleanly. -->
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] Clearing stale maintenance order tracking for ' + $ship.idcode + ' (no Waiting flag set)'" chance="100"/>
+            </do_if>
+            <remove_value name="global.$GT_MaintenanceOrders.{$ship}"/>
           </do_if>
         </do_if>
         
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-Maintenance] Starting maintenance check for ' + $ship.idcode" chance="100"/>
+        <do_if value="not $abortEarly">
+          <do_if value="not global.$GT_MaintenanceLastSignaledAt?">
+            <set_value name="global.$GT_MaintenanceLastSignaledAt" exact="table[]"/>
+          </do_if>
+          <do_if value="global.$GT_MaintenanceLastSignaledAt.{$ship}? and (player.age - @global.$GT_MaintenanceLastSignaledAt.{$ship}) lt 30s">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Maintenance] ' + $ship.idcode + ' GT_DoMaintenance throttled (last signal ' + (player.age - @global.$GT_MaintenanceLastSignaledAt.{$ship}) + 's ago, min 30s) - ignoring'" chance="100"/>
+            </do_if>
+            <set_value name="$abortEarly" exact="true"/>
+          </do_if>
         </do_if>
+        
+        <do_if value="not $abortEarly">
+          <set_value name="global.$GT_MaintenanceLastSignaledAt.{$ship}" exact="player.age"/>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] Starting maintenance check for ' + $ship.idcode" chance="100"/>
+          </do_if>
         
         <!-- Initialize pilot level before use -->
         <set_value name="$pilotLevel" exact="1"/>
@@ -70,6 +111,7 @@
         <set_value name="$needsEquipment" exact="false"/>
         <set_value name="$shipIsGalaxyMiner" exact="false"/>
         <set_value name="$autoDeployResourceProbes" exact="false"/>
+        <set_value name="$maxResourceProbesToBuy" exact="0"/>
         
         <!-- Miner-specific option gate (future-proof): only enabled when ship runs GalaxyMiner
              and AI parameters explicitly enable AutoDeployResourceProbes -->
@@ -83,6 +125,18 @@
           </do_elseif>
           <do_elseif value="$ship.defaultorder.$autoDeployResourceProbes?">
             <set_value name="$autoDeployResourceProbes" exact="$ship.defaultorder.$autoDeployResourceProbes"/>
+          </do_elseif>
+          <!-- Slider: how many probes to buy when restocking. Read from AI params first
+               (kept in sync by order.trade.galaxyminer.xml init / main_loop), fall back to
+               the order param directly. Clamped to the ship's actual deployable capacity below. -->
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$MaxResourceProbesToBuy?">
+            <set_value name="$maxResourceProbesToBuy" exact="global.$GT_AIParameters.{$ship}.$MaxResourceProbesToBuy"/>
+          </do_if>
+          <do_elseif value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$maxResourceProbesToBuy?">
+            <set_value name="$maxResourceProbesToBuy" exact="global.$GT_AIParameters.{$ship}.$maxResourceProbesToBuy"/>
+          </do_elseif>
+          <do_elseif value="$ship.defaultorder.$maxResourceProbesToBuy?">
+            <set_value name="$maxResourceProbesToBuy" exact="$ship.defaultorder.$maxResourceProbesToBuy"/>
           </do_elseif>
         </do_if>
         
@@ -115,14 +169,23 @@
         <!-- 2. CHECK EQUIPMENT (Level 15+)                                           -->
         <!-- ========================================================================= -->
         
+        <!-- Always read deployable + probe counts up-front: resource probe restock for miners is
+             gated below independently of the pilotLevel >= 15 check (probes are an essential
+             mining tool the player has explicitly opted into via the slider, not "advanced
+             defensive equipment" reserved for skilled pilots). -->
+        <set_value name="$deployableCapacity" exact="$ship.ammostorage.deployable.capacity"/>
+        <set_value name="$currentDeployables" exact="$ship.ammostorage.deployable.count"/>
+        <set_value name="$currentResourceProbes" exact="$ship.ammostorage.{deployablecategory.resourceprobe}.count"/>
+        <set_value name="$needsCountermeasures" exact="false"/>
+        <set_value name="$needsUnits" exact="false"/>
+        <set_value name="$needsResourceProbes" exact="$shipIsGalaxyMiner and $autoDeployResourceProbes and $currentResourceProbes lt 1"/>
+        
         <do_if value="$pilotLevel ge 15 and @global.$GT_Config.$Defense.$Enabled and @global.$GT_GlobalSettings.$DefensiveEquipment.$Enabled">
           <!-- Check countermeasures and deployables -->
           <set_value name="$countermeasureCapacity" exact="$ship.ammostorage.countermeasure.capacity"/>
           <set_value name="$currentCountermeasures" exact="$ship.ammostorage.countermeasure.count"/>
           <set_value name="$countermeasurePercentage" exact="if $countermeasureCapacity gt 0 then ($currentCountermeasures * 100) / $countermeasureCapacity else 100"/>
           
-          <set_value name="$deployableCapacity" exact="$ship.ammostorage.deployable.capacity"/>
-          <set_value name="$currentDeployables" exact="$ship.ammostorage.deployable.count"/>
           <set_value name="$deployablePercentage" exact="if $deployableCapacity gt 0 then ($currentDeployables * 100) / $deployableCapacity else 100"/>
           
           <!-- Also check UNITS (drones in docking bays) -->
@@ -142,8 +205,6 @@
           <set_value name="$needsCountermeasures" exact="$countermeasureCapacity gt 0 and $countermeasurePercentage lt $countermeasureThreshold"/>
           <!-- NOTE: Don't check deployables (mines/satellites) here - only restock if ship's loadout explicitly defines them -->
           <set_value name="$needsDeployables" exact="false"/>
-          <set_value name="$currentResourceProbes" exact="$ship.ammostorage.{deployablecategory.resourceprobe}.count"/>
-          <set_value name="$needsResourceProbes" exact="$shipIsGalaxyMiner and $autoDeployResourceProbes and $currentResourceProbes lt 1"/>
           <!-- NOTE: For units, check if below threshold to trigger maintenance -->
           <set_value name="$needsUnits" exact="$unitsCapacity gt 0 and $unitsPercentage lt $unifiedThreshold"/>
           
@@ -152,16 +213,23 @@
             <debug_text text="'[GT-Maintenance] RESUPPLY CHECK DETAILS for ' + $ship.idcode + ':'" chance="100"/>
             <debug_text text="'[GT-Maintenance]   CM: Current=' + $currentCountermeasures + '/' + $countermeasureCapacity + ' (' + $countermeasurePercentage + '%), Threshold=' + $countermeasureThreshold + '%, Needs=' + $needsCountermeasures + ' (capacity&gt;0=' + ($countermeasureCapacity gt 0) + ', percentage&lt;threshold=' + ($countermeasurePercentage lt $countermeasureThreshold) + ')'" chance="100"/>
             <debug_text text="'[GT-Maintenance]   Units: Current=' + $currentUnits + '/' + $unitsCapacity + ' (' + $unitsPercentage + '%), Threshold=' + $unifiedThreshold + '%, Needs=' + $needsUnits + ' (capacity&gt;0=' + ($unitsCapacity gt 0) + ', percentage&lt;threshold=' + ($unitsPercentage lt $unifiedThreshold) + ')'" chance="100"/>
-            <debug_text text="'[GT-Maintenance]   Resource probes (Miner): AutoDeploy=' + $autoDeployResourceProbes + ', Current=' + $currentResourceProbes + ', Needs=' + $needsResourceProbes" chance="100"/>
-            <debug_text text="'[GT-Maintenance]   Result: needsCountermeasures=' + $needsCountermeasures + ', needsUnits=' + $needsUnits + ', needsResourceProbes=' + $needsResourceProbes + ', needsEquipment=' + ($needsCountermeasures or $needsUnits or $needsResourceProbes)" chance="100"/>
           </do_if>
-          
-          <do_if value="$needsCountermeasures or $needsUnits or $needsResourceProbes">
-            <set_value name="$needsEquipment" exact="true"/>
-            <set_value name="$whatNeedsRestocking" exact="if $needsCountermeasures and $needsUnits and $needsResourceProbes then 'CM + units + resource probes' else if $needsCountermeasures and $needsUnits then 'CM + units' else if $needsCountermeasures and $needsResourceProbes then 'CM + resource probes' else if $needsUnits and $needsResourceProbes then 'units + resource probes' else if $needsCountermeasures then 'CM only' else if $needsUnits then 'Units only' else 'resource probes only'"/>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Maintenance] ' + $ship.idcode + ' needs equipment (CM: ' + $countermeasurePercentage + '%, Units: ' + $unitsPercentage + '%, ResourceProbes: ' + $currentResourceProbes + ' - will restock ' + $whatNeedsRestocking + ')'" chance="100"/>
-            </do_if>
+        </do_if>
+        
+        <!-- Resource probe needs: independent of pilot level / Defense gates because probes are an
+             essential mining tool the player has explicitly opted into via "Auto Deploy Resource
+             Probes" + "Max Resource Probes to Buy" slider. The level-15 gate above only governs
+             defensive equipment (CM + drones + towers). -->
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Maintenance]   Resource probes (Miner): AutoDeploy=' + $autoDeployResourceProbes + ', Current=' + $currentResourceProbes + ', Needs=' + $needsResourceProbes + ', SliderTarget=' + $maxResourceProbesToBuy" chance="100"/>
+          <debug_text text="'[GT-Maintenance]   Result: needsCountermeasures=' + $needsCountermeasures + ', needsUnits=' + $needsUnits + ', needsResourceProbes=' + $needsResourceProbes + ', needsEquipment=' + ($needsCountermeasures or $needsUnits or $needsResourceProbes)" chance="100"/>
+        </do_if>
+        
+        <do_if value="$needsCountermeasures or $needsUnits or $needsResourceProbes">
+          <set_value name="$needsEquipment" exact="true"/>
+          <set_value name="$whatNeedsRestocking" exact="if $needsCountermeasures and $needsUnits and $needsResourceProbes then 'CM + units + resource probes' else if $needsCountermeasures and $needsUnits then 'CM + units' else if $needsCountermeasures and $needsResourceProbes then 'CM + resource probes' else if $needsUnits and $needsResourceProbes then 'units + resource probes' else if $needsCountermeasures then 'CM only' else if $needsUnits then 'Units only' else 'resource probes only'"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] ' + $ship.idcode + ' needs equipment (ResourceProbes: ' + $currentResourceProbes + ' - will restock ' + $whatNeedsRestocking + ')'" chance="100"/>
           </do_if>
         </do_if>
         
@@ -225,6 +293,7 @@
             ]"/>
           </do_else>
         </do_else>
+        </do_if>
       </actions>
     </cue>
     
@@ -279,8 +348,9 @@
         <set_value name="$repairThreshold" exact="@$params.$RepairThreshold"/>
         <set_value name="$shipIsGalaxyMiner" exact="false"/>
         <set_value name="$autoDeployResourceProbes" exact="false"/>
+        <set_value name="$maxResourceProbesToBuy" exact="0"/>
         
-        <!-- Re-resolve Miner probe option in execution context (queue-safe) -->
+        <!-- Re-resolve Miner probe options in execution context (queue-safe) -->
         <do_if value="$ship.defaultorder? and @$ship.defaultorder != null and @$ship.defaultorder.id == 'GalaxyMiner'">
           <set_value name="$shipIsGalaxyMiner" exact="true"/>
           <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$AutoDeployResourceProbes?">
@@ -291,6 +361,15 @@
           </do_elseif>
           <do_elseif value="$ship.defaultorder.$autoDeployResourceProbes?">
             <set_value name="$autoDeployResourceProbes" exact="$ship.defaultorder.$autoDeployResourceProbes"/>
+          </do_elseif>
+          <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$MaxResourceProbesToBuy?">
+            <set_value name="$maxResourceProbesToBuy" exact="global.$GT_AIParameters.{$ship}.$MaxResourceProbesToBuy"/>
+          </do_if>
+          <do_elseif value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$maxResourceProbesToBuy?">
+            <set_value name="$maxResourceProbesToBuy" exact="global.$GT_AIParameters.{$ship}.$maxResourceProbesToBuy"/>
+          </do_elseif>
+          <do_elseif value="$ship.defaultorder.$maxResourceProbesToBuy?">
+            <set_value name="$maxResourceProbesToBuy" exact="$ship.defaultorder.$maxResourceProbesToBuy"/>
           </do_elseif>
         </do_if>
         
@@ -630,8 +709,8 @@
           </do_all>
           
           <!-- Re-sort combined list by gate distance (equipment docks + wharfs + shipyards merged). -->
-          <!-- Keep unreachable stations in list; native sort places them after reachable stations. -->
-          <sort_list list="$potentialStations" sortbygatedistanceto="$ship"/>
+          <!-- v8 compat: standalone <sort_list> in v8 only supports sortbyvalue/sortdescending. The sortbygatedistanceto attribute is v9-only on this element. (It works on <find_station> via the sortresultwithlimit attributeGroup, which is why the find_station calls above keep that attribute unchanged.) Same ordering achieved here via the gatedistance.{$ship} script property. The find_station calls above already drop unreachable stations (sortbygatedistanceto on find_station auto-excludes objects with gatedistance == -1), so $potentialStations contains only reachable entries by this point. -->
+          <sort_list list="$potentialStations" sortbyvalue="loop.element.gatedistance.{$ship}"/>
           
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Found ' + $potentialStations.count + ' potential equipment stations (equipment docks + wharfs + shipyards, sorted by distance)'" chance="100"/>
@@ -876,15 +955,20 @@
                 </do_if>
               </do_if>
               
-              <!-- Miner probe restock check: require at least one resource probe when enabled -->
+              <!-- Miner probe restock check: require slider amount (or at least 1) of resource
+                   probes from the station, capped at the ship's deployable capacity. -->
               <do_if value="$needsResourceProbes">
                 <do_if value="not $evalammotable">
                   <set_value name="$evalammotable" exact="table[]"/>
                 </do_if>
-                <set_value name="$evalammotable.{macro.eq_arg_resourceprobe_01_macro.ware}" exact="1"/>
+                <set_value name="$probeEvalCap" exact="[1, @$ship.ammostorage.deployable.capacity].max"/>
+                <set_value name="$probeEvalAmount" exact="[1, [$maxResourceProbesToBuy, $probeEvalCap].min].max"/>
+                <set_value name="$evalammotable.{macro.eq_arg_resourceprobe_01_macro.ware}" exact="$probeEvalAmount"/>
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-Maintenance]   Added resource probe requirement to ammo eval table'" chance="100"/>
+                  <debug_text text="'[GT-Maintenance]   Added resource probe requirement to ammo eval table (amount=' + $probeEvalAmount + ', sliderTarget=' + $maxResourceProbesToBuy + ', cap=' + $probeEvalCap + ')'" chance="100"/>
                 </do_if>
+                <remove_value name="$probeEvalAmount"/>
+                <remove_value name="$probeEvalCap"/>
               </do_if>
               
               <!-- NOTE: Deployables (mines/satellites) are NOT checked for trading ships -->
@@ -1264,14 +1348,23 @@
               </do_if>
             </do_if>
             
-            <!-- Miner probe restock: keep at least 1 resource probe loaded when enabled -->
+            <!-- Miner probe restock: target the slider amount the player set in the order panel
+                 ($maxResourceProbesToBuy, resolved above from GT_AIParameters / order param), capped
+                 at the ship's actual deployable.capacity (resource probes share the deployable pool
+                 with satellites/mines/nav-beacons; same cap interrupt.restock enforces internally at
+                 ~377-378). Floor at 1 so when the toggle is on but the slider was never touched the
+                 ship still gets a usable probe stock instead of 0. add_build_to_modify_ship SETS
+                 inventory (does not ADD to it), so this is the absolute target the station should
+                 stock up to — current probes are not added on top. -->
             <do_if value="$needsResourceProbes">
-              <set_value name="$resourceProbeTargetCount" exact="1"/>
+              <set_value name="$probeBuildCap" exact="[1, @$ship.ammostorage.deployable.capacity].max"/>
+              <set_value name="$resourceProbeTargetCount" exact="[1, [$maxResourceProbesToBuy, $probeBuildCap].min].max"/>
               <set_value name="$resourceProbeWare" exact="macro.eq_arg_resourceprobe_01_macro.ware"/>
               <set_value name="$ammotable.{$resourceProbeWare}" exact="[$resourceProbeTargetCount, @$ammotable.{$resourceProbeWare}].max"/>
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Maintenance]   - Adding resource probe target: ' + $resourceProbeWare + ' x' + $resourceProbeTargetCount + ' (current=' + $currentResourceProbes + ')'" chance="100"/>
+                <debug_text text="'[GT-Maintenance]   - Adding resource probe target: ' + $resourceProbeWare + ' x' + $resourceProbeTargetCount + ' (current=' + $currentResourceProbes + ', sliderTarget=' + $maxResourceProbesToBuy + ', cap=' + $probeBuildCap + ')'" chance="100"/>
               </do_if>
+              <remove_value name="$probeBuildCap"/>
             </do_if>
             
             <!-- Add CURRENT units to unit table (preserve existing units) -->
@@ -1330,18 +1423,42 @@
               <debug_text text="'[GT-Maintenance] Final shopping list: Ammo types=' + @$ammotable.keys.count + ', Unit types=' + @$unittable.keys.count" chance="100"/>
             </do_if>
             
-            <set_value name="global.$GT_ResupplyOrders.{$ship}" exact="table[
-              $Station = $equipmentStation,
-              $AmmoTable = $ammotable,
-              $UnitTable = $unittable,
-              $DeployablesBefore = $storedCurrentDeployables,
-              $CountermeasuresBefore = $storedCurrentCM,
-              $UnitsBefore = $storedCurrentUnits,
-              $DefenseDronesBefore = $beforeDefenseDrones,
-              $CargoDronesBefore = $beforeCargoDrones,
-              $LaserTowersBefore = $beforeLaserTowers,
-              $RepairDronesBefore = $beforeRepairDrones
-            ]"/>
+            <!-- =====================================================================
+                 SILENT-TRUNCATION FIX: an inline table[$k1=v1, $k2=v2, ...] literal in X4
+                 silently truncates the entry as soon as ANY value evaluates to null at
+                 construction time, dropping every key from that point on (the receiver
+                 then stores a partial table missing the rest). For an S-class galaxy
+                 miner with Total Units: 0/0 (no unit capacity), the reads of
+                 $ship.units.{macro.X}.count return null at lines 1146-1149, which made
+                 $beforeDefenseDrones / $beforeCargoDrones / $beforeLaserTowers /
+                 $beforeRepairDrones nullable. With the old inline literal that emptied
+                 every key from $DefenseDronesBefore onwards in some races, but more
+                 critically the truncation also collapsed earlier keys via the X4
+                 expression engine's evaluate-the-whole-literal step - the live log
+                 captured this as "Found pending resupply order at HOP Paranid Wharf
+                 (Ammo types=null, Unit types=null)" inside order.trade.galaxyminer.xml's
+                 executor (~line 427), which then issued an add_build_to_modify_ship with
+                 null tables and the wharf RESTOCKED ... NOTHING (no probes purchased,
+                 user sees "stuck searching for resources" because no probes ever load).
+                 Coalesce every $beforeXXX read to 0 first, then assign each key on the
+                 global table individually so an isolated null can never poison the entry.
+                 ===================================================================== -->
+            <set_value name="$storedDefenseDronesBefore" exact="if $beforeDefenseDrones? and $beforeDefenseDrones != null then $beforeDefenseDrones else 0"/>
+            <set_value name="$storedCargoDronesBefore" exact="if $beforeCargoDrones? and $beforeCargoDrones != null then $beforeCargoDrones else 0"/>
+            <set_value name="$storedLaserTowersBefore" exact="if $beforeLaserTowers? and $beforeLaserTowers != null then $beforeLaserTowers else 0"/>
+            <set_value name="$storedRepairDronesBefore" exact="if $beforeRepairDrones? and $beforeRepairDrones != null then $beforeRepairDrones else 0"/>
+
+            <set_value name="global.$GT_ResupplyOrders.{$ship}" exact="table[]"/>
+            <set_value name="global.$GT_ResupplyOrders.{$ship}.$Station" exact="$equipmentStation"/>
+            <set_value name="global.$GT_ResupplyOrders.{$ship}.$AmmoTable" exact="$ammotable"/>
+            <set_value name="global.$GT_ResupplyOrders.{$ship}.$UnitTable" exact="$unittable"/>
+            <set_value name="global.$GT_ResupplyOrders.{$ship}.$DeployablesBefore" exact="$storedCurrentDeployables"/>
+            <set_value name="global.$GT_ResupplyOrders.{$ship}.$CountermeasuresBefore" exact="$storedCurrentCM"/>
+            <set_value name="global.$GT_ResupplyOrders.{$ship}.$UnitsBefore" exact="$storedCurrentUnits"/>
+            <set_value name="global.$GT_ResupplyOrders.{$ship}.$DefenseDronesBefore" exact="$storedDefenseDronesBefore"/>
+            <set_value name="global.$GT_ResupplyOrders.{$ship}.$CargoDronesBefore" exact="$storedCargoDronesBefore"/>
+            <set_value name="global.$GT_ResupplyOrders.{$ship}.$LaserTowersBefore" exact="$storedLaserTowersBefore"/>
+            <set_value name="global.$GT_ResupplyOrders.{$ship}.$RepairDronesBefore" exact="$storedRepairDronesBefore"/>
             
             <!-- PERFORMANCE OPTIMIZATION: Defer UI operations (ship renaming, logbook messages) -->
             <do_if value="not global.$GT_DeferredUIUpdates?">
@@ -1475,7 +1592,14 @@
           <do_while value="global.$GT_ResupplyCompleteQueue.count gt 0">
             <set_value name="$data" exact="global.$GT_ResupplyCompleteQueue.{1}"/>
             <remove_from_list name="global.$GT_ResupplyCompleteQueue" exact="$data"/>
-            <set_value name="$ship" exact="$data.$Ship"/>
+            <!-- Case-sensitive table-key fix: order.build.equip.xml (~116), order.restock.xml
+                 (~120), and order.repair.xml (~19) all append rows as table[$ship = this.ship,
+                 ...] using lowercase $ship. X4 expression-engine table-key lookup is
+                 case-sensitive, so reading $data.$Ship returned null and cascaded the entire
+                 cleanup path into "Property lookup failed: $data.$Ship" / "$ship == null"
+                 spam (visible in the live log at t=2080.22, ~10 errors per resupply). The
+                 ship reference must be read with the exact casing the writers used. -->
+            <set_value name="$ship" exact="$data.$ship"/>
             
             <!-- Check if equipment order actually succeeded -->
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -1802,7 +1926,14 @@
           <do_while value="global.$GT_RepairCompleteQueue.count gt 0">
             <set_value name="$data" exact="global.$GT_RepairCompleteQueue.{1}"/>
             <remove_from_list name="global.$GT_RepairCompleteQueue" exact="$data"/>
-            <set_value name="$ship" exact="$data.$Ship"/>
+            <!-- Case-sensitive table-key fix: order.build.equip.xml (~116), order.restock.xml
+                 (~120), and order.repair.xml (~19) all append rows as table[$ship = this.ship,
+                 ...] using lowercase $ship. X4 expression-engine table-key lookup is
+                 case-sensitive, so reading $data.$Ship returned null and cascaded the entire
+                 cleanup path into "Property lookup failed: $data.$Ship" / "$ship == null"
+                 spam (visible in the live log at t=2080.22, ~10 errors per resupply). The
+                 ship reference must be read with the exact casing the writers used. -->
+            <set_value name="$ship" exact="$data.$ship"/>
             
             <!-- Mark repair order as complete in tracking -->
             <do_if value="global.$GT_MaintenanceOrders? and global.$GT_MaintenanceOrders.{$ship}?">

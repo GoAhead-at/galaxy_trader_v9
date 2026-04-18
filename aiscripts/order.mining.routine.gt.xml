@@ -55,6 +55,8 @@
 
       <param name="deepspace" default="false" type="bool" text="{1041, 10082}" advanced="true" comment="Operate in deep space. Operate only in deep space. Currently defined as 100 +/- 50km from sector core edge"/>
       <param name="resourcescout" default="false" type="bool" text="{1041, 10109}" advanced="true" comment="Scout for resources. Visibly look for resources before mining"/>
+      <param name="autoDeployProbes" default="false" type="internal" comment="GT extension: drives the post-MiningCollect probe lifecycle (DEPLOY -> RECOVER -> BUY) ported from v8's proven baseline. After every successful mining slice the routine drops a probe on the freshly-mined asteroid field (when no operational probe is already within 64km), recovers a stale probe from the current sector when the sector is fully depleted (no basket ware shows any averagemaxyield), and signals md.GT_Maintenance.GT_DoMaintenance to refit when the bay is empty. Forwarded from order.trade.galaxyminer.xml; never edited on this internal routine, hence type='internal' (UI lives on the GalaxyMiner order)."/>
+      <param name="maxresourceprobestobuy" default="0" type="internal" comment="GT extension: target number of resource probes to buy per restock trip when $autoDeployProbes is enabled. The BUY step at the END of the mining slice fires only when the ship has run out of probes (count == 0) and signals md.GT_Maintenance.GT_DoMaintenance, which then reads the slider value back from global.$GT_AIParameters.{ship}.$MaxResourceProbesToBuy and clamps it against the ship's deployable capacity. 0 disables auto-buy. Forwarded from order.trade.galaxyminer.xml's $maxResourceProbesToBuy slider; never edited on this internal routine, hence type='internal' (UI lives on the GalaxyMiner order). Param name lower-cased here because the order params framework lower-cases all keys passed via &lt;param&gt; in &lt;run_script&gt;."/>
       <param name="duration" default="0s" type="time" infinitevalue="0s" advanced="true" text="{1041, 10034}" comment="Duration. Only accounts for time spent executing this order.">
         <input_param name="startvalue" value="0s"/>
         <input_param name="min" value="0s"/>
@@ -578,6 +580,13 @@
       <do_if value="$duration and ((player.age - $time_start) gt $duration)">
         <resume label="finish"/>
       </do_if>
+
+      <!-- v0.13.11: probe lifecycle (DEPLOY -> RECOVER -> BUY) was previously located here
+           at the top of the loop. It has been ported back to v8's structure and lives AFTER
+           the MiningCollect immediate sub-order at the end of this loop iteration so probes
+           are deployed on freshly-mined asteroid fields (and stale probes are recovered
+           against the same sector the ship just finished collecting in). See the new block
+           right after the `<create_order id='MiningCollect' immediate='true'>` call. -->
 
       <do_if value="not $resourcescout and this.assignedcontrolled.iscapitalship and ((this.assignedcontrolled.waretransport.indexof.{waretransport.solid} and not this.assignedcontrolled.units.{unitcategory.orecollector}.count) or (this.assignedcontrolled.waretransport.indexof.{waretransport.liquid} and not this.assignedcontrolled.units.{unitcategory.gascollector}.count))">
         <debug_text text="'%s %s %s has no collector drones. looping back to prep.'.[@this.assignedcontrolled.idcode, @this.assignedcontrolled.knownname, this.assignedcontrolled]" chance="$debugchance"/>
@@ -1370,12 +1379,18 @@
         </do_if>
       </do_if>
       <do_else>
+        <!-- v0.13.11: the scout-fallback that flew the ship to a sector with `resources.exists`
+             and ran `order.move.recon resourcescout=true` is REMOVED. The v8 baseline does not
+             have it; instead, vanilla mining routine semantics are restored — when the basket
+             is exhausted the ship reports the failure and the parent miner script handles
+             reassignment / idle. Probe-driven discovery happens organically through the
+             post-MiningCollect DEPLOY block at the end of every successful slice. -->
         <do_if value="@this.assignedcontrolled.order.isrunning">
           <set_value name="$failurereason" exact="{1045, 105}" comment="No resources found in range."/>
           <do_if value="this.assignedcontrolled.hasblacklist.{blacklisttype.sectoractivity}.{$blacklistgroup} or this.assignedcontrolled.hasblacklist.{blacklisttype.sectortravel}.{$blacklistgroup} or this.assignedcontrolled.hasblacklist.{blacklisttype.objectactivity}.{$blacklistgroup}">
             <set_value name="$failurereason" exact="{1045, 106}" comment="No resources found in allowed sectors."/>
           </do_if>
-          <debug_text text="'[GT-Miner-DIAG] FAIL_NO_RESOURCE ship=' + this.assignedcontrolled.idcode + ', reason=' + $failurereason + ', default=' + (if this.assignedcontrolled.defaultorder? then @this.assignedcontrolled.defaultorder.id else 'NONE') + ', current=' + (if this.assignedcontrolled.order? then @this.assignedcontrolled.order.id else 'NONE') + ', commander=' + (if this.assignedcontrolled.commander? and this.assignedcontrolled.commander.exists then this.assignedcontrolled.commander.idcode else 'NONE') + ', miningbasket=' + $miningbasket + ', gatherN=' + $gatheringspaces.count + ', sellN=' + $sellspaces.count + ', probesN=' + $probesectors.count" chance="100" filter="error"/>
+          <debug_text text="'[GT-Miner-DIAG] FAIL_NO_RESOURCE ship=' + this.assignedcontrolled.idcode + ', reason=' + $failurereason + ', default=' + (if this.assignedcontrolled.defaultorder? then @this.assignedcontrolled.defaultorder.id else 'NONE') + ', current=' + (if this.assignedcontrolled.order? then @this.assignedcontrolled.order.id else 'NONE') + ', commander=' + (if this.assignedcontrolled.commander? and this.assignedcontrolled.commander.exists then this.assignedcontrolled.commander.idcode else 'NONE') + ', miningbasket=' + $miningbasket + ', gatherN=' + $gatheringspaces.count + ', sellN=' + $sellspaces.count + ', probesN=' + $probesectors.count + ', autoDeployProbes=' + $autoDeployProbes + ', probesLoaded=' + this.assignedcontrolled.ammostorage.{deployablecategory.resourceprobe}.count" chance="100" filter="error"/>
           <set_order_failed order="this.assignedcontrolled.order" text="$failurereason"/>
           <remove_value name="$failurereason"/>
         </do_if>
@@ -1489,6 +1504,124 @@
       </create_order>
       <!-- very short wait to allow the newly-created order to start and prevent the following logic from needlessly being processed. -->
       <wait exact="1ms" sinceversion="4"/>
+
+      <!-- =========================================================================================
+           GT probe lifecycle (DEPLOY -> RECOVER -> BUY) — v8 baseline, restored in v0.13.11.
+
+           Position: AFTER the immediate MiningCollect sub-order returns. By the time control gets
+           here the ship has finished collecting in the target asteroid field, so this is the
+           natural moment to drop a probe (the probe will sit on the freshly-mined field and feed
+           the per-sector probe scan that lifts find_closest_resource yield ratings for this ship
+           and every other miner that scans the sector afterwards).
+
+           Vanilla reference pattern: order.move.recon.xml lines 898-907 (drop probe at current
+           position when no operational probe within 64km) and 1336-1342 (launch_resourceprobe).
+           We deliberately skip the resourcescout-only order.move.recon recon loop because that
+           bypasses MiningCollect entirely (label="collect" path above) — Galaxy-Miner needs to
+           mine, not just scout.
+
+           BUY: when the ship is empty on resource probes we fire a non-urgent GT_DoMaintenance
+           signal (v8 line ~1612). This routes through md.GT_Maintenance.DoMaintenance which uses
+           add_build_to_modify_ship — bypassing interrupt.restock.xml's loadout-level guard (~280)
+           that drops resourceprobe for miner-class loadouts. Slider quantity is read MD-side from
+           global.$GT_AIParameters.{ship}.$MaxResourceProbesToBuy. The miner script's executor
+           (order.trade.galaxyminer.xml main_loop) consumes the resulting global.$GT_ResupplyOrders
+           entry and calls add_build_to_modify_ship; on a failed wharf call it sets the same
+           this.$gtNextProbeResupplyAt blackboard variable read here, so a rejected build also
+           pauses the routine-side buy attempts. ========================================================================================= -->
+      <do_if value="$autoDeployProbes and this.assignedcontrolled.sector?">
+        <set_value name="$gtProbeCount" exact="this.assignedcontrolled.ammostorage.{deployablecategory.resourceprobe}.count"/>
+        <set_value name="$gtDeployableFree" exact="@this.assignedcontrolled.ammostorage.deployable.free"/>
+
+        <!-- 1) DEPLOY: drop a probe on the freshly-mined asteroid field if we have stock and no
+             operational probe of ours is already covering this radius. -->
+        <do_if value="$gtProbeCount gt 0">
+          <find_object name="$gtNearbyProbe" space="this.assignedcontrolled.sector" trueowner="this.assignedcontrolled.trueowner" deployablecategory="deployablecategory.resourceprobe">
+            <match_distance object="this.assignedcontrolled" max="64km"/>
+          </find_object>
+          <do_if value="not @$gtNearbyProbe.isoperational">
+            <set_value name="$gtProbeLegal" exact="true"/>
+            <do_if value="@this.assignedcontrolled.sector.policefaction and @this.assignedcontrolled.sector.resources.illegalto.{this.assignedcontrolled.sector.policefaction}">
+              <set_value name="$gtProbeLegal" exact="false"/>
+            </do_if>
+            <do_if value="$gtProbeLegal">
+              <launch_resourceprobe name="$gtProbeLaunched" object="this.assignedcontrolled"/>
+              <set_value name="$gtProbeCount" exact="this.assignedcontrolled.ammostorage.{deployablecategory.resourceprobe}.count"/>
+              <set_value name="$gtDeployableFree" exact="@this.assignedcontrolled.ammostorage.deployable.free"/>
+              <debug_text text="'[GT-Miner] ' + @this.assignedcontrolled.idcode + ': auto-deployed resource probe in ' + @this.assignedcontrolled.sector.knownname + ' (probes remaining: ' + $gtProbeCount + ')'" chance="$debugchance"/>
+              <remove_value name="$gtProbeLaunched"/>
+            </do_if>
+            <remove_value name="$gtProbeLegal"/>
+          </do_if>
+          <remove_value name="$gtNearbyProbe"/>
+        </do_if>
+
+        <!-- 2) RECOVER: scan the current sector for one of our own operational probes whose
+             field is now exhausted (no basket ware shows any average yield in this sector).
+             If found AND we have free deployable storage, push a CollectDeployables sub-order so
+             the ship picks up the probe between mining slices and can redeploy it elsewhere.
+             We act on at most ONE probe per slice to keep the routine responsive; remaining
+             stale probes will be picked up on subsequent visits.
+
+             "Stale" criterion (v8): averagemaxyield.{ware}.count gt 0 for any basket ware. The
+             sector is depleted only when NO basket ware has any yield left. Stricter than the
+             prior v9 check (resources.{ware}.exists), which also triggered for sectors where the
+             asteroid type was present but the player simply hadn't discovered it yet —
+             unintentionally collecting probes the player still wanted. -->
+        <do_if value="$gtDeployableFree gt 0 and @$warebasket.count gt 0">
+          <set_value name="$gtSectorDepleted" exact="true"/>
+          <do_for_each name="$gtBasketWare" in="$warebasket">
+            <do_if value="@this.assignedcontrolled.sector.averagemaxyield.{$gtBasketWare}.count gt 0">
+              <set_value name="$gtSectorDepleted" exact="false"/>
+              <break/>
+            </do_if>
+          </do_for_each>
+          <do_if value="$gtSectorDepleted">
+            <!-- Vanilla pattern: find_object returns the closest match, then filter operational
+                 status on the returned object (see order.move.recon.xml ~898-902). We don't
+                 constrain with match_distance because the probe could be anywhere in the sector
+                 — the ship will navigate to it via the CollectDeployables order. -->
+            <find_object name="$gtStaleProbe" space="this.assignedcontrolled.sector" trueowner="this.assignedcontrolled.trueowner" deployablecategory="deployablecategory.resourceprobe"/>
+            <do_if value="@$gtStaleProbe.exists and @$gtStaleProbe.isoperational">
+              <debug_text text="'[GT-Miner] ' + @this.assignedcontrolled.idcode + ': scheduling pickup of stale probe in depleted sector ' + @this.assignedcontrolled.sector.knownname + ' (deployable.free=' + $gtDeployableFree + ')'" chance="$debugchance"/>
+              <create_order id="'CollectDeployables'" object="this.assignedcontrolled" immediate="true">
+                <param name="targetlist" value="[$gtStaleProbe]"/>
+                <param name="debugchance" value="$debugchance"/>
+              </create_order>
+              <wait exact="1ms"/>
+            </do_if>
+            <remove_value name="$gtStaleProbe"/>
+          </do_if>
+          <remove_value name="$gtSectorDepleted"/>
+        </do_if>
+
+        <!-- 3) BUY: only fired when the ship has run OUT of probes (count == 0). The slider
+             ($maxresourceprobestobuy, mirrored to GT_AIParameters.$MaxResourceProbesToBuy by the
+             miner order's init / main_loop) controls HOW MANY to restock per buy run, not how
+             often. Triggering on every "below slider target" delta would spam resupply after every
+             single deploy and yo-yo the ship between mining and restock docking — resupply is
+             meant to happen when the ship is empty (vanilla mining-routine pattern at
+             order.mining.routine.xml ~365-367 also fires only on
+             `not ammostorage.{deployablecategory.resourceprobe}.count`).
+
+             Pipeline: signal 'GT_DoMaintenance' on player.galaxy -> gt_maintenance.xml DoMaintenance
+             reads $autoDeployResourceProbes + $maxResourceProbesToBuy from GT_AIParameters, picks
+             the closest equipment dock with stock, and queues add_build_to_modify_ship for the
+             slider amount (capped at deployable.capacity). This MD-side pipeline bypasses
+             interrupt.restock.xml's hard `loadout level le 0` guard (~280) which would otherwise
+             cancel ammo+unit resupply on stripped player ships, blocking the probe buy entirely.
+
+             Throttle: 5min between requests so we do not spam GT_Maintenance when no buyoffers
+             are reachable; gt_maintenance also tracks $GT_MaintenanceFailedResupply with its own
+             5-min cooldown so the two layers reinforce each other. -->
+        <do_if value="$gtProbeCount le 0 and (not this.$gtNextProbeResupplyAt? or player.age ge this.$gtNextProbeResupplyAt)">
+          <signal_objects object="player.galaxy" param="'GT_DoMaintenance'" param2="this.assignedcontrolled"/>
+          <debug_text text="'[GT-Miner] ' + @this.assignedcontrolled.idcode + ': out of resource probes - triggered GT_Maintenance for ' + $maxresourceprobestobuy + ' probes (slider target)'" chance="$debugchance"/>
+          <set_value name="this.$gtNextProbeResupplyAt" exact="player.age + 5min"/>
+        </do_if>
+        <remove_value name="$gtProbeCount"/>
+        <remove_value name="$gtDeployableFree"/>
+      </do_if>
 
       <label name="sellwares" />
 
@@ -1815,5 +1948,6 @@
       <debug_text text="'on_abort: updating duration from %s to %s'.[$duration, $duration - [(player.age - $time_start), $duration - 1s].min]" chance="$debugchance"/>
       <edit_order_param order="$thisorder" param="'duration'" value="[$duration - (player.age - $time_start), 1s].max"/>
     </do_if>
+    <do_if value="this.$gtNextProbeResupplyAt?"><remove_value name="this.$gtNextProbeResupplyAt"/></do_if>
   </on_abort>
 </aiscript>

@@ -754,9 +754,84 @@
       </do_all>
       <set_value name="$candidateWares" exact="$normalizedCandidateWares"/>
 
+      <!-- ============================================================================ -->
+      <!-- CARGO-FIRST INJECTION (pre-scoring guard)                                    -->
+      <!--                                                                              -->
+      <!-- Player report: a miner carrying Ice + Ore where Ore has zero demand and Ice  -->
+      <!-- has demand but neither ware ended up in $candidateWares this slice (e.g.,    -->
+      <!-- the demand-station scan missed Ice for timing reasons, or Ice was filtered   -->
+      <!-- out by the ship's basket restriction). The script then hits the "No mineable -->
+      <!-- wares" early-return below, waits this.$demandRecheckInterval, loops back -   -->
+      <!-- and the Ice keeps sitting in the bay forever while a willing Ice-buyer       -->
+      <!-- station goes hungry. The user-visible symptom is a ship "stuck searching     -->
+      <!-- for resources" with non-empty cargo, exactly the report.                     -->
+      <!--                                                                              -->
+      <!-- Fix: BEFORE the no-candidates early-return, scan the ship's actual cargo for -->
+      <!-- any ware that some $demandStations entry has capacity for. If found, append  -->
+      <!-- it to $candidateWares so:                                                    -->
+      <!--   (a) the no-candidates early-return below does not fire,                    -->
+      <!--   (b) scoring sees the ware (it scores low because there's no asteroid       -->
+      <!--       demand context but that's fine - scoring stays a "what to MINE" pass), -->
+      <!--   (c) the post-scoring CARGO-FIRST OVERRIDE block at line ~1044 picks the    -->
+      <!--       ware as $selectedWare and the standard primary-delivery block at line  -->
+      <!--       ~1437 routes the ship to the buyer.                                    -->
+      <!--                                                                              -->
+      <!-- Acceptance gate per cargo ware:                                              -->
+      <!--   1. Non-zero count in this.ship.cargo.{ware}                                -->
+      <!--   2. Ware is minable AND of waretransport solid/liquid (consistent with the  -->
+      <!--      candidate-build filters at lines 677/694 - no manufactured wares get    -->
+      <!--      injected even if a player accidentally loaded some)                     -->
+      <!--   3. SOME station in $demandStations has target > 0 for the ware AND         -->
+      <!--      currentStock/target < $overflowThreshold (capacity left for delivery).  -->
+      <!--                                                                              -->
+      <!-- We deliberately DO NOT enforce the $shipMineableBasket / $restrictToShipBasket-->
+      <!-- gate here. Those gates exist to bias what the ship MINES NEXT, not what it   -->
+      <!-- does with cargo it already carries. Refusing to deliver Ice the ship is      -->
+      <!-- already hauling - just because Ice is not in its current preferred basket -  -->
+      <!-- would force the player to manually unload at every basket reconfiguration.   -->
+      <!-- ============================================================================ -->
+      <do_if value="this.ship.cargo.list? and this.ship.cargo.list.count gt 0 and $demandStations? and $demandStations.count gt 0">
+        <do_for_each name="$cargoInjectWare" in="this.ship.cargo.list">
+          <do_if value="$cargoInjectWare? and $cargoInjectWare != null and not $candidateWares.indexof.{$cargoInjectWare} and $cargoInjectWare.hastag.minable and ($cargoInjectWare.waretransport == waretransport.solid or $cargoInjectWare.waretransport == waretransport.liquid) and this.ship.cargo.{$cargoInjectWare}.count gt 0">
+            <set_value name="$cargoInjectHasBuyer" exact="false"/>
+            <do_for_each name="$cargoInjectStation" in="$demandStations">
+              <do_if value="$cargoInjectHasBuyer">
+                <break/>
+              </do_if>
+              <do_if value="$cargoInjectStation? and $cargoInjectStation.exists">
+                <set_value name="$cargoInjectTarget" exact="@$cargoInjectStation.cargo.{$cargoInjectWare}.target"/>
+                <do_if value="$cargoInjectTarget? and $cargoInjectTarget gt 0">
+                  <set_value name="$cargoInjectCount" exact="@$cargoInjectStation.cargo.{$cargoInjectWare}.count"/>
+                  <set_value name="$cargoInjectPercent" exact="if $cargoInjectTarget gt 0 then ($cargoInjectCount * 100) / $cargoInjectTarget else 100"/>
+                  <do_if value="$cargoInjectPercent lt this.$overflowThreshold">
+                    <set_value name="$cargoInjectHasBuyer" exact="true"/>
+                  </do_if>
+                  <remove_value name="$cargoInjectCount"/>
+                  <remove_value name="$cargoInjectPercent"/>
+                </do_if>
+                <do_if value="$cargoInjectTarget?"><remove_value name="$cargoInjectTarget"/></do_if>
+              </do_if>
+            </do_for_each>
+            <do_if value="$cargoInjectHasBuyer">
+              <append_to_list name="$candidateWares" exact="$cargoInjectWare"/>
+              <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': CARGO-FIRST inject - ware ' + $cargoInjectWare.name + ' x' + this.ship.cargo.{$cargoInjectWare}.count + ' is in cargo and has a willing primary buyer; appended to candidate set so scoring + primary-delivery can route the ship to deliver instead of stalling at no-candidates wait.'" chance="this.$debugchance"/>
+            </do_if>
+            <remove_value name="$cargoInjectHasBuyer"/>
+          </do_if>
+        </do_for_each>
+        <do_if value="$cargoInjectStation?"><remove_value name="$cargoInjectStation"/></do_if>
+        <do_if value="$cargoInjectWare?"><remove_value name="$cargoInjectWare"/></do_if>
+      </do_if>
+
       <do_if value="$candidateWares.count == 0">
-        <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': No mineable wares. demandStationCount=' + $demandStations.count + ', resourceBasketCount=' + (if this.$resourceBasket? then this.$resourceBasket.count else 0) + ', shipMineableCount=' + (if $shipMineableBasket? then $shipMineableBasket.count else 0) + ', restrictToShipBasket=' + $restrictToShipBasket" chance="this.$debugchance"/>
+        <!-- Differentiated diagnostic: distinguish "no demand stations have anything we     -->
+        <!-- can mine" (the original case) from "no demand AND no deliverable cargo" (the    -->
+        <!-- truly stuck case). Both still fall through to the wait, but the log line tells  -->
+        <!-- the player which lever fixes it (add a buyer station vs. unload manually).      -->
+        <set_value name="$noCandHasCargo" exact="this.ship.cargo.list? and this.ship.cargo.list.count gt 0 and this.ship.cargo.used.all gt 0"/>
+        <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': No mineable wares. demandStationCount=' + $demandStations.count + ', resourceBasketCount=' + (if this.$resourceBasket? then this.$resourceBasket.count else 0) + ', shipMineableCount=' + (if $shipMineableBasket? then $shipMineableBasket.count else 0) + ', restrictToShipBasket=' + $restrictToShipBasket + ', cargoUsed=' + this.ship.cargo.used.all + '/' + this.ship.cargo.capacity.all + (if $noCandHasCargo then ' (cargo present but NO demand station has capacity for any ware in the bay - all primary buyers are full or the cargo wares are not in any buyer config; lower threshold or add a buyer to free this ship)' else '')" chance="this.$debugchance"/>
         <show_notification text="'Galaxy-Miner: no mineable wares available for ' + this.ship.knownname" timeout="8s"/>
+        <remove_value name="$noCandHasCargo"/>
         <wait exact="this.$demandRecheckInterval"/>
         <resume label="main_loop"/>
       </do_if>
@@ -908,35 +983,90 @@
                  before promoting the ware to "reachable" (otherwise the routine downstream falls
                  through and the miner stalls on "found nothing"). NPC ships skip the probe (vanilla
                  useundiscovered="not this.isplayerowned" -> true). -->
+          <!-- ============================================================================ -->
+          <!-- FUSED REACHABILITY + DISCOVERY PROBE                                         -->
+          <!--                                                                              -->
+          <!-- Single pass over gather sectors, doing the cheap checks before the expensive -->
+          <!-- engine call, with proper early exit. Replaces a previous two-pass design     -->
+          <!-- that had three real efficiency problems:                                     -->
+          <!--                                                                              -->
+          <!--   1. Reachability used <do_all> with <break/>. <break> in MD only works in   -->
+          <!--      do_while / do_for_each / do_each - NOT do_all (fixed-count iteration).  -->
+          <!--      So the loop scanned every gather sector even after finding a hit.       -->
+          <!--                                                                              -->
+          <!--   2. Reachability and discovery were separate loops over the same gather     -->
+          <!--      list. Two passes through the same data.                                 -->
+          <!--                                                                              -->
+          <!--   3. The discovery loop called find_closest_resource on EVERY gather sector  -->
+          <!--      regardless of whether the sector even had asteroids of this ware. The   -->
+          <!--      cheap MD check (sector.resources.{ware}.exists) was only consulted by   -->
+          <!--      the reachability pass; the discovery pass blindly hit the engine. For   -->
+          <!--      a fleet of 50 miners with 3 wares and 13 gather sectors, that's ~2000  -->
+          <!--      engine calls per minute, many of them wasted on empty sectors.          -->
+          <!--                                                                              -->
+          <!-- This fused loop:                                                             -->
+          <!--   - Iterates gather sectors via do_for_each so <break/> actually works.      -->
+          <!--   - Does the cheap MD checks first (sector validity, resources.exists,       -->
+          <!--     yieldrating) BEFORE the expensive engine call.                           -->
+          <!--   - For player ships with a sector that passes the cheap checks, immediately -->
+          <!--     runs find_closest_resource useundiscovered="false" anchored on THAT     -->
+          <!--     sector (vanilla pattern - see comment block below for the ship-anchor    -->
+          <!--     bug history). NPC ships skip the engine call entirely (always            -->
+          <!--     discoverable, mirroring vanilla useundiscovered="not isplayerowned").    -->
+          <!--   - Breaks out as soon as both flags are true (ware is reachable AND         -->
+          <!--     discoverable - we have everything we need). NPC ships break out as soon  -->
+          <!--     as reachable becomes true (discoverable is initialized true for them).   -->
+          <!--                                                                              -->
+          <!-- PER-SAFE-SECTOR ANCHORING (mirrors gt_context_diagnose.xml:1925-1956 fix):   -->
+          <!-- Previously used refobject="this.ship" for the discovery probe. That call    -->
+          <!-- folds the ship's current position / accessibility into the resolution -      -->
+          <!-- sibling player-owned miners at the exact same wall-clock tick disagreed     -->
+          <!-- on whether Silicon was discovered (ship A in Heretic's End said             -->
+          <!-- undiscovered, ship B in Watchful Gaze said discovered) even though          -->
+          <!-- player faction-wide discovery state was identical for both. Vanilla         -->
+          <!-- order.mining.routine.xml never anchors find_closest_resource on this.ship - -->
+          <!-- it iterates gather spaces and anchors on each sector. We mirror that here.  -->
+          <!--                                                                              -->
+          <!-- Cost per ware (typical: 3 wares, 13 gather sectors):                        -->
+          <!--   Old: 13 cheap + 13 engine calls = 26 ops, no early exit                   -->
+          <!--   New: <=13 cheap + <=13 engine calls (only sectors with asteroids), with   -->
+          <!--        early exit on first hit. Real-world: typically 2-4 engine calls per  -->
+          <!--        ware before break, ~80% reduction.                                   -->
+          <!-- ============================================================================ -->
           <set_value name="$wareIsReachable" exact="false"/>
-          <do_all exact="this.$minerScoreGatherSpaces.count" counter="$gsi">
-            <set_value name="$gatherSectorEval" exact="this.$minerScoreGatherSpaces.{$gsi}"/>
+          <set_value name="$wareIsDiscoverable" exact="not this.ship.isplayerowned"/>
+          <do_for_each name="$gatherSectorEval" in="this.$minerScoreGatherSpaces">
             <do_if value="$gatherSectorEval? and $gatherSectorEval.exists and $gatherSectorEval.isclass.sector and $gatherSectorEval.resources.{$wareEval}.exists">
               <set_value name="$sectorYieldRating" exact="@$gatherSectorEval.yieldrating.{$wareEval}"/>
               <do_if value="$sectorYieldRating ge this.$minReachableYieldRating">
                 <set_value name="$wareIsReachable" exact="true"/>
-                <break/>
+                <!-- Engine call only when this sector actually has asteroids with usable
+                     yield AND we still need a discovery hit (NPC ships skip; subsequent
+                     player-ship sectors skip after the first hit). -->
+                <do_if value="this.ship.isplayerowned and not $wareIsDiscoverable">
+                  <set_value name="$discTrySec" exact="null"/>
+                  <set_value name="$discTryPos" exact="null"/>
+                  <find_closest_resource sector="$discTrySec" position="$discTryPos" ware="$wareEval" refobject="$gatherSectorEval" minamount="1" useundiscovered="false"/>
+                  <do_if value="$discTrySec? and @$discTrySec.exists">
+                    <set_value name="$wareIsDiscoverable" exact="true"/>
+                  </do_if>
+                  <do_if value="$discTrySec?"><remove_value name="$discTrySec"/></do_if>
+                  <do_if value="$discTryPos?"><remove_value name="$discTryPos"/></do_if>
+                </do_if>
+                <do_if value="$wareIsReachable and $wareIsDiscoverable">
+                  <break/>
+                </do_if>
               </do_if>
+              <do_if value="$sectorYieldRating?"><remove_value name="$sectorYieldRating"/></do_if>
             </do_if>
-          </do_all>
-          <!-- Discoverability is tracked separately so the diag can distinguish
-               "asteroids exist but undiscovered" from "no asteroids in range":
-               - NPC ships: always discoverable (vanilla useundiscovered="not this.isplayerowned" -> true).
-               - Player ships with no asteroid type in range: discoverability is irrelevant (false).
-               - Player ships with asteroids in range: run the authoritative engine probe. -->
-          <set_value name="$wareIsDiscoverable" exact="not this.ship.isplayerowned"/>
-          <do_if value="$wareIsReachable and this.ship.isplayerowned">
-            <set_value name="$probedSector" exact="null"/>
-            <set_value name="$probedPos" exact="null"/>
-            <find_closest_resource sector="$probedSector" position="$probedPos" ware="$wareEval" refobject="this.ship" useundiscovered="false"/>
-            <do_if value="$probedSector? and @$probedSector.exists">
-              <set_value name="$wareIsDiscoverable" exact="true"/>
-            </do_if>
-            <!-- Vanilla mining for player ships requires discovered asteroids; if the engine cannot
-                 find one, the ware is not actually mineable even if resources.exists is true. -->
-            <do_if value="not $wareIsDiscoverable">
-              <set_value name="$wareIsReachable" exact="false"/>
-            </do_if>
+          </do_for_each>
+          <do_if value="$gatherSectorEval?"><remove_value name="$gatherSectorEval"/></do_if>
+          <!-- Vanilla mining for player ships requires discovered asteroids; if the engine
+               could not find one in any safe-sector probe, the ware is not actually
+               mineable even though resources.exists was true somewhere. NPC ships have
+               $wareIsDiscoverable initialized true so this gate never fires for them. -->
+          <do_if value="$wareIsReachable and not $wareIsDiscoverable">
+            <set_value name="$wareIsReachable" exact="false"/>
           </do_if>
           <do_if value="$wareEval?">
             <set_value name="this.$minerScoreWareReachable.{$wareEval}" exact="$wareIsReachable"/>
@@ -1043,14 +1173,181 @@
            never read back as an input to selection. -->
       <set_value name="$selectedWare" exact="$bestWare"/>
 
+      <!-- ============================================================================ -->
+      <!-- CARGO-FIRST OVERRIDE                                                         -->
+      <!--                                                                              -->
+      <!-- Player report (live log 851806/851868/851930/851992/852054 for BLV-869):     -->
+      <!--   "Overflow wait. selected=Ore, urgency=9, overflowAllowed=0,                -->
+      <!--    cargoFree=0/35800 (0% free). Standing by until a buyer becomes available  -->
+      <!--    or the player intervenes."                                                 -->
+      <!-- BLV-869's cargo bay is full of SILICON, the player has stations that BUY     -->
+      <!-- Silicon with capacity, yet the ship sits idle for >250s because demand       -->
+      <!-- scoring picked Ore (higher urgency this slice) and the overflow-wait branch  -->
+      <!-- only checks the SELECTED ware. With Ore primary-capped and overflow-sell     -->
+      <!-- disabled, the loop loops back to demand-recheck forever - never even         -->
+      <!-- considering the Silicon already in the bay.                                  -->
+      <!--                                                                              -->
+      <!-- Vanilla mining routine handles the "deliver-then-mine" cycle internally     -->
+      <!-- as long as the ware passed in matches what the cargo holds. By forcing       -->
+      <!-- $selectedWare to a cargo ware with a buyer here, we hand the mining routine  -->
+      <!-- the right target and it does the delivery as the first action of the slice. -->
+      <!-- After the slice the cargo is empty, the next main_loop iteration re-scores  -->
+      <!-- normally, and the miner can then pursue Ore (or whatever scored highest).    -->
+      <!--                                                                              -->
+      <!-- Acceptance gate per cargo ware:                                              -->
+      <!--   1. $cargoWare in this.ship.cargo.list with count > 0                       -->
+      <!--   2. $cargoWare in $candidateWares (so it was already deemed mineable +      -->
+      <!--      relevant for this ship - prevents force-delivering wares to stations    -->
+      <!--      outside the ship's restricted basket / range)                            -->
+      <!--   3. SOME station in $demandStations has capacity for $cargoWare             -->
+      <!--      (storagePercent < $overflowThreshold AND target > 0). Reuses the same   -->
+      <!--      $demandStations list and the same threshold the primary-delivery        -->
+      <!--      block at line 1437 uses - if a station qualifies as a primary buyer     -->
+      <!--      for the SELECTED ware there, it qualifies as a primary buyer for the    -->
+      <!--      CARGO ware here too (the only delta is the ware in question).           -->
+      <!--                                                                              -->
+      <!-- We pick the cargo ware with the LARGEST in-bay amount (greedy: clear the    -->
+      <!-- biggest stack first; any leftover gets handled the next slice). Scoring      -->
+      <!-- here would just delay the inevitable.                                        -->
+      <!--                                                                              -->
+      <!-- We do NOT route this through the overflow-sell-mode branch. Overflow-sell    -->
+      <!-- is for "primary stations are full, find anyone willing to buy". Here we have -->
+      <!-- a willing PRIMARY buyer; the standard primary delivery path at line 1437     -->
+      <!-- handles it cleanly.                                                          -->
+      <!-- ============================================================================ -->
+      <do_if value="this.ship.cargo.list? and this.ship.cargo.list.count gt 0 and $demandStations? and $demandStations.count gt 0">
+        <set_value name="$cargoFirstBestWare" exact="null"/>
+        <set_value name="$cargoFirstBestAmount" exact="0"/>
+        <set_value name="$cargoFirstReason" exact="''"/>
+        <!-- $candidateWares filter intentionally NOT enforced here (was: ... and
+             $candidateWares.indexof.{$cargoWare}). The pre-scoring CARGO-FIRST INJECTION
+             block above already appends every deliverable cargo ware to $candidateWares
+             before the no-candidates early-return; the explicit indexof check would only
+             matter if some race dropped the entry between then and now (it cannot in a
+             single MD slice), and the buyer scan below ($cfStation loop) is the actual
+             gate that decides whether to override. Dropping the filter also makes this
+             block resilient to future reorderings: if a maintainer moves $candidateWares
+             rebuilds around, the cargo-first override still works because it asks the
+             demand stations directly. -->
+        <do_for_each name="$cargoWare" in="this.ship.cargo.list">
+          <do_if value="$cargoWare? and $cargoWare != null and this.ship.cargo.{$cargoWare}.count gt 0 and $cargoWare.hastag.minable">
+            <set_value name="$cargoWareAmount" exact="this.ship.cargo.{$cargoWare}.count"/>
+            <set_value name="$cargoWareHasBuyer" exact="false"/>
+            <!-- Scan demand stations once per cargo ware. Break on first qualifying station to
+                 keep the slice cheap (we only need to know IF a buyer exists, not which one;
+                 the primary delivery block at line 1437 will pick the best one with full
+                 deficit + reservation accounting). -->
+            <do_for_each name="$cfStation" in="$demandStations">
+              <do_if value="$cargoWareHasBuyer">
+                <break/>
+              </do_if>
+              <do_if value="$cfStation? and $cfStation.exists">
+                <set_value name="$cfTarget" exact="@$cfStation.cargo.{$cargoWare}.target"/>
+                <do_if value="$cfTarget? and $cfTarget gt 0">
+                  <set_value name="$cfCurrent" exact="@$cfStation.cargo.{$cargoWare}.count"/>
+                  <set_value name="$cfPercent" exact="if $cfTarget gt 0 then ($cfCurrent * 100) / $cfTarget else 100"/>
+                  <do_if value="$cfPercent lt this.$overflowThreshold">
+                    <set_value name="$cargoWareHasBuyer" exact="true"/>
+                  </do_if>
+                  <remove_value name="$cfCurrent"/>
+                  <remove_value name="$cfPercent"/>
+                </do_if>
+                <do_if value="$cfTarget?"><remove_value name="$cfTarget"/></do_if>
+              </do_if>
+            </do_for_each>
+            <do_if value="$cargoWareHasBuyer and $cargoWareAmount gt $cargoFirstBestAmount">
+              <set_value name="$cargoFirstBestAmount" exact="$cargoWareAmount"/>
+              <set_value name="$cargoFirstBestWare" exact="$cargoWare"/>
+            </do_if>
+            <remove_value name="$cargoWareAmount"/>
+            <remove_value name="$cargoWareHasBuyer"/>
+          </do_if>
+        </do_for_each>
+        <do_if value="$cfStation?"><remove_value name="$cfStation"/></do_if>
+        <do_if value="$cargoWare?"><remove_value name="$cargoWare"/></do_if>
+        <do_if value="$cargoFirstBestWare? and $cargoFirstBestWare != null">
+          <!-- ============================================================================ -->
+          <!-- TRIGGER GATE: only override when the ship CANNOT mine productively this      -->
+          <!-- slice. If the ship can keep mining (scored a reachable ware AND has free     -->
+          <!-- cargo space), let the standard flow proceed - the vanilla mining routine     -->
+          <!-- will naturally deliver any in-bay cargo as part of its mine-then-deliver     -->
+          <!-- cycle, or the overflow-wait branch downstream will trigger this override     -->
+          <!-- on the NEXT slice if the cargo situation persists.                            -->
+          <!--                                                                              -->
+          <!-- "Cannot mine productively" means ANY of:                                     -->
+          <!--   (a) $selectedWare is null - scoring picked nothing to mine                 -->
+          <!--   (b) Selected ware is not reachable - no asteroid discovered for it         -->
+          <!--   (c) Cargo is FULL (free.all <= 0) - even if scored & reachable, the ship   -->
+          <!--       has zero room to mine another cubic meter so it MUST deliver first     -->
+          <!--       (this is exactly the BLV-869 report: cargoFree=0/35800, full of        -->
+          <!--       Silicon, scored Ore, stuck in overflow wait forever)                    -->
+          <!--                                                                              -->
+          <!-- The "scoring picked a different ware than cargo" condition that previously   -->
+          <!-- gated this block was too aggressive: a ship with 5% Ice in the bay and 95%   -->
+          <!-- free space scored on a fresh, reachable Ore opportunity should KEEP mining   -->
+          <!-- Ore, not divert to deliver 5% of Ice. The vanilla mining routine handles     -->
+          <!-- the Ice on the natural deliver-cycle once Ore is mined.                      -->
+          <!-- ============================================================================ -->
+          <set_value name="$cargoFirstNoScoring" exact="not $selectedWare? or $selectedWare == null"/>
+          <set_value name="$cargoFirstUnreachable" exact="not $cargoFirstNoScoring and $wareReachable? and $wareReachable.{$selectedWare}? and not $wareReachable.{$selectedWare}"/>
+          <set_value name="$cargoFirstCargoFull" exact="this.ship.cargo.free.all le 0"/>
+          <set_value name="$cargoFirstShouldOverride" exact="$cargoFirstNoScoring or $cargoFirstUnreachable or $cargoFirstCargoFull"/>
+          <do_if value="$cargoFirstShouldOverride and ($cargoFirstNoScoring or $selectedWare != $cargoFirstBestWare)">
+            <set_value name="$cargoFirstReason" exact="if $cargoFirstNoScoring then 'no scoring winner' else (if $cargoFirstCargoFull then 'cargo is FULL (' + this.ship.cargo.used.all + '/' + this.ship.cargo.capacity.all + ') - cannot mine more without delivering, scoring picked ' + $selectedWare.name + ' (urgency=' + (if $wareUrgency? and $wareUrgency.{$selectedWare}? then $wareUrgency.{$selectedWare} else 0) + ')' else 'scoring picked ' + $selectedWare.name + ' (urgency=' + (if $wareUrgency? and $wareUrgency.{$selectedWare}? then $wareUrgency.{$selectedWare} else 0) + ') but it is unreachable - no discovered asteroid in range') + '; cargo holds ' + $cargoFirstBestAmount + ' ' + $cargoFirstBestWare.name + ' with a willing primary buyer'"/>
+            <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': CARGO-FIRST override - ' + $cargoFirstReason + '. Switching selected to ' + $cargoFirstBestWare.name + ' so the mining routine delivers existing cargo before mining anything new.'" chance="this.$debugchance"/>
+            <set_value name="$selectedWare" exact="$cargoFirstBestWare"/>
+            <set_value name="$bestWare" exact="$cargoFirstBestWare"/>
+            <!-- Force-clear the overflow flag for the new selected ware so the standard
+                 primary-delivery block (line 1437) handles delivery rather than the
+                 overflow-wait branch (which is keyed on the OLD selectedWare's primary
+                 capacity flag from scoring). The primary-delivery block computes its own
+                 deficit / capacity per station so this is safe. -->
+            <do_if value="$wareHasPrimaryCapacity?">
+              <set_value name="$wareHasPrimaryCapacity.{$cargoFirstBestWare}" exact="true"/>
+            </do_if>
+            <!-- Also mark reachable (we're not mining anything - just delivering existing
+                 cargo - so the asteroid-discovery question is moot for this slice). -->
+            <do_if value="$wareReachable?">
+              <set_value name="$wareReachable.{$cargoFirstBestWare}" exact="true"/>
+            </do_if>
+          </do_if>
+          <do_if value="not $cargoFirstShouldOverride">
+            <!-- Diagnostic: ship has deliverable cargo with a willing buyer but the gate
+                 says it can keep mining. Useful to confirm the gate isn't suppressing
+                 obviously needed deliveries during testing. Logged at debug-chance only. -->
+            <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': CARGO-FIRST evaluated but suppressed - ship can keep mining ' + (if $selectedWare? and $selectedWare != null then $selectedWare.name else 'NONE') + ' (reachable, cargoFree=' + this.ship.cargo.free.all + '/' + this.ship.cargo.capacity.all + '). Cargo holds ' + $cargoFirstBestAmount + ' ' + $cargoFirstBestWare.name + ' which will be delivered on the natural mine-then-deliver cycle.'" chance="this.$debugchance"/>
+          </do_if>
+          <remove_value name="$cargoFirstNoScoring"/>
+          <remove_value name="$cargoFirstUnreachable"/>
+          <remove_value name="$cargoFirstCargoFull"/>
+          <remove_value name="$cargoFirstShouldOverride"/>
+        </do_if>
+        <do_if value="$cargoFirstBestWare?"><remove_value name="$cargoFirstBestWare"/></do_if>
+        <do_if value="$cargoFirstBestAmount?"><remove_value name="$cargoFirstBestAmount"/></do_if>
+        <do_if value="$cargoFirstReason?"><remove_value name="$cargoFirstReason"/></do_if>
+      </do_if>
+
       <!-- Hardening: $selectedWare? is true even when set_value stored null (X4 set_value always materializes the variable).
            When scoring produces no reachable wares $bestWare stays null, the prior selection block then sets
            $selectedWare = null, and downstream lookups like $wareUrgency.{$selectedWare} or
            $stationEval.cargo.{$selectedWare}.target crash on .{null}. Force the early-return whenever the selected
            ware is missing OR null, and clear the stale active ware so the next cycle does not re-pick the same
-           null fallback. -->
-      <do_if value="not $selectedWare? or $selectedWare == null">
-        <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': No selected ware after demand scoring. bestWare=' + (if $bestWare? and $bestWare != null then $bestWare.name else 'NONE') + ', bestUrgency=' + $bestUrgency + ', activeWare=' + (if this.$activeMiningWare? and this.$activeMiningWare != null then this.$activeMiningWare.name else 'NONE')" chance="this.$debugchance"/>
+           null fallback.
+           $forceScout entry: the overflow-wait branch below at the demand-recheck wait can clear $selectedWare
+           and set $forceScout=true to route into the scout fallback instead of waiting forever. Without this
+           the miner would stay locked on a primary-capped ware (e.g. Ore at 90%+ fill, overflow disabled)
+           even when a higher-urgency UNDISCOVERED alternative (e.g. Silicon/Ice in unscouted sectors) sits
+           in $candidateWares - scoring would have given those zero urgency for being unreachable, so they
+           never won selection, and the existing "no ware selected" gate never opened either. -->
+      <label name="try_scout"/>
+      <do_if value="not $selectedWare? or $selectedWare == null or ($forceScout? and $forceScout)">
+        <do_if value="$forceScout? and $forceScout">
+          <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': SCOUT ENTRY (overflow wait): primary-capped ware ' + (if this.$activeMiningWare? and this.$activeMiningWare != null then this.$activeMiningWare.name else 'NONE') + ' has nowhere to deliver and overflow sell is disabled - routing to scout fallback to discover higher-urgency undiscovered alternatives.'" chance="this.$debugchance"/>
+          <set_value name="$forceScout" exact="false"/>
+        </do_if>
+        <do_else>
+          <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': No selected ware after demand scoring. bestWare=' + (if $bestWare? and $bestWare != null then $bestWare.name else 'NONE') + ', bestUrgency=' + $bestUrgency + ', activeWare=' + (if this.$activeMiningWare? and this.$activeMiningWare != null then this.$activeMiningWare.name else 'NONE')" chance="this.$debugchance"/>
+        </do_else>
         <set_value name="this.$activeMiningWare" exact="null"/>
         <set_value name="this.$activeMiningUrgency" exact="0"/>
 
@@ -1119,41 +1416,101 @@
             <set_value name="$scoutSector" exact="null"/>
             <set_value name="$scoutPosition" exact="null"/>
             <set_value name="$scoutWare" exact="null"/>
+            <!-- ONLY scout for wares that genuinely need discovery this slice. The map
+                 $wareReachable.{ware} is populated by the demand scoring loop above for every
+                 candidate ware (true = engine found a discovered asteroid in a safe gather sector,
+                 false = no discovered asteroid found in range). Without this gate the scout walks
+                 $candidateWares in order and accepts the first ware where find_closest_resource
+                 useundiscovered="true" returns ANY sector - which includes already-discovered
+                 asteroids, because useundiscovered="true" means INCLUDE undiscovered, not ONLY
+                 undiscovered. Result: the scout would happily fly to the home sector to "discover"
+                 Ore (already discovered, already in cargo) at gateDist=0 and never even look at
+                 Silicon/Ice (the actual undiscovered alternatives that triggered the route).
+                 Skip wares without a $wareReachable entry too - that means scoring did not run
+                 for them this slice and we have no basis to pick them as a scout target. -->
             <do_for_each name="$scoutCandWare" in="$candidateWares">
-              <find_closest_resource sector="$scoutFindSector" position="$scoutFindPos" ware="$scoutCandWare" refobject="this.ship" minamount="1" useundiscovered="true"/>
-              <do_if value="@$scoutFindSector.exists">
-                <set_value name="$scoutGD" exact="@this.ship.gatedistance.{$scoutFindSector}"/>
-                <set_value name="$scoutSafe" exact="@$scoutFindSector.exists and $scoutGD ge 0 and $scoutGD le this.$maxGatherDistance"/>
-                <do_if value="$scoutSafe and @$scoutFindSector.owner and this.ship.owner.hasrelation.enemy.{$scoutFindSector.owner}">
-                  <set_value name="$scoutSafe" exact="false"/>
+              <do_if value="not $wareReachable.{$scoutCandWare}? or $wareReachable.{$scoutCandWare}">
+                <continue/>
+              </do_if>
+              <!-- Fleet-level scout claim dedup: if another player-faction ship already claimed this
+                   ware as a scout target within the TTL window, skip it. Discovery is faction-wide,
+                   so a single successful probe drop benefits the whole fleet; routing every fleet
+                   member to the same undiscovered sector wastes travel time (the 64km in-sector
+                   probe-dedup only kicks in AFTER arrival). Self-claims do NOT block (we may
+                   re-enter and re-confirm our own intent on probe recycle). Stale claims (claimer
+                   despawned or TTL expired) are treated as absent and garbage-collected here. -->
+              <do_if value="global.$GT_ScoutClaims? and global.$GT_ScoutClaims.{$scoutCandWare}?">
+                <set_value name="$scoutClaim" exact="global.$GT_ScoutClaims.{$scoutCandWare}"/>
+                <do_if value="$scoutClaim.$Ship? and $scoutClaim.$Ship != null and $scoutClaim.$Ship.exists and $scoutClaim.$Ship != this.ship and $scoutClaim.$ExpiresAt? and player.age lt $scoutClaim.$ExpiresAt">
+                  <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': SCOUT skipping ' + $scoutCandWare.name + ' - already claimed by fleet member ' + $scoutClaim.$Ship.idcode + ' (claim TTL remaining=' + ($scoutClaim.$ExpiresAt - player.age) + ')'" chance="this.$debugchance"/>
+                  <remove_value name="$scoutClaim"/>
+                  <continue/>
                 </do_if>
-                <do_if value="$scoutSafe and @$scoutFindSector.hashazardousregion and @$scoutFindSector.takesregiondamage">
-                  <set_value name="$scoutSafe" exact="false"/>
+                <do_if value="not $scoutClaim.$Ship? or $scoutClaim.$Ship == null or not $scoutClaim.$Ship.exists or not $scoutClaim.$ExpiresAt? or player.age ge $scoutClaim.$ExpiresAt">
+                  <remove_value name="global.$GT_ScoutClaims.{$scoutCandWare}"/>
                 </do_if>
-                <do_if value="$scoutSafe and @$scoutFindSector.iscontested and @$scoutFindSector.contestingfactions.mayattack.{this.ship}">
-                  <set_value name="$scoutSafe" exact="false"/>
-                </do_if>
-                <do_if value="$scoutSafe">
+                <remove_value name="$scoutClaim"/>
+              </do_if>
+              <!-- Per-safe-sector probe. A single galaxy-wide find_closest_resource refobject="this.ship"
+                   (the previous implementation) returns only the absolutely closest match. If that match
+                   sits in an enemy/hazardous/contested sector OR beyond this.$maxGatherDistance, the per-
+                   result safety filter would reject it and the loop would skip the entire ware - even when
+                   another undiscovered asteroid for the same ware exists in a SAFE in-range sector slightly
+                   further away. Symptom in the wild: every miner (commander + subordinates) bought probes
+                   but logged "SCOUT skipped - no safe undiscovered candidate sector found within N jumps
+                   for any of 4 candidate ware(s)" forever, even when Silicon/Ice were undiscovered one
+                   jump away in a friendly sector. Mirroring vanilla order.mining.routine.xml's pattern
+                   (refobject="$gatheringspaces.{$i}"), we iterate the curated $wareReachabilityGatherSpaces
+                   list - which is already filtered for owner-enemy / hazardous / contested / blacklisted /
+                   gate-distance upstream (lines 819-876) - and anchor the search at each safe sector in
+                   turn. Any result whose returned sector is itself a member of $wareReachabilityGatherSpaces
+                   is by construction safe and in range, so no per-result safety re-check is needed. The
+                   gather list is in roughly gate-distance order so the first hit naturally prefers the
+                   closest safe sector with the ware. -->
+              <do_for_each name="$scoutGS" in="$wareReachabilityGatherSpaces">
+                <find_closest_resource sector="$scoutFindSector" position="$scoutFindPos" ware="$scoutCandWare" refobject="$scoutGS" minamount="1" useundiscovered="true"/>
+                <do_if value="@$scoutFindSector.exists and $wareReachabilityGatherSpaces.indexof.{$scoutFindSector}">
                   <set_value name="$scoutSector" exact="$scoutFindSector"/>
                   <set_value name="$scoutPosition" exact="$scoutFindPos"/>
                   <set_value name="$scoutWare" exact="$scoutCandWare"/>
                 </do_if>
-                <remove_value name="$scoutGD"/>
-                <remove_value name="$scoutSafe"/>
-              </do_if>
-              <do_if value="$scoutFindSector?">
-                <remove_value name="$scoutFindSector"/>
-              </do_if>
-              <do_if value="$scoutFindPos?">
-                <remove_value name="$scoutFindPos"/>
-              </do_if>
+                <do_if value="$scoutFindSector?">
+                  <remove_value name="$scoutFindSector"/>
+                </do_if>
+                <do_if value="$scoutFindPos?">
+                  <remove_value name="$scoutFindPos"/>
+                </do_if>
+                <do_if value="@$scoutSector.exists">
+                  <break/>
+                </do_if>
+              </do_for_each>
               <do_if value="@$scoutSector.exists">
                 <break/>
               </do_if>
             </do_for_each>
 
             <do_if value="@$scoutSector.exists">
-              <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': SCOUT - flying to ' + $scoutSector.knownname + ' to discover ' + $scoutWare.name + ' (probes onboard=' + $scoutProbeCount + ', gateDist=' + this.ship.gatedistance.{$scoutSector} + ')'" chance="this.$debugchance"/>
+              <!-- Register fleet-level claim BEFORE flying so other fleet members in the same or
+                   subsequent script slice see it during their candidate scan and pick a different
+                   unreachable ware (or stand by). TTL is 2x demandRecheckInterval so a silently
+                   despawned scout still releases the claim within ~one full cycle. Explicit release
+                   happens in on_abort. If we still hold a claim on a different ware (e.g. previous
+                   slice scouted Silicon, this slice we switched to Ice), drop the stale self-claim
+                   first to avoid hoarding multiple wares. Re-claiming the same ware just refreshes
+                   the TTL, which is what we want on recycle/retry. -->
+              <do_if value="not global.$GT_ScoutClaims?">
+                <set_value name="global.$GT_ScoutClaims" exact="table[]"/>
+              </do_if>
+              <do_if value="this.$gtScoutClaimWare? and this.$gtScoutClaimWare != null and this.$gtScoutClaimWare != $scoutWare and global.$GT_ScoutClaims.{this.$gtScoutClaimWare}?">
+                <set_value name="$priorClaim" exact="global.$GT_ScoutClaims.{this.$gtScoutClaimWare}"/>
+                <do_if value="$priorClaim.$Ship? and $priorClaim.$Ship == this.ship">
+                  <remove_value name="global.$GT_ScoutClaims.{this.$gtScoutClaimWare}"/>
+                </do_if>
+                <remove_value name="$priorClaim"/>
+              </do_if>
+              <set_value name="global.$GT_ScoutClaims.{$scoutWare}" exact="table[$Ship = this.ship, $ExpiresAt = player.age + (2 * this.$demandRecheckInterval)]"/>
+              <set_value name="this.$gtScoutClaimWare" exact="$scoutWare"/>
+              <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': SCOUT - flying to ' + $scoutSector.knownname + ' to discover ' + $scoutWare.name + ' (probes onboard=' + $scoutProbeCount + ', gateDist=' + this.ship.gatedistance.{$scoutSector} + ', fleet claim TTL=' + (2 * this.$demandRecheckInterval) + ')'" chance="this.$debugchance"/>
               <set_command_action commandaction="commandaction.searchingresources"/>
               <run_script name="'move.generic'" result="$scoutMoveOk">
                 <param name="destination" value="$scoutSector"/>
@@ -1307,7 +1664,53 @@
       </do_if>
 
       <do_if value="$overflowSellMode and not this.$allowOverflowSellToOthers">
-        <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Overflow wait. selected=' + $selectedWare.name + ', urgency=' + this.$activeMiningUrgency + ', overflowAllowed=0'" chance="this.$debugchance"/>
+        <!-- Scout-route escape from the overflow-wait dead-end:
+             without this, a player ship whose only reachable ware (e.g. Ore) is primary-capped
+             AND has overflow sell disabled would just sit at the demand-recheck wait forever -
+             even with $autoDeployResourceProbes=true, because the scout fallback at the
+             "no selected ware" gate never fires (Ore IS selected, just unreachable for delivery).
+             Higher-urgency alternatives (Silicon/Ice in undiscovered sectors) sit in
+             $candidateWares but scoring zeroed their urgency for being unreachable, so they
+             never won $bestWare. Route into the scout block when:
+               1. scout is enabled (autoDeployResourceProbes + not stayAtHome)
+               2. at least one candidate ware is known-not-reachable this slice (the engine
+                  could not find a discovered asteroid for it - the exact case scout exists
+                  to fix). Without this gate every overflow-wait would route to scout even
+                  when all candidates are already discovered (in which case waiting for
+                  primary stations to drain is the correct behaviour).
+               3. cargo has room to actually act on a discovery (cargo.free.all gt 0). With
+                  full cargo the miner cannot mine the discovered ware anyway - selling has
+                  to clear space first - so dispatching it on a round-trip to drop a probe
+                  is wasted travel. The ship should sit and wait near home until a buyer
+                  appears or the player intervenes (lowers threshold, enables overflow,
+                  builds another buyer). Players were reporting fleets of full miners
+                  flying off to "search resources" when they should be standing by to
+                  unload as soon as primary stations drain.
+             Throttle (this.$gtNextScoutAt) is enforced inside the scout block itself, so a
+             throttled route is cheap (one slice, one fall-through). -->
+        <set_value name="$overflowScoutRouteOK" exact="false"/>
+        <do_if value="this.$autoDeployResourceProbes and not this.$stayAtHome and $candidateWares? and $candidateWares.count gt 0 and $wareReachable? and this.ship.cargo.free.all gt 0">
+          <do_for_each name="$ovScoutWare" in="$candidateWares">
+            <do_if value="$wareReachable.{$ovScoutWare}? and not $wareReachable.{$ovScoutWare}">
+              <set_value name="$overflowScoutRouteOK" exact="true"/>
+              <break/>
+            </do_if>
+          </do_for_each>
+        </do_if>
+        <do_if value="$overflowScoutRouteOK">
+          <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Overflow wait routing to SCOUT. selected=' + $selectedWare.name + ' is primary-capped, overflowAllowed=0; at least one candidate ware is unreachable (probable undiscovered alternative); cargo has ' + this.ship.cargo.free.all + ' free space. Forcing scout fallback instead of demand-recheck wait.'" chance="this.$debugchance"/>
+          <set_value name="$selectedWare" exact="null"/>
+          <set_value name="$forceScout" exact="true"/>
+          <resume label="try_scout"/>
+        </do_if>
+        <!-- Genuine standby state: full or near-full cargo cannot be delivered (primary capped,
+             overflow disabled) and scouting is either disabled or pointless (no room to mine the
+             discovered ware). Set command action to standingby so the UI reflects reality
+             instead of the stale "searching resources" carried over from script init / the
+             scout block. The diag tool's MINER STALLED verdict already explains the cause and
+             lists actionable fixes (lower threshold, enable overflow, add a buyer). -->
+        <set_command_action commandaction="commandaction.standingby"/>
+        <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Overflow wait. selected=' + $selectedWare.name + ', urgency=' + this.$activeMiningUrgency + ', overflowAllowed=0, cargoFree=' + this.ship.cargo.free.all + '/' + this.ship.cargo.capacity.all + ' (' + (if this.ship.cargo.capacity.all gt 0 then (this.ship.cargo.free.all * 100) / this.ship.cargo.capacity.all else 0) + '% free). Standing by until a buyer becomes available or the player intervenes.'" chance="this.$debugchance"/>
         <wait exact="this.$demandRecheckInterval"/>
         <resume label="main_loop"/>
       </do_if>
@@ -1703,6 +2106,72 @@
       </do_if>
       <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Run mining slice ware=' + $selectedWare.name + ', urgency=' + this.$activeMiningUrgency + ', overflow=' + $overflowSellMode + ', primaryStation=' + (if $primaryDeliveryStation? and $primaryDeliveryStation.exists then $primaryDeliveryStation.idcode else 'NONE') + ', range=' + (if $range? then $range.knownname else 'null') + ', rangeClass=' + (if $range? then $range.class else 'null') + ', stayAtHome=' + this.$stayAtHome + ', minbuy=' + $minbuy + ', maxbuy=' + $maxbuy + ', minsell=' + $minsell + ', maxsell=' + $maxsell + ', cargoBefore=' + this.$miner_prevCargoTotal + ', commander=' + (if this.ship.commander? and this.ship.commander.exists then this.ship.commander.idcode else 'NONE') + ', default=' + (if this.ship.defaultorder? then @this.ship.defaultorder.id else 'NONE')" chance="this.$debugchance"/>
 
+      <!-- ============================================================================ -->
+      <!-- Equipment pre-check: capital miners require ore-collector / gas-collector    -->
+      <!-- drones to actually mine. Vanilla order.mining.routine.xml ~364-401 already   -->
+      <!-- guards this case INSIDE the routine, but the failure path there is:          -->
+      <!--   1. signal_objects param='resupply' (urgent)                                -->
+      <!--   2. wait 1s                                                                 -->
+      <!--   3. if interrupt.restock didn't supply -> set_order_failed + force idle +   -->
+      <!--      resume label="prep" (loops back inside the routine)                     -->
+      <!-- The outer GalaxyMiner order has no awareness of that internal failure: when  -->
+      <!-- the routine eventually returns it just continues to the next mining slice    -->
+      <!-- and re-runs the routine, which re-fails the same way. Each iteration emits   -->
+      <!-- a fresh set_order_failed event, the UI floods with "order failed" toasts /   -->
+      <!-- map-update events, and the menu becomes unresponsive (player report).        -->
+      <!--                                                                              -->
+      <!-- Fix: short-circuit at the outer level. If the SELECTED ware's transport      -->
+      <!-- class needs a collector category the ship lacks, skip the mining routine     -->
+      <!-- entirely this slice. When AutoResupply is enabled in GT settings, fire the   -->
+      <!-- exact same vanilla 'resupply' signal the routine would have fired (so        -->
+      <!-- interrupt.restock buys the collectors using its proven loadout/macro logic), -->
+      <!-- plus our GT_DoMaintenance signal so any other restock work piggybacks on the -->
+      <!-- same trip. When AutoResupply is disabled, just log + stand by; the player    -->
+      <!-- gets a clear actionable message instead of a UI lockup.                      -->
+      <!--                                                                              -->
+      <!-- Selected-ware-keyed (not ship.waretransport-keyed) so a dual-bay ship        -->
+      <!-- carrying both solid and liquid cargo capacity isn't blocked when only ONE    -->
+      <!-- collector type is missing and the current target ware uses the other type.   -->
+      <!-- Non-capital miners (S/M) use mining lasers directly and bypass this check    -->
+      <!-- entirely, mirroring the vanilla iscapitalship gate at routine line 364.      -->
+      <!-- ============================================================================ -->
+      <set_value name="$collectorPrecheckOK" exact="true"/>
+      <set_value name="$collectorMissing" exact="''"/>
+      <do_if value="$selectedWare? and $selectedWare != null and this.ship.iscapitalship">
+        <do_if value="$selectedWare.waretransport == waretransport.solid and not this.ship.units.{unitcategory.orecollector}.count">
+          <set_value name="$collectorPrecheckOK" exact="false"/>
+          <set_value name="$collectorMissing" exact="'ore-collector'"/>
+        </do_if>
+        <do_elseif value="$selectedWare.waretransport == waretransport.liquid and not this.ship.units.{unitcategory.gascollector}.count">
+          <set_value name="$collectorPrecheckOK" exact="false"/>
+          <set_value name="$collectorMissing" exact="'gas-collector'"/>
+        </do_elseif>
+      </do_if>
+      <do_if value="not $collectorPrecheckOK">
+        <set_value name="$autoResupplyEnabled" exact="if global.$GT_Config? and global.$GT_Config.$Maintenance? and global.$GT_Config.$Maintenance.$AutoResupply? then global.$GT_Config.$Maintenance.$AutoResupply else 1"/>
+        <do_if value="$autoResupplyEnabled">
+          <!-- Mirrors the exact urgent-resupply signal vanilla mining routine fires at lines 375 / 380.
+               interrupt.restock picks it up, finds an equipment dock selling the matching collector
+               drones, and routes the build through add_build_to_modify_ship. Throttle on this.$gtNextCollectorResupplyAt
+               so we don't spam the signal between slices when the wharf trip is already in flight. -->
+          <do_if value="not this.$gtNextCollectorResupplyAt? or player.age ge this.$gtNextCollectorResupplyAt">
+            <signal_objects object="this.ship" param="'resupply'" param2="[true]" param3="this.$debugchance"/>
+            <signal_objects object="player.galaxy" param="'GT_DoMaintenance'" param2="this.ship"/>
+            <set_value name="this.$gtNextCollectorResupplyAt" exact="player.age + 5min"/>
+            <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': COLLECTOR PRE-CHECK FAILED - missing ' + $collectorMissing + ' drones for selected ware ' + $selectedWare.name + ' (capital, waretransport=' + $selectedWare.waretransport + '). Signaled vanilla resupply (urgent) + GT_DoMaintenance. Standing by ' + this.$demandRecheckInterval + 's; throttled next collector resupply for 5min.'" chance="100"/>
+          </do_if>
+          <do_else>
+            <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': COLLECTOR PRE-CHECK FAILED - missing ' + $collectorMissing + ' drones for ' + $selectedWare.name + '; collector resupply already in flight (' + (this.$gtNextCollectorResupplyAt - player.age) + 's TTL remaining). Standing by ' + this.$demandRecheckInterval + 's.'" chance="100"/>
+          </do_else>
+        </do_if>
+        <do_else>
+          <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': COLLECTOR PRE-CHECK FAILED - missing ' + $collectorMissing + ' drones for ' + $selectedWare.name + '. AutoResupply is DISABLED in GT settings - cannot auto-buy. Standing by ' + this.$demandRecheckInterval + 's. Enable Settings -> Maintenance -> AutoResupply, or manually equip the missing collector drones at any wharf, to allow this miner to mine.'" chance="100"/>
+        </do_else>
+        <set_command_action commandaction="commandaction.standingby"/>
+        <wait exact="this.$demandRecheckInterval"/>
+        <resume label="main_loop"/>
+      </do_if>
+
       <!-- Run GT mining routine fork in time slices so GT maintenance/training can run between cycles -->
       <set_value name="$strictGatherSector" exact="if this.$stayAtHome and this.$homeSector? and this.$homeSector.exists then this.$homeSector else null"/>
       <run_script name="'order.mining.routine.gt'">
@@ -1953,5 +2422,15 @@
     <do_if value="this.$minerPrevStationIndex?"><remove_value name="this.$minerPrevStationIndex"/></do_if>
     <do_if value="this.$gtNextScoutAt?"><remove_value name="this.$gtNextScoutAt"/></do_if>
     <do_if value="this.$scoutLastProbe?"><remove_value name="this.$scoutLastProbe"/></do_if>
+    <!-- Release fleet-level scout claim so other fleet members can take over the ware immediately
+         instead of waiting out the TTL (which only exists as a safety net for silent despawn). -->
+    <do_if value="this.$gtScoutClaimWare? and this.$gtScoutClaimWare != null and global.$GT_ScoutClaims? and global.$GT_ScoutClaims.{this.$gtScoutClaimWare}?">
+      <set_value name="$abortClaim" exact="global.$GT_ScoutClaims.{this.$gtScoutClaimWare}"/>
+      <do_if value="$abortClaim.$Ship? and $abortClaim.$Ship == this.ship">
+        <remove_value name="global.$GT_ScoutClaims.{this.$gtScoutClaimWare}"/>
+      </do_if>
+      <remove_value name="$abortClaim"/>
+    </do_if>
+    <do_if value="this.$gtScoutClaimWare?"><remove_value name="this.$gtScoutClaimWare"/></do_if>
   </on_abort>
 </aiscript>

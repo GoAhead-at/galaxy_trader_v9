@@ -85,6 +85,64 @@ function GT_UI.formatMoney(amount)
     end
 end
 
+--- Format an EXACT credit amount with thousand separators and "Cr" suffix.
+--- No M/B compression -- use when the precise number matters (course costs,
+--- transaction receipts, fee breakdowns, ...).
+---
+--- IMPORTANT - input units: this helper expects WHOLE CREDITS, NOT raw
+--- centicredits. GetNPCBlackboard auto-converts money-typed fields from
+--- centicredits to credits when reading back from player.entity (verified:
+--- MD `player.money` of 427720000 returns 4277200 from the blackboard), so
+--- values pulled directly off the blackboard can be passed to this helper
+--- as-is. If you instead hold a raw centicredit value (e.g. from `player.money`
+--- before any blackboard round-trip), divide by 100 first.
+---
+--- The thousand separator is implemented in pure Lua to avoid the unit
+--- ambiguity in stock `ConvertMoneyString` (which silently divides by 100).
+---
+--- @param credits number  Whole-credit amount
+--- @return string  e.g. "1,500,000 Cr"
+function GT_UI.formatCreditsExact(credits)
+    local n = math.floor((credits or 0) + 0.5)
+    local s = tostring(n)
+    local formatted, k = s, 0
+    while true do
+        formatted, k = string.gsub(formatted, "^(-?%d+)(%d%d%d)", "%1,%2")
+        if k == 0 then break end
+    end
+    return formatted .. " Cr"
+end
+
+--- Format a duration in seconds as "N min" (rounded, minimum 1).
+--- @param seconds number
+--- @return string  e.g. "10 min"
+function GT_UI.formatDurationMin(seconds)
+    local minutes = math.floor((seconds or 0) / 60 + 0.5)
+    if minutes < 1 then minutes = 1 end
+    return tostring(minutes) .. " min"
+end
+
+-- =============================================================================
+-- LOCALIZATION
+-- =============================================================================
+
+--- Read a localized string with pcall protection. Returns the supplied fallback
+--- (or a "{page,id}" placeholder) if ReadText errors or returns empty.
+--- @param page number      Text page id
+--- @param id   number      Text entry id
+--- @param fallback string?  Optional fallback text
+--- @return string
+function GT_UI.safeReadText(page, id, fallback)
+    if not page or not id then
+        return fallback or "?"
+    end
+    local ok, txt = pcall(ReadText, page, id)
+    if ok and txt and txt ~= "" then
+        return txt
+    end
+    return fallback or string.format("{%d,%d}", page, id)
+end
+
 -- =============================================================================
 -- STRING HELPERS
 -- =============================================================================
@@ -400,6 +458,37 @@ function GT_UI.addEmptyRow(tbl, message, columnCount, options)
 end
 
 --[[
+    Add a small caption row (centered, muted color, word-wrapped). Useful as
+    an explanatory note beneath a disabled button or section header.
+
+    Cramming "label\n(reason)" into a single fixed-height row makes the second
+    line overflow into the next row visually -- always render the caption on
+    its own row instead.
+
+    Parameters:
+        tbl         : table object
+        message     : string  (will be rendered verbatim; caller adds parens)
+        options     : { halign=, fontsize=, color=, wordwrap=, colSpan= }
+
+    Returns: row object
+]]
+function GT_UI.addCaptionRow(tbl, message, options)
+    options = options or {}
+
+    local row = tbl:addRow(nil, { fixed = true })
+    if options.colSpan then
+        row[1]:setColSpan(options.colSpan)
+    end
+    row[1]:createText(message, {
+        halign   = options.halign or "center",
+        wordwrap = (options.wordwrap ~= false),
+        color    = options.color or Color["text_inactive"],
+        fontsize = options.fontsize or GT_UI.DEFAULTS.fontSize,
+    })
+    return row
+end
+
+--[[
     Add a footer row spanning all columns.
 
     Parameters:
@@ -435,12 +524,13 @@ end
         cell    : cell object (row[n])
         text    : button label
         options : {
+            active   = bool    (default true; pass false for a disabled button)
             height   = number  (default GT_UI.DEFAULTS.rowHeight)
             bgColor  = color   (default GT_UI.COLORS.buttonBg)
             fontSize = number  (default GT_UI.DEFAULTS.fontSize * 0.85)
             halign   = string  (default "center")
             color    = color   (text color, optional)
-            onClick  = function
+            onClick  = function (ignored when active == false)
         }
 
     Returns: button object
@@ -448,10 +538,15 @@ end
 function GT_UI.createButton(cell, text, options)
     options = options or {}
 
-    local btn = cell:createButton({
+    local btnConfig = {
         height  = options.height or GT_UI.DEFAULTS.rowHeight,
         bgColor = options.bgColor or GT_UI.COLORS.buttonBg,
-    })
+    }
+    if options.active == false then
+        btnConfig.active = false
+    end
+
+    local btn = cell:createButton(btnConfig)
 
     local textOpts = {
         halign   = options.halign or "center",
@@ -460,7 +555,7 @@ function GT_UI.createButton(cell, text, options)
     if options.color then textOpts.color = options.color end
     btn:setText(text, textOpts)
 
-    if options.onClick then
+    if options.onClick and options.active ~= false then
         local fn = options.onClick
         cell.handlers.onClick = function()
             fn()

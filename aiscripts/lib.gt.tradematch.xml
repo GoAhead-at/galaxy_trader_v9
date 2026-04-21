@@ -55,6 +55,13 @@
     <param name="maxDistanceSell" default="0"/>
     <param name="backtrackTolerance" default="0"/>
     <param name="allowZeroProfitSell" default="false"/>
+    <!-- MK3 'Ignore Player Pricing' companion filter: when true, reject any match whose delivery (customer) station is player-owned. -->
+    <param name="excludePlayerBuyers" default="false"/>
+    <!-- MK3 'Ignore Player Pricing' profit-semantics override: when true AND the supplier (buy-leg owner) is player-owned,
+         treat the supplier-side cost as zero (production is "free" from the player's perspective). This bypasses the
+         negative/zero/min-profit rejections for player-sourced trades and scores them by gross sell income (sellPrice * amount).
+         NPC-sourced trades in the same scan continue to use the normal profit gates and scoring. -->
+    <param name="playerSupplierFreeProduction" default="false"/>
   </params>
   <attention min="unknown">
     <actions>
@@ -222,6 +229,22 @@
             <continue/>
           </do_if>
 
+          <!-- MK3 'Ignore Player Pricing' companion filter: reject any trade whose delivery
+               customer ($sellStation) is player-owned. The MK3 ship must sell only to NPCs. -->
+          <do_if value="$excludePlayerBuyers and @$sellStation.isplayerowned">
+            <set_value name="$tradesRejected" operation="add"/>
+            <continue/>
+          </do_if>
+
+          <!-- MK3 'Ignore Player Pricing' profit-semantics override:
+               When the supplier is player-owned and the override is enabled, the player's
+               production cost for this ware is treated as zero (the station produced it for
+               "free" within the player's economy). Every credit the NPC customer pays is then
+               pure income, so the negative/zero/min-profit rejections must be skipped for
+               this pair, and gross income (sellPrice * amount) is used as the score basis.
+               NPC->NPC pairs in the same scan continue to use the normal profit gates. -->
+          <set_value name="$playerFreeSupplier" exact="$playerSupplierFreeProduction and @$buyStation.isplayerowned"/>
+
           <!-- MK4 supply hard policy (early gate):
                Delivery customer is $sellStation (game buy-offer owner). -->
           <do_if value="$scoreMode == 'supply' and $mk4CustomerMustBePlayer">
@@ -383,12 +406,14 @@
             <continue/>
           </do_if>
           <!-- Default sell-mode behavior requires positive unit profit.
-               MK1 can opt in to allow zero-profit station-price sells. -->
-          <do_if value="$scoreMode == 'sell' and $unitProfit lt 0">
+               MK1 can opt in to allow zero-profit station-price sells.
+               MK3 'Ignore Player Pricing' bypasses both gates for player-supplier trades
+               (cost is virtual zero, so any non-negative sell price is income). -->
+          <do_if value="$scoreMode == 'sell' and not $playerFreeSupplier and $unitProfit lt 0">
             <set_value name="$tradesRejected" operation="add"/>
             <continue/>
           </do_if>
-          <do_if value="$scoreMode == 'sell' and not $allowZeroProfitSell and $unitProfit == 0">
+          <do_if value="$scoreMode == 'sell' and not $allowZeroProfitSell and not $playerFreeSupplier and $unitProfit == 0">
             <set_value name="$tradesRejected" operation="add"/>
             <continue/>
           </do_if>
@@ -473,9 +498,18 @@
             <set_value name="$score" exact="$tradeAmount / ($distanceFactor * $priceFactor)"/>
           </do_if>
           <do_else>
-            <set_value name="$grossProfit" exact="$unitProfit * $tradeAmount"/>
-            <set_value name="$roi" exact="if $sellOffer.unitprice gt 0 then ($unitProfit * 100) / $sellOffer.unitprice else 0"/>
-            <do_if value="$grossProfit lt $minAbsoluteProfit or $roi lt $minROI">
+            <!-- MK3 'Ignore Player Pricing': for player suppliers, treat the supplier-side
+                 cost as zero so the full sell price counts as gain. This affects both the
+                 min-profit/ROI gate and the score basis. NPC suppliers use unmodified math. -->
+            <do_if value="$playerFreeSupplier">
+              <set_value name="$grossProfit" exact="$buyOffer.unitprice * $tradeAmount"/>
+              <set_value name="$roi" exact="if $buyOffer.unitprice gt 0 then 100 else 0"/>
+            </do_if>
+            <do_else>
+              <set_value name="$grossProfit" exact="$unitProfit * $tradeAmount"/>
+              <set_value name="$roi" exact="if $sellOffer.unitprice gt 0 then ($unitProfit * 100) / $sellOffer.unitprice else 0"/>
+            </do_else>
+            <do_if value="not $playerFreeSupplier and ($grossProfit lt $minAbsoluteProfit or $roi lt $minROI)">
               <set_value name="$tradesRejected" operation="add"/>
               <continue/>
             </do_if>
@@ -493,6 +527,16 @@
             </do_if>
           </do_else>
 
+          <!-- MK3 'Ignore Player Pricing' profit reporting:
+               When the supplier is player-owned and the override is enabled, the player's
+               wallet net of the trade is the full sell income (the buy-leg credits flow
+               within the player's own economy). Report Profit / UnitProfit accordingly so
+               the queued-trade logbook entry shows the actual gain to the player rather
+               than the negative ship-wallet delta. The $PlayerFreeSupplier tag lets the
+               logging cue switch to a buy-price-suppressed message format. -->
+          <set_value name="$reportedUnitProfit" exact="if $playerFreeSupplier then $buyOffer.unitprice else $unitProfit"/>
+          <set_value name="$reportedProfit" exact="$reportedUnitProfit * $tradeAmount"/>
+
           <set_value name="$trade" exact="table[
             $Ware = $ware,
             $BuyOffer = $sellOffer,
@@ -507,12 +551,13 @@
             $BuySector = $buyStation.sector,
             $SellSector = $sellStation.sector,
             $Distance = $distance,
-            $UnitProfit = $unitProfit,
+            $UnitProfit = $reportedUnitProfit,
             $BuyPrice = $sellOffer.unitprice,
             $SellPrice = $buyOffer.unitprice,
-            $ProfitPerUnit = $unitProfit,
+            $ProfitPerUnit = $reportedUnitProfit,
             $VolumePerUnit = $volumePerUnit,
-            $Profit = ($unitProfit * $tradeAmount)
+            $Profit = $reportedProfit,
+            $PlayerFreeSupplier = $playerFreeSupplier
           ]"/>
           <append_to_list name="$tradeList" exact="$trade"/>
           <set_value name="$tradesEvaluated" operation="add"/>

@@ -299,8 +299,8 @@ function gtDiagnose.populateFrame(frame)
                 { text = "Status", halign = "center" },
                 "Ware",
                 "Route",
-                { text = "Profit", halign = "right" },
-                { text = "ROI", halign = "right" },
+                { text = "Profit (incl. ROI)", halign = "right" },
+                { text = "Score", halign = "right" },
                 "Reason",
             })
         elseif isClearance then

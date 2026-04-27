@@ -256,6 +256,20 @@
         </do_if>
         <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Current Sector', $Status = 'INFO', $Detail = $currentSectorName]"/>
 
+        <!-- Early order id probe (the authoritative $orderId is resolved later in section 3,
+             but the home-sector display + verdict need to know whether home is mandatory for
+             this order type; MK2 routes via explicit source/dest station lists and therefore
+             treats homeStation as optional). Mirrors the lightweight probe used at line ~502
+             for the price-range section. -->
+        <set_value name="$diagOrderId" exact="'Unknown'"/>
+        <do_if value="$ship.defaultorder? and $ship.defaultorder.id?">
+          <set_value name="$diagOrderId" exact="$ship.defaultorder.id"/>
+        </do_if>
+        <do_elseif value="$ship.commander? and $ship.commander.exists and $ship.commander.defaultorder? and $ship.commander.defaultorder.id?">
+          <set_value name="$diagOrderId" exact="$ship.commander.defaultorder.id"/>
+        </do_elseif>
+        <set_value name="$homeSectorOptional" exact="$diagOrderId == 'GalaxyTraderMK2'"/>
+
         <!-- Home sector -->
         <set_value name="$homeSector" exact="null"/>
         <run_actions ref="md.GT_Libraries_General.GT_GetHomeSector" result="$homeSector">
@@ -267,6 +281,12 @@
           <set_value name="$homeSectorName" exact="$homeSector.knownname"/>
           <set_value name="$homeSectorResult" exact="'PASS'"/>
         </do_if>
+        <do_elseif value="$homeSectorOptional">
+          <!-- MK2 routes per source/dest station lists; missing homeStation is supported
+               (param default is null) and must not be flagged as a failure. -->
+          <set_value name="$homeSectorName" exact="'NONE (optional for MK2 - routed via source/destination lists)'"/>
+          <set_value name="$homeSectorResult" exact="'INFO'"/>
+        </do_elseif>
         <append_to_list name="$sec1.$Rows" exact="table[$Check = 'Home Sector', $Status = $homeSectorResult, $Detail = $homeSectorName]"/>
 
         <!-- Cargo -->
@@ -1096,6 +1116,22 @@
         </do_if>
         <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Ignore Carrier/Aux', $Status = 'INFO', $Detail = if $ignoreCarrierAux then 'true' else 'false']"/>
 
+        <!-- MK3 'Ignore Player Pricing' (mirrors order.trade.galaxytrader.xml param + runtime semantics):
+             When ON, the supplier scan accepts player-owned sell offers regardless of relativeprice,
+             player-owned buyers are excluded from the buyer scan, and player-supplier pairs bypass
+             the no-profit / profit-threshold / ROI rejection gates because the player's production
+             cost for those wares is treated as zero (the buy-leg credits flow within the player's
+             own economy). MK3-only param; ignored for MK1/MK2/MK4/Miner. -->
+        <set_value name="$ignorePlayerPricing" exact="false"/>
+        <do_if value="$orderId == 'GalaxyTraderMK3' and $gtOrder? and $gtOrder.$ignoreplayerpricing?">
+          <set_value name="$ignorePlayerPricing" exact="$gtOrder.$ignoreplayerpricing"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Ignore Player Pricing', $Status = 'INFO', $Detail = if $ignorePlayerPricing then 'true (MK3 buys from player at any price, sells only to NPCs)' else 'false']"/>
+        <!-- IPP scan stats are appended to Sec3 *after* the supplier/buyer loops below populate
+             the counters; the row is added here as a placeholder so it stays grouped with the
+             setting row. The scan loop sets $diagIppPlayerSuppliersAdded / $diagIppPlayerBuyersRejected
+             which are later surfaced via a follow-up append (see post-loop block). -->
+
         <!-- MK4-specific policy snapshot (must mirror runtime order.trade.galaxytradermk4) -->
         <set_value name="$diagMk4CustomerMustBePlayer" exact="false"/>
         <set_value name="$diagMk4AllowPlayerSuppliers" exact="true"/>
@@ -1313,11 +1349,28 @@
           <append_to_list name="$sec3.$Rows" exact="table[$Check = 'ROUTE_PLAN', $Status = if $mk1RoutePlanSnapshotSig == 'pending (no MK1 route plan snapshot yet)' then 'WARN' else 'INFO', $Detail = $mk1RoutePlanSnapshotSig]"/>
         </do_if>
 
-        <!-- MK2-specific: Source/Destination lists -->
+        <!-- MK2-specific: Source/Destination lists.
+             $mk2SourceCount / $mk2DestCount are pre-initialized outside the order-id gate
+             because the verdict block (much later) reads them for any order id when picking
+             priority 1a/1b - reading an undefined var would raise "Property lookup failed".
+             For non-MK2 orders the counts stay at 0 and are never displayed.
+             The MK2 storage-gate fields ($mk2*Storage*, $mk2SourceWares*, $mk2WorstSource*)
+             are initialized here for the same reason - the verdict's MK2-storage branch
+             reads them unconditionally and must not crash on non-MK2 orders. -->
+        <set_value name="$mk2SourceCount" exact="0"/>
+        <set_value name="$mk2DestCount" exact="0"/>
+        <set_value name="$mk2MinStorage" exact="20"/>
+        <set_value name="$mk2StaticStorage" exact="40"/>
+        <set_value name="$mk2MaxStorage" exact="70"/>
+        <set_value name="$mk2SourceWaresEvaluated" exact="0"/>
+        <set_value name="$mk2SourceWaresBelowStatic" exact="0"/>
+        <set_value name="$mk2SourceWaresMissingTarget" exact="0"/>
+        <set_value name="$mk2WorstSourceRatio" exact="-1"/>
+        <set_value name="$mk2WorstSourceDetail" exact="''"/>
+        <set_value name="$mk2BestSourceRatio" exact="-1"/>
+        <set_value name="$mk2BestSourceDetail" exact="''"/>
         <do_if value="$orderId == 'GalaxyTraderMK2'">
           <append_to_list name="$sec3.$Rows" exact="table[$Check = '--- MK2 Specific ---', $Status = 'INFO', $Detail = '']"/>
-          <set_value name="$mk2SourceCount" exact="0"/>
-          <set_value name="$mk2DestCount" exact="0"/>
           <do_if value="$gtOrder? and $gtOrder.$sourceList? and $gtOrder.$sourceList.count?">
             <set_value name="$mk2SourceCount" exact="$gtOrder.$sourceList.count"/>
           </do_if>
@@ -1326,6 +1379,98 @@
           </do_if>
           <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Source Stations', $Status = if $mk2SourceCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $mk2SourceCount + ' stations']"/>
           <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Destination Stations', $Status = if $mk2DestCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $mk2DestCount + ' stations']"/>
+
+          <!-- Read the configured storage thresholds. These mirror the order params and the
+               clamping done in order.trade.galaxytraderMK2.xml lines 176-182 (min &lt; static &lt; max). -->
+          <do_if value="$gtOrder.$minStorage?">
+            <set_value name="$mk2MinStorage" exact="[0, [$gtOrder.$minStorage, 99].min].max"/>
+          </do_if>
+          <do_if value="$gtOrder.$staticStorage?">
+            <set_value name="$mk2StaticStorage" exact="[0, [$gtOrder.$staticStorage, 99].min].max"/>
+          </do_if>
+          <do_if value="$mk2StaticStorage le $mk2MinStorage">
+            <set_value name="$mk2StaticStorage" exact="[99, $mk2MinStorage + 1].min"/>
+          </do_if>
+          <do_if value="$gtOrder.$maxStorage?">
+            <set_value name="$mk2MaxStorage" exact="[0, [$gtOrder.$maxStorage, 100].min].max"/>
+          </do_if>
+          <do_if value="$mk2MaxStorage le $mk2StaticStorage">
+            <set_value name="$mk2MaxStorage" exact="[100, $mk2StaticStorage + 1].min"/>
+          </do_if>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Storage Thresholds (min/static/max)', $Status = 'INFO', $Detail = '' + $mk2MinStorage + '% / ' + $mk2StaticStorage + '% / ' + $mk2MaxStorage + '% (source must be ABOVE static; dest must be AT OR BELOW min)']"/>
+
+          <!-- Per-source / per-ware static-storage gate evaluation.
+               Mirrors the runtime gate at order.trade.galaxytraderMK2.xml line 1112:
+                 sourceRatio = (cargo.{ware}.count * 100) / cargo.{ware}.target
+                 if sourceRatio &lt;= staticStorage  -> skipSourceBelowStatic (no trade)
+               We omit the get_ware_reservation correction (in-flight buy reservations) because
+               that is a small overstatement only and the diag is meant to surface the
+               player-actionable threshold, not produce byte-exact numbers. Capped at 12 rows
+               to avoid swamping the report when many wares are involved. -->
+          <do_if value="$mk2SourceCount gt 0">
+            <set_value name="$mk2SrcRowCap" exact="12"/>
+            <set_value name="$mk2SrcRowsAdded" exact="0"/>
+            <do_all exact="$mk2SourceCount" counter="$mk2si">
+              <set_value name="$mk2SrcStation" exact="$gtOrder.$sourceList.{$mk2si}"/>
+              <do_if value="$mk2SrcStation? and $mk2SrcStation.exists">
+                <set_value name="$mk2SrcProducts" exact="$mk2SrcStation.products.list"/>
+                <set_value name="$mk2SrcTradewares" exact="$mk2SrcStation.tradewares.list"/>
+                <create_list name="$mk2SrcSellable"/>
+                <do_all exact="$mk2SrcProducts.count" counter="$mk2spi">
+                  <append_to_list name="$mk2SrcSellable" exact="$mk2SrcProducts.{$mk2spi}"/>
+                </do_all>
+                <do_all exact="$mk2SrcTradewares.count" counter="$mk2sti">
+                  <set_value name="$mk2stw" exact="$mk2SrcTradewares.{$mk2sti}"/>
+                  <set_value name="$dup" exact="false"/>
+                  <do_all exact="$mk2SrcSellable.count" counter="$mk2sdi">
+                    <do_if value="$mk2SrcSellable.{$mk2sdi} == $mk2stw">
+                      <set_value name="$dup" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                  <do_if value="not $dup">
+                    <append_to_list name="$mk2SrcSellable" exact="$mk2stw"/>
+                  </do_if>
+                </do_all>
+                <do_all exact="$mk2SrcSellable.count" counter="$mk2swi">
+                  <set_value name="$mk2sw" exact="$mk2SrcSellable.{$mk2swi}"/>
+                  <set_value name="$mk2swCount" exact="$mk2SrcStation.cargo.{$mk2sw}.count"/>
+                  <set_value name="$mk2swTarget" exact="$mk2SrcStation.cargo.{$mk2sw}.target"/>
+                  <do_if value="$mk2swTarget le 0">
+                    <!-- Runtime treats target&lt;=0 as srcNoTarget (continue, no skip), so do
+                         not count it as a static-reserve violation; record separately. -->
+                    <set_value name="$mk2SourceWaresMissingTarget" operation="add"/>
+                    <do_if value="$mk2SrcRowsAdded lt $mk2SrcRowCap">
+                      <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Source Reserve: ' + @$mk2SrcStation.knownname + ' / ' + $mk2sw, $Status = 'WARN', $Detail = 'cargo target = 0 (station has no allocated storage for this ware - runtime skips silently)']"/>
+                      <set_value name="$mk2SrcRowsAdded" operation="add"/>
+                    </do_if>
+                  </do_if>
+                  <do_else>
+                    <set_value name="$mk2swRatio" exact="($mk2swCount * 100) / $mk2swTarget"/>
+                    <set_value name="$mk2SourceWaresEvaluated" operation="add"/>
+                    <set_value name="$mk2swPasses" exact="$mk2swRatio gt $mk2StaticStorage"/>
+                    <do_if value="not $mk2swPasses">
+                      <set_value name="$mk2SourceWaresBelowStatic" operation="add"/>
+                    </do_if>
+                    <!-- Track best (highest) and worst (lowest) ratios for the verdict line. -->
+                    <do_if value="$mk2WorstSourceRatio lt 0 or $mk2swRatio lt $mk2WorstSourceRatio">
+                      <set_value name="$mk2WorstSourceRatio" exact="$mk2swRatio"/>
+                      <set_value name="$mk2WorstSourceDetail" exact="@$mk2SrcStation.knownname + ' [' + @$mk2SrcStation.idcode + '] ' + $mk2sw + ' = ' + $mk2swCount + ' / ' + $mk2swTarget + ' (' + $mk2swRatio + '%)'"/>
+                    </do_if>
+                    <do_if value="$mk2swRatio gt $mk2BestSourceRatio">
+                      <set_value name="$mk2BestSourceRatio" exact="$mk2swRatio"/>
+                      <set_value name="$mk2BestSourceDetail" exact="@$mk2SrcStation.knownname + ' [' + @$mk2SrcStation.idcode + '] ' + $mk2sw + ' = ' + $mk2swCount + ' / ' + $mk2swTarget + ' (' + $mk2swRatio + '%)'"/>
+                    </do_if>
+                    <do_if value="$mk2SrcRowsAdded lt $mk2SrcRowCap">
+                      <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Source Reserve: ' + @$mk2SrcStation.knownname + ' / ' + $mk2sw, $Status = if $mk2swPasses then 'PASS' else 'BLOCK', $Detail = '' + $mk2swCount + ' / ' + $mk2swTarget + ' = ' + $mk2swRatio + '% ' + (if $mk2swPasses then '&gt; ' else '&lt;= ') + $mk2StaticStorage + '% staticStorage' + (if $mk2swPasses then ' (eligible to ship)' else ' (BELOW reserve - runtime refuses to drain)')]"/>
+                      <set_value name="$mk2SrcRowsAdded" operation="add"/>
+                    </do_if>
+                  </do_else>
+                </do_all>
+              </do_if>
+            </do_all>
+            <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Source Reserve Summary', $Status = if $mk2SourceWaresEvaluated == 0 then 'WARN' else (if $mk2SourceWaresBelowStatic == $mk2SourceWaresEvaluated then 'BLOCK' else (if $mk2SourceWaresBelowStatic gt 0 then 'WARN' else 'PASS')), $Detail = '' + ($mk2SourceWaresEvaluated - $mk2SourceWaresBelowStatic) + ' / ' + $mk2SourceWaresEvaluated + ' source-ware combinations are above the static reserve' + (if $mk2SourceWaresMissingTarget gt 0 then ' (' + $mk2SourceWaresMissingTarget + ' have no storage allocated)' else '')]"/>
+          </do_if>
         </do_if>
 
         <!-- Miner-specific: Home Anchor, Target Stations, Overflow -->
@@ -2831,32 +2976,76 @@
         <!-- clearance analysis)                                       -->
         <!-- ======================================================== -->
         <set_value name="$searchSectors" exact="[]"/>
+        <!-- MK2 routes per explicit source/dest station lists rather than via a home sector,
+             so derive search anchors from those stations when no home sector is configured.
+             Without this, MK2 ships without homeStation would scan zero sectors and produce
+             a misleading "no offers in 0 sectors" verdict. -->
+        <set_value name="$mk2AnchorSectors" exact="[]"/>
+        <do_if value="$orderId == 'GalaxyTraderMK2' and $gtOrder?">
+          <do_if value="$gtOrder.$sourceList? and $gtOrder.$sourceList.count gt 0">
+            <do_all exact="$gtOrder.$sourceList.count" counter="$mk2si">
+              <set_value name="$mk2sStation" exact="$gtOrder.$sourceList.{$mk2si}"/>
+              <do_if value="$mk2sStation? and $mk2sStation.exists and $mk2sStation.sector? and $mk2sStation.sector.exists and not $mk2AnchorSectors.indexof.{$mk2sStation.sector}">
+                <append_to_list name="$mk2AnchorSectors" exact="$mk2sStation.sector"/>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="$gtOrder.$destList? and $gtOrder.$destList.count gt 0">
+            <do_all exact="$gtOrder.$destList.count" counter="$mk2di">
+              <set_value name="$mk2dStation" exact="$gtOrder.$destList.{$mk2di}"/>
+              <do_if value="$mk2dStation? and $mk2dStation.exists and $mk2dStation.sector? and $mk2dStation.sector.exists and not $mk2AnchorSectors.indexof.{$mk2dStation.sector}">
+                <append_to_list name="$mk2AnchorSectors" exact="$mk2dStation.sector"/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_if>
+        <!-- Build the union of all anchor sectors (home sector + MK2 station sectors). -->
+        <set_value name="$searchAnchors" exact="[]"/>
         <do_if value="$homeSector? and $homeSector.exists">
-          <!-- Always include home sector -->
-          <append_to_list name="$searchSectors" exact="$homeSector"/>
-          <!-- Add neighboring sectors within diagnose search distance -->
-          <do_if value="$diagSearchDistance gt 0">
-            <find_sector name="$nearbySectors" space="player.galaxy" multiple="true">
-              <match_gate_distance object="$homeSector" min="0" max="$diagSearchDistance"/>
-            </find_sector>
-            <do_if value="$nearbySectors? and $nearbySectors.count gt 0">
-              <do_all exact="$nearbySectors.count" counter="$si">
-                <set_value name="$nearbySec" exact="$nearbySectors.{$si}"/>
-                <do_if value="$nearbySec != $homeSector">
-                  <!-- Diagnose parity fix: only include sectors reachable with blacklist-aware pathing. -->
-                  <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculatePathDistance" result="$diagSecDist">
-                    <param name="ship" value="$ship"/>
-                    <param name="fromSector" value="$homeSector"/>
-                    <param name="toSector" value="$nearbySec"/>
-                    <param name="blacklistgroup" value="$diagBlacklistGroup"/>
-                    <param name="useEscapeMode" value="false"/>
-                  </run_actions>
-                  <do_if value="$diagSecDist ge 0 and $diagSecDist le $diagSearchDistance">
-                    <append_to_list name="$searchSectors" exact="$nearbySec"/>
-                  </do_if>
-                </do_if>
-              </do_all>
+          <append_to_list name="$searchAnchors" exact="$homeSector"/>
+        </do_if>
+        <do_all exact="$mk2AnchorSectors.count" counter="$mk2ai">
+          <set_value name="$mk2aSec" exact="$mk2AnchorSectors.{$mk2ai}"/>
+          <do_if value="not $searchAnchors.indexof.{$mk2aSec}">
+            <append_to_list name="$searchAnchors" exact="$mk2aSec"/>
+          </do_if>
+        </do_all>
+        <do_if value="$searchAnchors.count gt 0">
+          <!-- Always include the anchor sectors themselves -->
+          <do_all exact="$searchAnchors.count" counter="$anchi">
+            <set_value name="$anchSec" exact="$searchAnchors.{$anchi}"/>
+            <do_if value="not $searchSectors.indexof.{$anchSec}">
+              <append_to_list name="$searchSectors" exact="$anchSec"/>
             </do_if>
+          </do_all>
+          <!-- Add neighboring sectors within diagnose search distance from any anchor.
+               For MK2 this expands coverage from each station's local sector outward; for
+               other orders the loop runs once with $homeSector as the sole anchor. -->
+          <do_if value="$diagSearchDistance gt 0">
+            <do_all exact="$searchAnchors.count" counter="$anchExpandIdx">
+              <set_value name="$anchExpandSec" exact="$searchAnchors.{$anchExpandIdx}"/>
+              <find_sector name="$nearbySectors" space="player.galaxy" multiple="true">
+                <match_gate_distance object="$anchExpandSec" min="0" max="$diagSearchDistance"/>
+              </find_sector>
+              <do_if value="$nearbySectors? and $nearbySectors.count gt 0">
+                <do_all exact="$nearbySectors.count" counter="$si">
+                  <set_value name="$nearbySec" exact="$nearbySectors.{$si}"/>
+                  <do_if value="$nearbySec != $anchExpandSec and not $searchSectors.indexof.{$nearbySec}">
+                    <!-- Diagnose parity fix: only include sectors reachable with blacklist-aware pathing. -->
+                    <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculatePathDistance" result="$diagSecDist">
+                      <param name="ship" value="$ship"/>
+                      <param name="fromSector" value="$anchExpandSec"/>
+                      <param name="toSector" value="$nearbySec"/>
+                      <param name="blacklistgroup" value="$diagBlacklistGroup"/>
+                      <param name="useEscapeMode" value="false"/>
+                    </run_actions>
+                    <do_if value="$diagSecDist ge 0 and $diagSecDist le $diagSearchDistance">
+                      <append_to_list name="$searchSectors" exact="$nearbySec"/>
+                    </do_if>
+                  </do_if>
+                </do_all>
+              </do_if>
+            </do_all>
           </do_if>
         </do_if>
 
@@ -2901,6 +3090,11 @@
              Policy = also matches the configured primary/overflow gates. -->
         <set_value name="$diagMinerRawBuyOffers" exact="[]"/>
         <set_value name="$diagMinerRawBuyOfferCount" exact="0"/>
+        <!-- MK3 'Ignore Player Pricing': count buyer offers excluded because the buyer is a
+             player-owned station (mirrors lib.gt.live.search excludePlayerBuyers + tradematch
+             rejection). Surfaced in the Sec3 settings table below for observability. -->
+        <set_value name="$diagIppPlayerBuyersRejected" exact="0"/>
+        <set_value name="$diagIppPlayerSuppliersAdded" exact="0"/>
 
         <do_all exact="$searchSectors.count" counter="$si">
           <set_value name="$searchSec" exact="$searchSectors.{$si}"/>
@@ -2935,6 +3129,46 @@
             <do_all exact="$secSellCount" counter="$soi">
               <append_to_list name="$allSellOffers" exact="$secSellOffers.{$soi}"/>
             </do_all>
+          </do_if>
+
+          <!-- ══════════════════════════════════════════════════════════════════
+               MK3 'Ignore Player Pricing' supplemental supplier scan (mirrors
+               lib.gt.live.search.xml lines 196-282): collect player-owned sell
+               offers WITHOUT the relativeprice cap so the simulation can see
+               player suppliers above the configured price band — matching what
+               the runtime ship will actually consider. Dedupe against the main
+               scan to avoid double-counting any player offers that already
+               passed the price cap. Only runs for MK3 with IPP enabled. -->
+          <do_if value="$ignorePlayerPricing and $orderId == 'GalaxyTraderMK3'">
+            <find_sell_offer space="$searchSec" result="$secPlayerSellOffers" multiple="true">
+              <match_seller tradesknownto="$ship.owner" owner="faction.player">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+              </match_seller>
+              <amount min="1"/>
+            </find_sell_offer>
+            <do_if value="$secPlayerSellOffers? and $secPlayerSellOffers.count gt 0">
+              <set_value name="$secPlayerSellAdded" exact="0"/>
+              <do_all exact="$secPlayerSellOffers.count" counter="$bpsoi">
+                <set_value name="$bpsOffer" exact="$secPlayerSellOffers.{$bpsoi}"/>
+                <do_if value="not $bpsOffer? or not $bpsOffer.owner? or not @$bpsOffer.owner.isplayerowned">
+                  <continue/>
+                </do_if>
+                <set_value name="$bpsDuplicate" exact="false"/>
+                <do_all exact="$allSellOffers.count" counter="$bpsdi">
+                  <do_if value="$allSellOffers.{$bpsdi} == $bpsOffer">
+                    <set_value name="$bpsDuplicate" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+                <do_if value="$bpsDuplicate">
+                  <continue/>
+                </do_if>
+                <append_to_list name="$allSellOffers" exact="$bpsOffer"/>
+                <set_value name="$secPlayerSellAdded" operation="add"/>
+                <set_value name="$secSellCount" operation="add"/>
+                <set_value name="$diagIppPlayerSuppliersAdded" operation="add"/>
+              </do_all>
+            </do_if>
           </do_if>
 
           <!-- Find buy offers (ship sells to station).
@@ -2985,6 +3219,13 @@
               <set_value name="$diagOfferAllowed" exact="true"/>
               <set_value name="$diagOfferStation" exact="if $boffer? and $boffer.owner? then $boffer.owner else null"/>
               <set_value name="$diagOfferWare" exact="if $boffer? and $boffer.ware? then $boffer.ware else null"/>
+              <!-- MK3 'Ignore Player Pricing': exclude player-owned buyers entirely so the
+                   diag mirrors the runtime (live.search.excludePlayerBuyers + tradematch
+                   rejection). MK3-only; counts skips for the settings observability row. -->
+              <do_if value="$ignorePlayerPricing and $orderId == 'GalaxyTraderMK3' and $diagOfferStation? and $diagOfferStation.exists and @$diagOfferStation.isplayerowned">
+                <set_value name="$diagIppPlayerBuyersRejected" operation="add"/>
+                <continue/>
+              </do_if>
               <!-- Miner relevance filter: drop non-minable wares and wares the ship can't carry.
                    Now that the engine pre-filter is no longer applying a wares restriction (when
                    no warebasket is configured), this post-filter prevents non-minable buy offers
@@ -3094,6 +3335,11 @@
         <do_else>
           <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Total Sell Offers', $Status = 'INFO', $Detail = '' + $allSellOffers.count]"/>
           <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Total Buy Offers', $Status = 'INFO', $Detail = '' + $allBuyOffers.count]"/>
+          <!-- MK3 IPP impact summary on the supplier/buyer pools (only when meaningful). -->
+          <do_if value="$ignorePlayerPricing and $orderId == 'GalaxyTraderMK3'">
+            <append_to_list name="$sec8.$Rows" exact="table[$Check = 'IPP: Player Suppliers Added', $Status = if $diagIppPlayerSuppliersAdded gt 0 then 'INFO' else 'WARN', $Detail = '' + $diagIppPlayerSuppliersAdded + ' player sell offer' + (if $diagIppPlayerSuppliersAdded == 1 then '' else 's') + ' admitted past relativeprice cap']"/>
+            <append_to_list name="$sec8.$Rows" exact="table[$Check = 'IPP: Player Buyers Excluded', $Status = 'INFO', $Detail = '' + $diagIppPlayerBuyersRejected + ' player buy offer' + (if $diagIppPlayerBuyersRejected == 1 then '' else 's') + ' filtered (sell only to NPCs)']"/>
+          </do_if>
         </do_else>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = '--- Per Sector ---', $Status = 'INFO', $Detail = '']"/>
         <do_all exact="$sectorBreakdown.count" counter="$sbi">
@@ -3132,7 +3378,10 @@
         <set_value name="$rejectWareBasket" exact="0"/>
         <set_value name="$rejectCargoType" exact="0"/>
         <set_value name="$rejectCargoUtil" exact="0"/>
-        <set_value name="$maxPairs" exact="500"/>
+        <!-- Pair-cap removed: the diag tool must report the FULL truth of what the trader will
+             actually consider, not a truncated sample. The diag is player-triggered and runs
+             once per request, so per-pair runtime cost is irrelevant - accuracy outweighs any
+             frame-drop concern. -->
         <set_value name="$pairDetails" exact="[]"/>
         <set_value name="$diagShowExecutableOnly" exact="false"/>
         <do_if value="$orderId == 'GalaxyTraderMK4Supply'">
@@ -3160,12 +3409,9 @@
           </do_if>
         </do_all>
 
-        <!-- Iterate buy offers and match with sell offers of same ware -->
-        <set_value name="$pairLoopDone" exact="false"/>
+        <!-- Iterate buy offers and match with sell offers of same ware. No upper bound on pairs:
+             the diag must show what the trader will actually evaluate at runtime. -->
         <do_all exact="$allBuyOffers.count" counter="$boi">
-          <do_if value="$pairLoopDone">
-            <continue/>
-          </do_if>
           <set_value name="$buyOffer" exact="$allBuyOffers.{$boi}"/>
           <do_if value="not $buyOffer.exists or not $buyOffer.ware?">
             <continue/>
@@ -3203,9 +3449,6 @@
           </do_if>
 
           <do_all exact="$sellByWare.{$pairWare}.count" counter="$soi">
-            <do_if value="$pairLoopDone">
-              <continue/>
-            </do_if>
             <set_value name="$sellOffer" exact="$sellByWare.{$pairWare}.{$soi}"/>
 
             <!-- Skip same station -->
@@ -3216,24 +3459,35 @@
 
             <set_value name="$pairCount" operation="add"/>
 
-            <!-- Cap total pairs -->
-            <do_if value="$pairCount gt $maxPairs">
-              <set_value name="$pairLoopDone" exact="true"/>
-              <continue/>
-            </do_if>
-
             <!-- === Evaluate this pair === -->
             <set_value name="$pairVerdict" exact="'PASS'"/>
             <set_value name="$pairReason" exact="''"/>
+            <!-- Score state (mirrors lib.gt.tradematch.xml score formula). Initialised per pair
+                 because locals leak across iterations otherwise; pairs that bail before the
+                 path checks fire keep $pairScore = 0 and naturally sort to the bottom of the
+                 score-ranked Pair Details table. -->
+            <set_value name="$pairScore" exact="0"/>
+            <set_value name="$pairHasDistances" exact="false"/>
+            <set_value name="$buyDist" exact="-1"/>
+            <set_value name="$sellDist" exact="-1"/>
 
             <set_value name="$buyStation" exact="$sellOffer.owner"/>
             <set_value name="$sellStation" exact="$buyOffer.owner"/>
             <set_value name="$buyPrice" exact="$sellOffer.unitprice"/>
             <set_value name="$sellPrice" exact="$buyOffer.unitprice"/>
+            <!-- $mk4SupplierIsPlayerOwned is a generic 'supplier-station-is-player' flag despite
+                 the legacy name; reused by MK3 IPP logic below. Renaming would touch unrelated
+                 MK4 paths, so the name is preserved for diff-clarity. -->
             <set_value name="$mk4SupplierIsPlayerOwned" exact="false"/>
             <do_if value="$buyStation? and $buyStation.exists and $buyStation.isplayerowned">
               <set_value name="$mk4SupplierIsPlayerOwned" exact="true"/>
             </do_if>
+            <!-- MK3 'Ignore Player Pricing' pair flag: when ON and the supplier is player-owned,
+                 the runtime (lib.gt.tradematch.xml playerSupplierFreeProduction) treats the buy
+                 cost as zero, bypasses no_profit/below_profit_threshold/below_roi gates and
+                 reports gross sell income as profit. Mirror that here so the diag verdict and
+                 reported numbers match what the runtime ship will actually do. -->
+            <set_value name="$diagPairPlayerFreeSupplier" exact="$ignorePlayerPricing and $orderId == 'GalaxyTraderMK3' and $mk4SupplierIsPlayerOwned"/>
             <set_value name="$sellOfferAmount" exact="$sellOffer.offeramount.{$ship}"/>
             <do_if value="$sellOfferAmount == null">
               <set_value name="$sellOfferAmount" exact="$sellOffer.amount"/>
@@ -3283,6 +3537,14 @@
             <set_value name="$roi" exact="0"/>
             <do_if value="$buyPrice gt 0">
               <set_value name="$roi" exact="($profitPerUnit * 100) / $buyPrice"/>
+            </do_if>
+            <!-- IPP override: replicate lib.gt.tradematch.xml ($playerFreeSupplier branch).
+                 unitProfit becomes the full sell price, totalProfit becomes gross sell income,
+                 ROI is conceptually infinite (player paid 0) - rendered as 'n/a (free)' below. -->
+            <do_if value="$diagPairPlayerFreeSupplier">
+              <set_value name="$profitPerUnit" exact="$sellPrice"/>
+              <set_value name="$totalProfit" exact="$sellPrice * $maxAmount"/>
+              <set_value name="$roi" exact="0"/>
             </do_if>
 
             <!-- MK4 policy checks (must mirror runtime behavior):
@@ -3365,7 +3627,9 @@
                 </do_if>
               </do_if>
               <do_else>
-                <do_if value="$sellPrice le $buyPrice">
+                <!-- IPP bypass: skip no_profit gate when supplier is player-owned and IPP is on
+                     (player's production cost is treated as zero - any sale is profitable). -->
+                <do_if value="$sellPrice le $buyPrice and not $diagPairPlayerFreeSupplier">
                   <set_value name="$pairVerdict" exact="'FAIL'"/>
                   <set_value name="$pairReason" exact="'no_profit (sell=' + ($sellPrice / 100) + ' le buy=' + ($buyPrice / 100) + ')'"/>
                   <set_value name="$rejectNoProfit" operation="add"/>
@@ -3472,8 +3736,9 @@
               </do_if>
             </do_if>
 
-            <do_if value="$pairVerdict == 'PASS' and $orderId != 'GalaxyTraderMK4Supply'">
-              <!-- Check 9: Profit threshold (values pre-computed above) -->
+            <do_if value="$pairVerdict == 'PASS' and $orderId != 'GalaxyTraderMK4Supply' and not $diagPairPlayerFreeSupplier">
+              <!-- Check 9: Profit threshold (values pre-computed above).
+                   IPP bypass: player-free-supplier pairs skip the threshold gate. -->
               <do_if value="$totalProfit lt $finalProfitThreshold">
                 <set_value name="$pairVerdict" exact="'FAIL'"/>
                 <set_value name="$pairReason" exact="'below_profit_threshold (' + ($totalProfit / 100) + ' Cr lt ' + ($finalProfitThreshold / 100) + ' Cr)'"/>
@@ -3481,8 +3746,9 @@
               </do_if>
             </do_if>
 
-            <do_if value="$pairVerdict == 'PASS' and $orderId != 'GalaxyTraderMK4Supply'">
-              <!-- Check 10: ROI threshold -->
+            <do_if value="$pairVerdict == 'PASS' and $orderId != 'GalaxyTraderMK4Supply' and not $diagPairPlayerFreeSupplier">
+              <!-- Check 10: ROI threshold. IPP bypass: ROI is conceptually infinite when the
+                   supplier cost is zero, so skip the gate for player-free-supplier pairs. -->
               <do_if value="$roi lt $effectiveROI">
                 <set_value name="$pairVerdict" exact="'FAIL'"/>
                 <set_value name="$pairReason" exact="'below_roi (' + $roi + '% lt ' + $effectiveROI + '%)'"/>
@@ -3520,6 +3786,7 @@
                 <param name="blacklistgroup" value="$blacklistgroup"/>
                 <param name="useEscapeMode" value="false"/>
               </run_actions>
+              <set_value name="$pairHasDistances" exact="true"/>
 
               <do_if value="$buyDist lt 0">
                 <set_value name="$pairVerdict" exact="'FAIL'"/>
@@ -3533,31 +3800,119 @@
               </do_elseif>
             </do_if>
 
-            <!-- Record pass / track best -->
+            <!-- ==============================================================================
+                 SCORE COMPUTATION (mirrors lib.gt.tradematch.xml score formula).
+                 Computed for ALL pairs that reached Check 12 (so distances are known) regardless
+                 of final pass/fail verdict. This means FAIL pairs that lost on a late check
+                 (path_blocked, blacklist) still get a meaningful score for sort ordering, while
+                 pairs that bailed early (no_profit, illegal, cargo_incompatible) keep the
+                 default $pairScore = 0 and cluster at the bottom of the score-ranked list.
+
+                 Sell-mode (MK1/MK2/MK3, default trader):
+                   distance       = max(buyDist, sellDist)              [worst-case leg]
+                   gt_distpenalty = order.distancepenalty / 50.0          [runtime conversion]
+                   distanceFactor = 1.0 + distance * gt_distpenalty
+                   grossProfitCr  = totalProfit / 100   (Cr units, integer)
+                   score          = grossProfitCr / distanceFactor
+                   factionBonus   = 1.1 if factionPriority and either station player-owned
+                                  = 1.0 otherwise
+                   score          = score * factionBonus
+
+                 Supply-mode (MK4Supply only):
+                   priceFactor    = max(1, buyPrice / 100)
+                   score          = tradeAmount / (distanceFactor * priceFactor)
+
+                 Player-free-supplier (IPP) reuses sell-mode but $totalProfit is already the
+                 gross sell income, so the formula picks it up automatically. -->
+            <do_if value="$pairHasDistances and $buyDist ge 0 and $sellDist ge 0">
+              <set_value name="$scoreDistance" exact="[$buyDist, $sellDist].max"/>
+              <set_value name="$gtDistPenalty" exact="$distancePenalty / 50.0"/>
+              <set_value name="$scoreDistanceFactor" exact="1.0 + ($scoreDistance * $gtDistPenalty)"/>
+              <do_if value="$scoreDistanceFactor le 0">
+                <set_value name="$scoreDistanceFactor" exact="1.0"/>
+              </do_if>
+              <do_if value="$orderId == 'GalaxyTraderMK4Supply'">
+                <set_value name="$scorePriceFactor" exact="$buyPrice / 100"/>
+                <do_if value="$scorePriceFactor lt 1">
+                  <set_value name="$scorePriceFactor" exact="1"/>
+                </do_if>
+                <set_value name="$pairScore" exact="$maxAmount / ($scoreDistanceFactor * $scorePriceFactor)"/>
+              </do_if>
+              <do_else>
+                <set_value name="$scoreGrossCr" exact="$totalProfit / 100"/>
+                <set_value name="$pairScore" exact="$scoreGrossCr / $scoreDistanceFactor"/>
+                <do_if value="$factionPriority and ($buyStation.isplayerowned or $sellStation.isplayerowned)">
+                  <set_value name="$pairScore" exact="$pairScore * 1.1"/>
+                </do_if>
+              </do_else>
+            </do_if>
+
+            <!-- Record pass / track best (kept by score, not by raw profit, so the headline
+                 'Best Passing Pair' line matches what the runtime would actually pick first). -->
             <do_if value="$pairVerdict == 'PASS'">
               <set_value name="$passCount" operation="add"/>
-              <do_if value="$totalProfit gt $bestDiagProfit">
-                <set_value name="$bestDiagProfit" exact="$totalProfit"/>
-                <set_value name="$bestDiagPairDesc" exact="$pairWare.name + ': ' + $buyStation.knownname + ' -> ' + $sellStation.knownname + ' (' + ($totalProfit / 100) + ' Cr, ROI ' + $roi + '%)'"/>
+              <do_if value="$pairScore gt $bestDiagProfit">
+                <set_value name="$bestDiagProfit" exact="$pairScore"/>
+                <!-- IPP best-pair description: tag the route as a player-free-supplier sale and
+                     show 'free' in place of an arithmetic ROI (which would otherwise read as 0). -->
+                <set_value name="$bestDiagPairDesc" exact="$pairWare.name + ': ' + $buyStation.knownname + ' -> ' + $sellStation.knownname + ' (' + ($totalProfit / 100) + ' Cr, ROI ' + (if $diagPairPlayerFreeSupplier then 'n/a (free)' else ('' + $roi + '%')) + (if $diagPairPlayerFreeSupplier then ' [IPP gross]' else '') + ', Score ' + ($pairScore)i + ')'"/>
               </do_if>
             </do_if>
 
-            <!-- Record pair details: Ware | Route | Profit | ROI | Reason -->
+            <!-- Record pair details: Ware | Route | Profit (incl. ROI) | Score | Reason.
+                 ROI is folded into the Profit cell to free Col5 for Score - the prioritisation
+                 metric the trader actually uses to pick the next trade. Sort key is $pairScore
+                 (numeric); the post-loop selection sort below orders rows by score desc. -->
             <set_value name="$pdRoute" exact="$buyStation.knownname + ' -> ' + $sellStation.knownname"/>
-            <set_value name="$pdProfitStr" exact="($totalProfit / 100) + 'Cr'"/>
-            <set_value name="$pdROIStr" exact="$roi + '%'"/>
+            <set_value name="$pdROIPart" exact="if $diagPairPlayerFreeSupplier then 'IPP gross' else ('ROI ' + $roi + '%')"/>
+            <set_value name="$pdProfitStr" exact="(if $diagPairPlayerFreeSupplier then '~' else '') + ($totalProfit / 100) + 'Cr' + ' &#183; ' + $pdROIPart"/>
+            <set_value name="$pdScoreStr" exact="if not $pairHasDistances then '-' else ('' + ($pairScore)i)"/>
             <set_value name="$pdReason" exact="''"/>
             <do_if value="$pairVerdict != 'PASS'">
               <set_value name="$pdReason" exact="$pairReason"/>
             </do_if>
             <do_if value="not ($diagShowExecutableOnly and $pairVerdict != 'PASS')">
-              <append_to_list name="$pairDetails" exact="table[$Check = $pairWare.name, $Status = $pairVerdict, $Detail = $pdRoute, $Col4 = $pdProfitStr, $Col5 = $pdROIStr, $Col6 = $pdReason]"/>
+              <append_to_list name="$pairDetails" exact="table[$Check = $pairWare.name, $Status = $pairVerdict, $Detail = $pdRoute, $Col4 = $pdProfitStr, $Col5 = $pdScoreStr, $Col6 = $pdReason, $SortKey = $pairScore]"/>
             </do_if>
           </do_all>
         </do_all>
 
+        <!-- ==============================================================================
+             SORT $pairDetails BY $SortKey DESCENDING (selection-sort pattern, mirrors the
+             $rscWareRows sort earlier in this file). MD has no insert_in_list / list.sort,
+             so we walk the source list once per output row, picking the highest-key entry
+             that has not been claimed yet. A boolean parallel list $pdClaimed marks emitted
+             rows. Score is the same metric the runtime trader uses to pick its next trade,
+             so this puts the most attractive pairs at the top of the Pair Details table. -->
+        <do_if value="$pairDetails.count gt 1">
+          <set_value name="$pdClaimed" exact="[]"/>
+          <do_all exact="$pairDetails.count" counter="$pdci">
+            <append_to_list name="$pdClaimed" exact="false"/>
+          </do_all>
+          <set_value name="$pairDetailsSorted" exact="[]"/>
+          <do_all exact="$pairDetails.count" counter="$pdsi">
+            <set_value name="$pdBestIdx" exact="0"/>
+            <set_value name="$pdBestKey" exact="-1000000000.0"/>
+            <do_all exact="$pairDetails.count" counter="$pdsk">
+              <do_if value="not $pdClaimed.{$pdsk}">
+                <set_value name="$pdRow" exact="$pairDetails.{$pdsk}"/>
+                <set_value name="$pdRowKey" exact="if $pdRow.$SortKey? then $pdRow.$SortKey else 0"/>
+                <do_if value="$pdRowKey gt $pdBestKey">
+                  <set_value name="$pdBestKey" exact="$pdRowKey"/>
+                  <set_value name="$pdBestIdx" exact="$pdsk"/>
+                </do_if>
+              </do_if>
+            </do_all>
+            <do_if value="$pdBestIdx gt 0">
+              <append_to_list name="$pairDetailsSorted" exact="$pairDetails.{$pdBestIdx}"/>
+              <set_value name="$pdClaimed.{$pdBestIdx}" exact="true"/>
+            </do_if>
+          </do_all>
+          <set_value name="$pairDetails" exact="$pairDetailsSorted"/>
+        </do_if>
+
         <!-- Add pair evaluation summary -->
-        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Total Pairs Evaluated', $Status = 'INFO', $Detail = '' + $pairCount + (if $pairCount gt $maxPairs then ' (capped at ' + $maxPairs + ')' else '')]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Total Pairs Evaluated', $Status = 'INFO', $Detail = '' + $pairCount]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Pairs Passing All Checks', $Status = if $passCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $passCount + ' / ' + $pairCount]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Best Passing Pair', $Status = if $passCount gt 0 then 'PASS' else 'FAIL', $Detail = $bestDiagPairDesc]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = '--- Rejection Breakdown ---', $Status = 'INFO', $Detail = '']"/>
@@ -3619,6 +3974,297 @@
             <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Hint', $Status = 'INFO', $Detail = 'See Clearance section for per-sector/per-station rejection details.' ]"/>
           </do_else>
         </do_if>
+        <do_elseif value="$orderId == 'GalaxyTraderMK2'">
+          <!-- MK2 pair details rebuilt from the actual order configuration.
+               The generic pair table above is built from sector-wide find_sell_offer/
+               find_buy_offer scans, which is the correct model for MK1/MK3/MK4 (those
+               orders search the sector for opportunities). MK2 instead trades exclusively
+               between the explicit $sourceList and $destList, so the only meaningful pair
+               table is one that iterates source x destination x ware and walks the same
+               gates the runtime applies in order.trade.galaxytraderMK2.xml lines 997-1494.
+               We mirror those gates 1:1 here so each row carries a verdict + reasoning
+               line that maps directly to a runtime skip counter (illegal/cargo, noSrcOffer,
+               srcNoTarget, srcBelowStatic, self, distance, noDstOffer, noNeed, minTrade).
+               Reservations (skipReserved) are intentionally NOT modelled - they require
+               get_ware_reservation which can mutate engine state in unpredictable ways
+               from an MD diagnostic context, and the player-actionable signal is already
+               captured by the other gates. -->
+          <set_value name="$mk2PairCount" exact="0"/>
+          <set_value name="$mk2PairPass" exact="0"/>
+          <set_value name="$mk2PairSkipIllegal" exact="0"/>
+          <set_value name="$mk2PairSkipNoSrc" exact="0"/>
+          <set_value name="$mk2PairSkipSrcNoTarget" exact="0"/>
+          <set_value name="$mk2PairSkipBelowStatic" exact="0"/>
+          <set_value name="$mk2PairSkipSelf" exact="0"/>
+          <set_value name="$mk2PairSkipDistance" exact="0"/>
+          <set_value name="$mk2PairSkipNoDst" exact="0"/>
+          <set_value name="$mk2PairSkipNoNeed" exact="0"/>
+          <set_value name="$mk2PairSkipMinTrade" exact="0"/>
+          <set_value name="$mk2PairRows" exact="[]"/>
+          <set_value name="$mk2NoBasketWares" exact="$mk2SourceCount le 0 or $mk2DestCount le 0"/>
+          <do_if value="not $mk2NoBasketWares">
+            <set_value name="$mk2OrderAutowares" exact="if $gtOrder.$autowares? then $gtOrder.$autowares else true"/>
+            <set_value name="$mk2OrderManualBasket" exact="if $gtOrder.$warebasket? then $gtOrder.$warebasket else []"/>
+            <set_value name="$mk2OrderIgnoreRules" exact="if $gtOrder.$ignoretraderules? then $gtOrder.$ignoretraderules else false"/>
+            <set_value name="$mk2OrderAllowIllegal" exact="if $gtOrder.$allowillegal? then $gtOrder.$allowillegal else false"/>
+            <set_value name="$mk2OrderMaxDist" exact="if $gtOrder.$maxDistance? then $gtOrder.$maxDistance else 0"/>
+            <set_value name="$mk2OrderMinFill" exact="0"/>
+            <do_if value="this.$debug? and false">
+              <!-- minCargoFillPercent is read from the live trader instance (this.$minCargoFillPercent)
+                   and is not exposed on the order object; we approximate using the order's
+                   minimum-trade derivation - see runtime line 1398. The diag uses 1 as a
+                   safe lower bound, matching the [1, ...].max guard. -->
+            </do_if>
+            <set_value name="$mk2RowCap" exact="40"/>
+            <do_all exact="$mk2SourceCount" counter="$pmsi">
+              <set_value name="$pmSrc" exact="$gtOrder.$sourceList.{$pmsi}"/>
+              <do_if value="not $pmSrc? or not $pmSrc.exists">
+                <continue/>
+              </do_if>
+              <!-- Build the source's effective ware list: manual basket if autowares=false,
+                   otherwise products union tradewares. Mirrors runtime lines 961-985. -->
+              <create_list name="$pmSrcWares"/>
+              <do_if value="not $mk2OrderAutowares">
+                <do_all exact="$mk2OrderManualBasket.count" counter="$pmmwi">
+                  <append_to_list name="$pmSrcWares" exact="$mk2OrderManualBasket.{$pmmwi}"/>
+                </do_all>
+              </do_if>
+              <do_else>
+                <set_value name="$pmSrcProducts" exact="$pmSrc.products.list"/>
+                <set_value name="$pmSrcTradewares" exact="$pmSrc.tradewares.list"/>
+                <do_all exact="$pmSrcProducts.count" counter="$pmspi">
+                  <append_to_list name="$pmSrcWares" exact="$pmSrcProducts.{$pmspi}"/>
+                </do_all>
+                <do_all exact="$pmSrcTradewares.count" counter="$pmsti">
+                  <set_value name="$pmstw" exact="$pmSrcTradewares.{$pmsti}"/>
+                  <set_value name="$dup" exact="false"/>
+                  <do_all exact="$pmSrcWares.count" counter="$pmsdi">
+                    <do_if value="$pmSrcWares.{$pmsdi} == $pmstw">
+                      <set_value name="$dup" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                  <do_if value="not $dup">
+                    <append_to_list name="$pmSrcWares" exact="$pmstw"/>
+                  </do_if>
+                </do_all>
+              </do_else>
+
+              <do_all exact="$pmSrcWares.count" counter="$pmwi">
+                <set_value name="$pmWare" exact="$pmSrcWares.{$pmwi}"/>
+                <set_value name="$pmRoute" exact="@$pmSrc.knownname + ' [' + @$pmSrc.idcode + '] -&gt; (any dst)'"/>
+                <set_value name="$pmStatus" exact="'PASS'"/>
+                <set_value name="$pmReason" exact="''"/>
+
+                <!-- Gate 1: illegal / cargo capacity (skipIllegalOrNoCargo, runtime line 1000) -->
+                <set_value name="$pmShipCargoMax" exact="$ship.cargo.{$pmWare}.max"/>
+                <do_if value="$pmShipCargoMax le 0">
+                  <set_value name="$pmStatus" exact="'BLOCK'"/>
+                  <set_value name="$pmReason" exact="'illegal/cargo: ship cannot carry ' + $pmWare + ' (cargo.max=0 - hold size or container type)'"/>
+                  <set_value name="$mk2PairSkipIllegal" operation="add"/>
+                </do_if>
+                <do_elseif value="not $mk2OrderAllowIllegal and $pmWare.illegal">
+                  <set_value name="$pmStatus" exact="'BLOCK'"/>
+                  <set_value name="$pmReason" exact="'illegal/cargo: ' + $pmWare + ' is illegal here and Allow Illegal is OFF'"/>
+                  <set_value name="$mk2PairSkipIllegal" operation="add"/>
+                </do_elseif>
+
+                <!-- Gate 2: source has a sell offer (skipNoSourceOffer, runtime line 1014) -->
+                <do_if value="$pmStatus == 'PASS'">
+                  <do_if value="$mk2OrderIgnoreRules and $pmSrc.isplayerowned">
+                    <find_sell_offer seller="$pmSrc" wares="$pmWare" result="$pmSrcOffer"/>
+                  </do_if>
+                  <do_else>
+                    <find_sell_offer tradepartner="$ship" seller="$pmSrc" wares="$pmWare" result="$pmSrcOffer"/>
+                  </do_else>
+                  <do_if value="$pmSrcOffer == null and $mk2OrderIgnoreRules and $pmSrc.isplayerowned">
+                    <find_sell_offer tradepartner="$ship" seller="$pmSrc" wares="$pmWare" result="$pmSrcOffer"/>
+                  </do_if>
+                  <set_value name="$pmSrcOfferAmount" exact="0"/>
+                  <set_value name="$pmSrcOfferAvail" exact="false"/>
+                  <do_if value="$pmSrcOffer? and $pmSrcOffer.exists">
+                    <set_value name="$pmSrcOfferAvail" exact="$pmSrcOffer.available"/>
+                    <set_value name="$pmSrcOfferAmount" exact="if $pmSrcOffer.offeramount.{$ship}? then $pmSrcOffer.offeramount.{$ship} else 0"/>
+                    <do_if value="$pmSrcOfferAmount le 0 and $mk2OrderIgnoreRules and $pmSrc.isplayerowned">
+                      <set_value name="$pmSrcOfferAmount" exact="[$pmSrc.cargo.{$pmWare}.count, $pmShipCargoMax].min"/>
+                    </do_if>
+                  </do_if>
+                  <do_if value="$pmSrcOffer == null">
+                    <set_value name="$pmStatus" exact="'BLOCK'"/>
+                    <set_value name="$pmReason" exact="'noSrcOffer: source has no sell offer for ' + $pmWare + ' (typically: not a sellable ware here, station policy, or relation rules block ' + (if $ship.owner? then @$ship.owner.name else 'this faction') + ')'"/>
+                    <set_value name="$mk2PairSkipNoSrc" operation="add"/>
+                  </do_if>
+                  <do_elseif value="not $pmSrcOfferAvail or $pmSrcOfferAmount le 0">
+                    <set_value name="$pmStatus" exact="'BLOCK'"/>
+                    <set_value name="$pmReason" exact="'noSrcOffer: source offer present but ' + (if not $pmSrcOfferAvail then 'flagged unavailable' else 'amount=0 (station has no stock to sell right now)')"/>
+                    <set_value name="$mk2PairSkipNoSrc" operation="add"/>
+                  </do_elseif>
+                </do_if>
+
+                <!-- Gate 3: source.cargo.{ware}.target > 0 (skipSourceNoTarget, runtime line 1104) -->
+                <set_value name="$pmSrcTarget" exact="$pmSrc.cargo.{$pmWare}.target"/>
+                <do_if value="$pmStatus == 'PASS' and $pmSrcTarget le 0">
+                  <set_value name="$pmStatus" exact="'BLOCK'"/>
+                  <set_value name="$pmReason" exact="'srcNoTarget: source has no allocated cargo target for ' + $pmWare + ' (cargo.target=0 - station manager has not assigned storage)'"/>
+                  <set_value name="$mk2PairSkipSrcNoTarget" operation="add"/>
+                </do_if>
+
+                <!-- Gate 4: source ratio above static reserve (skipSourceBelowStatic, runtime line 1112) -->
+                <set_value name="$pmSrcCount" exact="$pmSrc.cargo.{$pmWare}.count"/>
+                <set_value name="$pmSrcRatio" exact="-1"/>
+                <do_if value="$pmStatus == 'PASS' and $pmSrcTarget gt 0">
+                  <set_value name="$pmSrcRatio" exact="($pmSrcCount * 100) / $pmSrcTarget"/>
+                  <do_if value="$pmSrcRatio le $mk2StaticStorage">
+                    <set_value name="$pmStatus" exact="'BLOCK'"/>
+                    <set_value name="$pmReason" exact="'srcBelowStatic: source has ' + $pmSrcCount + '/' + $pmSrcTarget + ' = ' + $pmSrcRatio + '% &lt;= ' + $mk2StaticStorage + '% staticStorage reserve (runtime refuses to drain a source below this floor)'"/>
+                    <set_value name="$mk2PairSkipBelowStatic" operation="add"/>
+                  </do_if>
+                </do_if>
+
+                <!-- For source-side blockers we record a single "any dst" row and skip the
+                     destination loop entirely, exactly like the runtime continues out of
+                     the source loop without iterating destinations. -->
+                <do_if value="$pmStatus != 'PASS'">
+                  <set_value name="$mk2PairCount" operation="add"/>
+                  <do_if value="$mk2PairRows.count lt $mk2RowCap">
+                    <append_to_list name="$mk2PairRows" exact="table[$Check = $pmWare.name, $Status = $pmStatus, $Detail = $pmRoute, $Col4 = '' + (if $pmSrcRatio ge 0 then ('src ' + $pmSrcRatio + '%') else 'src n/a'), $Col5 = '', $Col6 = $pmReason]"/>
+                  </do_if>
+                  <continue/>
+                </do_if>
+
+                <!-- Per-destination evaluation. -->
+                <do_all exact="$mk2DestCount" counter="$pmdi">
+                  <set_value name="$pmDst" exact="$gtOrder.$destList.{$pmdi}"/>
+                  <do_if value="not $pmDst? or not $pmDst.exists">
+                    <continue/>
+                  </do_if>
+                  <set_value name="$pmRoute2" exact="@$pmSrc.knownname + ' [' + @$pmSrc.idcode + '] -&gt; ' + @$pmDst.knownname + ' [' + @$pmDst.idcode + ']'"/>
+                  <set_value name="$pmStatus2" exact="'PASS'"/>
+                  <set_value name="$pmReason2" exact="''"/>
+                  <set_value name="$pmDist" exact="-1"/>
+
+                  <!-- Gate 5: same station (skipSelfTarget, runtime line 1127) -->
+                  <do_if value="$pmDst == $pmSrc">
+                    <set_value name="$pmStatus2" exact="'BLOCK'"/>
+                    <set_value name="$pmReason2" exact="'self: source and destination are the same station'"/>
+                    <set_value name="$mk2PairSkipSelf" operation="add"/>
+                  </do_if>
+
+                  <!-- Gate 6: distance (skipDistance, runtime line 1131-1137) -->
+                  <do_if value="$pmStatus2 == 'PASS' and $mk2OrderMaxDist gt 0">
+                    <set_value name="$pmDist" exact="$pmSrc.gatedistance.{$pmDst}"/>
+                    <do_if value="$pmDist lt 0">
+                      <set_value name="$pmStatus2" exact="'BLOCK'"/>
+                      <set_value name="$pmReason2" exact="'distance: no gate path from source to destination (gatedistance=-1, sectors not connected)'"/>
+                      <set_value name="$mk2PairSkipDistance" operation="add"/>
+                    </do_if>
+                    <do_elseif value="$pmDist gt $mk2OrderMaxDist">
+                      <set_value name="$pmStatus2" exact="'BLOCK'"/>
+                      <set_value name="$pmReason2" exact="'distance: ' + $pmDist + ' gates &gt; ' + $mk2OrderMaxDist + ' maxDistance (raise pilot level or maxDistance)'"/>
+                      <set_value name="$mk2PairSkipDistance" operation="add"/>
+                    </do_elseif>
+                  </do_if>
+
+                  <!-- Gate 7: dest has a buy offer (skipNoDestOffer, runtime line 1149) -->
+                  <set_value name="$pmDstOfferAmount" exact="0"/>
+                  <set_value name="$pmDstOfferAvail" exact="false"/>
+                  <do_if value="$pmStatus2 == 'PASS'">
+                    <do_if value="$mk2OrderIgnoreRules and $pmDst.isplayerowned">
+                      <find_buy_offer buyer="$pmDst" wares="$pmWare" result="$pmDstOffer"/>
+                    </do_if>
+                    <do_else>
+                      <find_buy_offer tradepartner="$ship" buyer="$pmDst" wares="$pmWare" result="$pmDstOffer"/>
+                    </do_else>
+                    <do_if value="$pmDstOffer == null and $mk2OrderIgnoreRules and $pmDst.isplayerowned">
+                      <find_buy_offer tradepartner="$ship" buyer="$pmDst" wares="$pmWare" result="$pmDstOffer"/>
+                    </do_if>
+                    <do_if value="$pmDstOffer? and $pmDstOffer.exists">
+                      <set_value name="$pmDstOfferAvail" exact="$pmDstOffer.available"/>
+                      <set_value name="$pmDstOfferAmount" exact="if $pmDstOffer.offeramount.{$ship}? then $pmDstOffer.offeramount.{$ship} else 0"/>
+                      <do_if value="$pmDstOfferAmount le 0 and $mk2OrderIgnoreRules and $pmDst.isplayerowned">
+                        <set_value name="$pmDstOfferAmount" exact="[0, $pmDst.cargo.{$pmWare}.target - $pmDst.cargo.{$pmWare}.count].max"/>
+                      </do_if>
+                    </do_if>
+                    <do_if value="$pmDstOffer == null">
+                      <set_value name="$pmStatus2" exact="'BLOCK'"/>
+                      <set_value name="$pmReason2" exact="'noDstOffer: destination does not buy ' + $pmWare + ' (not a resource, not a tradeware, or station/relation policy blocks)'"/>
+                      <set_value name="$mk2PairSkipNoDst" operation="add"/>
+                    </do_if>
+                    <do_elseif value="not $pmDstOfferAvail or $pmDstOfferAmount le 0">
+                      <set_value name="$pmStatus2" exact="'BLOCK'"/>
+                      <set_value name="$pmReason2" exact="'noDstOffer: dest offer present but ' + (if not $pmDstOfferAvail then 'flagged unavailable' else 'demand=0 (cargo at or above target - no room)')"/>
+                      <set_value name="$mk2PairSkipNoDst" operation="add"/>
+                    </do_elseif>
+                  </do_if>
+
+                  <!-- Gate 8: bucket / need check (skipNoNeed, runtime line 1309-1365).
+                       Simplified to the L4+ profile (the diag does not know pilot level
+                       at order params time); uses the same thresholds. -->
+                  <set_value name="$pmDstCount" exact="$pmDst.cargo.{$pmWare}.count"/>
+                  <set_value name="$pmDstTarget" exact="[$pmDst.cargo.{$pmWare}.target, 1].max"/>
+                  <set_value name="$pmDstRatio" exact="($pmDstCount * 100) / $pmDstTarget"/>
+                  <set_value name="$pmBucket" exact="'none'"/>
+                  <do_if value="$pmStatus2 == 'PASS'">
+                    <do_if value="$pmDstRatio le 5">
+                      <set_value name="$pmBucket" exact="'A (critical &lt;=5%)'"/>
+                    </do_if>
+                    <do_elseif value="$pmDstRatio le 20">
+                      <set_value name="$pmBucket" exact="'B (urgent &lt;=20%)'"/>
+                    </do_elseif>
+                    <do_elseif value="$pmDstRatio le $mk2MinStorage">
+                      <set_value name="$pmBucket" exact="'C (need &lt;=' + $mk2MinStorage + '% minStorage)'"/>
+                    </do_elseif>
+                    <do_elseif value="$pmSrcRatio gt $mk2MaxStorage and $pmSrcRatio gt ($pmDstRatio + 10)">
+                      <set_value name="$pmBucket" exact="'D (rebalance: src ' + $pmSrcRatio + '% &gt; ' + $mk2MaxStorage + '% max and gt dst ' + $pmDstRatio + '% +10)'"/>
+                    </do_elseif>
+                    <do_else>
+                      <set_value name="$pmStatus2" exact="'BLOCK'"/>
+                      <set_value name="$pmReason2" exact="'noNeed: dst ' + $pmDstCount + '/' + $pmDstTarget + ' = ' + $pmDstRatio + '% is above ' + $mk2MinStorage + '% minStorage and src ' + $pmSrcRatio + '% does not trigger the rebalance bucket (src must be &gt;' + $mk2MaxStorage + '% maxStorage AND &gt;dst+10)'"/>
+                      <set_value name="$mk2PairSkipNoNeed" operation="add"/>
+                    </do_else>
+                  </do_if>
+
+                  <!-- Gate 9: minimum trade amount (skipMinTrade, runtime line 1414).
+                       Use a 1-unit floor here - the diag does not have access to
+                       this.$minCargoFillPercent or low-volume profile, so we report PASS
+                       whenever the engine could move at least 1 unit. The runtime check
+                       is added to the reason string when the trade would be tiny. -->
+                  <set_value name="$pmTradeAmount" exact="0"/>
+                  <do_if value="$pmStatus2 == 'PASS'">
+                    <set_value name="$pmTradeAmount" exact="[$pmShipCargoMax, $pmSrcOfferAmount, $pmDstOfferAmount].min"/>
+                    <do_if value="$pmTradeAmount le 0">
+                      <set_value name="$pmStatus2" exact="'BLOCK'"/>
+                      <set_value name="$pmReason2" exact="'minTrade: computed trade amount is 0 (cargo room ' + $pmShipCargoMax + ', src offer ' + $pmSrcOfferAmount + ', dst demand ' + $pmDstOfferAmount + ')'"/>
+                      <set_value name="$mk2PairSkipMinTrade" operation="add"/>
+                    </do_if>
+                  </do_if>
+
+                  <do_if value="$pmStatus2 == 'PASS'">
+                    <set_value name="$pmReason2" exact="'eligible: bucket=' + $pmBucket + ' src=' + $pmSrcRatio + '% dst=' + $pmDstRatio + '% trade=' + $pmTradeAmount + ' units (final amount may be lower after fairness/reservation)'"/>
+                    <set_value name="$mk2PairPass" operation="add"/>
+                  </do_if>
+
+                  <set_value name="$mk2PairCount" operation="add"/>
+                  <do_if value="$mk2PairRows.count lt $mk2RowCap">
+                    <append_to_list name="$mk2PairRows" exact="table[$Check = $pmWare.name, $Status = $pmStatus2, $Detail = $pmRoute2, $Col4 = 'src ' + $pmSrcRatio + '% / dst ' + $pmDstRatio + '%', $Col5 = (if $pmDist ge 0 then ('' + $pmDist + ' gates') else ''), $Col6 = $pmReason2]"/>
+                  </do_if>
+                </do_all>
+              </do_all>
+            </do_all>
+          </do_if>
+
+          <!-- Header row + skip summary so the player can read the picture at a glance. -->
+          <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'MK2 Pairs Evaluated', $Status = if $mk2PairPass gt 0 then 'PASS' else (if $mk2PairCount == 0 then 'WARN' else 'FAIL'), $Detail = '' + $mk2PairCount + ' src*dst*ware combinations checked, ' + $mk2PairPass + ' PASS, ' + ($mk2PairCount - $mk2PairPass) + ' BLOCK (showing first ' + $mk2PairRows.count + ')']"/>
+          <do_if value="$mk2NoBasketWares">
+            <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'No Pairs', $Status = 'WARN', $Detail = 'No source/destination stations configured (see MK2 Specific section)']"/>
+          </do_if>
+          <do_if value="$mk2PairCount gt 0">
+            <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Skip Breakdown', $Status = 'INFO', $Detail = 'illegal/cargo=' + $mk2PairSkipIllegal + ', noSrcOffer=' + $mk2PairSkipNoSrc + ', srcNoTarget=' + $mk2PairSkipSrcNoTarget + ', srcBelowStatic=' + $mk2PairSkipBelowStatic + ', self=' + $mk2PairSkipSelf + ', distance=' + $mk2PairSkipDistance + ', noDstOffer=' + $mk2PairSkipNoDst + ', noNeed=' + $mk2PairSkipNoNeed + ', minTrade=' + $mk2PairSkipMinTrade]"/>
+          </do_if>
+          <do_all exact="$mk2PairRows.count" counter="$pmri">
+            <append_to_list name="$sec8b.$Rows" exact="$mk2PairRows.{$pmri}"/>
+          </do_all>
+        </do_elseif>
         <do_else>
           <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Pairs Evaluated', $Status = 'INFO', $Detail = '' + $pairCount + ' scanned, ' + $pairDetails.count + ' shown (' + $passCount + ' PASS' + (if $orderId == 'GalaxyTraderMK4Supply' and $diagShowExecutableOnly then ', executable-only view' else ', ' + ($pairCount - $passCount) + ' FAIL') + ')']"/>
           <do_all exact="$pairDetails.count" counter="$pi">
@@ -4122,11 +4768,48 @@
         </do_if>
         <!-- ====== NORMAL TRADING VERDICT ====== -->
         <do_else>
-        <!-- Priority 1: No home sector -->
-        <do_if value="not $homeSector? or not $homeSector.exists">
+        <!-- Priority 1a: MK2 routes via explicit source/destination station lists.
+             A missing home sector is allowed (the order's homeStation param is optional,
+             default null). The genuine MK2-critical state is "no source stations" or
+             "no destination stations" - both lists are mandatory for MK2 to plan a trade.
+             These three branches are flattened into the parent do_if/do_elseif chain so
+             that an MK2 ship with both lists populated falls through to the regular
+             priority gates (money, offers, pair filters) instead of swallowing them. -->
+        <do_if value="$orderId == 'GalaxyTraderMK2' and $mk2SourceCount le 0 and $mk2DestCount le 0">
+          <set_value name="$verdict" exact="'CRITICAL: MK2 has no source and no destination stations configured - cannot plan trades'"/>
+          <append_to_list name="$suggestions" exact="'Reconfigure this MK2 trade order on the ship and assign at least one source station and one destination station via the order params.'"/>
+        </do_if>
+        <do_elseif value="$orderId == 'GalaxyTraderMK2' and $mk2SourceCount le 0">
+          <set_value name="$verdict" exact="'CRITICAL: MK2 has no source stations configured - cannot plan trades'"/>
+          <append_to_list name="$suggestions" exact="'Reconfigure this MK2 trade order on the ship and assign at least one source station via the order params.'"/>
+        </do_elseif>
+        <do_elseif value="$orderId == 'GalaxyTraderMK2' and $mk2DestCount le 0">
+          <set_value name="$verdict" exact="'CRITICAL: MK2 has no destination stations configured - cannot plan trades'"/>
+          <append_to_list name="$suggestions" exact="'Reconfigure this MK2 trade order on the ship and assign at least one destination station via the order params.'"/>
+        </do_elseif>
+        <!-- Priority 1c: MK2 source stations exist but every sellable ware is at or below
+             the static-reserve threshold. This is the player-actionable equivalent of the
+             runtime "srcBelowStatic" skip (order.trade.galaxytraderMK2.xml line 1112) and
+             surfaces what would otherwise show up only as a cryptic debug log line. We
+             require at least one ware was actually evaluated - if none were, the source has
+             no allocated storage and a separate diagnosis is more appropriate. -->
+        <do_elseif value="$orderId == 'GalaxyTraderMK2' and $mk2SourceWaresEvaluated gt 0 and $mk2SourceWaresBelowStatic == $mk2SourceWaresEvaluated">
+          <set_value name="$verdict" exact="'MK2 IDLE (source below static reserve): every sellable ware on the configured source station(s) is at or below the static-storage reserve of ' + $mk2StaticStorage + '%. The runtime refuses to drain a source until it climbs ABOVE this threshold. Worst case: ' + $mk2WorstSourceDetail + ' . Highest fill seen: ' + $mk2BestSourceDetail + ' .'"/>
+          <append_to_list name="$suggestions" exact="'Wait for the source station to produce more stock (the static reserve is intentional - it prevents the trader from emptying a production line below operating margins).'"/>
+          <append_to_list name="$suggestions" exact="'OR lower this trader''s Static Storage % in its order params (current ' + $mk2StaticStorage + '%) so it ships earlier - e.g. set it to a value below the highest source fill (' + $mk2BestSourceRatio + '%).'"/>
+        </do_elseif>
+        <!-- Priority 1d: MK2 source stations exist but no source ware has any allocated
+             storage (cargo.{ware}.target == 0 for all wares). The runtime treats this as
+             srcNoTarget (silent continue) and the trader will never trade. -->
+        <do_elseif value="$orderId == 'GalaxyTraderMK2' and $mk2SourceCount gt 0 and $mk2SourceWaresEvaluated == 0 and $mk2SourceWaresMissingTarget gt 0">
+          <set_value name="$verdict" exact="'MK2 IDLE (source has no storage allocated): the configured source station(s) have no cargo storage allocated for any of their sellable wares. The runtime cannot read a fill ratio and skips the pair silently.'"/>
+          <append_to_list name="$suggestions" exact="'Wait for the station manager to assign storage to the produced wares, or pick a different source station.'"/>
+        </do_elseif>
+        <!-- Priority 1b: No home sector (non-MK2 orders only - MK2 does not require one). -->
+        <do_elseif value="$orderId != 'GalaxyTraderMK2' and (not $homeSector? or not $homeSector.exists)">
           <set_value name="$verdict" exact="'CRITICAL: No home sector - ship cannot search for trades'"/>
           <append_to_list name="$suggestions" exact="'Assign ship to a commander or set a home sector'"/>
-        </do_if>
+        </do_elseif>
         <!-- Priority 2: Money gate -->
         <do_elseif value="$playerMoney le $moneyGateThreshold">
           <set_value name="$verdict" exact="'BLOCKED: Money gate - player funds too low (' + ($playerMoney / 100) + ' Cr lt ' + ($moneyGateThreshold / 100) + ' Cr threshold)'"/>

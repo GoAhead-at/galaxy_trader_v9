@@ -554,12 +554,32 @@
           <set_value name="$diagTradewares" exact="$diagStation.tradewares.list"/>
           <set_value name="$diagResources" exact="$diagStation.resources.list"/>
           <set_value name="$diagWareLogged" exact="0"/>
-          <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': STATION dst ' + $diagStation.knownname + ' [' + $diagStation.idcode + '] owner=' + (if $diagStation.isplayerowned then 'player' else 'foreign') + ' products=' + $diagProducts.count + ' tradewares=' + $diagTradewares.count + ' resources=' + $diagResources.count" chance="this.$debugchance"/>
-          <do_all exact="$diagResources.count" counter="$dri">
+          <!-- Build the union of resources + tradewares to mirror the basket-side semantics.
+               Trading Posts / Equipment Docks expose what they buy/sell via tradewares only,
+               so probing only resources hides them from this per-ware diagnostic dump. -->
+          <create_list name="$diagDestWares"/>
+          <do_all exact="$diagResources.count" counter="$ddri">
+            <append_to_list name="$diagDestWares" exact="$diagResources.{$ddri}"/>
+          </do_all>
+          <do_all exact="$diagTradewares.count" counter="$ddti">
+            <set_value name="$ddw" exact="$diagTradewares.{$ddti}"/>
+            <set_value name="$dup" exact="false"/>
+            <do_all exact="$diagDestWares.count" counter="$dddi">
+              <do_if value="$diagDestWares.{$dddi} == $ddw">
+                <set_value name="$dup" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+            <do_if value="not $dup">
+              <append_to_list name="$diagDestWares" exact="$ddw"/>
+            </do_if>
+          </do_all>
+          <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': STATION dst ' + $diagStation.knownname + ' [' + $diagStation.idcode + '] owner=' + (if $diagStation.isplayerowned then 'player' else 'foreign') + ' products=' + $diagProducts.count + ' tradewares=' + $diagTradewares.count + ' resources=' + $diagResources.count + ' waresForOffers=' + $diagDestWares.count" chance="this.$debugchance"/>
+          <do_all exact="$diagDestWares.count" counter="$dri">
             <do_if value="$diagWareLogged ge $diagWareLimit">
               <break/>
             </do_if>
-            <set_value name="$diagWare" exact="$diagResources.{$dri}"/>
+            <set_value name="$diagWare" exact="$diagDestWares.{$dri}"/>
             <set_value name="$cargoCount" exact="$diagStation.cargo.{$diagWare}.count"/>
             <set_value name="$cargoTarget" exact="$diagStation.cargo.{$diagWare}.target"/>
             <set_value name="$cargoTargetSafe" exact="[$cargoTarget, 1].max"/>
@@ -687,6 +707,15 @@
         </do_all>
       </do_if>
 
+      <!-- Build the union of every ware any active destination is willing to receive.
+           A destination accepts a ware via two channels:
+             1. resources  - production inputs the station consumes (factories/wharves).
+             2. tradewares - "wares that are bought/sold at the container but are neither
+                product nor resource" (per stock_game scriptproperties.xml). Trading Posts,
+                Equipment Docks and similar pass-through stations expose what they buy/sell
+                here, NOT in resources. Skipping tradewares hid e.g. a Trading Post buyer of
+                Energy Cells from the auto-basket even though the station openly trades them.
+           The variable name is kept for backward reference; the contents are the union. -->
       <create_list name="$targetResourceWares"/>
       <do_all exact="this.$activeDestinations.count" counter="$di">
         <set_value name="$dest" exact="this.$activeDestinations.{$di}"/>
@@ -702,6 +731,20 @@
           </do_all>
           <do_if value="not $dup">
             <append_to_list name="$targetResourceWares" exact="$rw"/>
+          </do_if>
+        </do_all>
+        <set_value name="$destTradewares" exact="$dest.tradewares.list"/>
+        <do_all exact="$destTradewares.count" counter="$dti">
+          <set_value name="$tw" exact="$destTradewares.{$dti}"/>
+          <set_value name="$dup" exact="false"/>
+          <do_all exact="$targetResourceWares.count" counter="$dtri">
+            <do_if value="$targetResourceWares.{$dtri} == $tw">
+              <set_value name="$dup" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+          <do_if value="not $dup">
+            <append_to_list name="$targetResourceWares" exact="$tw"/>
           </do_if>
         </do_all>
       </do_all>
@@ -786,6 +829,82 @@
 
       <do_if value="this.$debuglevel ge 1 and $resolvedWaresDisplay != this.$lastResolvedWaresDisplay">
         <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': resolved wares (' + (if this.$autowares then 'auto' else 'manual') + ') count=' + $resolvedWaresCount + ' [' + $resolvedWaresDisplay + ']'" chance="this.$debugchance"/>
+        <!-- AUTOWARES selection trace: when the resolved basket changes, dump the full
+             input lists (per-source sellable wares, per-destination acceptable wares) and
+             the union/intersection that produced the outgoing selection. Bounded to the
+             change-detection gate above so it does not spam every trade cycle. The trace
+             only makes sense in auto mode; manual mode just echoes $manualSourceWares. -->
+        <do_if value="this.$autowares">
+          <set_value name="$awTargetUnionDisplay" exact="''"/>
+          <do_all exact="$targetResourceWares.count" counter="$awtui">
+            <do_if value="$awtui gt 1">
+              <set_value name="$awTargetUnionDisplay" exact="$awTargetUnionDisplay + ', '"/>
+            </do_if>
+            <set_value name="$awTargetUnionDisplay" exact="$awTargetUnionDisplay + $targetResourceWares.{$awtui}"/>
+          </do_all>
+          <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': AUTOWARES dst-union (resources + tradewares across ' + this.$activeDestinations.count + ' destinations) count=' + $targetResourceWares.count + ' [' + $awTargetUnionDisplay + ']'" chance="this.$debugchance"/>
+          <do_all exact="this.$activeSources.count" counter="$awsi">
+            <set_value name="$awSrc" exact="this.$activeSources.{$awsi}"/>
+            <set_value name="$awSrcProducts" exact="$awSrc.products.list"/>
+            <set_value name="$awSrcTradewares" exact="$awSrc.tradewares.list"/>
+            <create_list name="$awSrcSellable"/>
+            <do_all exact="$awSrcProducts.count" counter="$awspi">
+              <append_to_list name="$awSrcSellable" exact="$awSrcProducts.{$awspi}"/>
+            </do_all>
+            <do_all exact="$awSrcTradewares.count" counter="$awsti">
+              <set_value name="$awstw" exact="$awSrcTradewares.{$awsti}"/>
+              <set_value name="$dup" exact="false"/>
+              <do_all exact="$awSrcSellable.count" counter="$awsdi">
+                <do_if value="$awSrcSellable.{$awsdi} == $awstw">
+                  <set_value name="$dup" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+              <do_if value="not $dup">
+                <append_to_list name="$awSrcSellable" exact="$awstw"/>
+              </do_if>
+            </do_all>
+            <set_value name="$awSrcDisplay" exact="''"/>
+            <do_all exact="$awSrcSellable.count" counter="$awsdi2">
+              <do_if value="$awsdi2 gt 1">
+                <set_value name="$awSrcDisplay" exact="$awSrcDisplay + ', '"/>
+              </do_if>
+              <set_value name="$awSrcDisplay" exact="$awSrcDisplay + $awSrcSellable.{$awsdi2}"/>
+            </do_all>
+            <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': AUTOWARES src ' + $awSrc.knownname + ' [' + $awSrc.idcode + '] products=' + $awSrcProducts.count + ' tradewares=' + $awSrcTradewares.count + ' sellable=' + $awSrcSellable.count + ' [' + $awSrcDisplay + ']'" chance="this.$debugchance"/>
+          </do_all>
+          <do_all exact="this.$activeDestinations.count" counter="$awdi">
+            <set_value name="$awDst" exact="this.$activeDestinations.{$awdi}"/>
+            <set_value name="$awDstResources" exact="$awDst.resources.list"/>
+            <set_value name="$awDstTradewares" exact="$awDst.tradewares.list"/>
+            <create_list name="$awDstAcceptable"/>
+            <do_all exact="$awDstResources.count" counter="$awdri">
+              <append_to_list name="$awDstAcceptable" exact="$awDstResources.{$awdri}"/>
+            </do_all>
+            <do_all exact="$awDstTradewares.count" counter="$awdti">
+              <set_value name="$awdtw" exact="$awDstTradewares.{$awdti}"/>
+              <set_value name="$dup" exact="false"/>
+              <do_all exact="$awDstAcceptable.count" counter="$awddi">
+                <do_if value="$awDstAcceptable.{$awddi} == $awdtw">
+                  <set_value name="$dup" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+              <do_if value="not $dup">
+                <append_to_list name="$awDstAcceptable" exact="$awdtw"/>
+              </do_if>
+            </do_all>
+            <set_value name="$awDstDisplay" exact="''"/>
+            <do_all exact="$awDstAcceptable.count" counter="$awddi2">
+              <do_if value="$awddi2 gt 1">
+                <set_value name="$awDstDisplay" exact="$awDstDisplay + ', '"/>
+              </do_if>
+              <set_value name="$awDstDisplay" exact="$awDstDisplay + $awDstAcceptable.{$awddi2}"/>
+            </do_all>
+            <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': AUTOWARES dst ' + $awDst.knownname + ' [' + $awDst.idcode + '] resources=' + $awDstResources.count + ' tradewares=' + $awDstTradewares.count + ' acceptable=' + $awDstAcceptable.count + ' [' + $awDstDisplay + ']'" chance="this.$debugchance"/>
+          </do_all>
+          <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': AUTOWARES selection (sources sellable INTERSECT destinations acceptable) count=' + $resolvedWaresCount + ' [' + $resolvedWaresDisplay + ']'" chance="this.$debugchance"/>
+        </do_if>
       </do_if>
       <set_value name="this.$lastResolvedWaresDisplay" exact="$resolvedWaresDisplay"/>
 

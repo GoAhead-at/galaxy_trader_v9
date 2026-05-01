@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<aiscript name="order.trade.galaxyminer" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="3">
+<aiscript name="order.trade.galaxyminer" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="4">
   <order id="GalaxyMiner" name="{77000, 31002}" description="{77000, 31102}" category="mining" infinite="true" allowinloop="false" canplayercancel="true">
     <params>
       <param name="homeStation" type="object" default="null" text="{77000, 31010}" comment="{77000, 31110}">
@@ -33,6 +33,9 @@
       <param name="assignToStation" default="true" type="bool" text="{77000, 31016}" comment="{77000, 31116}"/>
       <param name="playerStationsOnly" default="false" type="bool" text="{77000, 31028}" comment="{77000, 31128}"/>
       <param name="stayAtHome" default="false" type="bool" text="{77000, 31017}" comment="{77000, 31117}" />
+      <param name="idleParking" default="false" type="bool" text="{77000, 1096}" comment="{77000, 1097}">
+        <patch value="false" sinceversion="4"/>
+      </param>
       <param name="autoDeployResourceProbes" default="false" type="bool" text="{77000, 31018}" comment="{77000, 31118}">
         <!-- Backfill for legacy saves created before this param existed. Without sinceversion the
              AI director throws when re-loading a v1 miner order that lacks this field. Aligned with
@@ -232,6 +235,7 @@
     <set_value name="this.$assignToStation" exact="$assignToStation"/>
     <set_value name="this.$playerStationsOnly" exact="$playerStationsOnly"/>
     <set_value name="this.$stayAtHome" exact="$stayAtHome"/>
+    <set_value name="this.$idleParking" exact="$idleParking"/>
     <set_value name="this.$autoDeployResourceProbes" exact="$autoDeployResourceProbes"/>
     <!-- Clamp maxResourceProbesToBuy to [0, ship's deployable capacity] at init time. The order
          param's input_param max is evaluated at order-edit time and may go stale if the player
@@ -288,6 +292,7 @@
     <set_value name="this.$minerIntentWare" exact="null"/>
     <set_value name="this.$minerOverflowCommanderBackup" exact="null"/>
     <set_value name="this.$minerDetachedForOverflow" exact="false"/>
+    <set_value name="this.$minerIdleNoWorkCount" exact="0"/>
 
     <do_if value="this.$homeConfigValid">
       <set_command_action commandaction="commandaction.searchingresources"/>
@@ -407,6 +412,16 @@
     </do_if>
     <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': v2->v3 patch applied (blockedstations=' + this.$effectiveBlockedStations.count + ')'" filter="savegame"/>
   </patch>
+  <patch sinceversion="4">
+    <do_if value="not $idleParking?">
+      <set_value name="$idleParking" exact="false"/>
+    </do_if>
+    <set_value name="this.$idleParking" exact="$idleParking"/>
+    <do_if value="not this.$minerIdleNoWorkCount?">
+      <set_value name="this.$minerIdleNoWorkCount" exact="0"/>
+    </do_if>
+    <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': v3->v4 patch applied (idleParking=' + this.$idleParking + ')'" filter="savegame"/>
+  </patch>
 
   <attention min="unknown">
     <actions>
@@ -416,6 +431,7 @@
       <!-- Runtime sync for assignToStation toggle edits -->
       <set_value name="this.$assignToStation" exact="$assignToStation"/>
       <set_value name="this.$playerStationsOnly" exact="$playerStationsOnly"/>
+      <set_value name="this.$idleParking" exact="if $idleParking? then $idleParking else false"/>
       <set_value name="$minerBlockedStations" exact="if $blockedstations? then $blockedstations else (if this.$effectiveBlockedStations? then this.$effectiveBlockedStations else [])"/>
       <do_if value="this.ship.defaultorder? and this.ship.defaultorder.id == 'GalaxyMiner' and this.ship.defaultorder.$blockedstations?">
         <set_value name="$minerBlockedStations" exact="this.ship.defaultorder.$blockedstations"/>
@@ -927,6 +943,18 @@
         <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': No mineable wares. demandStationCount=' + $demandStations.count + ', resourceBasketCount=' + (if this.$resourceBasket? then this.$resourceBasket.count else 0) + ', shipMineableCount=' + (if $shipMineableBasket? then $shipMineableBasket.count else 0) + ', restrictToShipBasket=' + $restrictToShipBasket + ', cargoUsed=' + this.ship.cargo.used.all + '/' + this.ship.cargo.capacity.all + (if $noCandHasCargo then ' (cargo present but NO demand station has capacity for any ware in the bay - all primary buyers are full or the cargo wares are not in any buyer config; lower threshold or add a buyer to free this ship)' else '')" chance="this.$debugchance"/>
         <show_notification text="'Galaxy-Miner: no mineable wares available for ' + this.ship.knownname" timeout="8s"/>
         <remove_value name="$noCandHasCargo"/>
+        <set_value name="this.$minerIdleNoWorkCount" exact="[this.$minerIdleNoWorkCount + 1, 5].min"/>
+        <do_if value="this.$idleParking and this.$minerIdleNoWorkCount ge 5 and this.ship.cargo.count == 0 and (not global.$GT_IdleParkingReleased? or not global.$GT_IdleParkingReleased.{this.ship}?)">
+          <set_value name="$minerIdleHome" exact="if this.$homeStation? and this.$homeStation.exists then this.$homeStation else (if this.$homeSector? and this.$homeSector.exists then this.$homeSector else null)"/>
+          <do_if value="$minerIdleHome? and $minerIdleHome != null">
+            <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': idle parking threshold reached - parking at ' + $minerIdleHome.knownname" chance="this.$debugchance"/>
+            <create_order object="this.ship" id="'GTIdlePark'" immediate="true">
+              <param name="home" value="$minerIdleHome"/>
+              <param name="debugchance" value="this.$debugchance"/>
+            </create_order>
+            <return/>
+          </do_if>
+        </do_if>
         <wait exact="this.$demandRecheckInterval"/>
         <resume label="main_loop"/>
       </do_if>
@@ -1069,10 +1097,10 @@
             <continue/>
           </do_if>
           <!-- Reachability check (vanilla-aligned, mirrors order.mining.routine.xml ~1086-1141):
-               - Primary signal is sector.resources.{ware}.exists; vanilla never gates reachability on yield.
-               - Yield is read with @ (no '?' guard) so a missing MD context reading reads as 0, a valid
-                 low-yield score; the floor (this.$minReachableYieldRating) is then a low cutoff, not a
-                 "doesn't exist -> drop" rule.
+               - Primary signal is sector.resources.{ware}.exists; vanilla does not require a non-zero
+                 sector.yieldrating before it calls find_closest_resource. A resource probe can report
+                 sector/probe yield 0 while the engine can still resolve a valid discovered field.
+               - Yield is still read for diagnostics, but it must not be a hard pre-filter.
                - For player-owned ships, vanilla calls find_closest_resource useundiscovered="false";
                  a single per-ware probe verifies the engine can actually locate a discovered asteroid
                  before promoting the ware to "reachable" (otherwise the routine downstream falls
@@ -1101,8 +1129,8 @@
           <!--                                                                              -->
           <!-- This fused loop:                                                             -->
           <!--   - Iterates gather sectors via do_for_each so <break/> actually works.      -->
-          <!--   - Does the cheap MD checks first (sector validity, resources.exists,       -->
-          <!--     yieldrating) BEFORE the expensive engine call.                           -->
+          <!--   - Does the cheap MD checks first (sector validity, resources.exists)        -->
+          <!--     BEFORE the expensive engine call.                                        -->
           <!--   - For player ships with a sector that passes the cheap checks, immediately -->
           <!--     runs find_closest_resource useundiscovered="false" anchored on THAT     -->
           <!--     sector (vanilla pattern - see comment block below for the ship-anchor    -->
@@ -1133,24 +1161,22 @@
           <do_for_each name="$gatherSectorEval" in="this.$minerScoreGatherSpaces">
             <do_if value="$gatherSectorEval? and $gatherSectorEval.exists and $gatherSectorEval.isclass.sector and $gatherSectorEval.resources.{$wareEval}.exists">
               <set_value name="$sectorYieldRating" exact="@$gatherSectorEval.yieldrating.{$wareEval}"/>
-              <do_if value="$sectorYieldRating ge this.$minReachableYieldRating">
-                <set_value name="$wareIsReachable" exact="true"/>
-                <!-- Engine call only when this sector actually has asteroids with usable
-                     yield AND we still need a discovery hit (NPC ships skip; subsequent
-                     player-ship sectors skip after the first hit). -->
-                <do_if value="this.ship.isplayerowned and not $wareIsDiscoverable">
-                  <set_value name="$discTrySec" exact="null"/>
-                  <set_value name="$discTryPos" exact="null"/>
-                  <find_closest_resource sector="$discTrySec" position="$discTryPos" ware="$wareEval" refobject="$gatherSectorEval" minamount="1" useundiscovered="false"/>
-                  <do_if value="$discTrySec? and @$discTrySec.exists">
-                    <set_value name="$wareIsDiscoverable" exact="true"/>
-                  </do_if>
-                  <do_if value="$discTrySec?"><remove_value name="$discTrySec"/></do_if>
-                  <do_if value="$discTryPos?"><remove_value name="$discTryPos"/></do_if>
+              <set_value name="$wareIsReachable" exact="true"/>
+              <!-- Engine call mirrors vanilla player-ship routing. Do not gate this on
+                   sectorYieldRating: zero aggregate yield is exactly the case where the
+                   engine call must decide whether a discovered field is still usable. -->
+              <do_if value="this.ship.isplayerowned and not $wareIsDiscoverable">
+                <set_value name="$discTrySec" exact="null"/>
+                <set_value name="$discTryPos" exact="null"/>
+                <find_closest_resource sector="$discTrySec" position="$discTryPos" ware="$wareEval" refobject="$gatherSectorEval" minamount="1" useundiscovered="false"/>
+                <do_if value="$discTrySec? and @$discTrySec.exists">
+                  <set_value name="$wareIsDiscoverable" exact="true"/>
                 </do_if>
-                <do_if value="$wareIsReachable and $wareIsDiscoverable">
-                  <break/>
-                </do_if>
+                <do_if value="$discTrySec?"><remove_value name="$discTrySec"/></do_if>
+                <do_if value="$discTryPos?"><remove_value name="$discTryPos"/></do_if>
+              </do_if>
+              <do_if value="$wareIsReachable and $wareIsDiscoverable">
+                <break/>
               </do_if>
               <do_if value="$sectorYieldRating?"><remove_value name="$sectorYieldRating"/></do_if>
             </do_if>
@@ -1668,12 +1694,33 @@
         <set_value name="$scoutDidWork" exact="$scoutAttempted"/>
         <remove_value name="$scoutAttempted"/>
 
+        <do_if value="not $scoutDidWork">
+          <set_value name="this.$minerIdleNoWorkCount" exact="[this.$minerIdleNoWorkCount + 1, 5].min"/>
+          <do_if value="this.$idleParking and this.$minerIdleNoWorkCount ge 5 and this.ship.cargo.count == 0 and (not global.$GT_IdleParkingReleased? or not global.$GT_IdleParkingReleased.{this.ship}?)">
+            <set_value name="$minerIdleHome" exact="if this.$homeStation? and this.$homeStation.exists then this.$homeStation else (if this.$homeSector? and this.$homeSector.exists then this.$homeSector else null)"/>
+            <do_if value="$minerIdleHome? and $minerIdleHome != null">
+              <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': idle parking threshold reached - parking at ' + $minerIdleHome.knownname" chance="this.$debugchance"/>
+              <create_order object="this.ship" id="'GTIdlePark'" immediate="true">
+                <param name="home" value="$minerIdleHome"/>
+                <param name="debugchance" value="this.$debugchance"/>
+              </create_order>
+              <return/>
+            </do_if>
+          </do_if>
+        </do_if>
         <wait exact="if $scoutDidWork then 5s else this.$demandRecheckInterval"/>
         <remove_value name="$scoutDidWork"/>
         <resume label="main_loop"/>
       </do_if>
       <set_value name="this.$activeMiningWare" exact="$selectedWare"/>
       <set_value name="this.$activeMiningUrgency" exact="$wareUrgency.{$selectedWare}"/>
+      <set_value name="this.$minerIdleNoWorkCount" exact="0"/>
+      <do_if value="global.$GT_IdleParkingReleased? and global.$GT_IdleParkingReleased.{this.ship}?">
+        <remove_value name="global.$GT_IdleParkingReleased.{this.ship}"/>
+      </do_if>
+      <do_if value="global.$GT_IdleParkingHold? and global.$GT_IdleParkingHold.{this.ship}?">
+        <remove_value name="global.$GT_IdleParkingHold.{this.ship}"/>
+      </do_if>
 
       <!-- Overflow handling: if all primary targets are full, optionally allow overflow sell -->
       <set_value name="$overflowSellMode" exact="false"/>
@@ -1771,6 +1818,18 @@
         </do_if>
         <do_else>
           <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Overflow mode but no sell opportunities for candidate wares. Waiting.'" chance="this.$debugchance"/>
+          <set_value name="this.$minerIdleNoWorkCount" exact="[this.$minerIdleNoWorkCount + 1, 5].min"/>
+          <do_if value="this.$idleParking and this.$minerIdleNoWorkCount ge 5 and this.ship.cargo.count == 0 and (not global.$GT_IdleParkingReleased? or not global.$GT_IdleParkingReleased.{this.ship}?)">
+            <set_value name="$minerIdleHome" exact="if this.$homeStation? and this.$homeStation.exists then this.$homeStation else (if this.$homeSector? and this.$homeSector.exists then this.$homeSector else null)"/>
+            <do_if value="$minerIdleHome? and $minerIdleHome != null">
+              <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': idle parking threshold reached - parking at ' + $minerIdleHome.knownname" chance="this.$debugchance"/>
+              <create_order object="this.ship" id="'GTIdlePark'" immediate="true">
+                <param name="home" value="$minerIdleHome"/>
+                <param name="debugchance" value="this.$debugchance"/>
+              </create_order>
+              <return/>
+            </do_if>
+          </do_if>
           <wait exact="this.$demandRecheckInterval"/>
           <resume label="main_loop"/>
         </do_else>
@@ -1824,6 +1883,18 @@
              lists actionable fixes (lower threshold, enable overflow, add a buyer). -->
         <set_command_action commandaction="commandaction.standingby"/>
         <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Overflow wait. selected=' + $selectedWare.name + ', urgency=' + this.$activeMiningUrgency + ', overflowAllowed=0, cargoFree=' + this.ship.cargo.free.all + '/' + this.ship.cargo.capacity.all + ' (' + (if this.ship.cargo.capacity.all gt 0 then (this.ship.cargo.free.all * 100) / this.ship.cargo.capacity.all else 0) + '% free). Standing by until a buyer becomes available or the player intervenes.'" chance="this.$debugchance"/>
+        <set_value name="this.$minerIdleNoWorkCount" exact="[this.$minerIdleNoWorkCount + 1, 5].min"/>
+        <do_if value="this.$idleParking and this.$minerIdleNoWorkCount ge 5 and this.ship.cargo.count == 0 and (not global.$GT_IdleParkingReleased? or not global.$GT_IdleParkingReleased.{this.ship}?)">
+          <set_value name="$minerIdleHome" exact="if this.$homeStation? and this.$homeStation.exists then this.$homeStation else (if this.$homeSector? and this.$homeSector.exists then this.$homeSector else null)"/>
+          <do_if value="$minerIdleHome? and $minerIdleHome != null">
+            <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': idle parking threshold reached - parking at ' + $minerIdleHome.knownname" chance="this.$debugchance"/>
+            <create_order object="this.ship" id="'GTIdlePark'" immediate="true">
+              <param name="home" value="$minerIdleHome"/>
+              <param name="debugchance" value="this.$debugchance"/>
+            </create_order>
+            <return/>
+          </do_if>
+        </do_if>
         <wait exact="this.$demandRecheckInterval"/>
         <resume label="main_loop"/>
       </do_if>

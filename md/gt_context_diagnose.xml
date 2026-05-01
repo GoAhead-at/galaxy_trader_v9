@@ -1637,8 +1637,8 @@
         <!-- 0 if stayAtHome), enumerate sectors via find_sector +    -->
         <!-- match_gate_distance, then for each minable ware in the   -->
         <!-- ship cargo basket query sector.resources.{ware}.exists   -->
-        <!-- and sector.yieldrating.{ware} (the same fields the miner -->
-        <!-- uses at order.trade.galaxyminer.xml ~717-722). Apply the -->
+        <!-- as the reachability pre-check and keep yieldrating as    -->
+        <!-- informational only. Apply the                            -->
         <!-- same A4 safety pre-filter (hostile / hazardous /         -->
         <!-- contested / sector-blacklisted) so the diagnostic        -->
         <!-- mirrors the miner's reachability decision exactly.       -->
@@ -1957,17 +1957,16 @@
           </do_if>
 
           <!-- Step 4: per-ware reachability + best-yield scan across $rscKeptSectors.
-               Vanilla-aligned predicates (mirrors order.mining.routine.xml ~1086-1141):
-                 - sector.resources.{ware}.exists is the actual reachability signal.
-                 - yieldrating is read with @ (no '?' guard) so a missing MD reading reads as 0;
-                   vanilla never gates on yield existence. The $rscMinYield floor remains a low
-                   cutoff (1) to suppress sectors with no yield reading at all from the score.
-                 - $rscBestSecName / $rscBestYield are seeded from the FIRST qualifying sector
+               Vanilla-aligned predicates (mirrors order.mining.routine.xml ~1086-1141
+               and order.trade.galaxyminer.xml's pre-score):
+                 - sector.resources.{ware}.exists is the reachability pre-check.
+                 - yieldrating is read with @ (no '?' guard) for display/ranking only; a zero
+                   yield must NOT suppress the route-discovery probe.
+                 - $rscBestSecName / $rscBestYield are seeded from the FIRST resource sector
                    (regardless of its yield value) instead of using strict 'gt running max' on a
                    zero-init max - otherwise a first sector with yield 0 would leave the name empty
                    and the row would render as "best in: ". After the first match, comparisons
                    switch to strict gt as expected. -->
-          <set_value name="$rscMinYield" exact="1"/>
           <set_value name="$rscWareRows" exact="[]"/>
           <!-- Counts split by discovery state so the header row can give the player an
                accurate "X mineable, Y undiscovered" breakdown. The diag now probes
@@ -2003,15 +2002,13 @@
               <set_value name="$rscSecEval" exact="$rscKeptSectors.{$rsj}"/>
               <do_if value="$rscSecEval? and $rscSecEval.exists and $rscSecEval.isclass.sector and $rscSecEval.resources.{$rscWare}.exists">
                 <set_value name="$rscSecYield" exact="@$rscSecEval.yieldrating.{$rscWare}"/>
-                <do_if value="$rscSecYield ge $rscMinYield">
-                  <set_value name="$rscWareSectorCount" exact="$rscWareSectorCount + 1"/>
-                  <set_value name="$rscSecName" exact="if $rscSecEval.knownname? then @$rscSecEval.knownname else 'unknown'"/>
-                  <append_to_list name="$rscWareSectorsList" exact="table[$Name = $rscSecName, $Yield = $rscSecYield]"/>
-                  <do_if value="not $rscBestSeeded or $rscSecYield gt $rscBestYield">
-                    <set_value name="$rscBestYield" exact="$rscSecYield"/>
-                    <set_value name="$rscBestSecName" exact="$rscSecName"/>
-                    <set_value name="$rscBestSeeded" exact="true"/>
-                  </do_if>
+                <set_value name="$rscWareSectorCount" exact="$rscWareSectorCount + 1"/>
+                <set_value name="$rscSecName" exact="if $rscSecEval.knownname? then @$rscSecEval.knownname else 'unknown'"/>
+                <append_to_list name="$rscWareSectorsList" exact="table[$Name = $rscSecName, $Yield = $rscSecYield]"/>
+                <do_if value="not $rscBestSeeded or $rscSecYield gt $rscBestYield">
+                  <set_value name="$rscBestYield" exact="$rscSecYield"/>
+                  <set_value name="$rscBestSecName" exact="$rscSecName"/>
+                  <set_value name="$rscBestSeeded" exact="true"/>
                 </do_if>
               </do_if>
             </do_all>
@@ -2090,10 +2087,12 @@
                 <do_if value="not ($rscDiscProbedSector? and @$rscDiscProbedSector.exists)">
                   <set_value name="$rscDiscTrySec" exact="null"/>
                   <set_value name="$rscDiscTryPos" exact="null"/>
-                  <find_closest_resource sector="$rscDiscTrySec" position="$rscDiscTryPos" ware="$rscWare" refobject="$rscDiscAnchor" minamount="1" useundiscovered="false"/>
-                  <do_if value="$rscDiscTrySec? and @$rscDiscTrySec.exists">
-                    <set_value name="$rscDiscProbedSector" exact="$rscDiscTrySec"/>
-                    <set_value name="$rscDiscProbedPos" exact="$rscDiscTryPos"/>
+                  <do_if value="$rscDiscAnchor? and $rscDiscAnchor.exists and $rscDiscAnchor.isclass.sector and $rscDiscAnchor.resources.{$rscWare}.exists">
+                    <find_closest_resource sector="$rscDiscTrySec" position="$rscDiscTryPos" ware="$rscWare" refobject="$rscDiscAnchor" minamount="1" useundiscovered="false"/>
+                    <do_if value="$rscDiscTrySec? and @$rscDiscTrySec.exists">
+                      <set_value name="$rscDiscProbedSector" exact="$rscDiscTrySec"/>
+                      <set_value name="$rscDiscProbedPos" exact="$rscDiscTryPos"/>
+                    </do_if>
                   </do_if>
                   <do_if value="$rscDiscTrySec?"><remove_value name="$rscDiscTrySec"/></do_if>
                   <do_if value="$rscDiscTryPos?"><remove_value name="$rscDiscTryPos"/></do_if>
@@ -2102,8 +2101,9 @@
               <set_value name="$rscDiscState" exact="if $rscDiscProbedSector? and @$rscDiscProbedSector.exists then 'discovered' else 'undiscovered'"/>
               <!-- Parallel probe to disambiguate the player's mental model from the engine's
                    routing model. Layers in play:
-                     1. sector.yieldrating.{ware} (statistical yield; revealed by resource probes
-                        and survey cycles) - already captured by $rscHasAsteroids above.
+                     1. sector.resources.{ware}.exists (resource type exists in the sector) -
+                        already captured by $rscHasAsteroids above. sector.yieldrating is only
+                        a statistical display/ranking value and may legitimately read 0.
                      2. find_closest_resource useundiscovered="false" (asteroid-level discovery
                         the engine accepts for player-ship routing) - the per-safe-sector loop
                         above.
@@ -2123,10 +2123,12 @@
                   <do_if value="not ($rscExistsProbedSector? and @$rscExistsProbedSector.exists)">
                     <set_value name="$rscExistsTrySec" exact="null"/>
                     <set_value name="$rscExistsTryPos" exact="null"/>
-                    <find_closest_resource sector="$rscExistsTrySec" position="$rscExistsTryPos" ware="$rscWare" refobject="$rscExistsAnchor" minamount="1" useundiscovered="true"/>
-                    <do_if value="$rscExistsTrySec? and @$rscExistsTrySec.exists">
-                      <set_value name="$rscExistsProbedSector" exact="$rscExistsTrySec"/>
-                      <set_value name="$rscExistsProbedPos" exact="$rscExistsTryPos"/>
+                    <do_if value="$rscExistsAnchor? and $rscExistsAnchor.exists and $rscExistsAnchor.isclass.sector and $rscExistsAnchor.resources.{$rscWare}.exists">
+                      <find_closest_resource sector="$rscExistsTrySec" position="$rscExistsTryPos" ware="$rscWare" refobject="$rscExistsAnchor" minamount="1" useundiscovered="true"/>
+                      <do_if value="$rscExistsTrySec? and @$rscExistsTrySec.exists">
+                        <set_value name="$rscExistsProbedSector" exact="$rscExistsTrySec"/>
+                        <set_value name="$rscExistsProbedPos" exact="$rscExistsTryPos"/>
+                      </do_if>
                     </do_if>
                     <do_if value="$rscExistsTrySec?"><remove_value name="$rscExistsTrySec"/></do_if>
                     <do_if value="$rscExistsTryPos?"><remove_value name="$rscExistsTryPos"/></do_if>
@@ -2210,12 +2212,12 @@
             <set_value name="$rscKeptNamesText" exact="$rscKeptNamesText + ' (+' + ($rscKeptSectors.count - $rscNamesCap) + ' more)'"/>
           </do_if>
           <append_to_list name="$sec3b.$Rows" exact="table[$Check = 'Safe Sector Names', $Status = 'INFO', $Detail = $rscKeptNamesText]"/>
-          <append_to_list name="$sec3b.$Rows" exact="table[$Check = 'Minimum Yield Rating', $Status = 'INFO', $Detail = '' + $rscMinYield + ' (sectors with a lower rating are ignored)']"/>
+          <append_to_list name="$sec3b.$Rows" exact="table[$Check = 'Yield Handling', $Status = 'INFO', $Detail = 'sectorYield is informational only; sectors are not ignored just because yield reads 0']"/>
           <append_to_list name="$sec3b.$Rows" exact="table[$Check = 'Candidate Wares', $Status = if $rscCandWares.count gt 0 then 'PASS' else 'WARN', $Detail = '' + $rscCandWares.count + ' minable wares (taken from: ' + $rscWareSource + ')']"/>
-          <!-- "Reachable" here means "asteroid resource type exists in a safe sector with yield >= floor".
+          <!-- "Reachable" here means "asteroid resource type exists in a safe sector".
                This is the engine-level resources.exists check; it does NOT yet account for whether the
                player has actually discovered the asteroid (see Discovery Coverage row below). -->
-          <append_to_list name="$sec3b.$Rows" exact="table[$Check = 'Reachable Wares', $Status = if $rscHasAsteroidsCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $rscHasAsteroidsCount + ' of ' + $rscCandWares.count + ' wares have asteroids in a safe sector in range (resource exists in sector, yield >= ' + $rscMinYield + ')']"/>
+          <append_to_list name="$sec3b.$Rows" exact="table[$Check = 'Reachable Wares', $Status = if $rscHasAsteroidsCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $rscHasAsteroidsCount + ' of ' + $rscCandWares.count + ' wares have asteroids in a safe sector in range (resource exists in sector; yield may be 0)']"/>
           <do_if value="$rscIsPlayerShip">
             <!-- Discovery Coverage runs the authoritative engine probe at click time
                  (find_closest_resource useundiscovered="false", refobject=$ship), independent of
@@ -2313,7 +2315,7 @@
                         named instead of "one of the safe sectors".
                      c) engine has no asteroid for this ware anywhere reachable -> generic
                         "deploy/scout" advice referencing the top yield sectors. -->
-              <set_value name="$rscWNote" exact="if $rscOut.$Mineable then ('top: ' + $rscOut.$TopSectors) else (if $rscOut.$DiscState == 'undiscovered' then (if $rscOut.$EngineKnowsSectorName? and $rscOut.$EngineKnowsSectorName != '' then (if $rscOut.$ProbeInEngineKnownSector then ('engine knows the asteroid is in ' + $rscOut.$EngineKnowsSectorName + ' and your resource probe IS already in that sector - the probe reveals YIELD only, vanilla mining still needs asteroid-level discovery for player ships; fly a ship close to the asteroid to scout it visually OR drop a satellite within line-of-sight (top: ' + $rscOut.$TopSectors + ')') else ('engine knows the asteroid is in ' + $rscOut.$EngineKnowsSectorName + ' but no player resource probe is there - drop a probe in ' + $rscOut.$EngineKnowsSectorName + ', scout the sector with a satellite, or fly close enough to spot the asteroid visually (top: ' + $rscOut.$TopSectors + ')')) else ('asteroids exist in ' + $rscOut.$TopSectors + ' but the engine has not asteroid-discovered any - deploy a resource probe in one of these sectors, scout with a satellite, or fly close enough to spot it visually')) else ('no safe sector in range has yield >= ' + $rscMinYield))"/>
+              <set_value name="$rscWNote" exact="if $rscOut.$Mineable then ('top: ' + $rscOut.$TopSectors) else (if $rscOut.$DiscState == 'undiscovered' then (if $rscOut.$EngineKnowsSectorName? and $rscOut.$EngineKnowsSectorName != '' then (if $rscOut.$ProbeInEngineKnownSector then ('engine knows the asteroid is in ' + $rscOut.$EngineKnowsSectorName + ' and your resource probe IS already in that sector - the probe reveals YIELD only, vanilla mining still needs asteroid-level discovery for player ships; fly a ship close to the asteroid to scout it visually OR drop a satellite within line-of-sight (top: ' + $rscOut.$TopSectors + ')') else ('engine knows the asteroid is in ' + $rscOut.$EngineKnowsSectorName + ' but no player resource probe is there - drop a probe in ' + $rscOut.$EngineKnowsSectorName + ', scout the sector with a satellite, or fly close enough to spot the asteroid visually (top: ' + $rscOut.$TopSectors + ')')) else ('asteroids exist in ' + $rscOut.$TopSectors + ' but the engine has not asteroid-discovered any - deploy a resource probe in one of these sectors, scout with a satellite, or fly close enough to spot it visually')) else 'no safe sector in range has this resource type')"/>
               <append_to_list name="$sec3b.$Rows" exact="table[
                 $Status = $rscWStatus,
                 $Check = $rscWLabel,
@@ -2453,9 +2455,9 @@
                     </do_if>
                     <set_value name="$rscProbeRouteOK" exact="$rscProbeRouteSec? and @$rscProbeRouteSec.exists"/>
                     <set_value name="$rscProbeRouteSecName" exact="if $rscProbeRouteOK and $rscProbeRouteSec.knownname? then @$rscProbeRouteSec.knownname else 'NONE'"/>
-                    <do_if value="$rscProbeY gt 0 or $rscProbeSY gt 0 or $rscProbeRouteOK">
+                    <do_if value="$rscProbeInKept or $rscProbeY gt 0 or $rscProbeSY gt 0 or $rscProbeRouteOK">
                       <set_value name="$rscProbeWareStatus" exact="if $rscProbeRouteOK and $rscProbeInKept then 'PASS' else (if $rscProbeY gt 0 or $rscProbeSY gt 0 then 'WARN' else 'INFO')"/>
-                      <set_value name="$rscProbeWareDetail" exact="'probeYield=' + $rscProbeY + ', sectorYield=' + $rscProbeSY + ', routingDiscovered=' + (if $rscProbeRouteOK then ('yes -> ' + $rscProbeRouteSecName) else 'no (engine refuses to route a player ship - probe reveals YIELD only, asteroid-level discovery still needs visual / satellite scout)')"/>
+                      <set_value name="$rscProbeWareDetail" exact="'probeYield=' + $rscProbeY + ', sectorYield=' + $rscProbeSY + ', routingDiscovered=' + (if $rscProbeRouteOK then ('yes -> ' + $rscProbeRouteSecName + ' (yield values are informational only)') else 'no (yield 0 is not a blocker by itself; engine found no discovered routable asteroid for this player ship)')"/>
                       <append_to_list name="$sec3b.$Rows" exact="table[
                         $Check = '  ' + $rscProbeWare.name,
                         $Status = $rscProbeWareStatus,
@@ -4796,7 +4798,7 @@
         <do_elseif value="$orderId == 'GalaxyTraderMK2' and $mk2SourceWaresEvaluated gt 0 and $mk2SourceWaresBelowStatic == $mk2SourceWaresEvaluated">
           <set_value name="$verdict" exact="'MK2 IDLE (source below static reserve): every sellable ware on the configured source station(s) is at or below the static-storage reserve of ' + $mk2StaticStorage + '%. The runtime refuses to drain a source until it climbs ABOVE this threshold. Worst case: ' + $mk2WorstSourceDetail + ' . Highest fill seen: ' + $mk2BestSourceDetail + ' .'"/>
           <append_to_list name="$suggestions" exact="'Wait for the source station to produce more stock (the static reserve is intentional - it prevents the trader from emptying a production line below operating margins).'"/>
-          <append_to_list name="$suggestions" exact="'OR lower this trader''s Static Storage % in its order params (current ' + $mk2StaticStorage + '%) so it ships earlier - e.g. set it to a value below the highest source fill (' + $mk2BestSourceRatio + '%).'"/>
+          <append_to_list name="$suggestions" exact="'OR lower the trader Static Storage % in its order params (current ' + $mk2StaticStorage + '%) so it ships earlier - e.g. set it to a value below the highest source fill (' + $mk2BestSourceRatio + '%).'"/>
         </do_elseif>
         <!-- Priority 1d: MK2 source stations exist but no source ware has any allocated
              storage (cargo.{ware}.target == 0 for all wares). The runtime treats this as

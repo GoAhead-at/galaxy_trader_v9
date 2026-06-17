@@ -6017,6 +6017,38 @@
                     <continue/>
                   </do_if>
                 </do_if>
+
+                <!-- Trade-rule sourcing enforcement INSIDE the validation loop (not only the final gate).
+                     When ignoretraderules=false, the customer station's buy offer must permit the NPC
+                     source faction, and the source sell offer must permit the customer station.
+                     Doing this per-trade here (rather than only at order creation on the small
+                     prevalidated window) means EVERY trade-rule-violating cache entry is rejected and
+                     flagged in a single pass. That drives validTradesFound to 0 when all cache trades
+                     are non-compliant, which triggers the existing "all cached trades rejected -> force
+                     live search" escalation below instead of looping on the same top-scored violating
+                     trades. Sell-only trades have no source leg, so this only applies to buy+deliver. -->
+                <do_if value="not (if this.$effectiveIgnoreTradeRules? then this.$effectiveIgnoreTradeRules else false) and not $isSellOnlyTrade">
+                  <set_value name="$_tradeRuleBlocked" exact="false"/>
+                  <set_value name="$_tradeRuleReason" exact="''"/>
+                  <do_if value="$currentTrade.$SellOffer? and $buyStation? and $buyStation.exists and not $currentTrade.$SellOffer.cantradewith.{$buyStation}">
+                    <set_value name="$_tradeRuleBlocked" exact="true"/>
+                    <set_value name="$_tradeRuleReason" exact="'customer ' + @$sellStation.knownname + ' disallows source ' + @$buyStation.knownname"/>
+                  </do_if>
+                  <do_if value="not $_tradeRuleBlocked and $currentTrade.$BuyOffer? and $sellStation? and $sellStation.exists and not $currentTrade.$BuyOffer.cantradewith.{$sellStation}">
+                    <set_value name="$_tradeRuleBlocked" exact="true"/>
+                    <set_value name="$_tradeRuleReason" exact="'source ' + @$buyStation.knownname + ' disallows delivery to ' + @$sellStation.knownname"/>
+                  </do_if>
+                  <do_if value="$_tradeRuleBlocked">
+                    <set_value name="$tradesRejectedRestriction" operation="add"/>
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' rejected by trade rules (' + $_tradeRuleReason + ') → Trying next trade...'" chance="100"/>
+                    </do_if>
+                    <do_if value="$searchMethod == 'cache'">
+                      <signal_objects object="player.galaxy" param="'GT_Cache_Flag_Ship'" param2="table[$Ship = this.ship, $BuyOffer = @$currentTrade.$BuyOffer, $SellOffer = @$currentTrade.$SellOffer, $HomeSector = $searchHomeSector, $Reason = 'trade_rules_failed']"/>
+                    </do_if>
+                    <continue/>
+                  </do_if>
+                </do_if>
                 
                 <!-- All checks passed including clamping and final docking verification - this trade is valid -->
                 <set_value name="$validTradesFound" operation="add"/>
@@ -6240,28 +6272,10 @@
             </do_if>
           </do_if>
 
-          <!-- Trade-rule sourcing guard (mirror of MK1 supply fix).
-               tradepartner re-validation above only proves the player ship may dock/trade at each
-               station; it does NOT enforce the customer station's trade rules against the NPC source
-               faction. When ignoretraderules=false, require the customer buy offer to permit the NPC
-               source faction, and the source offer to permit the customer station.
-               $pendingTrade.$BuyOffer = NPC source offer ($finalBuyStation),
-               $pendingTrade.$SellOffer = customer buy offer ($finalSellStation). Sell-only trades have
-               no source leg, so this only applies to normal buy+deliver trades. -->
-          <do_if value="not (if this.$effectiveIgnoreTradeRules? then this.$effectiveIgnoreTradeRules else false) and not $isSellOnlyTradeForPending">
-            <do_if value="$finalSellOfferValid and $pendingTrade.$SellOffer? and $finalBuyStation? and $finalBuyStation.exists and not $pendingTrade.$SellOffer.cantradewith.{$finalBuyStation}">
-              <set_value name="$finalSellOfferValid" exact="false"/>
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FINAL VALIDATION FAILED - customer ' + @$finalSellStation.knownname + ' trade rules disallow sourcing from ' + @$finalBuyStation.knownname" chance="100"/>
-              </do_if>
-            </do_if>
-            <do_if value="$finalBuyOfferValid and $pendingTrade.$BuyOffer? and $finalSellStation? and $finalSellStation.exists and not $pendingTrade.$BuyOffer.cantradewith.{$finalSellStation}">
-              <set_value name="$finalBuyOfferValid" exact="false"/>
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FINAL VALIDATION FAILED - source ' + @$finalBuyStation.knownname + ' trade rules disallow delivery to ' + @$finalSellStation.knownname" chance="100"/>
-              </do_if>
-            </do_if>
-          </do_if>
+          <!-- NOTE: Trade-rule sourcing enforcement (customer/source cantradewith) now runs inside the
+               main validation loop, so every violating cache trade is rejected+flagged in one pass and
+               the "all cached trades rejected -> force live search" escalation fires. It is intentionally
+               NOT repeated here to avoid the late-stage single-candidate retry loop. -->
 
           <!-- Final MK3 faction blacklist safety net (applies to all sources: cache/live/fallback). -->
           <do_if value="$mk3FactionBlacklistFinal.keys.count gt 0">

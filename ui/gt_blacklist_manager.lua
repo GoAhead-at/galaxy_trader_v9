@@ -10,8 +10,8 @@ Features:
 - Automatically applies blacklist to all GT ships
 - Uses vanilla pathfinding for automatic route recalculation
 
-Dependencies: 
-- sn_mod_support_apis (Lua Loader API)
+Dependencies:
+- Loaded via ui.xml (works in packed cat/dat installs)
 - X4 FFI blacklist functions
 
 Author: GalaxyTrader Development Team
@@ -649,6 +649,8 @@ local function init()
     debugLog("Dynamic Blacklist Manager loaded successfully!")
     debugLog("Waiting for initialization signal from MD scripts...")
     debugLog("================================================================================")
+
+    AddUITriggeredEvent("gt_blacklist_manager", "Ready", {})
     
     return true
 end

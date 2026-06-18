@@ -653,6 +653,11 @@ local function init()
     return true
 end
 
+-- handle Lua_Loader.Load
+if Register_Require_Response then
+    Register_Require_Response("extensions.galaxy_trader.ui.gt_blacklist_manager", GT_Blacklist)
+end
+
 -- Initialize module immediately
 init()
 

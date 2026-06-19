@@ -115,6 +115,17 @@ end
 -- UTILITY FUNCTIONS
 -- =============================================================================
 
+-- Always-on load/init visibility (matches gt_mod_removal.lua; no debug flag required)
+local function logLoad(message, level)
+    level = level or "INFO"
+    local prefix = "[GT-Blacklist-Lua] "
+    if level == "ERROR" or level == "WARNING" then
+        DebugError(prefix .. message)
+    else
+        DebugError(prefix .. message)
+    end
+end
+
 local function debugLog(message, level)
     if GT_Blacklist.CONFIG.DEBUG_MODE then
         local prefix = level == "ERROR" and "❌" or level == "WARN" and "" or "🛡️"
@@ -616,13 +627,13 @@ end
 -- =============================================================================
 
 local function init()
-    debugLog("================================================================================")
-    debugLog("GalaxyTrader MK3 - Dynamic Blacklist Manager Loading...")
-    debugLog("================================================================================")
+    logLoad("================================================================================")
+    logLoad("GalaxyTrader MK3 - Dynamic Blacklist Manager Loading...")
+    logLoad("================================================================================")
     
     -- Verify FFI availability
     if not ffi then
-        debugLog("ERROR: FFI not available!", "ERROR")
+        logLoad("ERROR: FFI not available!", "ERROR")
         return false
     end
     
@@ -639,16 +650,16 @@ local function init()
     for _, event in ipairs(events) do
         local success = pcall(RegisterEvent, event.name, event.handler)
         if success then
-            debugLog(string.format("Registered event: %s", event.name))
+            logLoad(string.format("Registered event: %s", event.name))
         else
-            debugLog(string.format("Failed to register event: %s", event.name), "ERROR")
+            logLoad(string.format("Failed to register event: %s", event.name), "ERROR")
         end
     end
     
-    debugLog("================================================================================")
-    debugLog("Dynamic Blacklist Manager loaded successfully!")
-    debugLog("Waiting for initialization signal from MD scripts...")
-    debugLog("================================================================================")
+    logLoad("================================================================================")
+    logLoad("Dynamic Blacklist Manager loaded successfully!")
+    logLoad("Signalled MD: gt_blacklist_manager Ready")
+    logLoad("================================================================================")
 
     AddUITriggeredEvent("gt_blacklist_manager", "Ready", {})
     

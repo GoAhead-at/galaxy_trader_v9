@@ -12,6 +12,7 @@
     <param name="buySector" default="null"/>
     <param name="sellSector" default="null"/>
     <param name="ware" default="null"/>
+    <param name="checkSector" default="null"/>
     <param name="routeCacheTtl" default="300s"/>
     <param name="pilotSkill" default="null"/>
     <param name="includeCommander" default="false"/>
@@ -90,6 +91,179 @@
       </do_if>
 
       <!-- ================================================================= -->
+      <!-- MODE: sector_cargo_legality                                       -->
+      <!-- Check whether Monitored contraband may enter $checkSector.        -->
+      <!-- ================================================================= -->
+      <do_if value="$mode == 'sector_cargo_legality'">
+        <set_value name="$result" exact="table[
+          $IsLegal = true,
+          $Reason = 'skipped',
+          $BlockedWare = null,
+          $BlockedPoliceFaction = null,
+          $ShouldEnforce = false
+        ]"/>
+        <do_if value="not $allowIllegal or not $enforceRouteIllegalLegality">
+          <return value="$result"/>
+        </do_if>
+        <do_if value="$ship == null or $checkSector == null">
+          <set_value name="$result.$IsLegal" exact="false"/>
+          <set_value name="$result.$Reason" exact="'invalid_context'"/>
+          <set_value name="$result.$ShouldEnforce" exact="true"/>
+          <return value="$result"/>
+        </do_if>
+        <set_value name="$result.$ShouldEnforce" exact="true"/>
+        <set_value name="$shipOwner" exact="$ship.owner"/>
+        <do_if value="$shipOwner == null">
+          <set_value name="$result.$IsLegal" exact="false"/>
+          <set_value name="$result.$Reason" exact="'invalid_owner'"/>
+          <return value="$result"/>
+        </do_if>
+        <do_if value="not $checkSector.policefaction or ($checkSector.policefaction == $shipOwner)">
+          <set_value name="$result.$Reason" exact="'no_police'"/>
+          <return value="$result"/>
+        </do_if>
+        <set_value name="$cargoList" exact="$ship.cargo.list"/>
+        <do_if value="$cargoList.count == 0">
+          <set_value name="$result.$Reason" exact="'no_cargo'"/>
+          <return value="$result"/>
+        </do_if>
+        <do_all exact="$cargoList.count" counter="$ci">
+          <set_value name="$cargoWare" exact="$cargoList.{$ci}"/>
+          <do_if value="$cargoWare? and @$cargoWare.illegal gt 0 and $cargoWare.illegalto.{$checkSector.policefaction}.{$shipOwner}">
+            <set_value name="$result.$IsLegal" exact="false"/>
+            <set_value name="$result.$Reason" exact="'illegal_on_route'"/>
+            <set_value name="$result.$BlockedWare" exact="$cargoWare"/>
+            <set_value name="$result.$BlockedPoliceFaction" exact="$checkSector.policefaction"/>
+            <break/>
+          </do_if>
+        </do_all>
+        <return value="$result"/>
+      </do_if>
+
+      <!-- ================================================================= -->
+      <!-- MODE: invalidate_route_legality_cache                             -->
+      <!-- Clear cached route_legality verdict for one trade tuple (R3).     -->
+      <!-- ================================================================= -->
+      <do_if value="$mode == 'invalidate_route_legality_cache'">
+        <set_value name="$result" exact="table[$Invalidated = false]"/>
+        <do_if value="$homeSector? and $buySector? and $sellSector? and $ware? and $ship? and $ship.owner?">
+          <set_value name="$cacheOwner" exact="$ship.owner"/>
+          <set_value name="$cacheBlacklist" exact="$blacklistGroup"/>
+          <do_if value="$cacheBlacklist == null">
+            <set_value name="$cacheBlacklist" exact="blacklistgroup.civilian"/>
+          </do_if>
+          <set_value name="$cacheStart" exact="$startSector"/>
+          <do_if value="$cacheStart == null">
+            <set_value name="$cacheStart" exact="if $ship.sector? then $ship.sector else $buySector"/>
+          </do_if>
+          <do_if value="global.$GT_RouteLegalityCache? and global.$GT_RouteLegalityCache.{$homeSector}? and global.$GT_RouteLegalityCache.{$homeSector}.{$buySector}? and global.$GT_RouteLegalityCache.{$homeSector}.{$buySector}.{$sellSector}? and global.$GT_RouteLegalityCache.{$homeSector}.{$buySector}.{$sellSector}.{$ware}? and global.$GT_RouteLegalityCache.{$homeSector}.{$buySector}.{$sellSector}.{$ware}.{$allowIllegal}? and global.$GT_RouteLegalityCache.{$homeSector}.{$buySector}.{$sellSector}.{$ware}.{$allowIllegal}.{$enforceRouteIllegalLegality}? and global.$GT_RouteLegalityCache.{$homeSector}.{$buySector}.{$sellSector}.{$ware}.{$allowIllegal}.{$enforceRouteIllegalLegality}.{$cacheOwner}? and global.$GT_RouteLegalityCache.{$homeSector}.{$buySector}.{$sellSector}.{$ware}.{$allowIllegal}.{$enforceRouteIllegalLegality}.{$cacheOwner}.{$cacheBlacklist}? and global.$GT_RouteLegalityCache.{$homeSector}.{$buySector}.{$sellSector}.{$ware}.{$allowIllegal}.{$enforceRouteIllegalLegality}.{$cacheOwner}.{$cacheBlacklist}.{$cacheStart}?">
+            <set_value name="global.$GT_RouteLegalityCache.{$homeSector}.{$buySector}.{$sellSector}.{$ware}.{$allowIllegal}.{$enforceRouteIllegalLegality}.{$cacheOwner}.{$cacheBlacklist}.{$cacheStart}" exact="[]"/>
+            <set_value name="$result.$Invalidated" exact="true"/>
+          </do_if>
+        </do_if>
+        <return value="$result"/>
+      </do_if>
+
+      <!-- ================================================================= -->
+      <!-- MODE: route_enforce_precheck                                        -->
+      <!-- Pre-transit guard: read ActiveTradePolicy, check next sector.       -->
+      <!-- ================================================================= -->
+      <do_if value="$mode == 'route_enforce_precheck'">
+        <set_value name="$result" exact="table[
+          $ShouldAbort = false,
+          $IsLegal = true,
+          $Reason = 'skipped',
+          $BlockedWare = null,
+          $BlockedPoliceFaction = null,
+          $CacheInvalidated = false
+        ]"/>
+        <do_if value="$ship == null or $checkSector == null">
+          <return value="$result"/>
+        </do_if>
+        <do_if value="not global.$GT_Ships? or not global.$GT_Ships.{$ship}? or not global.$GT_Ships.{$ship}.$ActiveTradePolicy?">
+          <return value="$result"/>
+        </do_if>
+        <set_value name="$policy" exact="global.$GT_Ships.{$ship}.$ActiveTradePolicy"/>
+        <do_if value="not $policy.$AllowIllegal? or not $policy.$AllowIllegal or not $policy.$EnforceRouteIllegalLegality? or not $policy.$EnforceRouteIllegalLegality">
+          <return value="$result"/>
+        </do_if>
+        <!-- Inline sector cargo legality (avoid recursive lib.gt.pathfinding run_script; breaks caller result= binding). -->
+        <set_value name="$legality" exact="table[
+          $IsLegal = true,
+          $Reason = 'skipped',
+          $BlockedWare = null,
+          $BlockedPoliceFaction = null
+        ]"/>
+        <set_value name="$shipOwner" exact="$ship.owner"/>
+        <do_if value="$shipOwner == null">
+          <set_value name="$legality.$IsLegal" exact="false"/>
+          <set_value name="$legality.$Reason" exact="'invalid_owner'"/>
+        </do_if>
+        <do_elseif value="not $checkSector.policefaction or ($checkSector.policefaction == $shipOwner)">
+          <set_value name="$legality.$Reason" exact="'no_police'"/>
+        </do_elseif>
+        <do_else>
+          <set_value name="$cargoList" exact="$ship.cargo.list"/>
+          <do_if value="$cargoList.count == 0">
+            <set_value name="$legality.$Reason" exact="'no_cargo'"/>
+          </do_if>
+          <do_else>
+            <do_all exact="$cargoList.count" counter="$ci">
+              <set_value name="$cargoWare" exact="$cargoList.{$ci}"/>
+              <do_if value="$cargoWare? and @$cargoWare.illegal gt 0 and $cargoWare.illegalto.{$checkSector.policefaction}.{$shipOwner}">
+                <set_value name="$legality.$IsLegal" exact="false"/>
+                <set_value name="$legality.$Reason" exact="'illegal_on_route'"/>
+                <set_value name="$legality.$BlockedWare" exact="$cargoWare"/>
+                <set_value name="$legality.$BlockedPoliceFaction" exact="$checkSector.policefaction"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_else>
+        </do_else>
+        <do_if value="$legality.$IsLegal">
+          <return value="$result"/>
+        </do_if>
+        <set_value name="$result.$IsLegal" exact="false"/>
+        <set_value name="$result.$Reason" exact="$legality.$Reason"/>
+        <set_value name="$result.$BlockedWare" exact="$legality.$BlockedWare"/>
+        <set_value name="$result.$BlockedPoliceFaction" exact="$legality.$BlockedPoliceFaction"/>
+        <set_value name="$result.$ShouldAbort" exact="true"/>
+        <set_value name="global.$GT_Ships.{$ship}.$RouteIllegalAbort" exact="table[
+          $Reason = 'route_illegal_pre_transit',
+          $NextSector = $checkSector,
+          $NextSectorName = if $checkSector? then @$checkSector.knownname else 'Unknown',
+          $Ware = $legality.$BlockedWare,
+          $WareName = if $legality.$BlockedWare? then @$legality.$BlockedWare.name else 'Unknown',
+          $ActiveWare = if $policy.$Ware? then $policy.$Ware else null,
+          $ActiveWareName = if $policy.$Ware? then @$policy.$Ware.name else 'none',
+          $PoliceFaction = $legality.$BlockedPoliceFaction,
+          $PoliceFactionName = if $legality.$BlockedPoliceFaction? then @$legality.$BlockedPoliceFaction.knownname else 'Unknown',
+          $PoliceFactionId = if $legality.$BlockedPoliceFaction? and $legality.$BlockedPoliceFaction.id? then $legality.$BlockedPoliceFaction.id else 'none',
+          $Timestamp = player.age
+        ]"/>
+        <do_if value="$policy.$Ware? and $legality.$BlockedWare? and $legality.$BlockedWare == $policy.$Ware and $policy.$HomeSector? and $policy.$BuySector? and $policy.$SellSector?">
+          <run_script name="'lib.gt.pathfinding'" result="$cacheBust">
+            <param name="mode" value="'invalidate_route_legality_cache'"/>
+            <param name="ship" value="$ship"/>
+            <param name="homeSector" value="$policy.$HomeSector"/>
+            <param name="buySector" value="$policy.$BuySector"/>
+            <param name="sellSector" value="$policy.$SellSector"/>
+            <param name="ware" value="$policy.$Ware"/>
+            <param name="allowIllegal" value="true"/>
+            <param name="enforceRouteIllegalLegality" value="true"/>
+            <param name="startSector" value="if $policy.$RouteStart? then $policy.$RouteStart else (if $ship.sector? then $ship.sector else $policy.$BuySector)"/>
+            <param name="blacklistGroup" value="if $blacklistGroup? then $blacklistGroup else blacklistgroup.civilian"/>
+          </run_script>
+          <set_value name="$result.$CacheInvalidated" exact="if $cacheBust.$Invalidated? then $cacheBust.$Invalidated else false"/>
+        </do_if>
+        <remove_value name="global.$GT_Ships.{$ship}.$ActiveTradePolicy"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-RouteEnforce] BLOCK ' + $ship.idcode + ': next=' + @$checkSector.knownname + ', ware=' + (if $legality.$BlockedWare? then @$legality.$BlockedWare.name else 'null') + ', police=' + (if $legality.$BlockedPoliceFaction? then @$legality.$BlockedPoliceFaction.id else 'null') + ', cacheBust=' + $result.$CacheInvalidated" chance="100"/>
+        </do_if>
+        <return value="$result"/>
+      </do_if>
+
+      <!-- ================================================================= -->
       <!-- MODE: route_legality                                              -->
       <!-- ================================================================= -->
       <do_if value="$mode == 'route_legality'">
@@ -144,6 +318,12 @@
           <set_value name="$resolvedBlacklistGroup" exact="blacklistgroup.civilian"/>
         </do_if>
 
+        <!-- Phase B (R2): align highway flag with vanilla DockAndWait / move.generic -->
+        <set_value name="$useLocalHighways" exact="true"/>
+        <do_if value="$ship? and ($ship.isclass.ship_l or $ship.isclass.ship_xl)">
+          <set_value name="$useLocalHighways" exact="false"/>
+        </do_if>
+
         <!-- Build route sectors: ship/start -> buy -> sell -->
         <set_value name="$routeSectors" exact="[]"/>
         <set_value name="$lastRouteSector" exact="null"/>
@@ -152,7 +332,7 @@
 
         <set_value name="$pathToBuy" exact="[]"/>
         <do_if value="$routeStart != $buySector">
-          <get_jump_path component="$pathToBuy" multiple="true" uselocalhighways="true" useblacklist="$resolvedBlacklistGroup" refobject="$ship" useknownpath="$ship.isplayerowned">
+          <get_jump_path component="$pathToBuy" multiple="true" uselocalhighways="$useLocalHighways" useblacklist="$resolvedBlacklistGroup" refobject="$ship" useknownpath="$ship.isplayerowned">
             <start object="$ship"/>
             <end object="$buySector"/>
           </get_jump_path>
@@ -191,7 +371,7 @@
 
         <set_value name="$pathToSell" exact="[]"/>
         <do_if value="$buySector != $sellSector">
-          <get_jump_path component="$pathToSell" multiple="true" uselocalhighways="true" useblacklist="$resolvedBlacklistGroup" refobject="$ship" useknownpath="$ship.isplayerowned">
+          <get_jump_path component="$pathToSell" multiple="true" uselocalhighways="$useLocalHighways" useblacklist="$resolvedBlacklistGroup" refobject="$ship" useknownpath="$ship.isplayerowned">
             <start object="$buySector"/>
             <end object="$sellSector"/>
           </get_jump_path>
@@ -383,7 +563,7 @@
       <!-- ================================================================= -->
       <!-- MODE: spaces (legacy behavior)                                    -->
       <!-- ================================================================= -->
-      <!-- Guard: lib.find.sectors.inrange requires non-null refobject. Use ship sector fallback if homeSector invalid (e.g. ship in superhighway, destroyed sector). -->
+      <do_if value="$mode == 'spaces'">
       <set_value name="$refobject" exact="$homeSector"/>
       <do_if value="not $refobject? or not $refobject.exists">
         <set_value name="$refobject" exact="if $ship? and $ship.sector? then $ship.sector else null"/>
@@ -442,6 +622,7 @@
         $ShipIsIsolated = ($spaces.count == 0)
       ]"/>
       <return value="$result"/>
+      </do_if>
     </actions>
   </attention>
 </aiscript>

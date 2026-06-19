@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8" ?>
-<aiscript name="order.mining.routine.gt" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="29">
+<aiscript name="order.mining.routine.gt" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="30">
   <!--
   This script will try to automatically supply stations and will only work with
   a valid warebasket parameter (defined via jobs). It can do gas and mineral
@@ -58,6 +58,8 @@
       <param name="autoDeployProbes" default="false" type="internal" comment="GT extension: drives the post-MiningCollect probe lifecycle (DEPLOY -> RECOVER -> BUY) ported from v8's proven baseline. After every successful mining slice the routine drops a probe on the freshly-mined asteroid field (when no operational probe is already within 64km), recovers a stale probe from the current sector when the sector is fully depleted (no basket ware shows any averagemaxyield), and signals md.GT_Maintenance.GT_DoMaintenance to refit when the bay is empty. Forwarded from order.trade.galaxyminer.xml; never edited on this internal routine, hence type='internal' (UI lives on the GalaxyMiner order)."/>
       <param name="maxresourceprobestobuy" default="0" type="internal" comment="GT extension: target number of resource probes to buy per restock trip when $autoDeployProbes is enabled. The BUY step at the END of the mining slice fires only when the ship has run out of probes (count == 0) and signals md.GT_Maintenance.GT_DoMaintenance, which then reads the slider value back from global.$GT_AIParameters.{ship}.$MaxResourceProbesToBuy and clamps it against the ship's deployable capacity. 0 disables auto-buy. Forwarded from order.trade.galaxyminer.xml's $maxResourceProbesToBuy slider; never edited on this internal routine, hence type='internal' (UI lives on the GalaxyMiner order). Param name lower-cased here because the order params framework lower-cases all keys passed via &lt;param&gt; in &lt;run_script&gt;."/>
       <param name="logbookentries" default="true" type="internal" comment="Forwarded from GalaxyMiner order setup. Controls miner queue-time logbook messages while leaving XP transfer signals active."/>
+      <param name="allowIllegal" default="false" type="internal" comment="Forwarded from GalaxyMiner order setup. When true, ship may carry/trade illegal wares."/>
+      <param name="enforceRouteIllegalLegality" default="false" type="internal" comment="Forwarded from GalaxyMiner order setup. Illegal Route Filter for sell-leg path planning."/>
       <param name="duration" default="0s" type="time" infinitevalue="0s" advanced="true" text="{1041, 10034}" comment="Duration. Only accounts for time spent executing this order.">
         <input_param name="startvalue" value="0s"/>
         <input_param name="min" value="0s"/>
@@ -301,10 +303,24 @@
       <set_value name="$logbookentries" exact="true"/>
     </do_if>
   </patch>
+  <patch sinceversion="30">
+    <do_if value="not $allowIllegal?">
+      <set_value name="$allowIllegal" exact="false"/>
+    </do_if>
+    <do_if value="not $enforceRouteIllegalLegality?">
+      <set_value name="$enforceRouteIllegalLegality" exact="false"/>
+    </do_if>
+  </patch>
   <attention min="unknown">
     <actions>
       <do_if value="not $logbookentries?">
         <set_value name="$logbookentries" exact="true"/>
+      </do_if>
+      <do_if value="not $allowIllegal?">
+        <set_value name="$allowIllegal" exact="false"/>
+      </do_if>
+      <do_if value="not $enforceRouteIllegalLegality?">
+        <set_value name="$enforceRouteIllegalLegality" exact="false"/>
       </do_if>
       <do_if value="($minbuy gt 0) and ($minbuy ge $maxbuy)">
         <debug_text text="'minbuy is greater than maxbuy. cannot find spaces. resetting minbuy to 0.'" filter="error"/>
@@ -1666,6 +1682,9 @@
           <set_value name="$sellCargoDetail" exact="'none'"/>
         </do_else>
         <set_value name="$searchHomeSector" exact="if $homebase? and $homebase.exists and $homebase.sector? then @$homebase.sector else (if $range? and $range.isclass.sector then $range else (if $range? and $range.sector? then @$range.sector else this.assignedcontrolled.sector))"/>
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.assignedcontrolled}? and global.$GT_Ships.{this.assignedcontrolled}.$ActiveTradePolicy?">
+          <remove_value name="global.$GT_Ships.{this.assignedcontrolled}.$ActiveTradePolicy"/>
+        </do_if>
         <set_value name="$searchMaxDistance" exact="$maxsell"/>
         <set_value name="$gt_distancepenalty" exact="if global.$GT_AIParameters? and global.$GT_AIParameters.{this.assignedcontrolled}? and global.$GT_AIParameters.{this.assignedcontrolled}.$DistancePenalty? then (global.$GT_AIParameters.{this.assignedcontrolled}.$DistancePenalty / 50.0) else 0.02"/>
         <set_value name="$sellOwnerFilter" exact="'any'"/>
@@ -1708,6 +1727,7 @@
         <set_value name="$sellSkipOutOfRange" exact="0"/>
         <set_value name="$sellSkipPolicy" exact="0"/>
         <set_value name="$sellSkipBlockedStation" exact="0"/>
+        <set_value name="$sellSkipRouteIllegal" exact="0"/>
         <set_value name="$sellAcceptedOffers" exact="0"/>
         <do_if value="$liveBuyOffers.count gt 0">
           <do_all exact="$liveBuyOffers.count" counter="$offerIdx">
@@ -1780,6 +1800,23 @@
               <set_value name="$sellSkipOutOfRange" operation="add"/>
               <continue/>
             </do_if>
+            <do_if value="$allowIllegal and $enforceRouteIllegalLegality">
+              <run_script name="'lib.gt.pathfinding'" result="$minerRouteLegality">
+                <param name="mode" value="'route_legality'"/>
+                <param name="ship" value="this.assignedcontrolled"/>
+                <param name="homeSector" value="$searchHomeSector"/>
+                <param name="allowIllegal" value="$allowIllegal"/>
+                <param name="enforceRouteIllegalLegality" value="$enforceRouteIllegalLegality"/>
+                <param name="startSector" value="this.assignedcontrolled.sector"/>
+                <param name="buySector" value="this.assignedcontrolled.sector"/>
+                <param name="sellSector" value="if $sellStation? and $sellStation.exists and $sellStation.sector? then @$sellStation.sector else null"/>
+                <param name="ware" value="$sellWare"/>
+              </run_script>
+              <do_if value="not $minerRouteLegality.$IsLegal">
+                <set_value name="$sellSkipRouteIllegal" operation="add"/>
+                <continue/>
+              </do_if>
+            </do_if>
             <set_value name="$distanceFactor" exact="1.0 + ($sellDistance * $gt_distancepenalty)"/>
             <!-- Convert money to numeric credits explicitly before float math to avoid money/float conversion warnings. -->
             <set_value name="$sellUnitPriceCredits" exact="(($sellOffer.unitprice / 1ct)f) / 100.0"/>
@@ -1804,7 +1841,7 @@
             <wait exact="1ms" chance="0"/>
           </do_all>
         </do_if>
-        <debug_text text="'[GT-Miner] ' + this.assignedcontrolled.idcode + ': Sell offer filtering: raw=' + $liveBuyOffers.count + ', accepted=' + $sellAcceptedOffers + ', skipNoWare=' + $sellSkipNoWare + ', skipNoAmount=' + $sellSkipNoAmount + ', skipOutOfRange=' + $sellSkipOutOfRange + ', skipPolicy=' + $sellSkipPolicy + ', skipBlockedStation=' + $sellSkipBlockedStation + ', builtTrades=' + $sellOnlyTrades.count" chance="$debugchance"/>
+        <debug_text text="'[GT-Miner] ' + this.assignedcontrolled.idcode + ': Sell offer filtering: raw=' + $liveBuyOffers.count + ', accepted=' + $sellAcceptedOffers + ', skipNoWare=' + $sellSkipNoWare + ', skipNoAmount=' + $sellSkipNoAmount + ', skipOutOfRange=' + $sellSkipOutOfRange + ', skipPolicy=' + $sellSkipPolicy + ', skipBlockedStation=' + $sellSkipBlockedStation + ', skipRouteIllegal=' + $sellSkipRouteIllegal + ', builtTrades=' + $sellOnlyTrades.count" chance="$debugchance"/>
         <do_if value="$sellOnlyTrades.count gt 0">
           <run_script name="'lib.gt.score.trades'" result="$scoreResult">
             <param name="tradeList" value="$sellOnlyTrades"/>
@@ -1815,6 +1852,24 @@
             <set_value name="$bestTrade" exact="$scoreResult.$BestTrade"/>
           </do_if>
           <do_if value="$bestTrade? and $bestTrade.$SellOffer?">
+            <set_value name="$minerBestRouteOk" exact="true"/>
+            <do_if value="$allowIllegal and $enforceRouteIllegalLegality">
+              <run_script name="'lib.gt.pathfinding'" result="$minerBestRouteLegality">
+                <param name="mode" value="'route_legality'"/>
+                <param name="ship" value="this.assignedcontrolled"/>
+                <param name="homeSector" value="$searchHomeSector"/>
+                <param name="allowIllegal" value="$allowIllegal"/>
+                <param name="enforceRouteIllegalLegality" value="$enforceRouteIllegalLegality"/>
+                <param name="startSector" value="this.assignedcontrolled.sector"/>
+                <param name="buySector" value="this.assignedcontrolled.sector"/>
+                <param name="sellSector" value="if $bestTrade.$SellStation? and $bestTrade.$SellStation.exists and $bestTrade.$SellStation.sector? then @$bestTrade.$SellStation.sector else null"/>
+                <param name="ware" value="$bestTrade.$Ware"/>
+              </run_script>
+              <do_if value="not $minerBestRouteLegality.$IsLegal">
+                <set_value name="$minerBestRouteOk" exact="false"/>
+              </do_if>
+            </do_if>
+            <do_if value="$minerBestRouteOk">
             <append_to_list name="$buyoffers" exact="$bestTrade.$SellOffer"/>
             <do_if value="$homebase? and $homebase.exists and $bestTrade.$SellStation? and $bestTrade.$SellStation == $homebase">
               <do_if value="$homebase.sector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{this.assignedcontrolled} or $homebase.sector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{this.assignedcontrolled}">
@@ -1822,6 +1877,7 @@
               </do_if>
             </do_if>
             <debug_text text="'[GT-Miner] %s using GT pipeline: selling to %s (distance=%s, score=%s)'.[this.assignedcontrolled.idcode, $bestTrade.$SellStation.knownname, $bestTrade.$Distance, $bestTrade.$Score]" chance="$debugchance"/>
+            </do_if>
           </do_if>
         </do_if>
         <do_if value="$sellOnlyTrades.count gt 0 and not $buyoffers.count">
@@ -1888,6 +1944,26 @@
               ]"/>
             </do_if>
             <create_trade_order name="$tradeorder" object="this.object" tradeoffer="$buyoffer" amount="$amount" internal="$tradeorder_internal" immediate="true"/>
+            <do_if value="$allowIllegal and $enforceRouteIllegalLegality">
+              <do_if value="not global.$GT_Ships?">
+                <set_value name="global.$GT_Ships" exact="table[]"/>
+              </do_if>
+              <do_if value="not global.$GT_Ships.{this.assignedcontrolled}?">
+                <set_value name="global.$GT_Ships.{this.assignedcontrolled}" exact="table[]"/>
+              </do_if>
+              <set_value name="global.$GT_Ships.{this.assignedcontrolled}.$ActiveTradePolicy" exact="table[
+                $AllowIllegal = $allowIllegal,
+                $EnforceRouteIllegalLegality = $enforceRouteIllegalLegality,
+                $Ware = $resource_ware,
+                $BuySector = this.assignedcontrolled.sector,
+                $SellSector = if $resource_buyer? and $resource_buyer.exists and $resource_buyer.sector? then @$resource_buyer.sector else null,
+                $HomeSector = $searchHomeSector,
+                $RouteStart = this.assignedcontrolled.sector,
+                $Leg = 'sell',
+                $LogbookEntries = $logbookentries,
+                $SetAt = player.age
+              ]"/>
+            </do_if>
             <!-- if we are now actually selling, remove any virtual reservation for this ware as we have a real one as part of the trade order -->
             <remove_ware_reservation object="$resource_buyer" reserver="this.assignedcontrolled" type="sell" virtual="true" ware="$resource_ware"/>
             <remove_value name="$resource_buyer" />
@@ -1984,5 +2060,8 @@
       <edit_order_param order="$thisorder" param="'duration'" value="[$duration - (player.age - $time_start), 1s].max"/>
     </do_if>
     <do_if value="this.$gtNextProbeResupplyAt?"><remove_value name="this.$gtNextProbeResupplyAt"/></do_if>
+    <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.assignedcontrolled}.$ActiveTradePolicy?">
+      <remove_value name="global.$GT_Ships.{this.assignedcontrolled}.$ActiveTradePolicy"/>
+    </do_if>
   </on_abort>
 </aiscript>

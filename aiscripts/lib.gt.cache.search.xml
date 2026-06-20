@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<aiscript name="lib.gt.cache.search" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
+<aiscript name="lib.gt.cache.search" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="3">
   <params>
     <param name="ship" default="this.ship"/>
     <param name="searchMode" default="'buy_and_sell'"/>
@@ -30,6 +30,11 @@
     <param name="requireNonPlayerDeliveryStation" default="false"/>
     <param name="debugchance" default="0"/>
   </params>
+  <patch sinceversion="3">
+    <do_if value="not this.$gt_yieldMs?">
+      <set_value name="this.$gt_yieldMs" exact="1"/>
+    </do_if>
+  </patch>
   <attention min="unknown">
     <actions>
       <create_list name="$tradeList"/>
@@ -56,17 +61,50 @@
         ]"/>
       </do_if>
 
+      <set_value name="$maxDistanceBuyLeg" exact="if $maxDistanceBuy? and $maxDistanceBuy gt 0 then $maxDistanceBuy else $maxDistance"/>
+      <set_value name="$maxDistanceSellLeg" exact="if $maxDistanceSell? and $maxDistanceSell gt 0 then $maxDistanceSell else $maxDistance"/>
+      <!-- If cache was populated with a smaller search radius than this ship needs, treat as miss
+           so live search (with completion pass) can find trades outside the cached radius. -->
+      <set_value name="$cacheMaxDistanceMeta" exact="0"/>
+      <do_if value="global.$GT_TradeCacheMaxDistance? and global.$GT_TradeCacheMaxDistance.{$homeSector}?">
+        <set_value name="$cacheMaxDistanceMeta" exact="global.$GT_TradeCacheMaxDistance.{$homeSector}"/>
+      </do_if>
+      <set_value name="$requiredSearchRadius" exact="[$maxDistanceBuyLeg, $maxDistanceSellLeg].max"/>
+      <do_if value="$cacheMaxDistanceMeta gt 0 and $cacheMaxDistanceMeta lt $requiredSearchRadius">
+        <return value="table[
+          $Found = false,
+          $BestTrade = null,
+          $BestScore = 0,
+          $TradeList = $tradeList
+        ]"/>
+      </do_if>
+
       <set_value name="$now" exact="player.age"/>
       <set_value name="$foundCount" exact="0"/>
       <set_value name="$isSellOnlySearch" exact="$searchMode == 'sell_only'"/>
       <set_value name="$wareBasketCount" exact="if $wareBasket? and typeof $wareBasket == datatype.list then $wareBasket.count else 0"/>
       <set_value name="$isIsolatedMode" exact="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?"/>
       <set_value name="$cargoUtilThresholdPct" exact="[10,[$minCargoUtilPercent,100].min].max"/>
-      <set_value name="$maxDistanceBuyLeg" exact="if $maxDistanceBuy? and $maxDistanceBuy gt 0 then $maxDistanceBuy else $maxDistance"/>
-      <set_value name="$maxDistanceSellLeg" exact="if $maxDistanceSell? and $maxDistanceSell gt 0 then $maxDistanceSell else $maxDistance"/>
+      <!-- Per-ware diversification: each ware gets a slice of the result window so low-score
+           wares (e.g. small remainder deliveries) are not crowded out by a few dominant wares. -->
+      <set_value name="$foundPerWare" exact="table[]"/>
+      <set_value name="$maxTradesPerWareSetting" exact="20"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxTradesPerWare?">
+        <set_value name="$maxTradesPerWareSetting" exact="@global.$GT_GlobalSettings.$Performance.$MaxTradesPerWare"/>
+      </do_if>
+      <do_if value="$maxTradesPerWareSetting lt 1">
+        <set_value name="$maxTradesPerWareSetting" exact="1"/>
+      </do_if>
+      <set_value name="$perWareCap" exact="$maxTradesPerWareSetting"/>
+      <do_if value="$wareBasketCount gt 0">
+        <set_value name="$perWareCapFromBudget" exact="[1, ($maxEntries / $wareBasketCount)i].max"/>
+        <set_value name="$perWareCap" exact="[$perWareCapFromBudget, $maxTradesPerWareSetting].min"/>
+      </do_if>
+      <do_else>
+        <set_value name="$perWareCap" exact="[2, [$maxTradesPerWareSetting, 5].min].max"/>
+      </do_else>
       <!-- Iterate start-to-end (cache is sorted by Score descending via lib.gt.cache.write).
-           Best trades are at the front — first $maxEntries that pass filters are the best available.
-           Stop when we've found $maxEntries valid trades OR exhausted all entries. -->
+           Collect up to $perWareCap valid trades per ware until $maxEntries total OR cache exhausted. -->
       <!-- NOTE: $homeCacheCount is a snapshot; the list can shrink mid-loop (MD purge/cleanup
            runs while this AI script yields). Guard with bounds check before access. -->
       <do_all exact="$homeCacheCount" counter="$i">
@@ -275,10 +313,21 @@
              Skip entries where offeramount.{ship} is 0 — station capacity is fully reserved
              by other ships' pending trades. Without this check, the scanner would return 50
              entries all pointing to saturated stations while valid entries deeper in the cache
-             go unseen. This replaces the old per-ware limit's natural diversification effect. -->
+             go unseen. Per-ware quota below restores diversification without skipping saturated entries entirely. -->
         <do_if value="not $entry.$IsSellOnly?">
           <do_if value="$entry.$BuyOffer? and @$entry.$BuyOffer.exists">
             <set_value name="$preCheckBuyAmt" exact="@$entry.$BuyOffer.offeramount.{$ship}"/>
+            <!-- Parity with lib.gt.tradematch supply-mode: player delivery stations often have
+                 offeramount.{ship}=0 while cargo target-count still shows real need. -->
+            <do_if value="(not $preCheckBuyAmt? or $preCheckBuyAmt le 0) and $requirePlayerDeliveryStation and $entrySellStation? and $entrySellStation.exists">
+              <set_value name="$preCheckBuyWare" exact="if $entry.$Ware? then $entry.$Ware else null"/>
+              <do_if value="not $preCheckBuyWare? and @$entry.$BuyOffer.ware != null">
+                <set_value name="$preCheckBuyWare" exact="@$entry.$BuyOffer.ware"/>
+              </do_if>
+              <do_if value="$preCheckBuyWare?">
+                <set_value name="$preCheckBuyAmt" exact="[0, $entrySellStation.cargo.{$preCheckBuyWare}.target - $entrySellStation.cargo.{$preCheckBuyWare}.count].max"/>
+              </do_if>
+            </do_if>
             <do_if value="not $preCheckBuyAmt? or $preCheckBuyAmt le 0">
               <continue/>
             </do_if>
@@ -322,9 +371,27 @@
           </do_if>
         </do_if>
 
+        <!-- Per-ware quota gate (after all filters — only count shippable candidates). -->
+        <set_value name="$quotaWare" exact="if $entry.$Ware? then $entry.$Ware else null"/>
+        <do_if value="not $quotaWare? and $entry.$BuyOffer? and @$entry.$BuyOffer.exists and @$entry.$BuyOffer.ware != null">
+          <set_value name="$quotaWare" exact="@$entry.$BuyOffer.ware"/>
+        </do_if>
+        <do_if value="not $quotaWare? and $entry.$SellOffer? and @$entry.$SellOffer.exists and @$entry.$SellOffer.ware != null">
+          <set_value name="$quotaWare" exact="@$entry.$SellOffer.ware"/>
+        </do_if>
+        <do_if value="$quotaWare?">
+          <set_value name="$quotaWareFoundCount" exact="if $foundPerWare.{$quotaWare}? then $foundPerWare.{$quotaWare} else 0"/>
+          <do_if value="$quotaWareFoundCount ge $perWareCap">
+            <continue/>
+          </do_if>
+        </do_if>
+
         <!-- Entry passed all filters -->
         <append_to_list name="$tradeList" exact="$entry"/>
         <set_value name="$foundCount" operation="add"/>
+        <do_if value="$quotaWare?">
+          <set_value name="$foundPerWare.{$quotaWare}" exact="if $foundPerWare.{$quotaWare}? then ($foundPerWare.{$quotaWare} + 1) else 1"/>
+        </do_if>
         <do_if value="$entry.$Score gt $bestScore">
           <set_value name="$bestScore" exact="$entry.$Score"/>
           <set_value name="$bestTrade" exact="$entry"/>

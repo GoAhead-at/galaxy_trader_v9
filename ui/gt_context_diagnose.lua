@@ -18,6 +18,7 @@ local C = ffi.C
 ffi.cdef[[
     typedef uint64_t UniverseID;
     UniverseID GetPlayerID(void);
+    bool CopyToClipboard(const char*const text);
 ]]
 
 local menu = Helper.getMenu("MapMenu")
@@ -111,6 +112,76 @@ function gtDiagnose.parseReport()
 
     DebugError(string.format("[GT Diagnose] Parsed %d sections", #gtDiagnose.sections))
     return #gtDiagnose.sections > 0
+end
+
+--- Flatten the full parsed report into plain text for clipboard / bug reports.
+function gtDiagnose.buildPlainTextReport()
+    local lines = {}
+    table.insert(lines, string.format(
+        "MK3 Diagnostic Report: %s (%s)",
+        tostring(gtDiagnose.shipName), tostring(gtDiagnose.shipId)))
+    table.insert(lines, string.format("Game time: %.0fs", gtDiagnose.timestamp or 0))
+    table.insert(lines, "")
+
+    for _, section in ipairs(gtDiagnose.sections) do
+        table.insert(lines, "=== " .. tostring(section.name or "?") .. " ===")
+        local numCols = section.numCols or 3
+        if numCols >= 6 then
+            table.insert(lines, "Status | Col1 | Col2 | Col3 | Col4 | Col5")
+        else
+            table.insert(lines, "Check | Status | Detail")
+        end
+
+        for _, row in ipairs(section.rows or {}) do
+            if row.col4 then
+                table.insert(lines, string.format(
+                    "%s | %s | %s | %s | %s | %s",
+                    tostring(row.status or ""),
+                    tostring(row.check or ""),
+                    tostring(row.detail or ""),
+                    tostring(row.col4 or ""),
+                    tostring(row.col5 or ""),
+                    tostring(row.col6 or "")))
+            else
+                table.insert(lines, string.format(
+                    "%s | %s | %s",
+                    tostring(row.check or ""),
+                    tostring(row.status or ""),
+                    tostring(row.detail or "")))
+            end
+        end
+        table.insert(lines, "")
+    end
+
+    return table.concat(lines, "\n")
+end
+
+function gtDiagnose.copyReportToClipboard()
+    if #gtDiagnose.sections == 0 and not gtDiagnose.parseReport() then
+        DebugError("[GT Diagnose] Copy failed: no report data")
+        return false
+    end
+
+    local text = gtDiagnose.buildPlainTextReport()
+    local success = C.CopyToClipboard(text)
+    if success then
+        DebugError(string.format("[GT Diagnose] Report copied to clipboard (%d chars)", #text))
+    else
+        DebugError("[GT Diagnose] CopyToClipboard failed")
+    end
+    return success
+end
+
+--- Copy button row for scrollable content tables (addRow(true) is invalid in fixed header tables).
+function gtDiagnose.addCopyReportRow(tbl, columnCount)
+    local row = tbl:addRow(true, { fixed = true, bgColor = GT_UI.COLORS.headerBg })
+    row[1]:setColSpan(columnCount)
+    GT_UI.createButton(row[1], "Copy Report", {
+        fontSize = Helper.standardFontSize * 0.85,
+        onClick  = function()
+            gtDiagnose.copyReportToClipboard()
+        end,
+    })
 end
 
 -- =============================================================================
@@ -440,6 +511,8 @@ function gtDiagnose.populateFrame(frame)
             end
         end
 
+        gtDiagnose.addCopyReportRow(contentTable, 6)
+
         -- Footer
         GT_UI.addFooterRow(contentTable,
             string.format("Report at game time %.0fs  |  %d rows  |  %d sections total",
@@ -494,6 +567,8 @@ function gtDiagnose.populateFrame(frame)
             gtDiagnose.currentPage = newPage
             gtDiagnose.createAndDisplayFrame()
         end)
+
+        gtDiagnose.addCopyReportRow(contentTable, 3)
 
         -- Footer
         GT_UI.addFooterRow(contentTable,

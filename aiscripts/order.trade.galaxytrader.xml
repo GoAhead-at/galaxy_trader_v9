@@ -3821,21 +3821,6 @@
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': REACHED trade_found label - starting blacklist validation at game time ' + player.age" chance="100"/>
       </do_if>
       
-      <!-- FAST MONEY CHECK: Short-circuit the expensive 20-trade validation loop when player
-           money has dropped below the threshold since this ship's search started.
-           Checks static threshold (MinPlayerMoney + 1000 buffer) OR global money cap. -->
-      <do_if value="not this.$minPlayerMoney?">
-        <run_script name="'lib.gt.attention.min_player_money'" result="this.$minPlayerMoney"/>
-      </do_if>
-      <set_value name="$fastMoneyThreshold" exact="(this.$minPlayerMoney + 1000)Cr"/>
-      <do_if value="player.money le $fastMoneyThreshold or (global.$GT_MoneyCapActive? and global.$GT_MoneyCapActive and player.money le global.$GT_MoneyCapMoney)">
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FAST MONEY CHECK at trade_found: player.money=' + (player.money / 100) + ' Cr, threshold=' + (this.$minPlayerMoney + 1000) + ' Cr, globalCap=' + (if global.$GT_MoneyCapActive? and global.$GT_MoneyCapActive then (global.$GT_MoneyCapMoney / 100) else 'off') + ' - skipping validation, backing off'" chance="100"/>
-        </do_if>
-        <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
-        <resume label="no_trade_retry"/>
-      </do_if>
-      
       <!-- Initialize validation variables BEFORE do_if block to ensure they always exist -->
       <set_value name="$validTradeFound" exact="false"/>
       <set_value name="$pendingTrade" exact="null"/>
@@ -3889,6 +3874,40 @@
       <set_value name="$tradeListCountForDebug" exact="if $tradeList != null then $tradeList.count else 0"/>
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Received ' + $tradeListCountForDebug + ' trades to validate (source: ' + (if $searchMethod == 'cache' then 'CACHE' else if $searchMethod == 'live' then 'LIVE' else if $searchMethod != '' then $searchMethod else 'UNKNOWN') + ')'" chance="100"/>
+      </do_if>
+
+      <!-- FAST MONEY CHECK: Short-circuit validation when player money is exhausted.
+           MK3 IPP player-supplier trades treat the buy leg as zero player-economy cost (see
+           lib.gt.tradematch.xml $PlayerFreeSupplier) — skip this gate when such a candidate exists. -->
+      <set_value name="$tradeListHasIppPlayerSupplier" exact="false"/>
+      <set_value name="$fastMoneyIppEnabled" exact="if this.$effectiveIgnorePlayerPricing? then this.$effectiveIgnorePlayerPricing else false"/>
+      <do_if value="$fastMoneyIppEnabled and $tradeList.count gt 0">
+        <do_all exact="$tradeList.count" counter="$ippScanIdx">
+          <set_value name="$ippScanTrade" exact="$tradeList.{$ippScanIdx}"/>
+          <do_if value="$ippScanTrade? and not ($ippScanTrade.$IsSellOnly? and $ippScanTrade.$IsSellOnly)">
+            <do_if value="$ippScanTrade.$PlayerFreeSupplier? and $ippScanTrade.$PlayerFreeSupplier">
+              <set_value name="$tradeListHasIppPlayerSupplier" exact="true"/>
+              <break/>
+            </do_if>
+            <do_if value="not $tradeListHasIppPlayerSupplier and $ippScanTrade.$BuyOffer? and @$ippScanTrade.$BuyOffer.owner.isplayerowned">
+              <set_value name="$tradeListHasIppPlayerSupplier" exact="true"/>
+              <break/>
+            </do_if>
+          </do_if>
+        </do_all>
+      </do_if>
+      <do_if value="not $tradeListHasIppPlayerSupplier">
+        <do_if value="not this.$minPlayerMoney?">
+          <run_script name="'lib.gt.attention.min_player_money'" result="this.$minPlayerMoney"/>
+        </do_if>
+        <set_value name="$fastMoneyThreshold" exact="(this.$minPlayerMoney + 1000)Cr"/>
+        <do_if value="player.money le $fastMoneyThreshold or (global.$GT_MoneyCapActive? and global.$GT_MoneyCapActive and player.money le global.$GT_MoneyCapMoney)">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FAST MONEY CHECK at trade_found: player.money=' + (player.money / 100) + ' Cr, threshold=' + (this.$minPlayerMoney + 1000) + ' Cr, globalCap=' + (if global.$GT_MoneyCapActive? and global.$GT_MoneyCapActive then (global.$GT_MoneyCapMoney / 100) else 'off') + ' - skipping validation, backing off'" chance="100"/>
+          </do_if>
+          <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
+          <resume label="no_trade_retry"/>
+        </do_if>
       </do_if>
       
       <!-- Cap extra cache-detail logs to avoid spam -->
@@ -5895,7 +5914,17 @@
                so player.money is guaranteed to reflect all prior create_trade_order deductions.
                Mechanic 1: If the full trade would drain below MinPlayerMoney, reduce volume
                to fit (player.money - MinPlayerMoney). If even 1 unit is unaffordable, block
-               and back off via no_trade_retry with insufficient_funds. -->
+               and back off via no_trade_retry with insufficient_funds.
+               MK3 IPP player-supplier pairs skip this gate: buy-leg credits stay in the player
+               economy (matches lib.gt.tradematch.xml scoring and logbook Money=0 semantics). -->
+          <set_value name="$ippPlayerSupplier" exact="false"/>
+          <do_if value="$pendingTrade.$PlayerFreeSupplier? and $pendingTrade.$PlayerFreeSupplier">
+            <set_value name="$ippPlayerSupplier" exact="true"/>
+          </do_if>
+          <do_elseif value="this.$effectiveIgnorePlayerPricing? and not $isSellOnlyTradeForPending and $pendingTrade.$BuyOffer? and @$pendingTrade.$BuyOffer.owner.isplayerowned">
+            <set_value name="$ippPlayerSupplier" exact="true"/>
+          </do_elseif>
+          <do_if value="not $ippPlayerSupplier">
           <set_value name="$aiBuyPrice" exact="0"/>
           <do_if value="$pendingTrade.$BuyOffer? and $pendingTrade.$BuyOffer.unitprice?">
             <set_value name="$aiBuyPrice" exact="$pendingTrade.$BuyOffer.unitprice"/>
@@ -5943,6 +5972,7 @@
               <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
               <resume label="no_trade_retry"/>
             </do_else>
+          </do_if>
           </do_if>
 
           <!-- Vanilla pattern (order.trade.routine): queue SELL first as immediate,

@@ -486,6 +486,12 @@
       <signal_objects object="player.galaxy" param="'GT_Check_Maintenance'" param2="table[$Ship = this.ship]"/>
       <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield"/>
 
+      <!-- Leftover cargo must be cleared before supply or export search — otherwise cancelled
+           load/sell pairs leave cargo aboard and STEP 2c/4+ queue fresh buy/sell orders. -->
+      <do_if value="this.ship.cargo.count gt 0">
+        <resume label="mk1_clearance"/>
+      </do_if>
+
       <!-- ============================================================== -->
       <!-- STEP 2b: Supply mode — affordability + threshold check         -->
       <!-- ============================================================== -->
@@ -533,7 +539,7 @@
       <!-- ============================================================== -->
       <!-- STEP 2c: Priority supply phase (runs before sell when urgent)  -->
       <!-- ============================================================== -->
-      <do_if value="this.$supplyPriority">
+      <do_if value="this.$supplyPriority and this.ship.cargo.count == 0">
         <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': === SUPPLY PHASE START (priority) ==='" chance="this.$debugchance"/>
         <set_command_action commandaction="commandaction.searchingtrades"/>
 
@@ -900,6 +906,7 @@
       <!-- ============================================================== -->
       <!-- STEP 3: Handle leftover cargo from interrupted trades          -->
       <!-- ============================================================== -->
+      <label name="mk1_clearance"/>
       <set_value name="$hasLeftoverCargo" exact="this.ship.cargo.count gt 0"/>
       <do_if value="$hasLeftoverCargo">
         <set_command_action commandaction="commandaction.executingtrade"/>
@@ -992,6 +999,12 @@
             </interrupt>
           </wait>
         </do_if>
+        <!-- Orders finished or cancelled but cargo remains — retry clearance; do not export/supply. -->
+        <do_if value="this.ship.cargo.count gt 0">
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Leftover cargo remains after clearance attempt — retrying (skip export/supply until empty)'" chance="this.$debugchance"/>
+          <wait exact="10s" comment="Backoff before retrying clearance buyer search"/>
+          <resume label="main_loop"/>
+        </do_if>
       </do_if>
 
       <!-- Clear clearance flag as soon as cargo is empty so ship state/name reverts immediately. -->
@@ -1007,6 +1020,10 @@
             $nameType = 'trader'
           ]"/>
         </do_if>
+      </do_if>
+
+      <do_if value="this.ship.cargo.count gt 0">
+        <resume label="main_loop"/>
       </do_if>
 
       <!-- ============================================================== -->
@@ -1242,6 +1259,22 @@
         <set_value name="$mk1SellPriceMax" exact="if global.$GT_Config.$Trading.$SellPriceMax? then @global.$GT_Config.$Trading.$SellPriceMax else 1.0"/>
         <set_value name="$mk1BuyPriceMin" exact="if global.$GT_Config.$Trading.$BuyPriceMin? then @global.$GT_Config.$Trading.$BuyPriceMin else -0.9"/>
       </do_if>
+
+      <!-- Resolve home-station sell offers before buyer scan so live search can rank buyers by estimated profit. -->
+      <create_list name="$stationSellOffers"/>
+      <do_all exact="$effectiveWares.count" counter="$ewi">
+        <set_value name="$ware" exact="$effectiveWares.{$ewi}"/>
+        <do_if value="this.$ignoretraderules">
+          <find_sell_offer seller="this.$homeStation" wares="$ware" result="$stationSellOffer"/>
+        </do_if>
+        <do_else>
+          <find_sell_offer seller="this.$homeStation" wares="$ware" tradepartner="this.ship" result="$stationSellOffer"/>
+        </do_else>
+        <do_if value="$stationSellOffer.available and $stationSellOffer.amount gt 0">
+          <append_to_list name="$stationSellOffers" exact="$stationSellOffer"/>
+        </do_if>
+      </do_all>
+
       <run_script name="'lib.gt.live.search'" result="$sellLiveResult">
         <param name="ship" value="this.ship"/>
         <param name="searchMode" value="'sell_only'"/>
@@ -1256,6 +1289,9 @@
         <param name="ignoreMK1Supply" value="false"/>
         <param name="sellPriceMax" value="$mk1SellPriceMax"/>
         <param name="buyPriceMin" value="$mk1BuyPriceMin"/>
+        <param name="sourceSellOffers" value="$stationSellOffers"/>
+        <param name="scoreAwareBuyCap" value="true"/>
+        <param name="distancePenalty" value="0.1"/>
         <param name="debugchance" value="this.$debugchance"/>
       </run_script>
 
@@ -1281,20 +1317,6 @@
           </do_all>
         </do_if>
       </do_else>
-
-      <create_list name="$stationSellOffers"/>
-      <do_all exact="$effectiveWares.count" counter="$ewi">
-        <set_value name="$ware" exact="$effectiveWares.{$ewi}"/>
-        <do_if value="this.$ignoretraderules">
-          <find_sell_offer seller="this.$homeStation" wares="$ware" result="$stationSellOffer"/>
-        </do_if>
-        <do_else>
-          <find_sell_offer seller="this.$homeStation" wares="$ware" tradepartner="this.ship" result="$stationSellOffer"/>
-        </do_else>
-        <do_if value="$stationSellOffer.available and $stationSellOffer.amount gt 0">
-          <append_to_list name="$stationSellOffers" exact="$stationSellOffer"/>
-        </do_if>
-      </do_all>
 
       <set_value name="$mk1SellOfferStr" exact="''"/>
       <do_all exact="$stationSellOffers.count" counter="$msoi">
@@ -1443,7 +1465,7 @@
         <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': No sell trades found'" chance="this.$debugchance"/>
 
         <!-- If supply is enabled and not skipped, try opportunistic supply before waiting -->
-        <do_if value="this.$supply and not this.$supplySkipped and not this.$supplyPriority and not this.$mk1_opportunisticSupplyTried">
+        <do_if value="this.$supply and not this.$supplySkipped and not this.$supplyPriority and not this.$mk1_opportunisticSupplyTried and this.ship.cargo.count == 0">
           <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': No sells — attempting opportunistic supply (one-shot before fallback)'" chance="this.$debugchance"/>
           <set_value name="this.$mk1_opportunisticSupplyTried" exact="true"/>
           <set_value name="this.$supplyPriority" exact="true"/>
@@ -2082,7 +2104,7 @@
       <!-- ============================================================== -->
       <!-- STEP 11: Opportunistic supply (after sell, if enabled)         -->
       <!-- ============================================================== -->
-      <do_if value="this.$supply and not this.$supplySkipped and not this.$supplyPriority">
+      <do_if value="this.$supply and not this.$supplySkipped and not this.$supplyPriority and this.ship.cargo.count == 0">
         <!-- Check if any resource is below target (not threshold — just below target) -->
         <set_value name="$needsSupply" exact="false"/>
         <set_value name="$stationResources" exact="this.$homeStation.resources.list"/>

@@ -22,6 +22,54 @@
       </actions>
     </cue>
     
+    <!-- Trading Academy save/load recovery: re-dispatch DockAndTrain when
+         $AcademyEnrollment persisted but the ship lost its training order. -->
+    <cue name="RecoverAcademyEnrollmentsOnLoad" instantiate="true" version="1">
+      <conditions>
+        <event_game_loaded/>
+        <check_value value="global.$GT_Config?"/>
+      </conditions>
+      <delay exact="2s"/>
+      <actions>
+        <do_if value="global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
+          <do_all exact="global.$GT_Pilots.keys.count" counter="$pi">
+            <set_value name="$pilot" exact="global.$GT_Pilots.keys.{$pi}"/>
+            <do_if value="global.$GT_Pilots.{$pilot}.$AcademyEnrollment?">
+              <set_value name="$ship" exact="null"/>
+              <do_if value="global.$GT_Pilots.{$pilot}.$Ship? and global.$GT_Pilots.{$pilot}.$Ship.exists">
+                <set_value name="$ship" exact="global.$GT_Pilots.{$pilot}.$Ship"/>
+              </do_if>
+              <do_if value="$ship? and $ship.pilot? and $ship.pilot == $pilot">
+                <set_value name="$hasDockAndTrain" exact="false"/>
+                <do_if value="$ship.orders?">
+                  <do_all exact="$ship.orders.count" counter="$oi">
+                    <do_if value="@$ship.orders.{$oi}.id == 'DockAndTrain'">
+                      <set_value name="$hasDockAndTrain" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                </do_if>
+                <do_if value="not $hasDockAndTrain">
+                  <set_value name="global.$GT_Pilots.{$pilot}.$ManualTrainingRequested" exact="true"/>
+                  <set_value name="global.$GT_Pilots.{$pilot}.$TrainingState" exact="'manual_training_queued'"/>
+                  <remove_value name="global.$GT_Pilots.{$pilot}.$TrainingStarted"/>
+                  <remove_value name="global.$GT_Pilots.{$pilot}.$TrainingDuration"/>
+                  <remove_value name="global.$GT_Pilots.{$pilot}.$TrainingStation"/>
+                  <signal_objects object="player.galaxy" param="'GT_Training_Needed'" param2="table[
+                    $Ship = $ship,
+                    $Pilot = $pilot
+                  ]"/>
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT Academy] Load recovery: re-dispatching academy training for ' + $pilot.name + ' on ship ' + $ship.idcode" chance="100"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+      </actions>
+    </cue>
+    
     <!-- Pilot Registration -->
     <cue name="RegisterPilot" instantiate="true">
       <conditions>
@@ -790,15 +838,12 @@
             <set_value name="$isAcademyEnrollment" exact="global.$GT_Pilots.{$pilot}.$AcademyEnrollment?"/>
 
             <!-- Idempotency guard: HandleStartTraining is the canonical entry
-                 point for AI-driven dock.train flows and ALWAYS runs before
-                 the ship docks (it listens for GT_Start_Training emitted in
-                 the order.dock.train.xml init). For NPC traders that fully
-                 handles the academy course (cost deduction, $TrainingDuration,
-                 ship-name update). InitiateTraining only fires when the
-                 player avatar docks, so for the rare case of a
-                 player-piloted academy ship we'd otherwise double-charge and
-                 overwrite the locked-in duration. Skip the cost+state work
-                 when HandleStartTraining already stamped $CostPaid. -->
+                 point for AI-driven dock.train flows and runs after the ship
+                 docks (GT_Start_Training is emitted post-dock in
+                 order.dock.train.xml). InitiateTraining only fires when the
+                 player avatar docks on a player-piloted trader; skip duplicate
+                 cost+state work when HandleStartTraining already stamped
+                 $CostPaid, and defer unpaid academy enrollments entirely. -->
             <set_value name="$alreadyProcessedByStart" exact="false"/>
             <do_if value="$isAcademyEnrollment and global.$GT_Pilots.{$pilot}.$AcademyEnrollment.$CostPaid?">
               <set_value name="$alreadyProcessedByStart" exact="true"/>
@@ -891,6 +936,12 @@
                    academy enrollments. The debug log inside the
                    $alreadyProcessedByStart computation above is sufficient. -->
             </do_if>
+            <do_elseif value="$canAffordTraining and $isAcademyEnrollment">
+              <!-- Unpaid academy: HandleStartTraining owns payment + state. -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GalaxyTrader MK3] InitiateTraining: deferring academy enrollment for ' + $pilot.name + ' to HandleStartTraining (post-dock canonical path)'" chance="100"/>
+              </do_if>
+            </do_elseif>
             <do_elseif value="$canAffordTraining">
               <!-- Deduct training cost from player account -->
               <reward_player money="-$trainingCostMoney"/>
@@ -1554,14 +1605,13 @@
     <!-- Start Training Signal Handler.
 
          Fires when order.dock.train.xml signals 'GT_Start_Training' to
-         player.galaxy at the start of the dock+train AI flow. This is the
-         CANONICAL entry point for both NPC trader training and Trading
-         Academy enrollments because the AI script always emits this signal
-         regardless of whether the player avatar is on board. The sibling
-         InitiateTraining cue only fires for player.entity dock events
-         (i.e. the player piloting the trader themselves) and treats this
-         cue as authoritative when a marker indicates HandleStartTraining
-         already processed the academy course. -->
+         player.galaxy after the ship has successfully docked at the training
+         station. This is the CANONICAL entry point for both NPC trader
+         training and Trading Academy enrollments because the AI script always
+         emits this signal post-dock. The sibling InitiateTraining cue only
+         fires for player.entity dock events (i.e. the player piloting the
+         trader themselves) and treats this cue as authoritative when a marker
+         indicates HandleStartTraining already processed the academy course. -->
     <cue name="HandleStartTraining" instantiate="true">
       <conditions>
         <event_object_signalled object="player.galaxy" param="'GT_Start_Training'" comment="Handle training start request"/>
@@ -1717,11 +1767,12 @@
             <!-- Sufficient funds (or natural training): proceed normally.  -->
             <!-- ========================================================== -->
             
-            <!-- Deduct the academy fee here, on actual dock.train start, so
-                 that the player only pays once the course is committed to
-                 the engine. Mark the enrollment as paid so the sibling
-                 InitiateTraining cue (player-avatar dock case) does not
-                 deduct a second time.
+            <!-- Deduct the academy fee here, on successful dock, so the player
+                 only pays once the course is committed at the station. Mark
+                 the enrollment as paid so the sibling InitiateTraining cue
+                 (player-avatar dock case) does not deduct a second time.
+                 Skip payment when $CostPaid is already set (save/load retry or
+                 legacy saves that were charged before the post-dock fix).
                  
                  Lua wrote $AcademyEnrollment.$Cost as a plain number in
                  centi-credits, but reward_player demands a money-typed
@@ -1731,10 +1782,18 @@
                  The expression `n * 1Cr / 100` keeps the same numerical
                  magnitude but attaches datatype.money. -->
             <do_if value="$isAcademyEnrollment">
-              <set_value name="$trainingCostMoney" exact="($trainingCost * 1Cr) / 100"/>
-              <reward_player money="-$trainingCostMoney"/>
-              <set_value name="global.$GT_Pilots.{$pilot}.$AcademyEnrollment.$CostPaid" exact="true"/>
-              <set_value name="global.$GT_Pilots.{$pilot}.$TrainingCost" exact="$trainingCostMoney"/>
+              <set_value name="$academyAlreadyPaid" exact="global.$GT_Pilots.{$pilot}.$AcademyEnrollment.$CostPaid?"/>
+              <do_if value="not $academyAlreadyPaid">
+                <set_value name="$trainingCostMoney" exact="($trainingCost * 1Cr) / 100"/>
+                <reward_player money="-$trainingCostMoney"/>
+                <set_value name="global.$GT_Pilots.{$pilot}.$AcademyEnrollment.$CostPaid" exact="true"/>
+                <set_value name="global.$GT_Pilots.{$pilot}.$TrainingCost" exact="$trainingCostMoney"/>
+              </do_if>
+              <do_else>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GalaxyTrader MK3] HandleStartTraining: academy fee already paid for ' + $pilot.name + ' - skipping duplicate deduction'" chance="100"/>
+                </do_if>
+              </do_else>
             </do_if>
             
             <set_value name="global.$GT_Pilots.{$pilot}.$TrainingStarted" exact="player.age"/>
@@ -1970,7 +2029,11 @@
         <do_if value="$pilot and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}? and global.$GT_Pilots.{$pilot}.$ManualTrainingRequested? and global.$GT_Pilots.{$pilot}.$ManualTrainingRequested">
           <set_value name="$manualTrainingRequested" exact="true"/>
         </do_if>
-        <do_if value="$shouldProcessTraining and $retryReady and (global.$GT_GlobalSettings.$XP.$AutoTraining or $manualTrainingRequested)">
+        <set_value name="$academyEnrollmentPending" exact="false"/>
+        <do_if value="$pilot and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}? and global.$GT_Pilots.{$pilot}.$AcademyEnrollment?">
+          <set_value name="$academyEnrollmentPending" exact="true"/>
+        </do_if>
+        <do_if value="$shouldProcessTraining and $retryReady and (global.$GT_GlobalSettings.$XP.$AutoTraining or $manualTrainingRequested or $academyEnrollmentPending)">
           <!-- Calculate pilot skill-based jump distance limit from GT level (not vanilla skill). -->
           <set_value name="$pilotSkill" exact="1"/>
           <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{$pilot}? and global.$GT_Pilots.{$pilot}.$Level?">

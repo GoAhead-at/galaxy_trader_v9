@@ -3691,7 +3691,8 @@
                 </do_if>
 
                 <set_value name="$distanceFactor" exact="1.0 + ($sellDistance * $gt_distancepenalty)"/>
-                <set_value name="$sellScore" exact="($tradeAmount * [1, ($sellOffer.unitprice / 1Cr)].max) / $distanceFactor"/>
+                <set_value name="$sellUnitPriceCr" exact="($sellOffer.unitprice / 1Cr)i"/>
+                <set_value name="$sellScore" exact="($tradeAmount * [$sellUnitPriceCr, 1].max) / $distanceFactor"/>
                 <append_to_list name="$sellOnlyTrades" exact="table[
                   $IsSellOnly = true,
                   $Ware = $sellWare,
@@ -5517,11 +5518,24 @@
                     <!-- Check buy offer: available AND has SOME amount (clamping will handle exact amount reduction) -->
                     <set_value name="$buyOfferAvailable" exact="$currentTrade.$BuyOffer.available"/>
                     <set_value name="$buyOfferAmount" exact="@$currentTrade.$BuyOffer.offeramount.{this.assignedcontrolled}"/>
-                    <!-- Fallback for player/internal flows:
-                         offeramount.{ship} can be transiently 0 while raw amount is still tradable.
-                         Use raw amount fallback before declaring the offer invalid. -->
+                    <!-- Supplier-side fallback: only when offeramount is zero but the supplier
+                         physically holds unreserved stock (avoids matching reserved-away offers). -->
                     <do_if value="(not $buyOfferAmount? or $buyOfferAmount le 0) and $currentTrade.$BuyOffer.amount? and @$currentTrade.$BuyOffer.amount gt 0">
-                      <set_value name="$buyOfferAmount" exact="@$currentTrade.$BuyOffer.amount"/>
+                      <set_value name="$buyFallbackSeller" exact="null"/>
+                      <do_if value="$currentTrade.$BuyOffer.seller? and @$currentTrade.$BuyOffer.seller.exists">
+                        <set_value name="$buyFallbackSeller" exact="@$currentTrade.$BuyOffer.seller"/>
+                      </do_if>
+                      <do_if value="not $buyFallbackSeller? and $currentTrade.$BuyOffer.owner? and @$currentTrade.$BuyOffer.owner.exists">
+                        <set_value name="$buyFallbackSeller" exact="@$currentTrade.$BuyOffer.owner"/>
+                      </do_if>
+                      <set_value name="$buyFallbackStock" exact="0"/>
+                      <do_if value="$buyFallbackSeller? and $ware?">
+                        <get_ware_reservation object="$buyFallbackSeller" ware="$ware" type="buy" virtual="false" result="$buyFallbackReserved"/>
+                        <set_value name="$buyFallbackStock" exact="[$buyFallbackSeller.cargo.{$ware}.count - $buyFallbackReserved, 0].max"/>
+                      </do_if>
+                      <do_if value="$buyFallbackStock gt 0">
+                        <set_value name="$buyOfferAmount" exact="[$buyFallbackStock, @$currentTrade.$BuyOffer.amount].min"/>
+                      </do_if>
                     </do_if>
                     <set_value name="$buyOfferOwnerValid" exact="false"/>
                     <do_if value="$currentTrade.$BuyOffer.owner?">
@@ -6208,7 +6222,16 @@
                   <set_value name="$mk4PairAlreadyInWindow" exact="false"/>
                   <do_all exact="$validatedTradeCandidates.count" counter="$vdci">
                     <set_value name="$vdc" exact="$validatedTradeCandidates.{$vdci}"/>
-                    <do_if value="$vdc.$BuyOffer == $currentTrade.$BuyOffer and $vdc.$SellOffer == $currentTrade.$SellOffer">
+                    <set_value name="$mk4VdcPairMatch" exact="false"/>
+                    <do_if value="$vdc.$SellOffer == $currentTrade.$SellOffer">
+                      <do_if value="$isSellOnlyTrade and $vdc.$IsSellOnly? and $vdc.$IsSellOnly">
+                        <set_value name="$mk4VdcPairMatch" exact="true"/>
+                      </do_if>
+                      <do_elseif value="$vdc.$BuyOffer? and $currentTrade.$BuyOffer? and $vdc.$BuyOffer == $currentTrade.$BuyOffer">
+                        <set_value name="$mk4VdcPairMatch" exact="true"/>
+                      </do_elseif>
+                    </do_if>
+                    <do_if value="$mk4VdcPairMatch">
                       <set_value name="$mk4PairAlreadyInWindow" exact="true"/>
                       <break/>
                     </do_if>
@@ -6562,6 +6585,9 @@
           <set_value name="$mk4DestBudgetSkipped" exact="0"/>
           <set_value name="$mk4BacktrackSkipped" exact="0"/>
           <set_value name="$mk4DeliveryBudgetBySellOffer" exact="table[]"/>
+          <set_value name="$mk4SupplierBudgetByBuyOffer" exact="table[]"/>
+          <set_value name="$mk4SupBudgetSkipped" exact="0"/>
+          <set_value name="$mk4ShipCargoBudgetByWare" exact="table[]"/>
           <set_value name="$mk4SinglePreferred" exact="false"/>
           <set_value name="$mk4UseMinCargoThresholdForRoute" exact="if $gt_useMinCargoThreshold? then $gt_useMinCargoThreshold else (if this.$effectiveUseMinCargoThresholdFilter? then this.$effectiveUseMinCargoThresholdFilter else false)"/>
           <set_value name="$mk4ThresholdPctForSingle" exact="[10,[(if $gt_cargotarget? then $gt_cargotarget else (if this.$effectiveCargoTarget? then this.$effectiveCargoTarget else 10)),100].min].max"/>
@@ -6614,7 +6640,16 @@
               <set_value name="$mk4PrepPairDuplicate" exact="false"/>
               <do_all exact="$mk4PreparedCandidates.count" counter="$ppi">
                 <set_value name="$ppTrade" exact="$mk4PreparedCandidates.{$ppi}"/>
-                <do_if value="$ppTrade.$BuyOffer == $qt.$BuyOffer and $ppTrade.$SellOffer == $qt.$SellOffer">
+                <set_value name="$mk4PrepPairMatch" exact="false"/>
+                <do_if value="$ppTrade.$SellOffer == $qt.$SellOffer">
+                  <do_if value="$qtIsSellOnly and $ppTrade.$IsSellOnly? and $ppTrade.$IsSellOnly">
+                    <set_value name="$mk4PrepPairMatch" exact="true"/>
+                  </do_if>
+                  <do_elseif value="$ppTrade.$BuyOffer? and $qt.$BuyOffer? and $ppTrade.$BuyOffer == $qt.$BuyOffer">
+                    <set_value name="$mk4PrepPairMatch" exact="true"/>
+                  </do_elseif>
+                </do_if>
+                <do_if value="$mk4PrepPairMatch">
                   <set_value name="$mk4PrepPairDuplicate" exact="true"/>
                   <break/>
                 </do_if>
@@ -6695,6 +6730,18 @@
             <set_value name="$mk4PreparedCandidates" exact="$mk4SinglePreferredTrades"/>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-AI] ' + this.ship.idcode + ': MK4 single-trade preference applied: fill=' + $mk4SingleThresholdFillPct + '% threshold=' + $mk4ThresholdPctForSingle + '% (multitrade deferred)'" chance="100"/>
+            </do_if>
+          </do_if>
+
+          <!-- Clearance / sell-only: one buyer per cargo snapshot — multitrade would queue
+               multiple sells for the same ware and cause ERR_NOTHING_TO_SELL on later legs. -->
+          <do_if value="not $mk4SinglePreferred and $mk4PreparedCandidates.count gt 1 and $mk4PreparedCandidates.{1}.$IsSellOnly? and $mk4PreparedCandidates.{1}.$IsSellOnly">
+            <set_value name="$mk4SinglePreferred" exact="true"/>
+            <create_list name="$mk4SellOnlySingleTrades"/>
+            <append_to_list name="$mk4SellOnlySingleTrades" exact="$mk4PreparedCandidates.{1}"/>
+            <set_value name="$mk4PreparedCandidates" exact="$mk4SellOnlySingleTrades"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': MK4 sell-only single-leg enforced (clearance — multitrade deferred)'" chance="100"/>
             </do_if>
           </do_if>
 
@@ -6796,6 +6843,66 @@
                 <set_value name="$mk4PrimaryBudgetBlocked" exact="true"/>
               </do_if>
             </do_if>
+            <!-- Supplier pickup budget: cumulative buy per supplier sell offer must not
+                 exceed effective physical stock (player factory cargo minus outbound pickups). -->
+            <do_if value="not $mk4PrimaryBudgetBlocked and not $pIsSellOnly and $pPairAmount gt 0 and $mk4PrimaryTrade.$BuyOffer?">
+              <set_value name="$pSupBuyOffer" exact="$mk4PrimaryTrade.$BuyOffer"/>
+              <do_if value="not $mk4SupplierBudgetByBuyOffer.{$pSupBuyOffer}?">
+                <set_value name="$pSupBudgetInit" exact="@$pSupBuyOffer.offeramount.{this.assignedcontrolled}"/>
+                <do_if value="$pSupBudgetInit == null or $pSupBudgetInit le 0">
+                  <do_if value="$pSupBuyOffer.amount?">
+                    <set_value name="$pSupBudgetInit" exact="@$pSupBuyOffer.amount"/>
+                  </do_if>
+                  <do_else>
+                    <set_value name="$pSupBudgetInit" exact="0"/>
+                  </do_else>
+                </do_if>
+                <do_if value="global.$GT_Reservations? and global.$GT_Reservations.{$pSupBuyOffer}?">
+                  <set_value name="$pSupResData" exact="global.$GT_Reservations.{$pSupBuyOffer}"/>
+                  <do_if value="$pSupResData.$Until? and player.age lt @$pSupResData.$Until and $pSupResData.$Ship? and @$pSupResData.$Ship != this.ship">
+                    <set_value name="$pSupResAmt" exact="if $pSupResData.$Amount? and @$pSupResData.$Amount gt 0 then $pSupResData.$Amount else 1"/>
+                    <set_value name="$pSupBudgetInit" exact="[($pSupBudgetInit - $pSupResAmt), 0].max"/>
+                  </do_if>
+                </do_if>
+                <set_value name="$pSupStation" exact="if $mk4PrimaryTrade.$BuyStation? and $mk4PrimaryTrade.$BuyStation.exists then $mk4PrimaryTrade.$BuyStation else null"/>
+                <do_if value="not $pSupStation? and $pSupBuyOffer.seller? and @$pSupBuyOffer.seller.exists">
+                  <set_value name="$pSupStation" exact="@$pSupBuyOffer.seller"/>
+                </do_if>
+                <do_if value="not $pSupStation? and $pSupBuyOffer.owner?">
+                  <set_value name="$pSupStation" exact="@$pSupBuyOffer.owner"/>
+                </do_if>
+                <set_value name="$pSupWare" exact="if $mk4PrimaryTrade.$Ware? then $mk4PrimaryTrade.$Ware else (if $pSupBuyOffer.ware? then @$pSupBuyOffer.ware else null)"/>
+                <do_if value="$pSupStation? and $pSupStation.exists and $pSupWare?">
+                  <get_ware_reservation object="$pSupStation" ware="$pSupWare" type="buy" virtual="false" result="$pSupOutgoingTotal"/>
+                  <get_ware_reservation object="$pSupStation" ware="$pSupWare" type="buy" reserver="this.ship" virtual="false" result="$pSupOutgoingSelf"/>
+                  <set_value name="$pSupOutgoingOther" exact="[($pSupOutgoingTotal - $pSupOutgoingSelf), 0].max"/>
+                  <set_value name="$pSupPhysicalStock" exact="[($pSupStation.cargo.{$pSupWare}.count - $pSupOutgoingOther), 0].max"/>
+                  <set_value name="$pSupBudgetInit" exact="[$pSupBudgetInit, $pSupPhysicalStock].min"/>
+                </do_if>
+                <set_value name="$mk4SupplierBudgetByBuyOffer.{$pSupBuyOffer}" exact="$pSupBudgetInit"/>
+              </do_if>
+              <set_value name="$pSupBudgetRem" exact="$mk4SupplierBudgetByBuyOffer.{$pSupBuyOffer}"/>
+              <set_value name="$pPairAmount" exact="[$pPairAmount, $pSupBudgetRem].min"/>
+              <set_value name="$pBuyAmount" exact="[$pBuyAmount, $pPairAmount].min"/>
+              <set_value name="$pSellAmount" exact="$pPairAmount"/>
+              <set_value name="$pPurchaseCost" exact="if $pSupIsPlayer then 0 else ($pBuyPrice * $pPairAmount)"/>
+              <do_if value="$pPairAmount le 0">
+                <set_value name="$mk4PrimaryBudgetBlocked" exact="true"/>
+              </do_if>
+            </do_if>
+            <!-- Sell-only: cap by ship cargo remaining across legs (defense if multitrade ever runs). -->
+            <do_if value="not $mk4PrimaryBudgetBlocked and $pIsSellOnly and $pPairAmount gt 0 and $mk4PrimaryTrade.$Ware?">
+              <set_value name="$pCargoWare" exact="$mk4PrimaryTrade.$Ware"/>
+              <do_if value="not $mk4ShipCargoBudgetByWare.{$pCargoWare}?">
+                <set_value name="$mk4ShipCargoBudgetByWare.{$pCargoWare}" exact="this.ship.cargo.{$pCargoWare}.count"/>
+              </do_if>
+              <set_value name="$pCargoBudgetRem" exact="$mk4ShipCargoBudgetByWare.{$pCargoWare}"/>
+              <set_value name="$pPairAmount" exact="[$pPairAmount, $pCargoBudgetRem].min"/>
+              <set_value name="$pSellAmount" exact="$pPairAmount"/>
+              <do_if value="$pPairAmount le 0">
+                <set_value name="$mk4PrimaryBudgetBlocked" exact="true"/>
+              </do_if>
+            </do_if>
             <do_if value="not $mk4PrimaryBudgetBlocked and $pPairAmount gt 0">
               <set_value name="$mk4PrimaryTrade.$QueuedBuyAmount" exact="$pBuyAmount"/>
               <set_value name="$mk4PrimaryTrade.$QueuedSellAmount" exact="$pSellAmount"/>
@@ -6805,6 +6912,14 @@
                 <set_value name="$pDestSellOffer" exact="$mk4PrimaryTrade.$SellOffer"/>
                 <set_value name="$mk4DeliveryBudgetBySellOffer.{$pDestSellOffer}" exact="[($mk4DeliveryBudgetBySellOffer.{$pDestSellOffer} - $pPairAmount), 0].max"/>
               </do_if>
+              <do_if value="not $pIsSellOnly and $mk4PrimaryTrade.$BuyOffer?">
+                <set_value name="$pSupBuyOffer" exact="$mk4PrimaryTrade.$BuyOffer"/>
+                <set_value name="$mk4SupplierBudgetByBuyOffer.{$pSupBuyOffer}" exact="[($mk4SupplierBudgetByBuyOffer.{$pSupBuyOffer} - $pPairAmount), 0].max"/>
+              </do_if>
+              <do_elseif value="$pIsSellOnly and $mk4PrimaryTrade.$Ware?">
+                <set_value name="$pCargoWare" exact="$mk4PrimaryTrade.$Ware"/>
+                <set_value name="$mk4ShipCargoBudgetByWare.{$pCargoWare}" exact="[($mk4ShipCargoBudgetByWare.{$pCargoWare} - $pPairAmount), 0].max"/>
+              </do_elseif>
               <set_value name="$pVolumePerUnit" exact="if $mk4PrimaryTrade.$Ware? and $mk4PrimaryTrade.$Ware.volume? then $mk4PrimaryTrade.$Ware.volume else 1"/>
               <set_value name="$mk4RemainingVolume" exact="[0, $mk4RemainingVolume - ($pPairAmount * $pVolumePerUnit)].max"/>
               <set_value name="$mk4CurrentFillPct" exact="if $mk4CargoCapacityVol gt 0 then ((($mk4CargoCapacityVol - $mk4RemainingVolume) * 100) / $mk4CargoCapacityVol) else 100"/>
@@ -6834,7 +6949,16 @@
                 <set_value name="$mk4SecondaryAlreadySelected" exact="false"/>
                 <do_all exact="$mk4QueueableTrades.count" counter="$qdupi">
                   <set_value name="$mk4DupTrade" exact="$mk4QueueableTrades.{$qdupi}"/>
-                  <do_if value="$mk4DupTrade.$BuyOffer == $scTrade.$BuyOffer and $mk4DupTrade.$SellOffer == $scTrade.$SellOffer">
+                  <set_value name="$mk4SecPairMatch" exact="false"/>
+                  <do_if value="$mk4DupTrade.$SellOffer == $scTrade.$SellOffer">
+                    <do_if value="$scTrade.$IsSellOnly? and $scTrade.$IsSellOnly and $mk4DupTrade.$IsSellOnly? and $mk4DupTrade.$IsSellOnly">
+                      <set_value name="$mk4SecPairMatch" exact="true"/>
+                    </do_if>
+                    <do_elseif value="$mk4DupTrade.$BuyOffer? and $scTrade.$BuyOffer? and $mk4DupTrade.$BuyOffer == $scTrade.$BuyOffer">
+                      <set_value name="$mk4SecPairMatch" exact="true"/>
+                    </do_elseif>
+                  </do_if>
+                  <do_if value="$mk4SecPairMatch">
                     <set_value name="$mk4SecondaryAlreadySelected" exact="true"/>
                     <break/>
                   </do_if>
@@ -6922,6 +7046,51 @@
                   </do_if>
                 </do_if>
 
+                <!-- Supplier pickup budget (cumulative per BuyOffer across multitrade legs). -->
+                <do_if value="not $scIsSellOnly and $scPairAmount gt 0 and $scTrade.$BuyOffer?">
+                  <set_value name="$scSupBuyOffer" exact="$scTrade.$BuyOffer"/>
+                  <do_if value="not $mk4SupplierBudgetByBuyOffer.{$scSupBuyOffer}?">
+                    <set_value name="$scSupBudgetInit" exact="@$scSupBuyOffer.offeramount.{this.assignedcontrolled}"/>
+                    <do_if value="$scSupBudgetInit == null or $scSupBudgetInit le 0">
+                      <do_if value="$scSupBuyOffer.amount?">
+                        <set_value name="$scSupBudgetInit" exact="@$scSupBuyOffer.amount"/>
+                      </do_if>
+                      <do_else>
+                        <set_value name="$scSupBudgetInit" exact="0"/>
+                      </do_else>
+                    </do_if>
+                    <do_if value="global.$GT_Reservations? and global.$GT_Reservations.{$scSupBuyOffer}?">
+                      <set_value name="$scSupResData" exact="global.$GT_Reservations.{$scSupBuyOffer}"/>
+                      <do_if value="$scSupResData.$Until? and player.age lt @$scSupResData.$Until and $scSupResData.$Ship? and @$scSupResData.$Ship != this.ship">
+                        <set_value name="$scSupResAmt" exact="if $scSupResData.$Amount? and @$scSupResData.$Amount gt 0 then $scSupResData.$Amount else 1"/>
+                        <set_value name="$scSupBudgetInit" exact="[($scSupBudgetInit - $scSupResAmt), 0].max"/>
+                      </do_if>
+                    </do_if>
+                    <set_value name="$scSupStation" exact="if $scTrade.$BuyStation? and $scTrade.$BuyStation.exists then $scTrade.$BuyStation else null"/>
+                    <do_if value="not $scSupStation? and $scSupBuyOffer.seller? and @$scSupBuyOffer.seller.exists">
+                      <set_value name="$scSupStation" exact="@$scSupBuyOffer.seller"/>
+                    </do_if>
+                    <do_if value="not $scSupStation? and $scSupBuyOffer.owner?">
+                      <set_value name="$scSupStation" exact="@$scSupBuyOffer.owner"/>
+                    </do_if>
+                    <set_value name="$scSupWare" exact="if $scTrade.$Ware? then $scTrade.$Ware else (if $scSupBuyOffer.ware? then @$scSupBuyOffer.ware else null)"/>
+                    <do_if value="$scSupStation? and $scSupStation.exists and $scSupWare?">
+                      <get_ware_reservation object="$scSupStation" ware="$scSupWare" type="buy" virtual="false" result="$scSupOutgoingTotal"/>
+                      <get_ware_reservation object="$scSupStation" ware="$scSupWare" type="buy" reserver="this.ship" virtual="false" result="$scSupOutgoingSelf"/>
+                      <set_value name="$scSupOutgoingOther" exact="[($scSupOutgoingTotal - $scSupOutgoingSelf), 0].max"/>
+                      <set_value name="$scSupPhysicalStock" exact="[($scSupStation.cargo.{$scSupWare}.count - $scSupOutgoingOther), 0].max"/>
+                      <set_value name="$scSupBudgetInit" exact="[$scSupBudgetInit, $scSupPhysicalStock].min"/>
+                    </do_if>
+                    <set_value name="$mk4SupplierBudgetByBuyOffer.{$scSupBuyOffer}" exact="$scSupBudgetInit"/>
+                  </do_if>
+                  <set_value name="$scSupBudgetRem" exact="$mk4SupplierBudgetByBuyOffer.{$scSupBuyOffer}"/>
+                  <set_value name="$scPairAmount" exact="[$scPairAmount, $scSupBudgetRem].min"/>
+                  <do_if value="$scPairAmount le 0">
+                    <set_value name="$mk4SupBudgetSkipped" operation="add"/>
+                    <continue/>
+                  </do_if>
+                </do_if>
+
                 <set_value name="$scScore" exact="if $scTrade.$Score? then $scTrade.$Score else 0"/>
                 <do_if value="$scPairAmount gt $mk4BestSecondaryAmount or ($scPairAmount == $mk4BestSecondaryAmount and $scScore gt $mk4BestSecondaryScore)">
                   <set_value name="$mk4BestSecondaryTrade" exact="$scTrade"/>
@@ -6981,6 +7150,10 @@
               <do_if value="$mk4BestSecondaryTrade.$SellOffer?">
                 <set_value name="$bsDestSellOffer" exact="$mk4BestSecondaryTrade.$SellOffer"/>
                 <set_value name="$mk4DeliveryBudgetBySellOffer.{$bsDestSellOffer}" exact="[($mk4DeliveryBudgetBySellOffer.{$bsDestSellOffer} - $mk4BestSecondaryAmount), 0].max"/>
+              </do_if>
+              <do_if value="not $bsIsSellOnly and $mk4BestSecondaryTrade.$BuyOffer?">
+                <set_value name="$bsSupBuyOffer" exact="$mk4BestSecondaryTrade.$BuyOffer"/>
+                <set_value name="$mk4SupplierBudgetByBuyOffer.{$bsSupBuyOffer}" exact="[($mk4SupplierBudgetByBuyOffer.{$bsSupBuyOffer} - $mk4BestSecondaryAmount), 0].max"/>
               </do_if>
               <set_value name="$bsVolumePerUnit" exact="if $mk4BestSecondaryTrade.$Ware? and $mk4BestSecondaryTrade.$Ware.volume? then $mk4BestSecondaryTrade.$Ware.volume else 1"/>
               <set_value name="$mk4RemainingVolume" exact="[0, $mk4RemainingVolume - ($mk4BestSecondaryAmount * $bsVolumePerUnit)].max"/>
@@ -7058,7 +7231,7 @@
             <set_value name="$finalSellAmount" exact="if $pendingTrade.$QueuedSellAmount? then $pendingTrade.$QueuedSellAmount else (if $pendingTrade.$FinalSellAmount? then $pendingTrade.$FinalSellAmount else $pendingTrade.$Amount)"/>
 
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': MK4 multitrade execution set: queued=' + $mk4QueueableTrades.count + '/' + $mk4QueueSourceCount + ' (maxTrades=' + $validatedCandidateLimit + ', secondaryBudgetSkipped=' + $mk4SecondaryBudgetSkipped + ', destBudgetSkipped=' + $mk4DestBudgetSkipped + ', backtrackSkipped=' + $mk4BacktrackSkipped + ', singlePreferred=' + $mk4SinglePreferred + ')'" chance="100"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': MK4 multitrade execution set: queued=' + $mk4QueueableTrades.count + '/' + $mk4QueueSourceCount + ' (maxTrades=' + $validatedCandidateLimit + ', secondaryBudgetSkipped=' + $mk4SecondaryBudgetSkipped + ', destBudgetSkipped=' + $mk4DestBudgetSkipped + ', supBudgetSkipped=' + $mk4SupBudgetSkipped + ', backtrackSkipped=' + $mk4BacktrackSkipped + ', singlePreferred=' + $mk4SinglePreferred + ')'" chance="100"/>
             </do_if>
 
             <set_value name="$mk4CycleLegCount" exact="0"/>
@@ -7068,6 +7241,89 @@
             <set_value name="$mk4MultiTradeSummary" exact="''"/>
             <set_value name="$mk4MultiTradeSummaryCount" exact="0"/>
             <set_value name="$mk4MultiTradeSummaryMax" exact="6"/>
+
+            <!-- Pre-order re-clamp: supplier/customer offers may have changed since validation. -->
+            <create_list name="$mk4ExecTrades"/>
+            <do_all exact="$mk4QueueableTrades.count" counter="$mk4rci">
+              <set_value name="$mk4rcTrade" exact="$mk4QueueableTrades.{$mk4rci}"/>
+              <set_value name="$mk4rcIsSellOnly" exact="$mk4rcTrade.$IsSellOnly? and $mk4rcTrade.$IsSellOnly"/>
+              <set_value name="$mk4rcBuyAmt" exact="if $mk4rcTrade.$QueuedBuyAmount? then $mk4rcTrade.$QueuedBuyAmount else (if $mk4rcTrade.$FinalBuyAmount? then $mk4rcTrade.$FinalBuyAmount else (if $mk4rcTrade.$Amount? then $mk4rcTrade.$Amount else 0))"/>
+              <set_value name="$mk4rcSellAmt" exact="if $mk4rcTrade.$QueuedSellAmount? then $mk4rcTrade.$QueuedSellAmount else (if $mk4rcTrade.$FinalSellAmount? then $mk4rcTrade.$FinalSellAmount else (if $mk4rcTrade.$Amount? then $mk4rcTrade.$Amount else 0))"/>
+              <set_value name="$mk4rcClampFailed" exact="false"/>
+
+              <do_if value="not $mk4rcIsSellOnly and $mk4rcTrade.$BuyOffer? and @$mk4rcTrade.$BuyOffer.exists">
+                <set_value name="$mk4rcBuySeller" exact="null"/>
+                <do_if value="$mk4rcTrade.$BuyOffer.seller? and @$mk4rcTrade.$BuyOffer.seller.exists">
+                  <set_value name="$mk4rcBuySeller" exact="@$mk4rcTrade.$BuyOffer.seller"/>
+                </do_if>
+                <do_if value="not $mk4rcBuySeller? and $mk4rcTrade.$BuyOffer.owner? and @$mk4rcTrade.$BuyOffer.owner.exists">
+                  <set_value name="$mk4rcBuySeller" exact="@$mk4rcTrade.$BuyOffer.owner"/>
+                </do_if>
+                <do_if value="$mk4rcBuySeller?">
+                  <clamp_trade_amount trade="$mk4rcTrade.$BuyOffer" amount="$mk4rcBuyAmt" buyer="this.ship" seller="$mk4rcBuySeller" result="$mk4rcBuyAmt" reason="$mk4rcBuyClampReason"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$mk4rcClampFailed" exact="true"/>
+                </do_else>
+                <do_if value="not $mk4rcClampFailed and (not $mk4rcBuyAmt? or $mk4rcBuyAmt le 0)">
+                  <set_value name="$mk4rcClampFailed" exact="true"/>
+                </do_if>
+              </do_if>
+
+              <do_if value="not $mk4rcClampFailed and $mk4rcTrade.$SellOffer? and @$mk4rcTrade.$SellOffer.exists">
+                <set_value name="$mk4rcSellBuyer" exact="null"/>
+                <do_if value="$mk4rcTrade.$SellOffer.buyer? and @$mk4rcTrade.$SellOffer.buyer.exists">
+                  <set_value name="$mk4rcSellBuyer" exact="@$mk4rcTrade.$SellOffer.buyer"/>
+                </do_if>
+                <do_if value="not $mk4rcSellBuyer? and $mk4rcTrade.$SellOffer.owner? and @$mk4rcTrade.$SellOffer.owner.exists">
+                  <set_value name="$mk4rcSellBuyer" exact="@$mk4rcTrade.$SellOffer.owner"/>
+                </do_if>
+                <do_if value="not $mk4rcSellBuyer?">
+                  <set_value name="$mk4rcClampFailed" exact="true"/>
+                </do_if>
+                <do_if value="not $mk4rcClampFailed">
+                  <do_if value="$mk4rcIsSellOnly">
+                    <clamp_trade_amount trade="$mk4rcTrade.$SellOffer" amount="$mk4rcSellAmt" buyer="$mk4rcSellBuyer" seller="this.ship" result="$mk4rcSellAmt" reason="$mk4rcSellClampReason"/>
+                  </do_if>
+                  <do_else>
+                    <clamp_trade_amount trade="$mk4rcTrade.$SellOffer" amount="$mk4rcSellAmt" buyer="$mk4rcSellBuyer" result="$mk4rcSellAmt" reason="$mk4rcSellClampReason"/>
+                  </do_else>
+                  <do_if value="not $mk4rcSellAmt? or $mk4rcSellAmt le 0">
+                    <set_value name="$mk4rcClampFailed" exact="true"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+
+              <do_if value="not $mk4rcClampFailed and not $mk4rcIsSellOnly">
+                <set_value name="$mk4rcPairAmt" exact="[$mk4rcBuyAmt, $mk4rcSellAmt].min"/>
+                <set_value name="$mk4rcBuyAmt" exact="$mk4rcPairAmt"/>
+                <set_value name="$mk4rcSellAmt" exact="$mk4rcPairAmt"/>
+                <do_if value="$mk4rcPairAmt le 0">
+                  <set_value name="$mk4rcClampFailed" exact="true"/>
+                </do_if>
+              </do_if>
+
+              <do_if value="not $mk4rcClampFailed">
+                <set_value name="$mk4rcTrade.$QueuedBuyAmount" exact="$mk4rcBuyAmt"/>
+                <set_value name="$mk4rcTrade.$QueuedSellAmount" exact="$mk4rcSellAmt"/>
+                <append_to_list name="$mk4ExecTrades" exact="$mk4rcTrade"/>
+              </do_if>
+              <do_elseif value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': MK4 pre-order reclamp dropped leg (buy=' + (if $mk4rcBuyClampReason? then $mk4rcBuyClampReason else 'n/a') + ', sell=' + (if $mk4rcSellClampReason? then $mk4rcSellClampReason else 'n/a') + ')'" chance="100"/>
+              </do_elseif>
+            </do_all>
+            <set_value name="$mk4QueueableTrades" exact="$mk4ExecTrades"/>
+            <do_if value="$mk4QueueableTrades.count == 0">
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': MK4 pre-order reclamp removed all legs — retrying search'" chance="100"/>
+              </do_if>
+              <set_value name="this.$lastNoTradeReason" exact="'no_trade'"/>
+              <resume label="no_trade_retry"/>
+            </do_if>
+            <set_value name="$pendingTrade" exact="$mk4QueueableTrades.{1}"/>
+            <set_value name="$isSellOnlyTradeForPending" exact="$pendingTrade.$IsSellOnly? and $pendingTrade.$IsSellOnly"/>
+            <set_value name="$finalBuyAmount" exact="if $pendingTrade.$QueuedBuyAmount? then $pendingTrade.$QueuedBuyAmount else (if $pendingTrade.$FinalBuyAmount? then $pendingTrade.$FinalBuyAmount else $pendingTrade.$Amount)"/>
+            <set_value name="$finalSellAmount" exact="if $pendingTrade.$QueuedSellAmount? then $pendingTrade.$QueuedSellAmount else (if $pendingTrade.$FinalSellAmount? then $pendingTrade.$FinalSellAmount else $pendingTrade.$Amount)"/>
 
             <!-- MK1 parity: two-phase queueing (all SELL first, then all BUY).
                  Use reverse candidate iteration so first selected candidate executes first under LIFO. -->

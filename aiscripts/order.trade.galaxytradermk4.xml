@@ -3023,22 +3023,19 @@
             <resume label="no_trade_retry"/>
           </do_if>
           
-          <!-- GLOBAL MONEY CAP: When the authoritative guard blocked a trade (0 affordable units),
-               it set global.$GT_MoneyCapActive. This stops ALL ships from searching until money
-               increases. Clears automatically when player.money rises above the recorded level. -->
+          <!-- GLOBAL MONEY CAP heal: reaching this line means we already passed the early money
+               gate above, so player.money is greater than MinPlayerMoney + 1000 Cr (i.e. the
+               fleet is solvent). The fleet-wide cap is only meaningful while the player is broke,
+               and that case is already handled by the early gate. Clearing it here prevents a
+               solvent fleet from staying frozen on a stale wealth snapshot (the cap could have
+               been recorded at a higher balance than the player currently holds). The per-trade
+               authoritative budget guard still blocks any individual unaffordable trade. -->
           <do_if value="global.$GT_MoneyCapActive? and global.$GT_MoneyCapActive">
-            <do_if value="$earlyMoneyCheck le global.$GT_MoneyCapMoney">
-              <!-- Money hasn't increased since fleet-wide block - skip search -->
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GLOBAL MONEY CAP: player money=' + ($earlyMoneyCheck / 100) + ' Cr has not increased since cap (' + (global.$GT_MoneyCapMoney / 100) + ' Cr) - skipping trade search'" chance="100"/>
-              <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
-              <resume label="no_trade_retry"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GLOBAL MONEY CAP CLEARED (solvent): player money=' + ($earlyMoneyCheck / 100) + ' Cr above gate threshold (' + ($moneyGateThreshold / 100) + ' Cr) - resuming fleet trade searches'" chance="100"/>
             </do_if>
-            <do_else>
-              <!-- Money increased! Clear global cap so all ships can search again -->
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GLOBAL MONEY CAP CLEARED: player money=' + ($earlyMoneyCheck / 100) + ' Cr increased above cap (' + (global.$GT_MoneyCapMoney / 100) + ' Cr) - resuming fleet trade searches'" chance="100"/>
-              <set_value name="global.$GT_MoneyCapActive" exact="false"/>
-              <remove_value name="global.$GT_MoneyCapMoney"/>
-            </do_else>
+            <set_value name="global.$GT_MoneyCapActive" exact="false"/>
+            <remove_value name="global.$GT_MoneyCapMoney"/>
           </do_if>
           
           <!-- Wait briefly for any pending GT_Trade_Found signals before sending new request.
@@ -4036,14 +4033,16 @@
       
       <!-- FAST MONEY CHECK: Short-circuit the expensive 20-trade validation loop when player
            money has dropped below the threshold since this ship's search started.
-           Checks static threshold (MinPlayerMoney + 1000 buffer) OR global money cap. -->
+           Checks static threshold (MinPlayerMoney + 1000 buffer). The fleet money cap is NOT
+           consulted here: it is a wealth snapshot and must never block a ship that already holds
+           more than the threshold. The per-trade authoritative guard handles unaffordable trades. -->
       <do_if value="not this.$minPlayerMoney?">
         <run_script name="'lib.gt.attention.min_player_money'" result="this.$minPlayerMoney"/>
       </do_if>
       <set_value name="$fastMoneyThreshold" exact="(this.$minPlayerMoney + 1000)Cr"/>
-      <do_if value="player.money le $fastMoneyThreshold or (global.$GT_MoneyCapActive? and global.$GT_MoneyCapActive and player.money le global.$GT_MoneyCapMoney)">
+      <do_if value="player.money le $fastMoneyThreshold">
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FAST MONEY CHECK at trade_found: player.money=' + (player.money / 100) + ' Cr, threshold=' + (this.$minPlayerMoney + 1000) + ' Cr, globalCap=' + (if global.$GT_MoneyCapActive? and global.$GT_MoneyCapActive then (global.$GT_MoneyCapMoney / 100) else 'off') + ' - skipping validation, backing off'" chance="100"/>
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FAST MONEY CHECK at trade_found: player.money=' + (player.money / 100) + ' Cr, threshold=' + (this.$minPlayerMoney + 1000) + ' Cr - skipping validation, backing off'" chance="100"/>
         </do_if>
         <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
         <resume label="no_trade_retry"/>
@@ -6546,6 +6545,11 @@
           <set_value name="$mk4QueueMinMoney" exact="if this.$minPlayerMoney? then this.$minPlayerMoney else 1000"/>
           <set_value name="$mk4QueueSourceCount" exact="0"/>
           <set_value name="$mk4PrimaryBudgetBlocked" exact="false"/>
+          <!-- TRUE only when the primary leg fails for a genuine money reason (cannot afford even
+               1 unit above MinPlayerMoney). Non-money blocks (zero pair amount, destination
+               capacity exhausted, no candidate) leave this false so they do NOT raise the
+               fleet-wide money cap. -->
+          <set_value name="$mk4FleetMoneyInsolvent" exact="false"/>
           <set_value name="$mk4SecondaryBudgetSkipped" exact="0"/>
           <set_value name="$mk4DestBudgetSkipped" exact="0"/>
           <set_value name="$mk4BacktrackSkipped" exact="0"/>
@@ -6722,11 +6726,15 @@
                   <set_value name="$pPurchaseCost" exact="$pBuyPrice * $pBuyAmount"/>
                 </do_if>
                 <do_else>
+                  <!-- Cannot afford even 1 unit above MinPlayerMoney - genuine insolvency. -->
                   <set_value name="$mk4PrimaryBudgetBlocked" exact="true"/>
+                  <set_value name="$mk4FleetMoneyInsolvent" exact="true"/>
                 </do_else>
               </do_if>
               <do_else>
+                <!-- Purchase cost exceeds budget on a non-clampable buy leg - genuine insolvency. -->
                 <set_value name="$mk4PrimaryBudgetBlocked" exact="true"/>
+                <set_value name="$mk4FleetMoneyInsolvent" exact="true"/>
               </do_else>
             </do_elseif>
             <!-- Destination delivery budget: cumulative sell amount per customer buy offer
@@ -6973,13 +6981,23 @@
           </do_if>
 
           <do_if value="$mk4PrimaryBudgetBlocked or $mk4QueueableTrades.count == 0">
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': BLOCKED trade (multitrade budget guard): player.money=' + (player.money / 100) + ' Cr — cannot queue primary leg above MinPlayerMoney threshold (' + $mk4QueueMinMoney + ' Cr)'" chance="100"/>
+            <do_if value="$mk4FleetMoneyInsolvent">
+              <!-- Genuine insolvency: the primary leg cannot afford even 1 unit above
+                   MinPlayerMoney. Raise the fleet-wide money cap and back off long. -->
+              <set_value name="global.$GT_MoneyCapActive" exact="true"/>
+              <set_value name="global.$GT_MoneyCapMoney" exact="player.money"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GLOBAL MONEY CAP SET: player.money=' + (player.money / 100) + ' Cr — cannot afford 1 unit above MinPlayerMoney (' + $mk4QueueMinMoney + ' Cr)'" chance="100"/>
+              <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
             </do_if>
-            <set_value name="global.$GT_MoneyCapActive" exact="true"/>
-            <set_value name="global.$GT_MoneyCapMoney" exact="player.money"/>
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GLOBAL MONEY CAP SET: player.money=' + (player.money / 100) + ' Cr — all ships blocked until money increases'" chance="100"/>
-            <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
+            <do_else>
+              <!-- Non-money queue failure: zero pair amount, destination capacity exhausted,
+                   or no queueable candidate. This is NOT a budget problem, so it must not
+                   freeze the fleet. Use a normal no_trade backoff (short escalating cooldown). -->
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': multitrade produced no queueable legs (capacity/route, not budget): player.money=' + (player.money / 100) + ' Cr — retrying as no_trade'" chance="100"/>
+              </do_if>
+              <set_value name="this.$lastNoTradeReason" exact="'no_trade'"/>
+            </do_else>
             <resume label="no_trade_retry"/>
           </do_if>
 

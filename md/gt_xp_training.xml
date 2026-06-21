@@ -22,8 +22,10 @@
       </actions>
     </cue>
     
-    <!-- Trading Academy save/load recovery: re-dispatch DockAndTrain when
-         $AcademyEnrollment persisted but the ship lost its training order. -->
+    <!-- Trading Academy / in-flight training save/load recovery.
+         Re-dispatch DockAndTrain when enrollment or an active timer persists
+         but the ship lost its training order. When DockAndTrain still exists,
+         preserve timer fields and restore XPBlocked if the load dropped it. -->
     <cue name="RecoverAcademyEnrollmentsOnLoad" instantiate="true" version="1">
       <conditions>
         <event_game_loaded/>
@@ -34,7 +36,14 @@
         <do_if value="global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
           <do_all exact="global.$GT_Pilots.keys.count" counter="$pi">
             <set_value name="$pilot" exact="global.$GT_Pilots.keys.{$pi}"/>
+            <set_value name="$needsTrainingRecovery" exact="false"/>
             <do_if value="global.$GT_Pilots.{$pilot}.$AcademyEnrollment?">
+              <set_value name="$needsTrainingRecovery" exact="true"/>
+            </do_if>
+            <do_elseif value="global.$GT_Pilots.{$pilot}.$TrainingState? and global.$GT_Pilots.{$pilot}.$TrainingState == 'training_in_progress'">
+              <set_value name="$needsTrainingRecovery" exact="true"/>
+            </do_elseif>
+            <do_if value="$needsTrainingRecovery">
               <set_value name="$ship" exact="null"/>
               <do_if value="global.$GT_Pilots.{$pilot}.$Ship? and global.$GT_Pilots.{$pilot}.$Ship.exists">
                 <set_value name="$ship" exact="global.$GT_Pilots.{$pilot}.$Ship"/>
@@ -49,20 +58,44 @@
                     </do_if>
                   </do_all>
                 </do_if>
-                <do_if value="not $hasDockAndTrain">
+                <do_if value="$hasDockAndTrain and global.$GT_Pilots.{$pilot}.$TrainingState? and global.$GT_Pilots.{$pilot}.$TrainingState == 'training_in_progress'">
+                  <do_if value="not global.$GT_Pilots.{$pilot}.$XPBlocked? and global.$GT_Pilots.{$pilot}.$BlockedLevel? and global.$GT_Pilots.{$pilot}.$BlockedLevel gt 1">
+                    <run_actions ref="md.GT_Libraries_General.GT_SetTrainingBlocked">
+                      <param name="pilot" value="$pilot"/>
+                      <param name="level" value="global.$GT_Pilots.{$pilot}.$BlockedLevel"/>
+                      <param name="set_xpblocked" value="true"/>
+                    </run_actions>
+                    <set_value name="global.$GT_Pilots.{$pilot}.$TrainingState" exact="'training_in_progress'"/>
+                  </do_if>
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT Academy] Load recovery: preserving in-flight training for ' + $pilot.name + ' on ship ' + $ship.idcode + ' (DockAndTrain active)'" chance="100"/>
+                  </do_if>
+                </do_if>
+                <do_elseif value="not $hasDockAndTrain">
+                  <set_value name="$preserveTimer" exact="false"/>
+                  <do_if value="global.$GT_Pilots.{$pilot}.$TrainingState? and global.$GT_Pilots.{$pilot}.$TrainingState == 'training_in_progress'">
+                    <do_if value="global.$GT_Pilots.{$pilot}.$AcademyEnrollment? and global.$GT_Pilots.{$pilot}.$AcademyEnrollment.$CostPaid?">
+                      <set_value name="$preserveTimer" exact="true"/>
+                    </do_if>
+                    <do_elseif value="global.$GT_Pilots.{$pilot}.$TrainingStarted?">
+                      <set_value name="$preserveTimer" exact="true"/>
+                    </do_elseif>
+                  </do_if>
+                  <do_if value="not $preserveTimer">
+                    <remove_value name="global.$GT_Pilots.{$pilot}.$TrainingStarted"/>
+                    <remove_value name="global.$GT_Pilots.{$pilot}.$TrainingDuration"/>
+                    <remove_value name="global.$GT_Pilots.{$pilot}.$TrainingStation"/>
+                  </do_if>
                   <set_value name="global.$GT_Pilots.{$pilot}.$ManualTrainingRequested" exact="true"/>
                   <set_value name="global.$GT_Pilots.{$pilot}.$TrainingState" exact="'manual_training_queued'"/>
-                  <remove_value name="global.$GT_Pilots.{$pilot}.$TrainingStarted"/>
-                  <remove_value name="global.$GT_Pilots.{$pilot}.$TrainingDuration"/>
-                  <remove_value name="global.$GT_Pilots.{$pilot}.$TrainingStation"/>
                   <signal_objects object="player.galaxy" param="'GT_Training_Needed'" param2="table[
                     $Ship = $ship,
                     $Pilot = $pilot
                   ]"/>
                   <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                    <debug_text text="'[GT Academy] Load recovery: re-dispatching academy training for ' + $pilot.name + ' on ship ' + $ship.idcode" chance="100"/>
+                    <debug_text text="'[GT Academy] Load recovery: re-dispatching training for ' + $pilot.name + ' on ship ' + $ship.idcode + ' (timer preserved=' + $preserveTimer + ')'" chance="100"/>
                   </do_if>
-                </do_if>
+                </do_elseif>
               </do_if>
             </do_if>
           </do_all>
@@ -1675,6 +1708,43 @@
             <set_value name="$trainingCost" exact="global.$GT_Pilots.{$pilot}.$AcademyEnrollment.$Cost"/>
           </do_if>
           
+          <!-- Save/load + dock.train retry: resume in-flight session instead of
+               re-charging, re-running the funds gate, or resetting the timer. -->
+          <set_value name="$resumeMidTraining" exact="false"/>
+          <do_if value="global.$GT_Pilots.{$pilot}.$TrainingState? and global.$GT_Pilots.{$pilot}.$TrainingState == 'training_in_progress'">
+            <do_if value="$isAcademyEnrollment and global.$GT_Pilots.{$pilot}.$AcademyEnrollment.$CostPaid?">
+              <set_value name="$resumeMidTraining" exact="true"/>
+            </do_if>
+            <do_elseif value="global.$GT_Pilots.{$pilot}.$TrainingStarted? and global.$GT_Pilots.{$pilot}.$TrainingDuration?">
+              <set_value name="$resumeMidTraining" exact="true"/>
+            </do_elseif>
+          </do_if>
+          <do_if value="$resumeMidTraining">
+            <run_actions ref="md.GT_Libraries_General.GT_SetTrainingBlocked">
+              <param name="pilot" value="$pilot"/>
+              <param name="level" value="$level"/>
+              <param name="set_xpblocked" value="true"/>
+            </run_actions>
+            <set_value name="global.$GT_Pilots.{$pilot}.$TrainingState" exact="'training_in_progress'"/>
+            <set_value name="$fullDuration" exact="global.$GT_Pilots.{$pilot}.$TrainingDuration"/>
+            <do_if value="typeof $fullDuration != datatype.time">
+              <set_value name="$fullDuration" exact="$fullDuration * 1s"/>
+            </do_if>
+            <set_value name="$elapsedTraining" exact="player.age - global.$GT_Pilots.{$pilot}.$TrainingStarted"/>
+            <set_value name="$remainingTraining" exact="$fullDuration - $elapsedTraining"/>
+            <do_if value="$remainingTraining le 0s">
+              <set_value name="$remainingTraining" exact="1s"/>
+            </do_if>
+            <set_value name="global.$GT_Pilots.{$pilot}.$TrainingDuration" exact="$remainingTraining"/>
+            <do_if value="not global.$GT_Pilots.{$pilot}.$TrainingStation?">
+              <set_value name="global.$GT_Pilots.{$pilot}.$TrainingStation" exact="$station"/>
+            </do_if>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GalaxyTrader MK3] HandleStartTraining: resumed in-flight training for ' + $pilot.name + ' (remaining ' + ($remainingTraining / 1s) + 's)'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_else>
+          
           <!-- ============================================================ -->
           <!-- Insufficient-funds abort (academy only).                     -->
           <!--                                                              -->
@@ -1687,10 +1757,19 @@
           <!-- previous order, and the player must re-enroll explicitly.    -->
           <!-- Mirrors the abort flow in InitiateTraining for the rare      -->
           <!-- case where the player happens to pilot the trader itself.    -->
+          <!-- Skipped entirely when $CostPaid is already set (paid course  -->
+          <!-- or save/load mid-timer resume).                              -->
           <!-- ============================================================ -->
+          <set_value name="$academyAlreadyPaid" exact="false"/>
+          <do_if value="$isAcademyEnrollment and global.$GT_Pilots.{$pilot}.$AcademyEnrollment.$CostPaid?">
+            <set_value name="$academyAlreadyPaid" exact="true"/>
+          </do_if>
           <set_value name="$canAffordTraining" exact="true"/>
-          <do_if value="$isAcademyEnrollment and player.money lt $trainingCost">
-            <set_value name="$canAffordTraining" exact="false"/>
+          <do_if value="$isAcademyEnrollment and not $academyAlreadyPaid">
+            <set_value name="$trainingCostMoney" exact="($trainingCost * 1Cr) / 100"/>
+            <do_if value="player.money lt $trainingCostMoney">
+              <set_value name="$canAffordTraining" exact="false"/>
+            </do_if>
           </do_if>
           
           <do_if value="$isAcademyEnrollment and not $canAffordTraining">
@@ -1841,6 +1920,7 @@
               <param name="level" value="$displayLevel"/>
               <param name="nameType" value="'training'"/>
             </run_actions>
+          </do_else>
           </do_else>
         </do_if>
       </actions>
@@ -2229,8 +2309,19 @@
                    MD context anchors it to the engine instead of the
                    transient inherited aicontext, so it survives the parent
                    teardown and the ship actually heads to the academy. -->
+            <!-- MD dispatch (immediate=false) for academy enrollments and for
+                 Assist subordinates. Inherited GT aicontexts (miner/mk1/mk2
+                 under a commander) tear down when immediate DockAndTrain
+                 activates, aborting training ~1ms after init. -->
             <set_value name="$isAcademyEnrollment" exact="global.$GT_Pilots.{$pilot}.$AcademyEnrollment?"/>
+            <set_value name="$useMdDockDispatch" exact="false"/>
             <do_if value="$isAcademyEnrollment">
+              <set_value name="$useMdDockDispatch" exact="true"/>
+            </do_if>
+            <do_elseif value="$ship.defaultorder? and $ship.defaultorder.id == 'Assist'">
+              <set_value name="$useMdDockDispatch" exact="true"/>
+            </do_elseif>
+            <do_if value="$useMdDockDispatch">
               <set_value name="$alreadyQueued" exact="false"/>
               <do_if value="$ship.orders?">
                 <do_all exact="$ship.orders.count" counter="$oi">
@@ -2246,12 +2337,12 @@
                   <param name="debugchance" value="100"/>
                 </create_order>
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GalaxyTrader MK3] Academy DockAndTrain queued via MD for ' + $pilot.name + ' (ship ' + $ship.idcode + ') -> ' + $nearestStation.knownname" chance="100"/>
+                  <debug_text text="'[GalaxyTrader MK3] DockAndTrain queued via MD for ' + $pilot.name + ' (ship ' + $ship.idcode + ', academy=' + $isAcademyEnrollment + ', assist=' + ($ship.defaultorder? and $ship.defaultorder.id == 'Assist') + ') -> ' + $nearestStation.knownname" chance="100"/>
                 </do_if>
               </do_if>
               <do_else>
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GalaxyTrader MK3] Academy DockAndTrain skipped for ' + $pilot.name + ' (ship ' + $ship.idcode + ') - already queued'" chance="100"/>
+                  <debug_text text="'[GalaxyTrader MK3] DockAndTrain skipped for ' + $pilot.name + ' (ship ' + $ship.idcode + ') - already queued'" chance="100"/>
                 </do_if>
               </do_else>
             </do_if>

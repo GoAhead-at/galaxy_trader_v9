@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<aiscript name="lib.gt.tradematch" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="5">
+<aiscript name="lib.gt.tradematch" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="6">
   <params>
     <param name="ship" default="this.ship"/>
     <param name="sellOffers" default="[]"/>
@@ -491,33 +491,29 @@
                Prefer per-ship effective offer amounts (offeramount.{ship}) to match vanilla
                trade resolution, especially for internal/no-money flows. Fallback to raw amount
                when offeramount is unavailable. -->
-          <set_value name="$sellOfferAmount" exact="$sellOffer.offeramount.{$ship}"/>
-          <do_if value="$sellOfferAmount == null">
+          <set_value name="$sellOfferAmount" exact="0"/>
+          <do_if value="$sellOffer.offeramount.{$ship}?">
+            <set_value name="$sellOfferAmount" exact="$sellOffer.offeramount.{$ship}"/>
+          </do_if>
+          <do_elseif value="$sellOffer.amount?">
+            <set_value name="$sellOfferAmount" exact="$sellOffer.amount"/>
+          </do_elseif>
+          <!-- Diagnose parity: offeramount.{ship} may exist but be 0 (build storage / internal flows). -->
+          <do_if value="$sellOfferAmount le 0 and $sellOffer.amount? and $sellOffer.amount gt 0">
             <set_value name="$sellOfferAmount" exact="$sellOffer.amount"/>
           </do_if>
-          <do_if value="$sellOfferAmount == null">
-            <set_value name="$sellOfferAmount" exact="0"/>
+          <set_value name="$buyOfferAmount" exact="0"/>
+          <do_if value="$buyOffer.offeramount.{$ship}?">
+            <set_value name="$buyOfferAmount" exact="$buyOffer.offeramount.{$ship}"/>
           </do_if>
-          <!-- Supply-mode supplier gate (MK2 parity): cap pickup amount by physical stock minus
-               outgoing buy reservations so we do not match empty suppliers or stock already
-               committed to other inbound pickups. -->
-          <do_if value="$scoreMode == 'supply' and $buyStation? and $buyStation.exists and $ware?">
-            <get_ware_reservation object="$buyStation" ware="$ware" type="buy" virtual="false" result="$supplierOutgoingReserved"/>
-            <set_value name="$supplierEffectiveStock" exact="[$buyStation.cargo.{$ware}.count - $supplierOutgoingReserved, 0].max"/>
-            <set_value name="$sellOfferAmount" exact="[$sellOfferAmount, $supplierEffectiveStock].min"/>
-          </do_if>
-
-          <set_value name="$buyOfferAmount" exact="$buyOffer.offeramount.{$ship}"/>
-          <do_if value="$buyOfferAmount == null">
+          <do_elseif value="$buyOffer.amount?">
+            <set_value name="$buyOfferAmount" exact="$buyOffer.amount"/>
+          </do_elseif>
+          <do_if value="$buyOfferAmount le 0 and $buyOffer.amount? and $buyOffer.amount gt 0">
             <set_value name="$buyOfferAmount" exact="$buyOffer.amount"/>
           </do_if>
-          <do_if value="$buyOfferAmount == null">
-            <set_value name="$buyOfferAmount" exact="0"/>
-          </do_if>
-          <do_if value="$buyOfferAmount le 0 and $scoreMode == 'supply' and $sellStation? and $sellStation.exists and $ware?">
-            <!-- Supply-mode fallback for station demand when offeramount is unresolved/zero.
-                 This keeps player-owned/internal distribution candidates from being dropped
-                 before MK2 can apply its target-count demand semantics. -->
+          <do_if value="$buyOfferAmount le 0 and $sellStation? and $sellStation.exists and $ware?">
+            <!-- Target-count demand fallback (mirrors gt_context_diagnose pair eval for all modes). -->
             <set_value name="$buyOfferDemandFallback" exact="[0, $sellStation.cargo.{$ware}.target - $sellStation.cargo.{$ware}.count].max"/>
             <do_if value="$buyOfferDemandFallback gt 0">
               <set_value name="$buyOfferAmount" exact="$buyOfferDemandFallback"/>
@@ -566,6 +562,66 @@
                Cache entries should represent station-side opportunity; per-ship execution
                amount is resolved later via clamp_trade_amount in order.trade.galaxytrader. -->
           <set_value name="$tradeAmount" exact="[$sellOfferAmount, $buyOfferAmount].min"/>
+          <do_if value="$tradeAmount le 0">
+            <set_value name="this.$tm_tradesRejected" operation="add"/>
+            <continue/>
+          </do_if>
+
+          <!-- clamp_trade_amount preview (mirrors order.trade.galaxytrader trade_found).
+               Rejects broker/warehouse offers that list amount/offeramount but have no
+               exportable seller stock at execution time.
+               Seller/buyer resolution MUST match trade_found validation: prefer offer.seller
+               when seller? is set — do NOT gate on .exists or fall back to owner while seller?
+               is set (trading-station brokers clamp to seller_cargo=0 at validation). -->
+          <set_value name="$tmClampBuySeller" exact="null"/>
+          <do_if value="$sellOffer?">
+            <do_if value="$sellOffer.seller?">
+              <set_value name="$tmClampBuySeller" exact="@$sellOffer.seller"/>
+            </do_if>
+            <do_if value="$tmClampBuySeller == null and $sellOffer.owner?">
+              <set_value name="$tmClampBuySeller" exact="@$sellOffer.owner"/>
+            </do_if>
+          </do_if>
+          <do_if value="$tmClampBuySeller != null">
+            <set_value name="$tmClampPreview" exact="$tradeAmount"/>
+            <set_value name="$tmClampReason" exact="null"/>
+            <set_value name="$tmTradePartner" exact="if this.assignedcontrolled? then this.assignedcontrolled else $ship"/>
+            <clamp_trade_amount trade="$sellOffer" amount="$tmClampPreview" buyer="$tmTradePartner" seller="$tmClampBuySeller" result="$tmClampPreview" reason="$tmClampReason"/>
+            <do_if value="not $tmClampPreview? or $tmClampPreview le 0">
+              <set_value name="this.$tm_tradesRejected" operation="add"/>
+              <continue/>
+            </do_if>
+            <set_value name="$tradeAmount" exact="$tmClampPreview"/>
+            <set_value name="$sellOfferAmount" exact="[$sellOfferAmount, $tradeAmount].min"/>
+          </do_if>
+          <do_else>
+            <set_value name="this.$tm_tradesRejected" operation="add"/>
+            <continue/>
+          </do_else>
+          <set_value name="$tmClampSellBuyer" exact="null"/>
+          <do_if value="$buyOffer?">
+            <do_if value="$buyOffer.buyer?">
+              <set_value name="$tmClampSellBuyer" exact="@$buyOffer.buyer"/>
+            </do_if>
+            <do_if value="$tmClampSellBuyer == null and $buyOffer.owner?">
+              <set_value name="$tmClampSellBuyer" exact="@$buyOffer.owner"/>
+            </do_if>
+          </do_if>
+          <do_if value="$tmClampSellBuyer != null">
+            <set_value name="$tmSellClampPreview" exact="$tradeAmount"/>
+            <set_value name="$tmSellClampReason" exact="null"/>
+            <clamp_trade_amount trade="$buyOffer" amount="$tmSellClampPreview" buyer="$tmClampSellBuyer" result="$tmSellClampPreview" reason="$tmSellClampReason"/>
+            <do_if value="not $tmSellClampPreview? or $tmSellClampPreview le 0">
+              <set_value name="this.$tm_tradesRejected" operation="add"/>
+              <continue/>
+            </do_if>
+            <set_value name="$tradeAmount" exact="[$tradeAmount, $tmSellClampPreview].min"/>
+            <set_value name="$buyOfferAmount" exact="[$buyOfferAmount, $tradeAmount].min"/>
+          </do_if>
+          <do_else>
+            <set_value name="this.$tm_tradesRejected" operation="add"/>
+            <continue/>
+          </do_else>
           <do_if value="$tradeAmount le 0">
             <set_value name="this.$tm_tradesRejected" operation="add"/>
             <continue/>

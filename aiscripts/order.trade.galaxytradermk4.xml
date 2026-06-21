@@ -3092,6 +3092,11 @@
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': SENDING GT_Search_Request signal to MD at game time ' + player.age" chance="100"/>
           </do_if>
+          <set_value name="$requestForceLiveSearch" exact="false"/>
+          <do_if value="this.$forceLiveAfterLiveReject? and this.$forceLiveAfterLiveReject">
+            <set_value name="$requestForceLiveSearch" exact="true"/>
+            <set_value name="this.$forceLiveAfterLiveReject" exact="false"/>
+          </do_if>
           <signal_objects object="player.galaxy" param="'GT_Search_Request'" param2="table[
             $Ship = this.ship,
             $HomeBase = if this.$effectiveHome? then this.$effectiveHome else (if this.ship.defaultorder and this.ship.defaultorder.$home? then @this.ship.defaultorder.$home else this.ship.sector),
@@ -3109,7 +3114,8 @@
             $IgnoreTradeRules = @this.$effectiveIgnoreTradeRules,
             $IgnoreMK1Supply = if this.$effectiveIgnoreMK1Supply? then this.$effectiveIgnoreMK1Supply else true,
             $SearchPool = 'mk4_supply',
-            $SearchDepth = if this.$effectiveSearchDepth? then this.$effectiveSearchDepth else 30
+            $SearchDepth = if this.$effectiveSearchDepth? then this.$effectiveSearchDepth else 30,
+            $ForceLiveSearch = $requestForceLiveSearch
           ]"/>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GT_Search_Request signal SENT, now at game time ' + player.age" chance="100"/>
@@ -3126,11 +3132,24 @@
       <!-- Clear previous no-trade reason (prevents stale reason affecting timeout retry logic) -->
       <set_value name="this.$lastNoTradeReason" exact="''"/>
       <label name="wait_for_response"/>
+      <set_value name="this.$waitForResponseStartedAt" exact="player.age"/>
+      <label name="wait_for_response_continue"/>
+      <do_if value="not this.$waitForResponseStartedAt?">
+        <set_value name="this.$waitForResponseStartedAt" exact="player.age"/>
+      </do_if>
+      <do_if value="(player.age - this.$waitForResponseStartedAt) ge 120s">
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': WAIT TIMEOUT: 120s expired without semaphore grant (GT_Search_Go) at game time ' + player.age + ' — cleaning up queue entry and retrying'" chance="100"/>
+        </do_if>
+        <signal_objects object="player.galaxy" param="'GT_Search_Abort'" param2="table[$Ship = this.ship]"/>
+        <resume label="no_trade_retry"/>
+      </do_if>
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Wait interrupt handler ACTIVE at game time ' + player.age" chance="100"/>
       </do_if>
-      <!-- IMPORTANT: In X4, wait without min is RANDOM (0..max). Use min=max to avoid instant timeouts. -->
-      <wait min="120s" max="120s" comment="Wait for MD system response (120s; interrupted immediately on response)">
+      <!-- IMPORTANT: In X4, wait without min is RANDOM (0..max). Use min=max to avoid instant timeouts.
+           Guard startedAt for save-load resume mid-wait (instance var may be absent on older saves). -->
+      <wait min="if this.$waitForResponseStartedAt? then (if (120s - (player.age - this.$waitForResponseStartedAt)) gt 1ms then (120s - (player.age - this.$waitForResponseStartedAt)) else 1ms) else 120s" max="if this.$waitForResponseStartedAt? then (if (120s - (player.age - this.$waitForResponseStartedAt)) gt 1ms then (120s - (player.age - this.$waitForResponseStartedAt)) else 1ms) else 120s" comment="Wait for MD system response (120s total; interrupted immediately on response)">
         <interrupt>
           <conditions>
             <check_any>
@@ -3197,10 +3216,22 @@
               <resume label="trade_found"/>
             </do_elseif>
             <do_elseif value="event.param == 'GT_TradeSearch_InProgress'">
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': INTERRUPT FIRED: GT_TradeSearch_InProgress received at game time ' + player.age + ' - continuing to wait (no backoff)'" chance="100"/>
+              <do_if value="not this.$waitForResponseStartedAt?">
+                <set_value name="this.$waitForResponseStartedAt" exact="player.age"/>
               </do_if>
-              <resume label="wait_for_response"/>
+              <do_if value="(player.age - this.$waitForResponseStartedAt) ge 120s">
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-AI] ' + this.ship.idcode + ': WAIT TIMEOUT after InProgress keepalives (120s) - aborting search and retrying'" chance="100"/>
+                </do_if>
+                <signal_objects object="player.galaxy" param="'GT_Search_Abort'" param2="table[$Ship = this.ship]" delay="1ms"/>
+                <resume label="main_loop"/>
+              </do_if>
+              <do_else>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-AI] ' + this.ship.idcode + ': INTERRUPT FIRED: GT_TradeSearch_InProgress received at game time ' + player.age + ' - continuing to wait (no backoff)'" chance="100"/>
+                </do_if>
+                <resume label="wait_for_response_continue"/>
+              </do_else>
             </do_elseif>
             <do_elseif value="event.param == 'GT_TradeSearch_Reset'">
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -4034,6 +4065,56 @@
           <set_value name="$pipelineFound" exact="$pipelineTradeList.count gt 0"/>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Dispatch MK3 faction filter: before=' + $pipelineTradeListBeforeDispatchFilter + ', after=' + $pipelineTradeList.count + ', removed=' + ($pipelineTradeListBeforeDispatchFilter - $pipelineTradeList.count)" chance="100"/>
+          </do_if>
+        </do_if>
+
+        <!-- Live search can run 1+ seconds. Re-check per-ship offer amounts immediately before dispatch
+             so trades reserved/exhausted during matching are not sent to expensive validation. -->
+        <do_if value="$pipelineFound and $pipelineTradeList.count gt 0 and ($pipelineSearchMethod == 'live' or $pipelineSearchMethod == 'live_sell_only' or $pipelineSearchMethod == 'live_fallback')">
+          <set_value name="$pipelineBeforeFreshFilter" exact="$pipelineTradeList.count"/>
+          <create_list name="$pipelineTradeListFresh"/>
+          <do_all exact="$pipelineTradeList.count" counter="$freshIdx">
+            <set_value name="$freshTrade" exact="$pipelineTradeList.{$freshIdx}"/>
+            <set_value name="$freshKeep" exact="false"/>
+            <do_if value="$freshTrade? and $freshTrade.$IsSellOnly? and $freshTrade.$SellOffer?">
+              <set_value name="$freshSellAmt" exact="@$freshTrade.$SellOffer.offeramount.{this.ship}"/>
+              <do_if value="(not $freshSellAmt? or $freshSellAmt le 0) and @$freshTrade.$SellOffer.amount gt 0">
+                <set_value name="$freshSellAmt" exact="@$freshTrade.$SellOffer.amount"/>
+              </do_if>
+              <do_if value="$freshSellAmt? and $freshSellAmt gt 0">
+                <set_value name="$freshKeep" exact="true"/>
+              </do_if>
+            </do_if>
+            <do_elseif value="$freshTrade? and $freshTrade.$BuyOffer? and $freshTrade.$SellOffer?">
+              <set_value name="$freshBuyAmt" exact="@$freshTrade.$BuyOffer.offeramount.{this.ship}"/>
+              <do_if value="(not $freshBuyAmt? or $freshBuyAmt le 0) and @$freshTrade.$BuyOffer.amount gt 0">
+                <set_value name="$freshBuyAmt" exact="@$freshTrade.$BuyOffer.amount"/>
+              </do_if>
+              <do_if value="(not $freshBuyAmt? or $freshBuyAmt le 0) and $freshTrade.$SellOffer.owner? and @$freshTrade.$SellOffer.owner.exists">
+                <set_value name="$freshBuyWare" exact="if $freshTrade.$Ware? then $freshTrade.$Ware else null"/>
+                <do_if value="not $freshBuyWare? and @$freshTrade.$BuyOffer.ware != null">
+                  <set_value name="$freshBuyWare" exact="@$freshTrade.$BuyOffer.ware"/>
+                </do_if>
+                <do_if value="$freshBuyWare?">
+                  <set_value name="$freshBuyAmt" exact="[0, $freshTrade.$SellOffer.owner.cargo.{$freshBuyWare}.target - $freshTrade.$SellOffer.owner.cargo.{$freshBuyWare}.count].max"/>
+                </do_if>
+              </do_if>
+              <set_value name="$freshSellAmt" exact="@$freshTrade.$SellOffer.offeramount.{this.ship}"/>
+              <do_if value="(not $freshSellAmt? or $freshSellAmt le 0) and @$freshTrade.$SellOffer.amount gt 0">
+                <set_value name="$freshSellAmt" exact="@$freshTrade.$SellOffer.amount"/>
+              </do_if>
+              <do_if value="$freshBuyAmt? and $freshBuyAmt gt 0 and $freshSellAmt? and $freshSellAmt gt 0">
+                <set_value name="$freshKeep" exact="true"/>
+              </do_if>
+            </do_elseif>
+            <do_if value="$freshKeep">
+              <append_to_list name="$pipelineTradeListFresh" exact="$freshTrade"/>
+            </do_if>
+          </do_all>
+          <set_value name="$pipelineTradeList" exact="$pipelineTradeListFresh"/>
+          <set_value name="$pipelineFound" exact="$pipelineTradeList.count gt 0"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Fresh offer filter: before=' + $pipelineBeforeFreshFilter + ', after=' + $pipelineTradeList.count + ', removed=' + ($pipelineBeforeFreshFilter - $pipelineTradeList.count)" chance="100"/>
           </do_if>
         </do_if>
 
@@ -5510,7 +5591,10 @@
                   <!-- Sell-only trade: only check sell offer -->
                   <do_if value="$currentTrade.$SellOffer?">
                     <set_value name="$sellOfferAvailable" exact="$currentTrade.$SellOffer.available"/>
-                    <set_value name="$sellOfferAmount" exact="@$currentTrade.$SellOffer.offeramount.{this.assignedcontrolled}"/>
+                    <set_value name="$sellOfferAmount" exact="@$currentTrade.$SellOffer.offeramount.{this.ship}"/>
+                    <do_if value="(not $sellOfferAmount? or $sellOfferAmount le 0) and @$currentTrade.$SellOffer.amount gt 0">
+                      <set_value name="$sellOfferAmount" exact="@$currentTrade.$SellOffer.amount"/>
+                    </do_if>
                     <set_value name="$sellOfferOwnerValid" exact="false"/>
                     <do_if value="$currentTrade.$SellOffer.owner?">
                       <set_value name="$sellOwnerTmp" exact="@$currentTrade.$SellOffer.owner"/>
@@ -5539,7 +5623,7 @@
                   <do_if value="$currentTrade.$BuyOffer? and $currentTrade.$SellOffer?">
                     <!-- Check buy offer: available AND has SOME amount (clamping will handle exact amount reduction) -->
                     <set_value name="$buyOfferAvailable" exact="$currentTrade.$BuyOffer.available"/>
-                    <set_value name="$buyOfferAmount" exact="@$currentTrade.$BuyOffer.offeramount.{this.assignedcontrolled}"/>
+                    <set_value name="$buyOfferAmount" exact="@$currentTrade.$BuyOffer.offeramount.{this.ship}"/>
                     <!-- Supplier-side fallback: only when offeramount is zero but the supplier
                          physically holds unreserved stock (avoids matching reserved-away offers). -->
                     <do_if value="(not $buyOfferAmount? or $buyOfferAmount le 0) and $currentTrade.$BuyOffer.amount? and @$currentTrade.$BuyOffer.amount gt 0">
@@ -5559,6 +5643,15 @@
                         <set_value name="$buyOfferAmount" exact="[$buyFallbackStock, @$currentTrade.$BuyOffer.amount].min"/>
                       </do_if>
                     </do_if>
+                    <do_if value="(not $buyOfferAmount? or $buyOfferAmount le 0) and $currentTrade.$SellOffer.owner? and @$currentTrade.$SellOffer.owner.exists">
+                      <set_value name="$preValBuyWare" exact="if $currentTrade.$Ware? then $currentTrade.$Ware else null"/>
+                      <do_if value="not $preValBuyWare? and @$currentTrade.$BuyOffer.ware != null">
+                        <set_value name="$preValBuyWare" exact="@$currentTrade.$BuyOffer.ware"/>
+                      </do_if>
+                      <do_if value="$preValBuyWare?">
+                        <set_value name="$buyOfferAmount" exact="[0, $currentTrade.$SellOffer.owner.cargo.{$preValBuyWare}.target - $currentTrade.$SellOffer.owner.cargo.{$preValBuyWare}.count].max"/>
+                      </do_if>
+                    </do_if>
                     <set_value name="$buyOfferOwnerValid" exact="false"/>
                     <do_if value="$currentTrade.$BuyOffer.owner?">
                       <set_value name="$buyOwnerTmp" exact="@$currentTrade.$BuyOffer.owner"/>
@@ -5571,7 +5664,7 @@
                     
                     <!-- Check sell offer: available AND has SOME amount (clamping will handle exact amount reduction) -->
                     <set_value name="$sellOfferAvailable" exact="$currentTrade.$SellOffer.available"/>
-                    <set_value name="$sellOfferAmount" exact="@$currentTrade.$SellOffer.offeramount.{this.assignedcontrolled}"/>
+                    <set_value name="$sellOfferAmount" exact="@$currentTrade.$SellOffer.offeramount.{this.ship}"/>
                     <!-- Symmetric fallback for destination offer amount handling. -->
                     <do_if value="(not $sellOfferAmount? or $sellOfferAmount le 0) and $currentTrade.$SellOffer.amount? and @$currentTrade.$SellOffer.amount gt 0">
                       <set_value name="$sellOfferAmount" exact="@$currentTrade.$SellOffer.amount"/>
@@ -5751,7 +5844,7 @@
                     <set_value name="$buyClampReason" exact="'seller_missing'"/>
                   </do_else>
                   <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                    <set_value name="$buyOfferAmountAfterClamp" exact="@$currentTrade.$BuyOffer.offeramount.{this.assignedcontrolled}"/>
+                    <set_value name="$buyOfferAmountAfterClamp" exact="@$currentTrade.$BuyOffer.offeramount.{this.ship}"/>
                     <set_value name="$buyDesiredAfterClamp" exact="@$currentTrade.$BuyOffer.desiredamount"/>
                     <debug_text text="'[GT-Reserve] ' + this.ship.idcode + ': post-clamp BUY' +
                       '\n  original=' + $currentTrade.$Amount +
@@ -5831,7 +5924,7 @@
                   </do_else>
                   
                   <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                    <set_value name="$sellOfferAmountAfterClamp" exact="@$currentTrade.$SellOffer.offeramount.{this.assignedcontrolled}"/>
+                    <set_value name="$sellOfferAmountAfterClamp" exact="@$currentTrade.$SellOffer.offeramount.{this.ship}"/>
                     <set_value name="$sellDesiredAfterClamp" exact="@$currentTrade.$SellOffer.desiredamount"/>
                     <debug_text text="'[GT-Reserve] ' + this.ship.idcode + ': post-clamp SELL' +
                       '\n  original=' + $currentTrade.$Amount +
@@ -6625,7 +6718,7 @@
 
               <set_value name="$qtSellOfferAmount" exact="0"/>
               <do_if value="$qt.$SellOffer? and $qt.$SellOffer.exists">
-                <set_value name="$qtSellOfferAmount" exact="$qt.$SellOffer.offeramount.{this.assignedcontrolled}"/>
+                <set_value name="$qtSellOfferAmount" exact="$qt.$SellOffer.offeramount.{this.ship}"/>
                 <do_if value="$qtSellOfferAmount == null">
                   <set_value name="$qtSellOfferAmount" exact="0"/>
                 </do_if>
@@ -6638,7 +6731,7 @@
               <do_if value="not $qtIsSellOnly">
                 <set_value name="$qtBuyOfferAmount" exact="0"/>
                 <do_if value="$qt.$BuyOffer? and $qt.$BuyOffer.exists">
-                  <set_value name="$qtBuyOfferAmount" exact="$qt.$BuyOffer.offeramount.{this.assignedcontrolled}"/>
+                  <set_value name="$qtBuyOfferAmount" exact="$qt.$BuyOffer.offeramount.{this.ship}"/>
                   <do_if value="$qtBuyOfferAmount == null">
                     <set_value name="$qtBuyOfferAmount" exact="0"/>
                   </do_if>
@@ -6819,7 +6912,7 @@
             <do_if value="not $mk4PrimaryBudgetBlocked and $pPairAmount gt 0 and $mk4PrimaryTrade.$SellOffer?">
               <set_value name="$pDestSellOffer" exact="$mk4PrimaryTrade.$SellOffer"/>
               <do_if value="not $mk4DeliveryBudgetBySellOffer.{$pDestSellOffer}?">
-                <set_value name="$pDestBudgetInit" exact="@$pDestSellOffer.offeramount.{this.assignedcontrolled}"/>
+                <set_value name="$pDestBudgetInit" exact="@$pDestSellOffer.offeramount.{this.ship}"/>
                 <do_if value="$pDestBudgetInit == null or $pDestBudgetInit le 0">
                   <do_if value="$pDestSellOffer.amount?">
                     <set_value name="$pDestBudgetInit" exact="@$pDestSellOffer.amount"/>
@@ -6870,7 +6963,7 @@
             <do_if value="not $mk4PrimaryBudgetBlocked and not $pIsSellOnly and $pPairAmount gt 0 and $mk4PrimaryTrade.$BuyOffer?">
               <set_value name="$pSupBuyOffer" exact="$mk4PrimaryTrade.$BuyOffer"/>
               <do_if value="not $mk4SupplierBudgetByBuyOffer.{$pSupBuyOffer}?">
-                <set_value name="$pSupBudgetInit" exact="@$pSupBuyOffer.offeramount.{this.assignedcontrolled}"/>
+                <set_value name="$pSupBudgetInit" exact="@$pSupBuyOffer.offeramount.{this.ship}"/>
                 <do_if value="$pSupBudgetInit == null or $pSupBudgetInit le 0">
                   <do_if value="$pSupBuyOffer.amount?">
                     <set_value name="$pSupBudgetInit" exact="@$pSupBuyOffer.amount"/>
@@ -7028,7 +7121,7 @@
                 <do_if value="$scTrade.$SellOffer?">
                   <set_value name="$scDestSellOffer" exact="$scTrade.$SellOffer"/>
                   <do_if value="not $mk4DeliveryBudgetBySellOffer.{$scDestSellOffer}?">
-                    <set_value name="$scDestBudgetInit" exact="@$scDestSellOffer.offeramount.{this.assignedcontrolled}"/>
+                    <set_value name="$scDestBudgetInit" exact="@$scDestSellOffer.offeramount.{this.ship}"/>
                     <do_if value="$scDestBudgetInit == null or $scDestBudgetInit le 0">
                       <do_if value="$scDestSellOffer.amount?">
                         <set_value name="$scDestBudgetInit" exact="@$scDestSellOffer.amount"/>
@@ -7072,7 +7165,7 @@
                 <do_if value="not $scIsSellOnly and $scPairAmount gt 0 and $scTrade.$BuyOffer?">
                   <set_value name="$scSupBuyOffer" exact="$scTrade.$BuyOffer"/>
                   <do_if value="not $mk4SupplierBudgetByBuyOffer.{$scSupBuyOffer}?">
-                    <set_value name="$scSupBudgetInit" exact="@$scSupBuyOffer.offeramount.{this.assignedcontrolled}"/>
+                    <set_value name="$scSupBudgetInit" exact="@$scSupBuyOffer.offeramount.{this.ship}"/>
                     <do_if value="$scSupBudgetInit == null or $scSupBudgetInit le 0">
                       <do_if value="$scSupBuyOffer.amount?">
                         <set_value name="$scSupBudgetInit" exact="@$scSupBuyOffer.amount"/>
@@ -7380,7 +7473,7 @@
               <do_if value="$qt.$SellOffer? and $qtExecSellAmount gt 0">
                 <create_trade_order object="this.ship" tradeoffer="$qt.$SellOffer" amount="$qtExecSellAmount" immediate="true" internal="$qtSellLegInternal"/>
                 <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <set_value name="$sellOfferAmountAfterOrder" exact="@$qt.$SellOffer.offeramount.{this.assignedcontrolled}"/>
+                  <set_value name="$sellOfferAmountAfterOrder" exact="@$qt.$SellOffer.offeramount.{this.ship}"/>
                   <set_value name="$sellDesiredAfterOrder" exact="@$qt.$SellOffer.desiredamount"/>
                   <debug_text text="'[GT-Reserve] ' + this.ship.idcode + ': after create_trade_order SELL (phase=SELL, leg ' + $qidx + '/' + $mk4QueueableTrades.count + ')' +
                     '\n  orderAmount=' + $qtExecSellAmount +
@@ -7452,7 +7545,7 @@
               <do_if value="not $qtIsSellOnlyExec and $qt.$BuyOffer? and $qtExecBuyAmount gt 0">
                 <create_trade_order object="this.ship" tradeoffer="$qt.$BuyOffer" amount="$qtExecBuyAmount" immediate="true" internal="$qtBuyLegInternal"/>
                 <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <set_value name="$buyOfferAmountAfterOrder" exact="@$qt.$BuyOffer.offeramount.{this.assignedcontrolled}"/>
+                  <set_value name="$buyOfferAmountAfterOrder" exact="@$qt.$BuyOffer.offeramount.{this.ship}"/>
                   <set_value name="$buyDesiredAfterOrder" exact="@$qt.$BuyOffer.desiredamount"/>
                   <debug_text text="'[GT-Reserve] ' + this.ship.idcode + ': after create_trade_order BUY (phase=BUY, leg ' + $qidx + '/' + $mk4BuyPhaseTrades.count + ')' +
                     '\n  orderAmount=' + $qtExecBuyAmount +
@@ -8094,8 +8187,18 @@
             <!-- The wait block will catch GT_Trade_Found signal when live search completes -->
             <resume label="wait_for_response"/>
           </do_if>
+          <do_elseif value="$searchMethod == 'live' or $searchMethod == 'live_sell_only' or $searchMethod == 'live_fallback'">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': All live trades rejected - releasing scheduler slot, backing off before fresh live search' +
+                '\n  Rejection breakdown: Path=' + $tradesRejectedPathSafe + ', Docking=' + $tradesRejectedDockingSafe + ', OfferInvalid=' + $tradesRejectedOfferInvalidSafe + ', Distance=' + $tradesRejectedDistanceSafe + ', Cargo=' + $tradesRejectedCargoSafe + ', Restriction=' + $tradesRejectedRestrictionSafe + ', DemandReserved=' + $tradesRejectedDemandReservedSafe + ', Blacklist=' + $tradesBlacklistedSafe +
+                '\n  All ' + $tradeListCountSafe + ' live trades invalid at validation - skip stale cache on next attempt'" chance="100"/>
+            </do_if>
+            <signal_objects object="player.galaxy" param="'GT_Search_Abort'" param2="table[$Ship = this.ship]" delay="1ms"/>
+            <set_value name="this.$forceLiveAfterLiveReject" exact="true"/>
+            <resume label="no_trade_retry"/>
+          </do_elseif>
           <do_else>
-            <!-- Trades came from live search or search method unknown - use normal retry -->
+            <!-- Trades came from unknown source - use normal retry -->
             <resume label="no_trade_retry"/>
           </do_else>
         </do_else>

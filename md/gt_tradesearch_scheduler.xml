@@ -78,6 +78,9 @@
         <!-- Home refresh waiters (ships waiting for same-home live refresh completion) -->
         <set_value name="global.$GT_SearchSemaphore.$LiveWaitersByHome" exact="table[]"/>
         <set_value name="global.$GT_SearchSemaphore.$LiveWaiterQueuedByHome" exact="table[]"/>
+        <set_value name="global.$GT_SearchSemaphore.$LiveWaiterStartedAt" exact="table[]"/>
+        <set_value name="global.$GT_SearchSemaphore.$LiveWaiterWakePending" exact="table[]"/>
+        <set_value name="global.$GT_SearchSemaphore.$LiveWaiterPassCount" exact="table[]"/>
         <set_value name="global.$GT_SearchSemaphore.$LiveWaiterTickScheduled" exact="false"/>
 
         <!-- Cross-pool state -->
@@ -183,6 +186,28 @@
 
         <do_if value="not global.$GT_SearchSemaphore?">
           <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.InitSearchSemaphore"/>
+        </do_if>
+        <do_if value="global.$GT_SearchSemaphore?">
+          <do_if value="not global.$GT_SearchSemaphore.$LiveWaiterStartedAt?">
+            <set_value name="global.$GT_SearchSemaphore.$LiveWaiterStartedAt" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_SearchSemaphore.$LiveWaiterWakePending?">
+            <set_value name="global.$GT_SearchSemaphore.$LiveWaiterWakePending" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_SearchSemaphore.$LiveWaiterPassCount?">
+            <set_value name="global.$GT_SearchSemaphore.$LiveWaiterPassCount" exact="table[]"/>
+          </do_if>
+        </do_if>
+
+        <!-- Woken home refresh waiters skip cache and go straight to live (shared refresh did not help). -->
+        <do_if value="$ship? and global.$GT_SearchSemaphore? and global.$GT_SearchSemaphore.$LiveWaiterWakePending? and global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$ship}?">
+          <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$ship}"/>
+          <set_value name="$targetPhase" exact="'live'"/>
+          <set_value name="$forceLiveSearch" exact="true"/>
+          <do_if value="$params?">
+            <set_value name="$params.$ForceLiveSearch" exact="true"/>
+            <set_value name="$params.$Phase" exact="'live'"/>
+          </do_if>
         </do_if>
 
         <!-- Force-live requests skip cache and go directly to normal live pool.
@@ -377,12 +402,24 @@
               <do_if value="not global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}?">
                 <set_value name="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}" exact="[]"/>
               </do_if>
-              <append_to_list name="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}" exact="table[
+              <set_value name="$liveQueueEntry" exact="table[
                 $Ship = $ship,
                 $Params = $params,
                 $HomeSector = $homeSector,
                 $EnqueuedAt = player.age
               ]"/>
+              <do_if value="$forceLiveSearch">
+                <set_value name="$liveQueueMerged" exact="[$liveQueueEntry]"/>
+                <do_if value="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.count gt 0">
+                  <do_all exact="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.count" counter="$lqi">
+                    <append_to_list name="$liveQueueMerged" exact="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.{$lqi}"/>
+                  </do_all>
+                </do_if>
+                <set_value name="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}" exact="$liveQueueMerged"/>
+              </do_if>
+              <do_else>
+                <append_to_list name="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}" exact="$liveQueueEntry"/>
+              </do_else>
               <set_value name="global.$GT_SearchSemaphore.$LiveQueued.{$ship}" exact="true"/>
               <set_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}" exact="'live_queued'"/>
               <do_if value="not global.$GT_SearchSemaphore.$LiveHomesQueued.{$homeSector}?">
@@ -674,6 +711,65 @@
           <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.InitSearchSemaphore"/>
         </do_if>
 
+        <!-- Self-heal stale MK3 live-active / orphaned LiveHomeActive slots (parity with MK4 pool). -->
+        <set_value name="$liveStaleThreshold" exact="120s"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$StaleThresholdSeconds?">
+          <set_value name="$liveStaleThreshold" exact="@global.$GT_GlobalSettings.$Performance.$StaleThresholdSeconds"/>
+        </do_if>
+        <do_if value="global.$GT_SearchSemaphore.$LiveActiveShips? and global.$GT_SearchSemaphore.$LiveActiveShips.keys.count gt 0">
+          <set_value name="$liveActiveKeys" exact="global.$GT_SearchSemaphore.$LiveActiveShips.keys.list"/>
+          <do_all exact="$liveActiveKeys.count" counter="$laki">
+            <set_value name="$liveActiveShip" exact="$liveActiveKeys.{$laki}"/>
+            <set_value name="$liveActiveEntry" exact="if $liveActiveShip? and global.$GT_SearchSemaphore.$LiveActiveShips.{$liveActiveShip}? then @global.$GT_SearchSemaphore.$LiveActiveShips.{$liveActiveShip} else null"/>
+            <set_value name="$liveActiveStartedAt" exact="if $liveActiveEntry? and $liveActiveEntry.$StartedAt? then @$liveActiveEntry.$StartedAt else null"/>
+            <set_value name="$liveActiveStale" exact="false"/>
+            <do_if value="not $liveActiveShip? or ($liveActiveShip? and not $liveActiveShip.exists)">
+              <set_value name="$liveActiveStale" exact="true"/>
+            </do_if>
+            <do_if value="not $liveActiveStale and ($liveActiveStartedAt == null or (player.age - $liveActiveStartedAt) gt $liveStaleThreshold)">
+              <set_value name="$liveActiveStale" exact="true"/>
+            </do_if>
+            <do_if value="$liveActiveStale">
+              <set_value name="$staleLiveHome" exact="if $liveActiveEntry? and $liveActiveEntry.$HomeSector? then @$liveActiveEntry.$HomeSector else null"/>
+              <do_if value="$liveActiveShip? and global.$GT_SearchSemaphore.$LiveActiveShips.{$liveActiveShip}?">
+                <remove_value name="global.$GT_SearchSemaphore.$LiveActiveShips.{$liveActiveShip}"/>
+              </do_if>
+              <do_if value="global.$GT_SearchSemaphore.$LiveActive gt 0">
+                <set_value name="global.$GT_SearchSemaphore.$LiveActive" operation="subtract"/>
+              </do_if>
+              <do_if value="$staleLiveHome? and global.$GT_SearchSemaphore.$LiveHomeActive? and global.$GT_SearchSemaphore.$LiveHomeActive.{$staleLiveHome}? and @global.$GT_SearchSemaphore.$LiveHomeActive.{$staleLiveHome} == $liveActiveShip">
+                <remove_value name="global.$GT_SearchSemaphore.$LiveHomeActive.{$staleLiveHome}"/>
+              </do_if>
+              <do_if value="$liveActiveShip? and global.$GT_SearchSemaphore.$PhaseStateByShip? and global.$GT_SearchSemaphore.$PhaseStateByShip.{$liveActiveShip}? and @global.$GT_SearchSemaphore.$PhaseStateByShip.{$liveActiveShip} == 'live_active'">
+                <remove_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$liveActiveShip}"/>
+              </do_if>
+              <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Scheduler] DispatchLiveSearchGo: Cleared stale live-active owner=' + (if $liveActiveShip? then $liveActiveShip.idcode else 'null') + ' startedAt=' + (if $liveActiveStartedAt? then $liveActiveStartedAt else 'null') + ' age=' + player.age" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+        <do_if value="global.$GT_SearchSemaphore.$LiveHomeActive? and global.$GT_SearchSemaphore.$LiveHomeActive.keys.count gt 0">
+          <set_value name="$liveHomeActiveKeys" exact="global.$GT_SearchSemaphore.$LiveHomeActive.keys.list"/>
+          <do_all exact="$liveHomeActiveKeys.count" counter="$lhaki">
+            <set_value name="$orphanHome" exact="$liveHomeActiveKeys.{$lhaki}"/>
+            <set_value name="$orphanOwner" exact="if $orphanHome? and global.$GT_SearchSemaphore.$LiveHomeActive.{$orphanHome}? then @global.$GT_SearchSemaphore.$LiveHomeActive.{$orphanHome} else null"/>
+            <set_value name="$orphanHomeStale" exact="false"/>
+            <do_if value="not $orphanOwner? or not $orphanOwner.exists">
+              <set_value name="$orphanHomeStale" exact="true"/>
+            </do_if>
+            <do_if value="not $orphanHomeStale and global.$GT_SearchSemaphore.$LiveActiveShips? and not global.$GT_SearchSemaphore.$LiveActiveShips.{$orphanOwner}?">
+              <set_value name="$orphanHomeStale" exact="true"/>
+            </do_if>
+            <do_if value="$orphanHomeStale">
+              <remove_value name="global.$GT_SearchSemaphore.$LiveHomeActive.{$orphanHome}"/>
+              <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Scheduler] DispatchLiveSearchGo: Cleared orphaned LiveHomeActive home=' + (if $orphanHome? and $orphanHome.knownname? then @$orphanHome.knownname else '?') + ' owner=' + (if $orphanOwner? then $orphanOwner.idcode else 'null')" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+
         <do_if value="global.$GT_SearchSemaphore.$LiveHomesQueue.count gt 0 and global.$GT_SearchSemaphore.$LiveActive ge global.$GT_SearchSemaphore.$MaxConcurrentLive">
           <do_if value="not global.$GT_SearchSemaphore.$LiveDispatchScheduled">
             <set_value name="global.$GT_SearchSemaphore.$LiveDispatchScheduled" exact="true"/>
@@ -777,18 +873,79 @@
       <delay exact="20s"/>
       <actions>
         <set_value name="$hasAnyActiveWaiters" exact="false"/>
+        <set_value name="$waiterStaleThreshold" exact="120s"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$StaleThresholdSeconds?">
+          <set_value name="$waiterStaleThreshold" exact="@global.$GT_GlobalSettings.$Performance.$StaleThresholdSeconds"/>
+        </do_if>
         <do_if value="global.$GT_SearchSemaphore? and global.$GT_SearchSemaphore.$LiveWaitersByHome? and global.$GT_SearchSemaphore.$LiveWaitersByHome.keys.count gt 0">
           <set_value name="$homeKeys" exact="global.$GT_SearchSemaphore.$LiveWaitersByHome.keys.list"/>
           <do_all exact="$homeKeys.count" counter="$hki">
             <set_value name="$homeSector" exact="$homeKeys.{$hki}"/>
-            <do_if value="$homeSector? and global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}? and global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.count gt 0 and global.$GT_SearchSemaphore.$LiveHomeActive? and global.$GT_SearchSemaphore.$LiveHomeActive.{$homeSector}?">
-              <set_value name="$hasAnyActiveWaiters" exact="true"/>
-              <do_all exact="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.count" counter="$wi">
+            <do_if value="$homeSector? and global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}? and global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.count gt 0">
+              <set_value name="$homeOwner" exact="if global.$GT_SearchSemaphore.$LiveHomeActive? and global.$GT_SearchSemaphore.$LiveHomeActive.{$homeSector}? then @global.$GT_SearchSemaphore.$LiveHomeActive.{$homeSector} else null"/>
+              <set_value name="$homeOwnerStale" exact="false"/>
+              <do_if value="not $homeOwner? or not $homeOwner.exists">
+                <set_value name="$homeOwnerStale" exact="true"/>
+              </do_if>
+              <do_if value="not $homeOwnerStale and global.$GT_SearchSemaphore.$LiveActiveShips? and not global.$GT_SearchSemaphore.$LiveActiveShips.{$homeOwner}?">
+                <set_value name="$homeOwnerStale" exact="true"/>
+              </do_if>
+              <do_if value="not $homeOwnerStale and global.$GT_SearchSemaphore.$LiveActiveShips? and global.$GT_SearchSemaphore.$LiveActiveShips.{$homeOwner}?">
+                <set_value name="$homeOwnerEntry" exact="@global.$GT_SearchSemaphore.$LiveActiveShips.{$homeOwner}"/>
+                <set_value name="$homeOwnerStartedAt" exact="if $homeOwnerEntry? and $homeOwnerEntry.$StartedAt? then @$homeOwnerEntry.$StartedAt else null"/>
+                <do_if value="$homeOwnerStartedAt == null or (player.age - $homeOwnerStartedAt) gt $waiterStaleThreshold">
+                  <set_value name="$homeOwnerStale" exact="true"/>
+                </do_if>
+              </do_if>
+              <do_if value="$homeOwnerStale and global.$GT_SearchSemaphore.$LiveHomeActive? and global.$GT_SearchSemaphore.$LiveHomeActive.{$homeSector}?">
+                <remove_value name="global.$GT_SearchSemaphore.$LiveHomeActive.{$homeSector}"/>
+              </do_if>
+              <do_if value="$homeOwnerStale and $homeOwner? and global.$GT_SearchSemaphore.$LiveActiveShips? and global.$GT_SearchSemaphore.$LiveActiveShips.{$homeOwner}?">
+                <remove_value name="global.$GT_SearchSemaphore.$LiveActiveShips.{$homeOwner}"/>
+                <do_if value="global.$GT_SearchSemaphore.$LiveActive gt 0">
+                  <set_value name="global.$GT_SearchSemaphore.$LiveActive" operation="subtract"/>
+                </do_if>
+              </do_if>
+
+              <do_all exact="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.count" counter="$wi" reverse="true">
                 <set_value name="$wShip" exact="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.{$wi}"/>
-                <do_if value="$wShip? and $wShip.exists">
-                  <signal_objects object="$wShip" param="'GT_TradeSearch_InProgress'" delay="1ms"/>
+                <do_if value="not $wShip? or not $wShip.exists">
+                  <remove_value name="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.{$wi}"/>
+                  <continue/>
+                </do_if>
+                <set_value name="$waiterAge" exact="0s"/>
+                <do_if value="global.$GT_SearchSemaphore.$LiveWaiterStartedAt? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}.{$wShip}?">
+                  <set_value name="$waiterAge" exact="player.age - @global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}.{$wShip}"/>
+                </do_if>
+                <set_value name="$promoteWaiter" exact="false"/>
+                <do_if value="$homeOwnerStale or $waiterAge gt $waiterStaleThreshold">
+                  <set_value name="$promoteWaiter" exact="true"/>
+                </do_if>
+                <do_if value="$promoteWaiter">
+                  <remove_value name="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.{$wi}"/>
+                  <do_if value="global.$GT_SearchSemaphore.$LiveWaiterQueuedByHome? and global.$GT_SearchSemaphore.$LiveWaiterQueuedByHome.{$homeSector}? and global.$GT_SearchSemaphore.$LiveWaiterQueuedByHome.{$homeSector}.{$wShip}?">
+                    <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterQueuedByHome.{$homeSector}.{$wShip}"/>
+                  </do_if>
+                  <do_if value="global.$GT_SearchSemaphore.$LiveWaiterStartedAt? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}.{$wShip}?">
+                    <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}.{$wShip}"/>
+                  </do_if>
+                  <set_value name="global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$wShip}" exact="true"/>
+                  <signal_objects object="$wShip" param="'GT_TradeSearch_Reset'" delay="1ms"/>
+                  <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Scheduler] NotifyLiveWaitersTick: Promoted starved waiter ' + $wShip.idcode + ' home=' + (if $homeSector.knownname? then @$homeSector.knownname else '?') + ' waiterAge=' + $waiterAge + ' homeOwnerStale=' + $homeOwnerStale" chance="100"/>
+                  </do_if>
                 </do_if>
               </do_all>
+
+              <do_if value="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}? and global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.count gt 0 and global.$GT_SearchSemaphore.$LiveHomeActive? and global.$GT_SearchSemaphore.$LiveHomeActive.{$homeSector}?">
+                <set_value name="$hasAnyActiveWaiters" exact="true"/>
+                <do_all exact="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.count" counter="$wi">
+                  <set_value name="$wShip" exact="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.{$wi}"/>
+                  <do_if value="$wShip? and $wShip.exists">
+                    <signal_objects object="$wShip" param="'GT_TradeSearch_InProgress'" delay="1ms"/>
+                  </do_if>
+                </do_all>
+              </do_if>
             </do_if>
           </do_all>
         </do_if>
@@ -800,6 +957,7 @@
         <do_else>
           <set_value name="global.$GT_SearchSemaphore.$LiveWaiterTickScheduled" exact="false"/>
         </do_else>
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.DispatchLiveSearchGo"/>
       </actions>
     </cue>
 
@@ -828,7 +986,8 @@
             </do_if>
           </do_all>
         </do_if>
-        <do_if value="$searchType == 'live' and $mk4LiveEntry?">
+        <!-- Only route to mk4live when MK3 live slot is not active (avoids orphan MK4 entries leaving LiveActiveShips uncleared). -->
+        <do_if value="$searchType == 'live' and $mk4LiveEntry? and not $liveEntry?">
           <set_value name="$searchType" exact="'mk4live'"/>
         </do_if>
 
@@ -844,6 +1003,15 @@
           <do_if value="$ship? and $ship.exists">
             <do_if value="$found and $tradeList.count gt 0">
               <remove_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}"/>
+              <do_if value="global.$GT_SearchSemaphore.$LiveWaiterPassCount? and global.$GT_SearchSemaphore.$LiveWaiterPassCount.{$ship}?">
+                <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterPassCount.{$ship}"/>
+              </do_if>
+              <do_if value="global.$GT_SearchSemaphore.$LiveWaiterWakePending? and global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$ship}?">
+                <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$ship}"/>
+              </do_if>
+              <do_if value="$homeSector? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}.{$ship}?">
+                <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}.{$ship}"/>
+              </do_if>
               <signal_objects object="$ship" param="'GT_Trade_Found'" param2="table[
                 $TradeList = $tradeList,
                 $SearchMethod = $searchMethod
@@ -881,22 +1049,57 @@
                 </do_if>
               </do_if>
               <do_else>
-                <!-- Home refresh already active: park ship as waiter and keep it alive until completion. -->
+                <!-- Home refresh already active: park ship as waiter unless starved (then promote to live queue). -->
                 <set_value name="$homeActiveByOtherShip" exact="false"/>
                 <do_if value="$homeSector? and global.$GT_SearchSemaphore.$LiveHomeActive? and global.$GT_SearchSemaphore.$LiveHomeActive.{$homeSector}? and @global.$GT_SearchSemaphore.$LiveHomeActive.{$homeSector} != $ship">
                   <set_value name="$homeActiveByOtherShip" exact="true"/>
                 </do_if>
 
-                <do_if value="$homeActiveByOtherShip">
+                <set_value name="$waiterStaleThreshold" exact="120s"/>
+                <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$StaleThresholdSeconds?">
+                  <set_value name="$waiterStaleThreshold" exact="@global.$GT_GlobalSettings.$Performance.$StaleThresholdSeconds"/>
+                </do_if>
+                <set_value name="$starvedWaiter" exact="false"/>
+                <do_if value="$ship? and global.$GT_SearchSemaphore.$LiveWaiterWakePending? and global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$ship}?">
+                  <set_value name="$starvedWaiter" exact="true"/>
+                  <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$ship}"/>
+                </do_if>
+                <do_if value="not $starvedWaiter and $ship? and global.$GT_SearchSemaphore.$LiveWaiterPassCount? and global.$GT_SearchSemaphore.$LiveWaiterPassCount.{$ship}? and @global.$GT_SearchSemaphore.$LiveWaiterPassCount.{$ship} ge 1">
+                  <set_value name="$starvedWaiter" exact="true"/>
+                </do_if>
+                <do_if value="not $starvedWaiter and $ship? and $homeSector? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}.{$ship}?">
+                  <do_if value="(player.age - @global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}.{$ship}) gt $waiterStaleThreshold">
+                    <set_value name="$starvedWaiter" exact="true"/>
+                  </do_if>
+                </do_if>
+
+                <set_value name="$parkAsWaiter" exact="false"/>
+                <do_if value="$homeActiveByOtherShip and not $starvedWaiter">
+                  <set_value name="$parkAsWaiter" exact="true"/>
+                </do_if>
+
+                <do_if value="$parkAsWaiter">
                   <do_if value="not global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}?">
                     <set_value name="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}" exact="[]"/>
                   </do_if>
                   <do_if value="not global.$GT_SearchSemaphore.$LiveWaiterQueuedByHome.{$homeSector}?">
                     <set_value name="global.$GT_SearchSemaphore.$LiveWaiterQueuedByHome.{$homeSector}" exact="table[]"/>
                   </do_if>
+                  <do_if value="not global.$GT_SearchSemaphore.$LiveWaiterStartedAt?">
+                    <set_value name="global.$GT_SearchSemaphore.$LiveWaiterStartedAt" exact="table[]"/>
+                  </do_if>
+                  <do_if value="not global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}?">
+                    <set_value name="global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}" exact="table[]"/>
+                  </do_if>
+                  <do_if value="not global.$GT_SearchSemaphore.$LiveWaiterPassCount?">
+                    <set_value name="global.$GT_SearchSemaphore.$LiveWaiterPassCount" exact="table[]"/>
+                  </do_if>
                   <do_if value="not global.$GT_SearchSemaphore.$LiveWaiterQueuedByHome.{$homeSector}.{$ship}?">
                     <append_to_list name="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}" exact="$ship"/>
                     <set_value name="global.$GT_SearchSemaphore.$LiveWaiterQueuedByHome.{$homeSector}.{$ship}" exact="true"/>
+                    <set_value name="global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}.{$ship}" exact="player.age"/>
+                    <set_value name="$prevWaiterPassCount" exact="if global.$GT_SearchSemaphore.$LiveWaiterPassCount.{$ship}? then @global.$GT_SearchSemaphore.$LiveWaiterPassCount.{$ship} else 0"/>
+                    <set_value name="global.$GT_SearchSemaphore.$LiveWaiterPassCount.{$ship}" exact="$prevWaiterPassCount + 1"/>
                   </do_if>
                   <remove_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}"/>
                   <signal_objects object="$ship" param="'GT_TradeSearch_InProgress'" delay="1ms"/>
@@ -906,7 +1109,7 @@
                   </do_if>
                 </do_if>
                 <do_else>
-                  <!-- No active same-home live refresh -> enqueue live (fair by home). -->
+                  <!-- No active same-home live refresh, or starved waiter -> enqueue live (fair by home). -->
                   <set_value name="$enqueueLive" exact="true"/>
                   <do_if value="global.$GT_SearchSemaphore.$LiveQueued? and global.$GT_SearchSemaphore.$LiveQueued.{$ship}?">
                     <set_value name="$enqueueLive" exact="false"/>
@@ -919,6 +1122,9 @@
                     <set_value name="$liveParams" exact="if $cacheEntry? and $cacheEntry.$Params? then @$cacheEntry.$Params else (if $data? and $data.$Params? then @$data.$Params else table[$Ship = $ship])"/>
                     <set_value name="$liveParams.$Phase" exact="'live'"/>
                     <set_value name="$liveParams.$HomeSector" exact="$homeSector"/>
+                    <do_if value="$starvedWaiter">
+                      <set_value name="$liveParams.$ForceLiveSearch" exact="true"/>
+                    </do_if>
                     <set_value name="$useMK4LivePool" exact="$liveParams.$SearchPool? and $liveParams.$SearchPool == 'mk4_supply'"/>
                     <do_if value="$useMK4LivePool">
                       <set_value name="$liveParams.$Phase" exact="'mk4live'"/>
@@ -935,17 +1141,32 @@
                       <do_if value="not global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}?">
                         <set_value name="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}" exact="[]"/>
                       </do_if>
-                      <append_to_list name="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}" exact="table[
+                      <set_value name="$liveQueueEntry" exact="table[
                         $Ship = $ship,
                         $Params = $liveParams,
                         $HomeSector = $homeSector,
                         $EnqueuedAt = player.age
                       ]"/>
+                      <do_if value="$starvedWaiter">
+                        <set_value name="$liveQueueMerged" exact="[$liveQueueEntry]"/>
+                        <do_if value="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.count gt 0">
+                          <do_all exact="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.count" counter="$lqi">
+                            <append_to_list name="$liveQueueMerged" exact="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.{$lqi}"/>
+                          </do_all>
+                        </do_if>
+                        <set_value name="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}" exact="$liveQueueMerged"/>
+                      </do_if>
+                      <do_else>
+                        <append_to_list name="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}" exact="$liveQueueEntry"/>
+                      </do_else>
                       <set_value name="global.$GT_SearchSemaphore.$LiveQueued.{$ship}" exact="true"/>
                       <set_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}" exact="'live_queued'"/>
                       <do_if value="not global.$GT_SearchSemaphore.$LiveHomesQueued.{$homeSector}?">
                         <append_to_list name="global.$GT_SearchSemaphore.$LiveHomesQueue" exact="$homeSector"/>
                         <set_value name="global.$GT_SearchSemaphore.$LiveHomesQueued.{$homeSector}" exact="true"/>
+                      </do_if>
+                      <do_if value="$starvedWaiter and global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                        <debug_text text="'[GT-Scheduler] HandleSearchDone: Promoted starved waiter ' + $ship.idcode + ' to live queue home=' + (if $homeSector? and $homeSector.knownname? then @$homeSector.knownname else '?')" chance="100"/>
                       </do_if>
                     </do_else>
                   </do_if>
@@ -1080,6 +1301,10 @@
                 <do_all exact="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$waiterHome}.count" counter="$wi">
                   <set_value name="$wShip" exact="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$waiterHome}.{$wi}"/>
                   <do_if value="$wShip? and $wShip.exists">
+                    <do_if value="not global.$GT_SearchSemaphore.$LiveWaiterWakePending?">
+                      <set_value name="global.$GT_SearchSemaphore.$LiveWaiterWakePending" exact="table[]"/>
+                    </do_if>
+                    <set_value name="global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$wShip}" exact="true"/>
                     <signal_objects object="$wShip" param="'GT_TradeSearch_Reset'" delay="1ms"/>
                   </do_if>
                 </do_all>
@@ -1099,6 +1324,15 @@
 
           <do_if value="$ship? and $ship.exists">
             <do_if value="$found and $tradeList.count gt 0">
+              <do_if value="global.$GT_SearchSemaphore.$LiveWaiterPassCount? and global.$GT_SearchSemaphore.$LiveWaiterPassCount.{$ship}?">
+                <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterPassCount.{$ship}"/>
+              </do_if>
+              <do_if value="global.$GT_SearchSemaphore.$LiveWaiterWakePending? and global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$ship}?">
+                <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$ship}"/>
+              </do_if>
+              <do_if value="$homeSector? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}.{$ship}?">
+                <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}.{$ship}"/>
+              </do_if>
               <signal_objects object="$ship" param="'GT_Trade_Found'" param2="table[
                 $TradeList = $tradeList,
                 $SearchMethod = $searchMethod
@@ -1124,6 +1358,10 @@
               <do_all exact="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$ownedHomeEarly}.count" counter="$wi">
                 <set_value name="$wShip" exact="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$ownedHomeEarly}.{$wi}"/>
                 <do_if value="$wShip? and $wShip.exists">
+                  <do_if value="not global.$GT_SearchSemaphore.$LiveWaiterWakePending?">
+                    <set_value name="global.$GT_SearchSemaphore.$LiveWaiterWakePending" exact="table[]"/>
+                  </do_if>
+                  <set_value name="global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$wShip}" exact="true"/>
                   <signal_objects object="$wShip" param="'GT_TradeSearch_Reset'" delay="1ms"/>
                 </do_if>
               </do_all>
@@ -1248,6 +1486,21 @@
 
           <do_if value="global.$GT_SearchSemaphore.$PhaseStateByShip? and global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}?">
             <remove_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_SearchSemaphore.$LiveWaiterPassCount? and global.$GT_SearchSemaphore.$LiveWaiterPassCount.{$ship}?">
+            <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterPassCount.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_SearchSemaphore.$LiveWaiterWakePending? and global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$ship}?">
+            <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$ship}"/>
+          </do_if>
+          <do_if value="global.$GT_SearchSemaphore.$LiveWaiterStartedAt? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt.keys.count gt 0">
+            <set_value name="$waiterStartedHomes" exact="global.$GT_SearchSemaphore.$LiveWaiterStartedAt.keys.list"/>
+            <do_all exact="$waiterStartedHomes.count" counter="$wshi">
+              <set_value name="$wshHome" exact="$waiterStartedHomes.{$wshi}"/>
+              <do_if value="$wshHome? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$wshHome}? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$wshHome}.{$ship}?">
+                <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$wshHome}.{$ship}"/>
+              </do_if>
+            </do_all>
           </do_if>
         </do_if>
 

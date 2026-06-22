@@ -3267,6 +3267,21 @@
               <relativeprice max="$activeSellPriceMax" tradepartner="if $ship.isplayerowned then $ship else null"/>
             </find_sell_offer>
           </do_elseif>
+          <!-- MK4 runtime always passes includePlayerSellOffers=true (lib.gt.live.search).
+               The generic NPC-only scan (negateownerfilter) omits player suppliers, so
+               buyFromPlayer-only orders evaluate only doomed NPC×player pairs and hit the
+               pair-eval cap with mk4_supplier_policy_blocked before any player supplier
+               is considered. -->
+          <do_elseif value="$orderId == 'GalaxyTraderMK4Supply'">
+            <find_sell_offer tradepartner="$ship" space="$searchSec" result="$secSellOffers" multiple="true">
+              <match_seller tradesknownto="$ship.owner">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_seller>
+              <amount min="1"/>
+              <relativeprice max="$activeSellPriceMax" tradepartner="if $ship.isplayerowned then $ship else null"/>
+            </find_sell_offer>
+          </do_elseif>
           <do_else>
             <find_sell_offer tradepartner="$ship" space="$searchSec" result="$secSellOffers" multiple="true">
               <match_seller tradesknownto="$ship.owner" owner="faction.player" negateownerfilter="true">
@@ -3279,9 +3294,23 @@
           </do_else>
           <set_value name="$secSellCount" exact="0"/>
           <do_if value="$secSellOffers? and $secSellOffers.count?">
-            <set_value name="$secSellCount" exact="$secSellOffers.count"/>
-            <do_all exact="$secSellCount" counter="$soi">
-              <append_to_list name="$allSellOffers" exact="$secSellOffers.{$soi}"/>
+            <do_all exact="$secSellOffers.count" counter="$soi">
+              <set_value name="$diagSellOffer" exact="$secSellOffers.{$soi}"/>
+              <!-- MK4 supplier-policy prefilter at collection (mirrors pair gate + live.search
+                   ownerFilter semantics). Prevents eval-cap starvation when one supplier side
+                   is disabled — e.g. buyFromPlayer-only with hundreds of NPC sell offers. -->
+              <do_if value="$orderId == 'GalaxyTraderMK4Supply'">
+                <set_value name="$diagSellOwner" exact="if $diagSellOffer.owner? then $diagSellOffer.owner else null"/>
+                <set_value name="$diagSellIsPlayer" exact="false"/>
+                <do_if value="$diagSellOwner? and $diagSellOwner.exists and @$diagSellOwner.isplayerowned">
+                  <set_value name="$diagSellIsPlayer" exact="true"/>
+                </do_if>
+                <do_if value="($diagSellIsPlayer and not $diagMk4AllowPlayerSuppliers) or (not $diagSellIsPlayer and not $diagMk4AllowAiSuppliers)">
+                  <continue/>
+                </do_if>
+              </do_if>
+              <append_to_list name="$allSellOffers" exact="$diagSellOffer"/>
+              <set_value name="$secSellCount" operation="add"/>
             </do_all>
           </do_if>
 
@@ -4622,7 +4651,7 @@
             <do_elseif value="$diagPairPlayerFreeSupplier">
               <set_value name="$pdReason" exact="'IPP: gross sell income; profit/ROI/money gates bypassed'"/>
             </do_elseif>
-            <do_if value="not ($diagShowExecutableOnly and $pairVerdict != 'PASS') and $pairDetails.count lt $diagPairDisplayCap">
+            <do_if value="$pairDetails.count lt $diagPairDisplayCap">
               <append_to_list name="$pairDetails" exact="table[$Check = $pairWare.name, $Status = $pdStatus, $Detail = $pdRoute, $Col4 = $pdProfitStr, $Col5 = $pdScoreStr, $Col6 = $pdReason, $SortKey = $pairScore]"/>
             </do_if>
           </do_all>
@@ -4661,6 +4690,18 @@
             </do_if>
           </do_all>
           <set_value name="$pairDetails" exact="$pairDetailsSorted"/>
+        </do_if>
+        <!-- MK4 executable-only display: hide FAIL rows when PASS pairs exist (runtime view).
+             When none pass, keep FAIL rows — otherwise Pair Details is empty and useless. -->
+        <do_if value="$diagShowExecutableOnly and $orderId == 'GalaxyTraderMK4Supply' and $passCount gt 0">
+          <set_value name="$pairDetailsPassOnly" exact="[]"/>
+          <do_all exact="$pairDetails.count" counter="$pdpfo">
+            <set_value name="$pdpfRow" exact="$pairDetails.{$pdpfo}"/>
+            <do_if value="$pdpfRow.$Status? and $pdpfRow.$Status == 'PASS'">
+              <append_to_list name="$pairDetailsPassOnly" exact="$pdpfRow"/>
+            </do_if>
+          </do_all>
+          <set_value name="$pairDetails" exact="$pairDetailsPassOnly"/>
         </do_if>
 
         <!-- Runtime dispatch preview: score-sort passing pairs, then fresh-offer filter (mirrors live pipeline). -->
@@ -5175,7 +5216,10 @@
           </do_all>
         </do_elseif>
         <do_else>
-          <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Pairs Evaluated', $Status = 'INFO', $Detail = '' + $pairCount + ' scanned, ' + $pairDetails.count + ' shown (' + $passCount + ' PASS' + (if $orderId == 'GalaxyTraderMK4Supply' and $diagShowExecutableOnly then ', executable-only view' else ', ' + ($pairCount - $passCount) + ' FAIL') + ')']"/>
+          <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Pairs Evaluated', $Status = 'INFO', $Detail = '' + $pairCount + ' scanned, ' + $pairDetails.count + ' shown (' + $passCount + ' PASS' + (if $orderId == 'GalaxyTraderMK4Supply' and $diagShowExecutableOnly and $passCount gt 0 then ', executable-only view' else (if $orderId == 'GalaxyTraderMK4Supply' and $diagShowExecutableOnly and $passCount == 0 then ', no PASS — top rejected shown' else ', ' + ($pairCount - $passCount) + ' FAIL')) + ')']"/>
+          <do_if value="$orderId == 'GalaxyTraderMK4Supply' and $diagShowExecutableOnly and $passCount == 0 and $pairDetails.count gt 0">
+            <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'MK4 Pair Legend', $Status = 'INFO', $Detail = 'No executable pairs — showing highest-scored rejected candidates with failure reasons. [player] = player-owned supplier.']"/>
+          </do_if>
           <do_if value="$ignorePlayerPricing and $orderId == 'GalaxyTraderMK3'">
             <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'IPP Pair Legend', $Status = 'INFO', $Detail = '[IPP] = player-owned supplier; buy cost scored as zero; profit/ROI/money gates bypassed. [NPC] = non-player supplier. Runtime still picks highest score overall.']"/>
           </do_if>

@@ -324,6 +324,9 @@
         <run_actions ref="Ensure_Pilot_Fields">
           <param name="pilot" value="$pilot"/>
         </run_actions>
+        <run_actions ref="Sync_Stable_Identity_Index">
+          <param name="pilot" value="$pilot"/>
+        </run_actions>
         
         <!-- Update ship association -->
         <set_value name="global.$GT_Pilots.{$pilot}.$AssociatedShip" exact="$ship"/>
@@ -385,7 +388,8 @@
             
             <!-- Send logbook message when pilot returns from holiday on same ship -->
             <!-- Only send message if ship has GT default order active (not just when trade orders change) -->
-            <do_if value="$wasPaused">
+            <!-- Skip holiday return copy when this reactivation followed an eject rescue. -->
+            <do_if value="$wasPaused and not (global.$GT_Pilots.{$pilot}.$ResumedFromEject? and global.$GT_Pilots.{$pilot}.$ResumedFromEject)">
               <set_value name="$hasGTOrder" exact="false"/>
               <do_if value="$ship.defaultorder?">
                 <do_if value="global.$GT_ProtectedOrderIDs? and $ship.defaultorder? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.defaultorder.id}">
@@ -475,7 +479,7 @@
             
             <!-- Send logbook message when pilot is transferred to new ship after reactivation -->
             <!-- Only send message if ship has GT default order active (not just when trade orders change) -->
-            <do_if value="$wasPaused">
+            <do_if value="$wasPaused and not (global.$GT_Pilots.{$pilot}.$ResumedFromEject? and global.$GT_Pilots.{$pilot}.$ResumedFromEject)">
               <set_value name="$hasGTOrder" exact="false"/>
               <do_if value="$ship.defaultorder?">
                 <do_if value="global.$GT_ProtectedOrderIDs? and $ship.defaultorder? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.defaultorder.id}">
@@ -509,7 +513,7 @@
           
           <!-- Send logbook message when pilot returns from holiday (ShipID was cleared when paused) -->
           <!-- Only send message if ship has GT default order active (not just when trade orders change) -->
-          <do_if value="$wasPaused">
+          <do_if value="$wasPaused and not (global.$GT_Pilots.{$pilot}.$ResumedFromEject? and global.$GT_Pilots.{$pilot}.$ResumedFromEject)">
             <set_value name="$hasGTOrder" exact="false"/>
             <do_if value="$ship.defaultorder?">
               <do_if value="global.$GT_ProtectedOrderIDs? and $ship.defaultorder? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.defaultorder.id}">
@@ -538,6 +542,9 @@
         </do_if>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-ShipMgmt] Register_Pilot: Ship name update completed for ' + $pilot.name + ' on ' + $ship.knownname + ' (result: ' + (if $nameAlreadyUpdatedInBranch then 'branch' else $nameUpdateResult) + ')'" chance="100"/>
+        </do_if>
+        <do_if value="global.$GT_Pilots.{$pilot}.$ResumedFromEject?">
+          <remove_value name="global.$GT_Pilots.{$pilot}.$ResumedFromEject"/>
         </do_if>
       </actions>
     </library>
@@ -1555,6 +1562,498 @@
         <return value="$result"/>
       </actions>
     </library>
+
+    <!-- Maintain global.$GT_PilotsByStable — updated only via Rebind_Pilot_Registry / Sync_Stable_Identity_Index. -->
+    <library name="Sync_Stable_Identity_Index" purpose="run_actions">
+      <params>
+        <param name="pilot"/>
+      </params>
+      <actions>
+        <do_if value="not global.$GT_PilotsByStable?">
+          <set_value name="global.$GT_PilotsByStable" exact="table[]"/>
+        </do_if>
+        <do_if value="$pilot and $pilot.exists and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}?">
+          <set_value name="$stable" exact="if global.$GT_Pilots.{$pilot}.$StableIdentity? then global.$GT_Pilots.{$pilot}.$StableIdentity else ''"/>
+          <do_if value="$stable == ''">
+            <run_actions ref="Compute_Pilot_Stable_Key" result="$stable">
+              <param name="pilot" value="$pilot"/>
+            </run_actions>
+            <do_if value="$stable != ''">
+              <set_value name="global.$GT_Pilots.{$pilot}.$StableIdentity" exact="$stable"/>
+            </do_if>
+          </do_if>
+          <do_if value="$stable != ''">
+            <do_if value="$pilot.seed?">
+              <do_if value="not global.$GT_PilotsByStable.$s?">
+                <set_value name="global.$GT_PilotsByStable.$s" exact="table[]"/>
+              </do_if>
+              <set_value name="global.$GT_PilotsByStable.$s.{$pilot.seed}" exact="$pilot"/>
+            </do_if>
+            <do_elseif value="$pilot.idcode? and $pilot.idcode != ''">
+              <do_if value="not global.$GT_PilotsByStable.$i?">
+                <set_value name="global.$GT_PilotsByStable.$i" exact="table[]"/>
+              </do_if>
+              <set_value name="global.$GT_PilotsByStable.$i.{$pilot.idcode}" exact="$pilot"/>
+            </do_elseif>
+          </do_if>
+        </do_if>
+      </actions>
+    </library>
+
+    <!-- Remove transient destroy/eject scratch fields after rescue rebind. -->
+    <library name="Clear_Eject_Scratch_State" purpose="run_actions">
+      <params>
+        <param name="pilot"/>
+      </params>
+      <actions>
+        <do_if value="$pilot and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}?">
+          <remove_value name="global.$GT_Pilots.{$pilot}.$EjectedSector"/>
+          <remove_value name="global.$GT_Pilots.{$pilot}.$LastKnownPilotRef"/>
+          <remove_value name="global.$GT_Pilots.{$pilot}.$EjectTagBurstAttempt"/>
+          <remove_value name="global.$GT_Pilots.{$pilot}.$RescueCandidateShips"/>
+        </do_if>
+      </actions>
+    </library>
+
+    <!-- Lookup pilot from nested stable index (X4 cannot use 's:…' / 'i:…' as flat table keys). -->
+    <library name="Lookup_Pilot_From_Stable_Index" purpose="run_actions">
+      <params>
+        <param name="stableKey"/>
+      </params>
+      <actions>
+        <set_value name="$found" exact="null"/>
+        <do_if value="$stableKey != '' and global.$GT_PilotsByStable?">
+          <do_if value="global.$GT_PilotsByStable.$s? and global.$GT_PilotsByStable.$s.keys.count gt 0">
+            <do_all exact="global.$GT_PilotsByStable.$s.keys.count" counter="$si">
+              <set_value name="$seedKey" exact="global.$GT_PilotsByStable.$s.keys.{$si}"/>
+              <do_if value="'s:' + $seedKey == $stableKey and global.$GT_PilotsByStable.$s.{$seedKey}.exists">
+                <set_value name="$found" exact="global.$GT_PilotsByStable.$s.{$seedKey}"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="not $found and global.$GT_PilotsByStable.$i? and global.$GT_PilotsByStable.$i.keys.count gt 0">
+            <do_all exact="global.$GT_PilotsByStable.$i.keys.count" counter="$ii">
+              <set_value name="$idKey" exact="global.$GT_PilotsByStable.$i.keys.{$ii}"/>
+              <do_if value="'i:' + $idKey == $stableKey and global.$GT_PilotsByStable.$i.{$idKey}.exists">
+                <set_value name="$found" exact="global.$GT_PilotsByStable.$i.{$idKey}"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_if>
+        <return value="$found"/>
+      </actions>
+    </library>
+
+    <!-- All onboard personnel template keys (pilot seat + unassigned + service + marine). -->
+    <library name="Collect_Ship_Personnel_Templates" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+      </params>
+      <actions>
+        <set_value name="$pool" exact="[]"/>
+        <do_if value="$ship and $ship.exists">
+          <do_if value="$ship.people? and $ship.people.list?">
+            <do_all exact="$ship.people.list.count" counter="$pi">
+              <append_to_list name="$pool" exact="$ship.people.list.{$pi}"/>
+            </do_all>
+          </do_if>
+          <do_if value="$ship.people? and $ship.people.{entityrole.unassigned}? and $ship.people.{entityrole.unassigned}.list?">
+            <do_all exact="$ship.people.{entityrole.unassigned}.list.count" counter="$ui">
+              <append_to_list name="$pool" exact="$ship.people.{entityrole.unassigned}.list.{$ui}"/>
+            </do_all>
+          </do_if>
+          <do_if value="$ship.people? and $ship.people.{entityrole.service}? and $ship.people.{entityrole.service}.list?">
+            <do_all exact="$ship.people.{entityrole.service}.list.count" counter="$si">
+              <append_to_list name="$pool" exact="$ship.people.{entityrole.service}.list.{$si}"/>
+            </do_all>
+          </do_if>
+          <do_if value="$ship.people? and $ship.people.{entityrole.marine}? and $ship.people.{entityrole.marine}.list?">
+            <do_all exact="$ship.people.{entityrole.marine}.list.count" counter="$mi">
+              <append_to_list name="$pool" exact="$ship.people.{entityrole.marine}.list.{$mi}"/>
+            </do_all>
+          </do_if>
+          <do_if value="$ship.availablepeople? and $ship.availablepeople.list?">
+            <do_all exact="$ship.availablepeople.list.count" counter="$ai">
+              <append_to_list name="$pool" exact="$ship.availablepeople.list.{$ai}"/>
+            </do_all>
+          </do_if>
+          <do_if value="$ship.availablepeople? and $ship.availablepeople.{entityrole.unassigned}? and $ship.availablepeople.{entityrole.unassigned}.list?">
+            <do_all exact="$ship.availablepeople.{entityrole.unassigned}.list.count" counter="$aui">
+              <append_to_list name="$pool" exact="$ship.availablepeople.{entityrole.unassigned}.list.{$aui}"/>
+            </do_all>
+          </do_if>
+        </do_if>
+        <return value="$pool"/>
+      </actions>
+    </library>
+
+    <!-- Match untagged registry name against crew display names (may include (T:n) prefix). -->
+    <library name="Pilot_Display_Name_Matches" purpose="run_actions">
+      <params>
+        <param name="displayName" default="''"/>
+        <param name="originalName" default="''"/>
+        <param name="taggedPilotName" default="''"/>
+        <param name="pilotLevel" default="null"/>
+      </params>
+      <actions>
+        <set_value name="$match" exact="false"/>
+        <do_if value="$displayName? and $displayName != ''">
+          <do_if value="$originalName != '' and $displayName == $originalName">
+            <set_value name="$match" exact="true"/>
+          </do_if>
+          <do_if value="not $match and $taggedPilotName != '' and $displayName == $taggedPilotName">
+            <set_value name="$match" exact="true"/>
+          </do_if>
+          <do_if value="not $match and $originalName != '' and $pilotLevel? and $pilotLevel != null and $pilotLevel ge 1">
+            <set_value name="$expectedTagged" exact="'(T:' + $pilotLevel + ') ' + $originalName"/>
+            <do_if value="$displayName == $expectedTagged">
+              <set_value name="$match" exact="true"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        <return value="$match"/>
+      </actions>
+    </library>
+
+    <!-- True when a live pilot entity is the ship captain or listed in its crew pools. -->
+    <library name="Pilot_Is_On_Ship" purpose="run_actions">
+      <params>
+        <param name="pilot"/>
+        <param name="ship"/>
+      </params>
+      <actions>
+        <set_value name="$onShip" exact="false"/>
+        <do_if value="$pilot and $pilot.exists and $ship and $ship.exists">
+          <do_if value="$ship.pilot? and $ship.pilot == $pilot">
+            <set_value name="$onShip" exact="true"/>
+          </do_if>
+          <do_if value="not $onShip">
+            <run_actions ref="Collect_Ship_Personnel_Templates" result="$onShipPool">
+              <param name="ship" value="$ship"/>
+            </run_actions>
+            <do_all exact="$onShipPool.count" counter="$oi">
+              <set_value name="$crewTpl" exact="$onShipPool.{$oi}"/>
+              <set_value name="$crewEnt" exact="if $crewTpl and $ship.roleentity? and $ship.roleentity.{$crewTpl}? and $ship.roleentity.{$crewTpl}.exists then $ship.roleentity.{$crewTpl} else null"/>
+              <do_if value="$crewEnt and $crewEnt == $pilot">
+                <set_value name="$onShip" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_if>
+        <return value="$onShip"/>
+      </actions>
+    </library>
+
+    <!-- Stable key for a people-list template entry (seed lives on people.{template}, not the template id). -->
+    <library name="Template_Stable_Key_From_Crew" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="crewTemplate"/>
+      </params>
+      <actions>
+        <set_value name="$result" exact="''"/>
+        <do_if value="$crewTemplate? and $crewTemplate != null">
+          <do_if value="$ship and $ship.exists and $ship.availablepeople? and $ship.availablepeople.{$crewTemplate}? and $ship.availablepeople.{$crewTemplate}.seed?">
+            <set_value name="$result" exact="'s:' + $ship.availablepeople.{$crewTemplate}.seed"/>
+          </do_if>
+          <do_elseif value="$ship and $ship.exists and $ship.people? and $ship.people.{$crewTemplate}? and $ship.people.{$crewTemplate}.seed?">
+            <set_value name="$result" exact="'s:' + $ship.people.{$crewTemplate}.seed"/>
+          </do_elseif>
+          <do_elseif value="$crewTemplate.seed?">
+            <set_value name="$result" exact="'s:' + $crewTemplate.seed"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$result" exact="'s:' + $crewTemplate"/>
+          </do_else>
+        </do_if>
+        <return value="$result"/>
+      </actions>
+    </library>
+
+    <!-- Tiered live-pilot resolution: last-known ref → stable index → sector spacesuit scan. -->
+    <library name="Resolve_Live_Pilot_Tiered" purpose="run_actions">
+      <params>
+        <param name="livePilotHint" default="null"/>
+        <param name="stableKey" default="''"/>
+        <param name="sector" default="null"/>
+        <param name="ship" default="null"/>
+        <param name="originalName" default="''"/>
+        <param name="taggedPilotName" default="''"/>
+        <param name="pilotLevel" default="null"/>
+      </params>
+      <actions>
+        <set_value name="$resolved" exact="null"/>
+        <set_value name="$matchCount" exact="0"/>
+
+        <do_if value="$livePilotHint and $livePilotHint.exists? and $livePilotHint.exists">
+          <set_value name="$hintOk" exact="true"/>
+          <do_if value="$ship and $ship.exists">
+            <run_actions ref="Pilot_Is_On_Ship" result="$hintOk">
+              <param name="pilot" value="$livePilotHint"/>
+              <param name="ship" value="$ship"/>
+            </run_actions>
+          </do_if>
+          <do_if value="$hintOk">
+            <set_value name="$resolved" exact="$livePilotHint"/>
+            <set_value name="$matchCount" exact="1"/>
+          </do_if>
+        </do_if>
+
+        <do_if value="not $resolved and $stableKey != ''">
+          <run_actions ref="Lookup_Pilot_From_Stable_Index" result="$indexPilot">
+            <param name="stableKey" value="$stableKey"/>
+          </run_actions>
+          <do_if value="$indexPilot and $indexPilot.exists">
+            <set_value name="$indexOnShip" exact="true"/>
+            <do_if value="$ship and $ship.exists">
+              <run_actions ref="Pilot_Is_On_Ship" result="$indexOnShip">
+                <param name="pilot" value="$indexPilot"/>
+                <param name="ship" value="$ship"/>
+              </run_actions>
+            </do_if>
+            <do_if value="$indexOnShip">
+              <set_value name="$resolved" exact="$indexPilot"/>
+              <set_value name="$matchCount" exact="1"/>
+            </do_if>
+          </do_if>
+          <do_if value="not $resolved and global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
+            <do_all exact="global.$GT_Pilots.keys.count" counter="$ri">
+              <set_value name="$regKey" exact="global.$GT_Pilots.keys.{$ri}"/>
+              <do_if value="$regKey and $regKey.exists and global.$GT_Pilots.{$regKey}.$StableIdentity? and global.$GT_Pilots.{$regKey}.$StableIdentity == $stableKey">
+                <set_value name="$regOnShip" exact="true"/>
+                <do_if value="$ship and $ship.exists">
+                  <run_actions ref="Pilot_Is_On_Ship" result="$regOnShip">
+                    <param name="pilot" value="$regKey"/>
+                    <param name="ship" value="$ship"/>
+                  </run_actions>
+                </do_if>
+                <do_if value="$regOnShip">
+                  <set_value name="$resolved" exact="$regKey"/>
+                  <set_value name="$matchCount" exact="$matchCount + 1"/>
+                </do_if>
+              </do_if>
+            </do_all>
+            <do_if value="$matchCount != 1">
+              <set_value name="$resolved" exact="null"/>
+            </do_if>
+          </do_if>
+        </do_if>
+
+        <do_if value="not $resolved and $stableKey != '' and $sector and $sector.exists">
+          <set_value name="$spacesuits" exact="[]"/>
+          <find_ship_by_true_owner name="$spacesuits" class="class.spacesuit" faction="faction.player" space="$sector" multiple="true"/>
+          <do_all exact="$spacesuits.count" counter="$si">
+            <set_value name="$suit" exact="$spacesuits.{$si}"/>
+            <set_value name="$suitPilot" exact="if $suit.pilot? and $suit.pilot.exists then $suit.pilot else null"/>
+            <do_if value="$suitPilot">
+              <run_actions ref="Compute_Pilot_Stable_Key" result="$suitStable">
+                <param name="pilot" value="$suitPilot"/>
+              </run_actions>
+              <do_if value="$suitStable == $stableKey">
+                <set_value name="$resolved" exact="$suitPilot"/>
+                <set_value name="$matchCount" exact="$matchCount + 1"/>
+              </do_if>
+            </do_if>
+          </do_all>
+          <do_if value="$matchCount != 1">
+            <set_value name="$resolved" exact="null"/>
+          </do_if>
+          <set_value name="$matchCount" exact="0"/>
+        </do_if>
+
+        <do_if value="not $resolved and $stableKey != '' and $ship and $ship.exists">
+          <set_value name="$matchCount" exact="0"/>
+          <do_if value="$ship.pilot? and $ship.pilot.exists">
+            <run_actions ref="Compute_Pilot_Stable_Key" result="$shipPilotStable">
+              <param name="pilot" value="$ship.pilot"/>
+            </run_actions>
+            <do_if value="$shipPilotStable == $stableKey">
+              <set_value name="$resolved" exact="$ship.pilot"/>
+              <set_value name="$matchCount" exact="1"/>
+            </do_if>
+          </do_if>
+          <do_if value="not $resolved">
+            <run_actions ref="Collect_Ship_Personnel_Templates" result="$crewPool">
+              <param name="ship" value="$ship"/>
+            </run_actions>
+            <do_all exact="$crewPool.count" counter="$ci">
+              <set_value name="$crew" exact="$crewPool.{$ci}"/>
+              <set_value name="$crewEntity" exact="if $crew and $ship.roleentity? and $ship.roleentity.{$crew}? and $ship.roleentity.{$crew}.exists then $ship.roleentity.{$crew} else null"/>
+              <set_value name="$crewStableMatch" exact="false"/>
+              <do_if value="$crewEntity and $livePilotHint and $crewEntity == $livePilotHint">
+                <set_value name="$crewStableMatch" exact="true"/>
+              </do_if>
+              <do_if value="not $crewStableMatch and $stableKey != ''">
+                <run_actions ref="Template_Stable_Key_From_Crew" result="$crewTemplateStable">
+                  <param name="ship" value="$ship"/>
+                  <param name="crewTemplate" value="$crew"/>
+                </run_actions>
+                <do_if value="$crewTemplateStable == $stableKey">
+                  <set_value name="$crewStableMatch" exact="true"/>
+                </do_if>
+                <do_if value="not $crewStableMatch and $crewEntity">
+                  <run_actions ref="Compute_Pilot_Stable_Key" result="$crewStableEnt">
+                    <param name="pilot" value="$crewEntity"/>
+                  </run_actions>
+                  <do_if value="$crewStableEnt == $stableKey">
+                    <set_value name="$crewStableMatch" exact="true"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+              <do_if value="not $crewStableMatch and $originalName != '' and $ship.people? and $ship.people.{$crew}? and $ship.people.{$crew}.name?">
+                <run_actions ref="Pilot_Display_Name_Matches" result="$crewStableMatch">
+                  <param name="displayName" value="$ship.people.{$crew}.name"/>
+                  <param name="originalName" value="$originalName"/>
+                  <param name="taggedPilotName" value="$taggedPilotName"/>
+                  <param name="pilotLevel" value="$pilotLevel"/>
+                </run_actions>
+              </do_if>
+              <do_if value="not $crewStableMatch and $originalName != '' and $crewEntity and $crewEntity.name?">
+                <run_actions ref="Pilot_Display_Name_Matches" result="$crewStableMatch">
+                  <param name="displayName" value="$crewEntity.name"/>
+                  <param name="originalName" value="$originalName"/>
+                  <param name="taggedPilotName" value="$taggedPilotName"/>
+                  <param name="pilotLevel" value="$pilotLevel"/>
+                </run_actions>
+              </do_if>
+              <do_if value="not $crewStableMatch and $originalName != '' and $ship.availablepeople? and $ship.availablepeople.{$crew}? and $ship.availablepeople.{$crew}.name?">
+                <run_actions ref="Pilot_Display_Name_Matches" result="$crewStableMatch">
+                  <param name="displayName" value="$ship.availablepeople.{$crew}.name"/>
+                  <param name="originalName" value="$originalName"/>
+                  <param name="taggedPilotName" value="$taggedPilotName"/>
+                  <param name="pilotLevel" value="$pilotLevel"/>
+                </run_actions>
+              </do_if>
+              <do_if value="$crewStableMatch and not ($crewEntity and $crewEntity.exists) and $crew and $ship.roleentity? and $ship.roleentity.{$crew}? and $ship.roleentity.{$crew}.exists">
+                <set_value name="$crewEntity" exact="$ship.roleentity.{$crew}"/>
+              </do_if>
+              <do_if value="$crewStableMatch">
+                <do_if value="$crewEntity">
+                  <set_value name="$resolved" exact="$crewEntity"/>
+                  <set_value name="$matchCount" exact="$matchCount + 1"/>
+                </do_if>
+              </do_if>
+            </do_all>
+            <do_if value="$matchCount != 1">
+              <set_value name="$resolved" exact="null"/>
+            </do_if>
+          </do_if>
+        </do_if>
+
+        <return value="table[$Pilot = $resolved, $MatchCount = $matchCount]"/>
+      </actions>
+    </library>
+
+    <!-- Sole identity-recovery path: migrate registry key + maintain stable index. -->
+    <library name="Rebind_Pilot_Registry" purpose="run_actions">
+      <params>
+        <param name="livePilot" default="null"/>
+        <param name="registryPilotHint" default="null"/>
+        <param name="stableKey" default="''"/>
+        <param name="ship" default="null"/>
+        <param name="template" default="null"/>
+        <param name="resolveTiered" default="false"/>
+        <param name="sector" default="null"/>
+      </params>
+      <actions>
+        <set_value name="$targetPilot" exact="null"/>
+        <set_value name="$rebound" exact="false"/>
+
+        <do_if value="$livePilot and $livePilot.exists? and $livePilot.exists">
+          <set_value name="$targetPilot" exact="$livePilot"/>
+        </do_if>
+
+        <do_if value="not $targetPilot and $resolveTiered">
+          <run_actions ref="Resolve_Live_Pilot_Tiered" result="$tierResult">
+            <param name="livePilotHint" value="$registryPilotHint"/>
+            <param name="stableKey" value="$stableKey"/>
+            <param name="sector" value="$sector"/>
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          <do_if value="$tierResult.$Pilot? and $tierResult.$Pilot.exists">
+            <set_value name="$targetPilot" exact="$tierResult.$Pilot"/>
+          </do_if>
+        </do_if>
+
+        <do_if value="not $targetPilot and $stableKey != '' and $ship and $ship.exists">
+          <do_if value="$template? and $template != null and $ship.roleentity? and $ship.roleentity.{$template}? and $ship.roleentity.{$template}.exists">
+            <set_value name="$targetPilot" exact="$ship.roleentity.{$template}"/>
+          </do_if>
+        </do_if>
+
+        <do_if value="not $targetPilot">
+          <return value="table[$Success = false, $Pilot = null, $Rebound = false]"/>
+        </do_if>
+
+        <do_if value="$stableKey == ''">
+          <run_actions ref="Compute_Pilot_Stable_Key" result="$stableKey">
+            <param name="pilot" value="$targetPilot"/>
+          </run_actions>
+        </do_if>
+
+        <set_value name="$registryKey" exact="null"/>
+        <do_if value="$registryPilotHint and global.$GT_Pilots? and global.$GT_Pilots.{$registryPilotHint}?">
+          <set_value name="$registryKey" exact="$registryPilotHint"/>
+        </do_if>
+        <do_elseif value="$stableKey != '' and global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
+          <set_value name="$regMatchCount" exact="0"/>
+          <do_all exact="global.$GT_Pilots.keys.count" counter="$rk">
+            <set_value name="$candKey" exact="global.$GT_Pilots.keys.{$rk}"/>
+            <do_if value="global.$GT_Pilots.{$candKey}.$StableIdentity? and global.$GT_Pilots.{$candKey}.$StableIdentity == $stableKey">
+              <do_if value="$candKey.exists">
+                <set_value name="$registryKey" exact="$candKey"/>
+                <set_value name="$regMatchCount" exact="$regMatchCount + 1"/>
+              </do_if>
+              <do_elseif value="not $registryKey? or $registryKey == null">
+                <set_value name="$registryKey" exact="$candKey"/>
+                <set_value name="$regMatchCount" exact="$regMatchCount + 1"/>
+              </do_elseif>
+            </do_if>
+          </do_all>
+          <do_if value="$regMatchCount gt 1 and $targetPilot.exists">
+            <set_value name="$registryKey" exact="null"/>
+            <do_all exact="global.$GT_Pilots.keys.count" counter="$rk2">
+              <set_value name="$candKey2" exact="global.$GT_Pilots.keys.{$rk2}"/>
+              <do_if value="$candKey2 == $targetPilot">
+                <set_value name="$registryKey" exact="$candKey2"/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_elseif>
+
+        <do_if value="$registryKey and $registryKey != $targetPilot and global.$GT_Pilots.{$registryKey}? and not global.$GT_Pilots.{$targetPilot}?">
+          <set_value name="global.$GT_Pilots.{$targetPilot}" exact="global.$GT_Pilots.{$registryKey}"/>
+          <remove_value name="global.$GT_Pilots.{$registryKey}"/>
+          <set_value name="$rebound" exact="true"/>
+        </do_if>
+        <do_elseif value="$registryKey and $registryKey != $targetPilot and global.$GT_Pilots.{$registryKey}? and global.$GT_Pilots.{$targetPilot}?">
+          <remove_value name="global.$GT_Pilots.{$registryKey}"/>
+          <set_value name="$rebound" exact="true"/>
+        </do_elseif>
+
+        <do_if value="not global.$GT_Pilots?">
+          <set_value name="global.$GT_Pilots" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_Pilots.{$targetPilot}?">
+          <set_value name="global.$GT_Pilots.{$targetPilot}" exact="table[]"/>
+        </do_if>
+
+        <run_actions ref="Ensure_Pilot_Fields">
+          <param name="pilot" value="$targetPilot"/>
+        </run_actions>
+        <do_if value="$targetPilot.idcode?">
+          <set_value name="global.$GT_Pilots.{$targetPilot}.$PilotID" exact="$targetPilot.idcode"/>
+        </do_if>
+        <run_actions ref="Sync_Stable_Identity_Index">
+          <param name="pilot" value="$targetPilot"/>
+        </run_actions>
+
+        <return value="table[$Success = true, $Pilot = $targetPilot, $Rebound = $rebound]"/>
+      </actions>
+    </library>
     
     <!-- Initialize Pilot Data Structure -->
     <library name="Initialize_Pilot_Data" purpose="run_actions">
@@ -1592,15 +2091,19 @@
           
           <!-- If pilot exists but Status is missing/null, treat as paused to preserve XP -->
           <!-- This prevents accidental XP loss if Status field was somehow cleared -->
-          <do_if value="not $pilotStatus? or $pilotStatus == 'paused'">
+          <do_if value="not $pilotStatus? or $pilotStatus == 'paused' or $pilotStatus == 'ejected'">
             <set_value name="$wasPaused" exact="true"/>
+            <set_value name="$wasEjectedStatus" exact="$pilotStatus == 'ejected'"/>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-ShipMgmt] Reactivating PAUSED pilot: ' + $pilot.name + ' (XP: ' + (if global.$GT_Pilots.{$pilot}.$XP? then global.$GT_Pilots.{$pilot}.$XP else 0) + ', Level: ' + (if global.$GT_Pilots.{$pilot}.$Level? then global.$GT_Pilots.{$pilot}.$Level else 1) + ')'" chance="100"/>
+              <debug_text text="'[GT-ShipMgmt] Reactivating PAUSED/EJECTED pilot: ' + $pilot.name + ' (status=' + (if $pilotStatus? then $pilotStatus else 'NONE') + ', XP: ' + (if global.$GT_Pilots.{$pilot}.$XP? then global.$GT_Pilots.{$pilot}.$XP else 0) + ', Level: ' + (if global.$GT_Pilots.{$pilot}.$Level? then global.$GT_Pilots.{$pilot}.$Level else 1) + ')'" chance="100"/>
             </do_if>
             
             <!-- Restore pilot to active status with all previous data intact -->
             <set_value name="global.$GT_Pilots.{$pilot}.$Status" exact="'active'"/>
             <set_value name="global.$GT_Pilots.{$pilot}.$ResumedTime" exact="player.age"/>
+            <do_if value="$wasEjectedStatus">
+              <set_value name="global.$GT_Pilots.{$pilot}.$ResumedFromEject" exact="true"/>
+            </do_if>
             <set_value name="global.$GT_Pilots.{$pilot}.$AssociatedShip" exact="$ship"/>
             <set_value name="global.$GT_Pilots.{$pilot}.$Ship" exact="$ship"/>
             <set_value name="global.$GT_Pilots.{$pilot}.$ShipID" exact="$ship.idcode"/>
@@ -1614,8 +2117,9 @@
             <!-- Clean up pause-related fields -->
             <remove_value name="global.$GT_Pilots.{$pilot}.$PausedTime"/>
             <remove_value name="global.$GT_Pilots.{$pilot}.$PausedReason"/>
-            
-            <!-- Ensure all critical fields exist (defensive programming) -->
+            <run_actions ref="Clear_Eject_Scratch_State">
+              <param name="pilot" value="$pilot"/>
+            </run_actions>
             <run_actions ref="Ensure_Pilot_Fields">
               <param name="pilot" value="$pilot"/>
             </run_actions>
@@ -1717,10 +2221,14 @@
               </do_if>
             </do_all>
             <do_if value="$stableMatchCount == 1 and $stableMatchPilot">
+              <set_value name="$stableWasEjected" exact="global.$GT_Pilots.{$stableMatchPilot}.$Status? and global.$GT_Pilots.{$stableMatchPilot}.$Status == 'ejected'"/>
               <set_value name="global.$GT_Pilots.{$pilot}" exact="global.$GT_Pilots.{$stableMatchPilot}"/>
               <remove_value name="global.$GT_Pilots.{$stableMatchPilot}"/>
               <set_value name="global.$GT_Pilots.{$pilot}.$Status" exact="'active'"/>
               <set_value name="global.$GT_Pilots.{$pilot}.$ResumedTime" exact="player.age"/>
+              <do_if value="$stableWasEjected">
+                <set_value name="global.$GT_Pilots.{$pilot}.$ResumedFromEject" exact="true"/>
+              </do_if>
               <set_value name="global.$GT_Pilots.{$pilot}.$AssociatedShip" exact="$ship"/>
               <set_value name="global.$GT_Pilots.{$pilot}.$Ship" exact="$ship"/>
               <set_value name="global.$GT_Pilots.{$pilot}.$ShipID" exact="$ship.idcode"/>
@@ -1732,6 +2240,11 @@
               </do_elseif>
               <remove_value name="global.$GT_Pilots.{$pilot}.$PausedTime"/>
               <remove_value name="global.$GT_Pilots.{$pilot}.$PausedReason"/>
+              <do_if value="$stableWasEjected">
+                <run_actions ref="Clear_Eject_Scratch_State">
+                  <param name="pilot" value="$pilot"/>
+                </run_actions>
+              </do_if>
               <set_value name="$recoveredFromPilot" exact="$stableMatchPilot"/>
               <set_value name="$stableRecovered" exact="true"/>
               <run_actions ref="Ensure_Pilot_Fields">
@@ -1776,7 +2289,7 @@
               <set_value name="$candidatePilot" exact="$candidateKeys.{$ci}"/>
               <do_if value="$candidatePilot and $candidatePilot != $pilot and global.$GT_Pilots.{$candidatePilot}?">
                 <set_value name="$candidateStatus" exact="if global.$GT_Pilots.{$candidatePilot}.$Status? then global.$GT_Pilots.{$candidatePilot}.$Status else ''"/>
-                <do_if value="$candidateStatus == 'paused' or ($allowActiveIdentityRecovery and $candidateStatus == 'active')">
+                <do_if value="$candidateStatus == 'paused' or $candidateStatus == 'ejected' or ($allowActiveIdentityRecovery and $candidateStatus == 'active')">
                   <set_value name="$score" exact="0"/>
                   <set_value name="$candidatePilotNameDbg" exact="'NONE'"/>
                   <do_if value="global.$GT_Pilots.{$candidatePilot}.$OriginalPilotName? and global.$GT_Pilots.{$candidatePilot}.$OriginalPilotName != ''">

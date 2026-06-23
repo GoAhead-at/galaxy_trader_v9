@@ -131,7 +131,7 @@
 
     <!-- Re-apply protected order ID list on every load/new game. SystemInit skips when GT_Initialized is already
          true in the save, which left stale lists without GalaxyTraderMK4Supply and broke interact-menu GT actions. -->
-    <cue name="RefreshGTProtectedOrderIDs" instantiate="true" version="1">
+    <cue name="RefreshGTProtectedOrderIDs" instantiate="true" version="2">
       <conditions>
         <check_any>
           <event_game_loaded/>
@@ -1038,6 +1038,16 @@
           </do_if>
         </do_if>
 
+        <!-- Eject logbook is independent of tag refresh — registry key may differ from live spacesuit pilot entity. -->
+        <do_if value="$ejectMode">
+          <run_actions ref="md.GT_CoreSystem.TryWriteTestPilotEjectLogbook">
+            <param name="registryPilotHint" value="$pilotHint"/>
+            <param name="livePilot" value="$livePilot"/>
+            <param name="stableKey" value="$stableKey"/>
+            <param name="sector" value="$sector"/>
+          </run_actions>
+        </do_if>
+
         <run_actions ref="md.GT_CoreSystem.MaybeRetryBoundedPilotTagRefresh">
           <param name="pilot" value="$livePilot"/>
           <param name="stableKey" value="$stableKey"/>
@@ -1057,6 +1067,7 @@
         <param name="hasGTOrder" default="false"/>
         <param name="source" default="'rescue_rebind'"/>
         <param name="registryPilotHint" default="null"/>
+        <param name="spacesuit" default="null"/>
       </params>
       <actions>
         <set_value name="$result" exact="false"/>
@@ -1107,6 +1118,8 @@
           <return value="false"/>
         </do_if>
 
+        <set_value name="$resolvedPilot" exact="if $livePilot and $livePilot.exists then $livePilot else null"/>
+
         <!-- registryPilotHint must match the live entity — never rebind the wrong ejected record. -->
         <do_if value="$registryPilotHint and $livePilot and $livePilot.exists and $stableKey != ''">
           <run_actions ref="md.GT_Ship_Management.Compute_Pilot_Stable_Key" result="$liveStableKey">
@@ -1118,20 +1131,25 @@
             </do_if>
             <return value="false"/>
           </do_if>
-          <run_actions ref="md.GT_Ship_Management.Pilot_Is_On_Ship" result="$liveOnShip">
-            <param name="pilot" value="$livePilot"/>
-            <param name="ship" value="$ship"/>
-          </run_actions>
-          <do_if value="not $liveOnShip">
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Core] HandleRescueRebindForEjectedPilot: live pilot not on ship=' + $ship.idcode + ', source=' + $source" chance="100"/>
+          <set_value name="$pilotStillInSpacesuit" exact="$livePilot.ship? and $livePilot.ship.exists and $livePilot.ship.isclass.spacesuit"/>
+          <do_if value="not $pilotStillInSpacesuit">
+            <run_actions ref="md.GT_Ship_Management.Pilot_Is_On_Ship" result="$liveOnShip">
+              <param name="pilot" value="$livePilot"/>
+              <param name="ship" value="$ship"/>
+            </run_actions>
+            <do_if value="not $liveOnShip">
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Core] HandleRescueRebindForEjectedPilot: live pilot not on ship=' + $ship.idcode + ', source=' + $source" chance="100"/>
+              </do_if>
+              <return value="false"/>
             </do_if>
-            <return value="false"/>
+          </do_if>
+          <do_if value="$pilotStillInSpacesuit">
+            <set_value name="$resolvedPilot" exact="null"/>
           </do_if>
         </do_if>
 
-        <set_value name="$resolvedPilot" exact="$livePilot"/>
-        <do_if value="not ($resolvedPilot and $resolvedPilot.exists)">
+        <do_if value="not ($resolvedPilot and $resolvedPilot.exists) or ($resolvedPilot.ship? and $resolvedPilot.ship.isclass.spacesuit)">
           <set_value name="$resolveHint" exact="if $registryKey and global.$GT_Pilots.{$registryKey}.$LastKnownPilotRef? then global.$GT_Pilots.{$registryKey}.$LastKnownPilotRef else null"/>
           <run_actions ref="md.GT_Ship_Management.Resolve_Live_Pilot_Tiered" result="$tierRes">
             <param name="livePilotHint" value="$resolveHint"/>
@@ -1176,8 +1194,415 @@
           <param name="source" value="$source"/>
         </run_actions>
 
+        <run_actions ref="md.GT_CoreSystem.TryWriteTestPilotRescueLogbook">
+          <param name="pilot" value="$pilot"/>
+          <param name="ship" value="$ship"/>
+          <param name="registryPilotHint" value="if $registryKey? then $registryKey else $pilot"/>
+        </run_actions>
+
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-Core] HandleRescueRebindForEjectedPilot: pilot=' + (if $pilot.name? then $pilot.name else 'NONE') + ', ship=' + $ship.idcode + ', hasGTOrder=' + $hasGTOrder + ', source=' + $source" chance="100"/>
+        </do_if>
+        <return value="true"/>
+      </actions>
+    </library>
+
+    <!-- TEST: one logbook entry per eject, map object = pilot spacesuit (not destroyed hull). -->
+    <library name="TryWriteTestPilotEjectLogbook" purpose="run_actions">
+      <params>
+        <param name="registryPilotHint"/>
+        <param name="livePilot" default="null"/>
+        <param name="stableKey" default="''"/>
+        <param name="sector" default="null"/>
+      </params>
+      <actions>
+        <do_if value="not global.$GT_Pilots?">
+          <return value="false"/>
+        </do_if>
+
+        <!-- Resolve ejected registry row — live spacesuit pilot entity is often a different key than destroy-time hint. -->
+        <set_value name="$regKey" exact="null"/>
+        <set_value name="$lookupStable" exact="$stableKey"/>
+        <do_if value="$registryPilotHint and global.$GT_Pilots.{$registryPilotHint}? and global.$GT_Pilots.{$registryPilotHint}.$Status? and global.$GT_Pilots.{$registryPilotHint}.$Status == 'ejected'">
+          <set_value name="$regKey" exact="$registryPilotHint"/>
+          <do_if value="$lookupStable == '' and global.$GT_Pilots.{$registryPilotHint}.$StableIdentity?">
+            <set_value name="$lookupStable" exact="global.$GT_Pilots.{$registryPilotHint}.$StableIdentity"/>
+          </do_if>
+        </do_if>
+        <do_if value="not $regKey and $livePilot and $livePilot.exists and global.$GT_Pilots.{$livePilot}? and global.$GT_Pilots.{$livePilot}.$Status? and global.$GT_Pilots.{$livePilot}.$Status == 'ejected'">
+          <set_value name="$regKey" exact="$livePilot"/>
+          <do_if value="$lookupStable == '' and global.$GT_Pilots.{$livePilot}.$StableIdentity?">
+            <set_value name="$lookupStable" exact="global.$GT_Pilots.{$livePilot}.$StableIdentity"/>
+          </do_if>
+        </do_if>
+        <do_if value="not $regKey and $lookupStable != '' and global.$GT_Pilots.keys.count gt 0">
+          <do_all exact="global.$GT_Pilots.keys.count" counter="$ri">
+            <set_value name="$candKey" exact="global.$GT_Pilots.keys.{$ri}"/>
+            <do_if value="global.$GT_Pilots.{$candKey}.$Status? and global.$GT_Pilots.{$candKey}.$Status == 'ejected' and global.$GT_Pilots.{$candKey}.$StableIdentity? and global.$GT_Pilots.{$candKey}.$StableIdentity == $lookupStable">
+              <set_value name="$regKey" exact="$candKey"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <do_if value="not $regKey">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Core] TryWriteTestPilotEjectLogbook: no ejected registry row (hint=' + (if $registryPilotHint and $registryPilotHint.name? then $registryPilotHint.name else 'NONE') + ', stable=' + $lookupStable + ')'" chance="100"/>
+          </do_if>
+          <return value="false"/>
+        </do_if>
+        <do_if value="global.$GT_Pilots.{$regKey}.$EjectLogbookWritten? and global.$GT_Pilots.{$regKey}.$EjectLogbookWritten">
+          <return value="false"/>
+        </do_if>
+
+        <set_value name="$spacesuitPilot" exact="if $livePilot and $livePilot.exists then $livePilot else null"/>
+        <do_if value="not ($spacesuitPilot and $spacesuitPilot.exists) and global.$GT_Pilots.{$regKey}.$LastKnownPilotRef? and global.$GT_Pilots.{$regKey}.$LastKnownPilotRef.exists">
+          <set_value name="$spacesuitPilot" exact="global.$GT_Pilots.{$regKey}.$LastKnownPilotRef"/>
+        </do_if>
+
+        <set_value name="$spacesuit" exact="null"/>
+        <do_if value="$spacesuitPilot and $spacesuitPilot.exists and $spacesuitPilot.ship? and $spacesuitPilot.ship.exists and $spacesuitPilot.ship.isclass.spacesuit">
+          <set_value name="$spacesuit" exact="$spacesuitPilot.ship"/>
+        </do_if>
+
+        <!-- Spacesuit may not exist at hull-destroy time; scan eject sector once pilot entity is bound (Resolve_Live_Pilot_Tiered pattern). -->
+        <do_if value="not ($spacesuit? and $spacesuit.exists) and $lookupStable != ''">
+          <set_value name="$searchSector" exact="if $sector? then $sector else (if global.$GT_Pilots.{$regKey}.$EjectedSector? then global.$GT_Pilots.{$regKey}.$EjectedSector else null)"/>
+          <do_if value="$searchSector? and $searchSector.exists">
+            <set_value name="$spacesuits" exact="[]"/>
+            <find_ship_by_true_owner name="$spacesuits" class="class.spacesuit" faction="faction.player" space="$searchSector" multiple="true"/>
+            <do_all exact="$spacesuits.count" counter="$si">
+              <set_value name="$suit" exact="$spacesuits.{$si}"/>
+              <do_if value="not ($spacesuit? and $spacesuit.exists) and $suit.pilot? and $suit.pilot.exists">
+                <run_actions ref="md.GT_Ship_Management.Compute_Pilot_Stable_Key" result="$suitStable">
+                  <param name="pilot" value="$suit.pilot"/>
+                </run_actions>
+                <do_if value="$suitStable == $lookupStable">
+                  <set_value name="$spacesuit" exact="$suit"/>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_if>
+
+        <do_if value="not ($spacesuit? and $spacesuit.exists)">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Core] TryWriteTestPilotEjectLogbook: spacesuit not resolved yet (reg=' + (if $regKey.name? then $regKey.name else 'NONE') + ', stable=' + $lookupStable + ')'" chance="100"/>
+          </do_if>
+          <return value="false"/>
+        </do_if>
+
+        <set_value name="global.$GT_Pilots.{$regKey}.$EjectLogbookWritten" exact="true"/>
+        <run_actions ref="md.GT_CoreSystem.RegisterEjectedSpacesuitForDockWatch">
+          <param name="spacesuit" value="$spacesuit"/>
+          <param name="registryPilotHint" value="$regKey"/>
+        </run_actions>
+        <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+          <param name="Message" value="'GT_eject'"/>
+          <param name="Category" value="'alerts'"/>
+          <param name="Title" value="'GT_eject'"/>
+          <param name="Object" value="$spacesuit"/>
+          <param name="Interaction" value="'showonmap'"/>
+          <param name="CheckGlobalSettings" value="false"/>
+        </run_actions>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Core] TryWriteTestPilotEjectLogbook: wrote GT_eject, reg=' + (if $regKey.name? then $regKey.name else 'NONE') + ', spacesuit=' + (if $spacesuit.idcode? then $spacesuit.idcode else 'NONE')" chance="100"/>
+        </do_if>
+        <return value="true"/>
+      </actions>
+    </library>
+
+    <!-- True for direct player ships and Assist subs (isplayerowned is often false on subordinates). -->
+    <library name="GT_ShipIsPlayerFleet" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+      </params>
+      <actions>
+        <do_if value="not $ship or not $ship.exists">
+          <return value="false"/>
+        </do_if>
+        <do_if value="$ship.isplayerowned">
+          <return value="true"/>
+        </do_if>
+        <do_if value="$ship.commander? and $ship.commander.exists and $ship.commander.isplayerowned">
+          <return value="true"/>
+        </do_if>
+        <do_if value="$ship.owner? and $ship.owner == faction.player">
+          <return value="true"/>
+        </do_if>
+        <return value="false"/>
+      </actions>
+    </library>
+
+    <!-- Per-spacesuit dock pickup handler (shared by WatchEjectedSpacesuitDock). -->
+    <library name="ProcessEjectedSpacesuitDockPickup" purpose="run_actions">
+      <params>
+        <param name="spacesuit"/>
+        <param name="dockObject"/>
+        <param name="registryPilotHint" default="null"/>
+        <param name="source" default="'spacesuit_docked'"/>
+      </params>
+      <actions>
+        <set_value name="$rescued" exact="false"/>
+        <do_if value="not $spacesuit or not $spacesuit.exists">
+          <return value="false"/>
+        </do_if>
+        <run_actions ref="md.GT_CoreSystem.ResolveRescueShipFromDockObject" result="$rescueShip">
+          <param name="dockObject" value="$dockObject"/>
+        </run_actions>
+        <do_if value="not ($rescueShip and $rescueShip.exists)">
+          <return value="false"/>
+        </do_if>
+        <set_value name="$livePilot" exact="if $spacesuit.pilot? and $spacesuit.pilot.exists then $spacesuit.pilot else null"/>
+        <set_value name="$regHint" exact="$registryPilotHint"/>
+        <do_if value="not $regHint and $livePilot and $livePilot.exists and global.$GT_Pilots? and global.$GT_Pilots.{$livePilot}? and global.$GT_Pilots.{$livePilot}.$Status? and global.$GT_Pilots.{$livePilot}.$Status == 'ejected'">
+          <set_value name="$regHint" exact="$livePilot"/>
+        </do_if>
+        <do_if value="not $regHint and global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
+          <do_all exact="global.$GT_Pilots.keys.count" counter="$ei">
+            <set_value name="$eKey" exact="global.$GT_Pilots.keys.{$ei}"/>
+            <do_if value="not $regHint and global.$GT_Pilots.{$eKey}.$Status? and global.$GT_Pilots.{$eKey}.$Status == 'ejected'">
+              <set_value name="$regHint" exact="$eKey"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <do_if value="$regHint?">
+          <run_actions ref="md.GT_CoreSystem.TryRescueEjectedPilotAtPickup" result="$rescued">
+            <param name="livePilot" value="$livePilot"/>
+            <param name="rescueShip" value="$rescueShip"/>
+            <param name="registryPilotHint" value="$regHint"/>
+            <param name="spacesuit" value="$spacesuit"/>
+            <param name="source" value="$source"/>
+          </run_actions>
+        </do_if>
+        <do_if value="not $rescued">
+          <run_actions ref="md.GT_CoreSystem.QueueScanPlayerShipForEjectedPilotRescue">
+            <param name="ship" value="$rescueShip"/>
+            <param name="source" value="'spacesuit_docked_at_rescue'"/>
+            <param name="registryPilotHint" value="$regHint"/>
+          </run_actions>
+        </do_if>
+        <return value="$rescued"/>
+      </actions>
+    </library>
+
+    <!-- Start a per-spacesuit dock watcher (avoids global group — not safe during save-load second pass). -->
+    <library name="RegisterEjectedSpacesuitForDockWatch" purpose="run_actions">
+      <params>
+        <param name="spacesuit"/>
+        <param name="registryPilotHint" default="null"/>
+      </params>
+      <actions>
+        <do_if value="not $spacesuit or not $spacesuit.exists or not $spacesuit.isclass.spacesuit">
+          <return value="false"/>
+        </do_if>
+        <signal_cue_instantly cue="md.GT_CoreSystem.WatchEjectedSpacesuitDock" param="table[
+          $Spacesuit = $spacesuit,
+          $RegistryPilotHint = $registryPilotHint
+        ]"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Core] RegisterEjectedSpacesuitForDockWatch: suit=' + (if $spacesuit.idcode? then $spacesuit.idcode else 'NONE')" chance="100"/>
+        </do_if>
+        <return value="true"/>
+      </actions>
+    </library>
+
+    <!-- event_object_docked param is often a dock bay, not the rescue hull — walk up to the ship. -->
+    <library name="ResolveRescueShipFromDockObject" purpose="run_actions">
+      <params>
+        <param name="dockObject"/>
+      </params>
+      <actions>
+        <set_value name="$rescueShip" exact="null"/>
+        <do_if value="$dockObject? and $dockObject.exists">
+          <do_if value="$dockObject.isclass.ship and not $dockObject.isclass.spacesuit">
+            <set_value name="$rescueShip" exact="$dockObject"/>
+          </do_if>
+          <do_elseif value="$dockObject.container? and $dockObject.container.exists and $dockObject.container.isclass.ship and not $dockObject.container.isclass.spacesuit">
+            <set_value name="$rescueShip" exact="$dockObject.container"/>
+          </do_elseif>
+          <do_elseif value="$dockObject.dock? and $dockObject.dock.controllable? and $dockObject.dock.controllable.exists">
+            <set_value name="$rescueShip" exact="$dockObject.dock.controllable"/>
+          </do_elseif>
+        </do_if>
+        <return value="$rescueShip"/>
+      </actions>
+    </library>
+
+    <!-- Resolve rescue hull from a spacesuit at dock/removal time (vanilla often destroys the suit on pickup). -->
+    <library name="ResolveRescueShipFromSpacesuitContext" purpose="run_actions">
+      <params>
+        <param name="spacesuit"/>
+        <param name="sector" default="null"/>
+      </params>
+      <actions>
+        <set_value name="$rescueShip" exact="null"/>
+        <do_if value="$spacesuit?">
+          <do_if value="$spacesuit.container? and $spacesuit.container.exists and $spacesuit.container.isclass.ship and not $spacesuit.container.isclass.spacesuit">
+            <set_value name="$rescueShip" exact="$spacesuit.container"/>
+          </do_if>
+          <do_if value="not ($rescueShip? and $rescueShip.exists) and $spacesuit.assigneddock? and $spacesuit.assigneddock.controllable? and $spacesuit.assigneddock.controllable.exists">
+            <set_value name="$rescueShip" exact="$spacesuit.assigneddock.controllable"/>
+          </do_if>
+          <do_if value="not ($rescueShip? and $rescueShip.exists) and $spacesuit.order? and @$spacesuit.order.id == 'DockAt' and $spacesuit.order.$destination? and $spacesuit.order.$destination.exists and $spacesuit.order.$destination.isclass.ship and not $spacesuit.order.$destination.isclass.spacesuit">
+            <set_value name="$rescueShip" exact="$spacesuit.order.$destination"/>
+          </do_if>
+        </do_if>
+        <do_if value="not ($rescueShip? and $rescueShip.exists)">
+          <run_actions ref="md.GT_CoreSystem.FindRescueCandidateShipsNearSpacesuit" result="$candidates">
+            <param name="spacesuit" value="$spacesuit"/>
+            <param name="sector" value="$sector"/>
+          </run_actions>
+          <do_if value="$candidates.count gt 0">
+            <set_value name="$rescueShip" exact="$candidates.{1}"/>
+          </do_if>
+        </do_if>
+        <return value="$rescueShip"/>
+      </actions>
+    </library>
+
+    <!-- GT_RESCUE_EVENT + rebind when a rescue hull is identified at pickup time. -->
+    <library name="TryRescueEjectedPilotAtPickup" purpose="run_actions">
+      <params>
+        <param name="livePilot"/>
+        <param name="rescueShip"/>
+        <param name="registryPilotHint"/>
+        <param name="spacesuit" default="null"/>
+        <param name="source" default="'pilot_pickup'"/>
+      </params>
+      <actions>
+        <set_value name="$rescued" exact="false"/>
+        <do_if value="not $rescueShip or not $rescueShip.exists">
+          <return value="false"/>
+        </do_if>
+        <run_actions ref="md.GT_CoreSystem.GT_ShipIsPlayerFleet" result="$isPlayerFleet">
+          <param name="ship" value="$rescueShip"/>
+        </run_actions>
+        <do_if value="not $isPlayerFleet">
+          <return value="false"/>
+        </do_if>
+        <set_value name="$pilotName" exact="if $livePilot and $livePilot.exists and $livePilot.name? then $livePilot.name else (if $registryPilotHint and $registryPilotHint.name? then $registryPilotHint.name else 'NONE')"/>
+        <run_actions ref="md.GT_CoreSystem.TryWriteTestPilotRescueEventLogbook">
+          <param name="ship" value="$rescueShip"/>
+          <param name="spacesuit" value="$spacesuit"/>
+          <param name="pilotName" value="$pilotName"/>
+          <param name="source" value="$source"/>
+          <param name="registryPilotHint" value="$registryPilotHint"/>
+        </run_actions>
+        <run_actions ref="md.GT_CoreSystem.TryWriteTestPilotRescueLogbook">
+          <param name="pilot" value="$livePilot"/>
+          <param name="ship" value="$rescueShip"/>
+          <param name="registryPilotHint" value="$registryPilotHint"/>
+        </run_actions>
+        <run_actions ref="md.GT_CoreSystem.DeterminePilotAssignmentHasGTOrder" result="$hasGTOrder">
+          <param name="ship" value="$rescueShip"/>
+        </run_actions>
+        <set_value name="$resolvedPilot" exact="if $livePilot and $livePilot.exists then $livePilot else null"/>
+        <do_if value="$resolvedPilot and $resolvedPilot.exists">
+          <run_actions ref="md.GT_CoreSystem.HandleRescueRebindForEjectedPilot" result="$rescued">
+            <param name="livePilot" value="$resolvedPilot"/>
+            <param name="ship" value="$rescueShip"/>
+            <param name="hasGTOrder" value="$hasGTOrder"/>
+            <param name="registryPilotHint" value="$registryPilotHint"/>
+            <param name="spacesuit" value="$spacesuit"/>
+            <param name="source" value="$source"/>
+          </run_actions>
+        </do_if>
+        <do_if value="not $rescued">
+          <run_actions ref="md.GT_CoreSystem.ScanPlayerShipForEjectedPilotRescue" result="$rescued">
+            <param name="ship" value="$rescueShip"/>
+            <param name="registryPilotHint" value="$registryPilotHint"/>
+            <param name="source" value="$source"/>
+          </run_actions>
+        </do_if>
+        <return value="$rescued"/>
+      </actions>
+    </library>
+
+    <!-- Scan every player-fleet ship in sector for an ejected pilot already transferred as crew. -->
+    <library name="ScanPlayerFleetInSectorForEjectedPilot" purpose="run_actions">
+      <params>
+        <param name="sector"/>
+        <param name="registryPilotHint"/>
+        <param name="source" default="'sector_fleet_rescue_scan'"/>
+      </params>
+      <actions>
+        <set_value name="$rescued" exact="false"/>
+        <do_if value="not $registryPilotHint or not global.$GT_Pilots? or not global.$GT_Pilots.{$registryPilotHint}? or not global.$GT_Pilots.{$registryPilotHint}.$Status? or global.$GT_Pilots.{$registryPilotHint}.$Status != 'ejected'">
+          <return value="false"/>
+        </do_if>
+        <set_value name="$searchSpace" exact="if $sector? and $sector.exists then $sector else player.sector"/>
+        <find_ship_by_true_owner name="$ships" space="$searchSpace" faction="faction.player" class="[class.ship_s, class.ship_m, class.ship_l, class.ship_xl]" multiple="true" checkoperational="true"/>
+        <do_all exact="$ships.count" counter="$si">
+          <do_if value="not $rescued">
+            <set_value name="$scanShip" exact="$ships.{$si}"/>
+            <run_actions ref="md.GT_CoreSystem.ScanPlayerShipForEjectedPilotRescue" result="$rescued">
+              <param name="ship" value="$scanShip"/>
+              <param name="registryPilotHint" value="$registryPilotHint"/>
+              <param name="source" value="$source"/>
+            </run_actions>
+          </do_if>
+        </do_all>
+        <return value="$rescued"/>
+      </actions>
+    </library>
+
+    <!-- TEST: mark rescue pickup moment (spacesuit dock / crew transfer) before rebind succeeds. -->
+    <library name="TryWriteTestPilotRescueEventLogbook" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="spacesuit" default="null"/>
+        <param name="pilotName" default="'NONE'"/>
+        <param name="source" default="'unknown'"/>
+        <param name="registryPilotHint" default="null"/>
+      </params>
+      <actions>
+        <do_if value="not $ship or not $ship.exists">
+          <return value="false"/>
+        </do_if>
+        <do_if value="$registryPilotHint and global.$GT_Pilots? and global.$GT_Pilots.{$registryPilotHint}? and global.$GT_Pilots.{$registryPilotHint}.$RescueEventLogbookWritten? and global.$GT_Pilots.{$registryPilotHint}.$RescueEventLogbookWritten">
+          <return value="false"/>
+        </do_if>
+        <set_value name="$shipID" exact="if $ship.idcode? then $ship.idcode else 'NONE'"/>
+        <set_value name="$suitID" exact="if $spacesuit? and $spacesuit.exists and $spacesuit.idcode? then $spacesuit.idcode else 'NONE'"/>
+        <debug_text text="'[GT-Core] event_pilot_rescue: ship=' + $shipID + ', spacesuit=' + $suitID + ', pilot=' + $pilotName + ', source=' + $source + ', isplayerowned=' + (if $ship.isplayerowned then '1' else '0')" chance="100"/>
+        <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+          <param name="Message" value="'GT_RESCUE_EVENT ' + $shipID + ' suit=' + $suitID + ' pilot=' + $pilotName + ' source=' + $source"/>
+          <param name="Category" value="'alerts'"/>
+          <param name="Title" value="'GT_RESCUE_EVENT ' + $shipID"/>
+          <param name="Object" value="$ship"/>
+          <param name="Interaction" value="'showonmap'"/>
+          <param name="Highlighted" value="true"/>
+          <param name="CheckGlobalSettings" value="false"/>
+        </run_actions>
+        <do_if value="$registryPilotHint and global.$GT_Pilots? and global.$GT_Pilots.{$registryPilotHint}?">
+          <set_value name="global.$GT_Pilots.{$registryPilotHint}.$RescueEventLogbookWritten" exact="true"/>
+        </do_if>
+        <return value="true"/>
+      </actions>
+    </library>
+
+    <!-- TEST: one logbook entry per rescue in the player global logbook (no object= → not ship-only). -->
+    <library name="TryWriteTestPilotRescueLogbook" purpose="run_actions">
+      <params>
+        <param name="pilot"/>
+        <param name="ship"/>
+        <param name="registryPilotHint" default="null"/>
+      </params>
+      <actions>
+        <set_value name="$regKey" exact="if $registryPilotHint? then $registryPilotHint else (if $pilot? then $pilot else null)"/>
+        <do_if value="$regKey and global.$GT_Pilots? and global.$GT_Pilots.{$regKey}? and global.$GT_Pilots.{$regKey}.$RescueLogbookWritten? and global.$GT_Pilots.{$regKey}.$RescueLogbookWritten">
+          <return value="false"/>
+        </do_if>
+        <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+          <param name="Message" value="'GT_rescue'"/>
+          <param name="Category" value="'general'"/>
+          <param name="Title" value="'GT_rescue'"/>
+          <param name="CheckGlobalSettings" value="false"/>
+        </run_actions>
+        <do_if value="$regKey and global.$GT_Pilots? and global.$GT_Pilots.{$regKey}?">
+          <set_value name="global.$GT_Pilots.{$regKey}.$RescueLogbookWritten" exact="true"/>
+        </do_if>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Core] TryWriteTestPilotRescueLogbook: pilot=' + (if $pilot and $pilot.name? then $pilot.name else 'NONE') + ', ship=' + (if $ship and $ship.idcode? then $ship.idcode else 'NONE')" chance="100"/>
         </do_if>
         <return value="true"/>
       </actions>
@@ -1196,6 +1621,14 @@
         </do_if>
         <do_if value="not $pilot and global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$Pilot? and global.$GT_Pilots? and global.$GT_Pilots.{global.$GT_Ships.{$ship}.$Pilot}?">
           <set_value name="$pilot" exact="global.$GT_Ships.{$ship}.$Pilot"/>
+        </do_if>
+        <do_if value="not $pilot and $destroyedShipID != '' and global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
+          <do_all exact="global.$GT_Ships.keys.count" counter="$gsi">
+            <set_value name="$regShip" exact="global.$GT_Ships.keys.{$gsi}"/>
+            <do_if value="not $pilot and $regShip.idcode? and $regShip.idcode == $destroyedShipID and global.$GT_Ships.{$regShip}.$Pilot? and global.$GT_Pilots? and global.$GT_Pilots.{global.$GT_Ships.{$regShip}.$Pilot}?">
+              <set_value name="$pilot" exact="global.$GT_Ships.{$regShip}.$Pilot"/>
+            </do_if>
+          </do_all>
         </do_if>
         <do_if value="not $pilot and global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
           <do_all exact="global.$GT_Pilots.keys.count" counter="$pi">
@@ -1297,7 +1730,13 @@
       </params>
       <actions>
         <set_value name="$rescued" exact="false"/>
-        <do_if value="not $ship or not $ship.exists or not $ship.isplayerowned">
+        <do_if value="not $ship or not $ship.exists">
+          <return value="false"/>
+        </do_if>
+        <run_actions ref="md.GT_CoreSystem.GT_ShipIsPlayerFleet" result="$isPlayerFleet">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        <do_if value="not $isPlayerFleet">
           <return value="false"/>
         </do_if>
         <do_if value="not $registryPilotHint or not global.$GT_Pilots? or not global.$GT_Pilots.{$registryPilotHint}? or not global.$GT_Pilots.{$registryPilotHint}.$Status? or global.$GT_Pilots.{$registryPilotHint}.$Status != 'ejected'">
@@ -1365,7 +1804,10 @@
       </params>
       <actions>
         <set_value name="$anyRescued" exact="false"/>
-        <do_if value="not $ship or not $ship.exists or not $ship.isplayerowned">
+        <run_actions ref="md.GT_CoreSystem.GT_ShipIsPlayerFleet" result="$isPlayerFleet">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        <do_if value="not $isPlayerFleet">
           <return value="false"/>
         </do_if>
 
@@ -1500,6 +1942,13 @@
             </do_if>
           </do_all>
         </do_if>
+        <do_elseif value="$candidates.count == 0">
+          <find_ship_by_true_owner name="$sectorShips" space="$searchSpace" faction="faction.player" class="[class.ship_s, class.ship_m, class.ship_l, class.ship_xl]" multiple="true" checkoperational="true"/>
+          <set_value name="$sectorScanLimit" exact="if $sectorShips.count lt $maxCandidates then $sectorShips.count else $maxCandidates"/>
+          <do_all exact="$sectorScanLimit" counter="$si">
+            <append_to_list name="$candidates" exact="$sectorShips.{$si}"/>
+          </do_all>
+        </do_elseif>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <set_value name="$candidateIds" exact="''"/>
           <do_all exact="$candidates.count" counter="$ci">
@@ -1570,18 +2019,46 @@
       </params>
       <actions>
         <set_value name="$rescued" exact="false"/>
-        <run_actions ref="md.GT_CoreSystem.FindRescueCandidateShipsNearSpacesuit" result="$candidates">
+        <run_actions ref="md.GT_CoreSystem.ResolveRescueShipFromSpacesuitContext" result="$rescueShip">
           <param name="spacesuit" value="$spacesuit"/>
           <param name="sector" value="$sector"/>
         </run_actions>
-        <do_if value="$registryPilotHint and global.$GT_Pilots? and global.$GT_Pilots.{$registryPilotHint}? and $candidates.count gt 0">
-          <set_value name="global.$GT_Pilots.{$registryPilotHint}.$RescueCandidateShips" exact="$candidates"/>
+        <set_value name="$livePilot" exact="if $registryPilotHint and $registryPilotHint.exists then $registryPilotHint else null"/>
+        <do_if value="$spacesuit? and $spacesuit.pilot? and $spacesuit.pilot.exists">
+          <set_value name="$livePilot" exact="$spacesuit.pilot"/>
         </do_if>
-        <run_actions ref="md.GT_CoreSystem.TryRescueOnCandidateShips" result="$rescued">
-          <param name="candidateShips" value="$candidates"/>
-          <param name="registryPilotHint" value="$registryPilotHint"/>
-          <param name="source" value="$source"/>
-        </run_actions>
+        <do_if value="not ($registryPilotHint and global.$GT_Pilots? and global.$GT_Pilots.{$registryPilotHint}? and global.$GT_Pilots.{$registryPilotHint}.$RescueEventLogbookWritten? and global.$GT_Pilots.{$registryPilotHint}.$RescueEventLogbookWritten)">
+          <do_if value="$rescueShip? and $rescueShip.exists and $registryPilotHint?">
+            <run_actions ref="md.GT_CoreSystem.TryRescueEjectedPilotAtPickup" result="$rescued">
+              <param name="livePilot" value="$livePilot"/>
+              <param name="rescueShip" value="$rescueShip"/>
+              <param name="registryPilotHint" value="$registryPilotHint"/>
+              <param name="spacesuit" value="$spacesuit"/>
+              <param name="source" value="$source"/>
+            </run_actions>
+          </do_if>
+        </do_if>
+        <do_if value="not $rescued">
+          <run_actions ref="md.GT_CoreSystem.FindRescueCandidateShipsNearSpacesuit" result="$candidates">
+            <param name="spacesuit" value="$spacesuit"/>
+            <param name="sector" value="$sector"/>
+          </run_actions>
+          <do_if value="$registryPilotHint and global.$GT_Pilots? and global.$GT_Pilots.{$registryPilotHint}? and $candidates.count gt 0">
+            <set_value name="global.$GT_Pilots.{$registryPilotHint}.$RescueCandidateShips" exact="$candidates"/>
+          </do_if>
+          <run_actions ref="md.GT_CoreSystem.TryRescueOnCandidateShips" result="$rescued">
+            <param name="candidateShips" value="$candidates"/>
+            <param name="registryPilotHint" value="$registryPilotHint"/>
+            <param name="source" value="$source"/>
+          </run_actions>
+        </do_if>
+        <do_if value="not $rescued and $registryPilotHint?">
+          <run_actions ref="md.GT_CoreSystem.ScanPlayerFleetInSectorForEjectedPilot" result="$rescued">
+            <param name="sector" value="$sector"/>
+            <param name="registryPilotHint" value="$registryPilotHint"/>
+            <param name="source" value="$source"/>
+          </run_actions>
+        </do_if>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-Core] TryImmediateSpacesuitDestroyRescue: rescued=' + $rescued + ', candidates=' + $candidates.count + ', pilotHint=' + (if $registryPilotHint.name? then $registryPilotHint.name else 'NONE')" chance="100"/>
         </do_if>
@@ -1741,8 +2218,11 @@
         <set_value name="$ship" exact="event.param2"/>
         <set_value name="$assignment" exact="event.param3"/>
         
-        <!-- Only process pilot post reassignments on player-owned ships. -->
-        <do_if value="$assignment == controlpost.aipilot and $ship and $ship.exists and $ship.isplayerowned">
+        <!-- Only process pilot post reassignments on player fleet ships (includes Assist subs). -->
+        <run_actions ref="md.GT_CoreSystem.GT_ShipIsPlayerFleet" result="$isPlayerFleet">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        <do_if value="$assignment == controlpost.aipilot and $ship and $ship.exists and $isPlayerFleet">
           <!-- event.param may be an actor object OR a payload table depending on vanilla path. -->
           <set_value name="$newPilot" exact="null"/>
           <set_value name="$newPilotTemplate" exact="null"/>
@@ -1960,7 +2440,7 @@
         </do_if>
 
         <!-- Vanilla RescueShip boards ejected pilots as unassigned crew (entityrole), not ship pilot. -->
-        <do_elseif value="$ship and $ship.exists and $ship.isplayerowned and typeof $assignment == datatype.entityrole">
+        <do_elseif value="$ship and $ship.exists and $isPlayerFleet and typeof $assignment == datatype.entityrole">
           <set_value name="$rescuedCrew" exact="false"/>
           <set_value name="$newCrew" exact="null"/>
           <set_value name="$newCrewTemplate" exact="null"/>
@@ -1979,6 +2459,18 @@
               <set_value name="$newCrew" exact="$ship.roleentity.{$newCrewTemplate}"/>
             </do_if>
           </do_elseif>
+          <set_value name="$newCrewName" exact="'NONE'"/>
+          <do_if value="$newCrew and $newCrew.name?">
+            <set_value name="$newCrewName" exact="$newCrew.name"/>
+          </do_if>
+          <do_elseif value="$newPilotRaw and $newPilotRaw.name?">
+            <set_value name="$newCrewName" exact="$newPilotRaw.name"/>
+          </do_elseif>
+          <run_actions ref="md.GT_CoreSystem.TryWriteTestPilotRescueEventLogbook">
+            <param name="ship" value="$ship"/>
+            <param name="pilotName" value="$newCrewName"/>
+            <param name="source" value="'vanilla_entityrole_assignment'"/>
+          </run_actions>
           <run_actions ref="md.GT_CoreSystem.DeterminePilotAssignmentHasGTOrder" result="$hasGTOrder">
             <param name="ship" value="$ship"/>
           </run_actions>
@@ -2015,7 +2507,11 @@
         <set_value name="$newPilotTemplate" exact="if $data.$newPilotTemplate? then $data.$newPilotTemplate else null"/>
         <set_value name="$attempt" exact="if $data.$attempt? then $data.$attempt else 1"/>
         
-        <do_if value="$ship and $ship.exists and $ship.isplayerowned">
+        <do_if value="$ship and $ship.exists">
+          <run_actions ref="md.GT_CoreSystem.GT_ShipIsPlayerFleet" result="$isPlayerFleet">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          <do_if value="$isPlayerFleet">
           <run_actions ref="md.GT_CoreSystem.DeterminePilotAssignmentHasGTOrder" result="$hasGTOrder">
             <param name="ship" value="$ship"/>
           </run_actions>
@@ -2162,6 +2658,7 @@
               </run_actions>
             </do_else>
           </do_else>
+          </do_if>
         </do_if>
       </actions>
     </cue>
@@ -2584,33 +3081,42 @@
       </actions>
     </cue>
 
-    <!-- Spacesuit docks at player ship (manual pickup or RescueShip success path). -->
-    <cue name="HandleEjectedPilotDockedAtPlayerShip" instantiate="true">
+    <!-- Per-spacesuit dock watcher: event_object_docked object= requires a concrete object, not a global group. -->
+    <cue name="WatchEjectedSpacesuitDock" instantiate="true">
       <conditions>
-        <event_object_docked_at group="global.$PlayerShipsGroup"/>
+        <event_cue_signalled cue="md.GT_CoreSystem.WatchEjectedSpacesuitDock"/>
       </conditions>
       <actions>
-        <do_if value="event.object and event.object.exists and event.object.isplayerowned and event.object.isclass.ship and event.param and event.param.exists and event.param.isclass.spacesuit">
-          <set_value name="$rescued" exact="false"/>
-          <run_actions ref="md.GT_CoreSystem.DeterminePilotAssignmentHasGTOrder" result="$hasGTOrder">
-            <param name="ship" value="event.object"/>
-          </run_actions>
-          <do_if value="event.param.pilot? and event.param.pilot.exists">
-            <run_actions ref="md.GT_CoreSystem.HandleRescueRebindForEjectedPilot" result="$rescued">
-              <param name="livePilot" value="event.param.pilot"/>
-              <param name="ship" value="event.object"/>
-              <param name="hasGTOrder" value="$hasGTOrder"/>
-              <param name="source" value="'spacesuit_docked_at_rescue'"/>
-            </run_actions>
-          </do_if>
-          <do_if value="not $rescued">
-            <run_actions ref="md.GT_CoreSystem.QueueScanPlayerShipForEjectedPilotRescue">
-              <param name="ship" value="event.object"/>
-              <param name="source" value="'spacesuit_docked_at_rescue'"/>
-            </run_actions>
-          </do_if>
+        <set_value name="this.$spacesuit" exact="event.param.$Spacesuit"/>
+        <set_value name="this.$registryPilotHint" exact="if event.param.$RegistryPilotHint? then event.param.$RegistryPilotHint else null"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Core] WatchEjectedSpacesuitDock: suit=' + (if this.$spacesuit? and this.$spacesuit.idcode? then this.$spacesuit.idcode else 'NONE')" chance="100"/>
         </do_if>
       </actions>
+      <cues>
+        <cue name="OnSpacesuitDocked" instantiate="true">
+          <conditions>
+            <event_object_docked object="parent.$spacesuit"/>
+          </conditions>
+          <actions>
+            <run_actions ref="md.GT_CoreSystem.ProcessEjectedSpacesuitDockPickup">
+              <param name="spacesuit" value="parent.$spacesuit"/>
+              <param name="dockObject" value="event.param"/>
+              <param name="registryPilotHint" value="parent.$registryPilotHint"/>
+              <param name="source" value="'spacesuit_docked'"/>
+            </run_actions>
+            <cancel_cue cue="parent"/>
+          </actions>
+        </cue>
+        <cue name="OnSpacesuitDestroyed" instantiate="true">
+          <conditions>
+            <event_object_destroyed object="parent.$spacesuit"/>
+          </conditions>
+          <actions>
+            <cancel_cue cue="parent"/>
+          </actions>
+        </cue>
+      </cues>
     </cue>
 
     <!-- GT pilot eject lifecycle: destroy → ejected status → bounded retag burst. -->
@@ -2620,8 +3126,34 @@
       </conditions>
       <actions>
         <set_value name="$ship" exact="event.param"/>
-        <do_if value="$ship and $ship.isplayerowned and ($ship.isclass.ship or $ship.isclass.spacesuit)">
-          <set_value name="$destroyedShipID" exact="if $ship.idcode? then $ship.idcode else ''"/>
+        <set_value name="$killer" exact="event.param2"/>
+        <set_value name="$killMethod" exact="if event.param3? then event.param3 else 'NONE'"/>
+
+        <!-- TEST DIAG: mark exact vanilla destroy event timing in log + logbook (before any GT guards). -->
+        <set_value name="$destroyDiagID" exact="if $ship? and $ship.idcode? then $ship.idcode else 'NONE'"/>
+        <set_value name="$destroyedShipID" exact="if $ship? and $ship.idcode? then $ship.idcode else ''"/>
+        <set_value name="$destroyedShipName" exact="if $ship? and $ship.knownname? then $ship.knownname else 'NONE'"/>
+        <set_value name="$destroyedClass" exact="if $ship? and $ship.isclass.spacesuit then 'spacesuit' else (if $ship? and $ship.isclass.ship then 'ship' else 'other')"/>
+        <set_value name="$destroyDefaultOrder" exact="if $ship? and $ship.defaultorder? then @$ship.defaultorder.id else 'NONE'"/>
+        <set_value name="$destroyCurrentOrder" exact="if $ship? and $ship.order? then @$ship.order.id else 'NONE'"/>
+        <set_value name="$destroyPilotName" exact="if $ship? and $ship.pilot? and $ship.pilot.name? then $ship.pilot.name else 'NONE'"/>
+        <set_value name="$destroySectorName" exact="if $ship? and $ship.sector? then $ship.sector.knownname else 'NONE'"/>
+        <set_value name="$destroyCommanderID" exact="if $ship? and $ship.commander? and $ship.commander.exists and $ship.commander.idcode? then $ship.commander.idcode else 'NONE'"/>
+        <debug_text text="'[GT-Core] event_player_owned_destroyed: id=' + $destroyDiagID + ', name=' + $destroyedShipName + ', class=' + $destroyedClass + ', sector=' + $destroySectorName + ', default=' + $destroyDefaultOrder + ', current=' + $destroyCurrentOrder + ', pilot=' + $destroyPilotName + ', commander=' + $destroyCommanderID + ', killMethod=' + $killMethod + ', isplayerowned=' + (if $ship? and $ship.isplayerowned then '1' else '0')" chance="100"/>
+        <!-- event_player_owned_destroyed includes Assist subordinates where isplayerowned is false — do not gate on isplayerowned. -->
+        <do_if value="$ship? and $ship.exists">
+          <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+            <param name="Message" value="'GT_DESTROY_EVENT ' + $destroyDiagID + ' default=' + $destroyDefaultOrder + ' current=' + $destroyCurrentOrder"/>
+            <param name="Category" value="'alerts'"/>
+            <param name="Title" value="'GT_DESTROY_EVENT ' + $destroyDiagID"/>
+            <param name="Object" value="$ship"/>
+            <param name="Interaction" value="'showonmap'"/>
+            <param name="Highlighted" value="true"/>
+            <param name="CheckGlobalSettings" value="false"/>
+          </run_actions>
+        </do_if>
+
+        <do_if value="$ship and ($ship.isclass.ship or $ship.isclass.spacesuit)">
           <run_actions ref="md.GT_CoreSystem.ResolveGTPilotForDestroyedShip" result="$pilot">
             <param name="ship" value="$ship"/>
             <param name="destroyedShipID" value="$destroyedShipID"/>
@@ -2631,15 +3163,39 @@
           </do_if>
 
           <do_if value="$pilot and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}?">
-            <!-- Spacesuit follow-up: rescue only after hull eject is recorded. -->
+            <!-- Spacesuit follow-up: vanilla removes the suit on pickup (killMethod=removed, current=DockAt). -->
             <do_if value="$ship.isclass.spacesuit and global.$GT_Pilots.{$pilot}.$Status? and global.$GT_Pilots.{$pilot}.$Status == 'ejected'">
               <set_value name="$ejectSector" exact="if $ship.sector? then $ship.sector else null"/>
-              <run_actions ref="md.GT_CoreSystem.QueueDelayedSpacesuitDestroyRescue">
+              <set_value name="$livePilot" exact="if $ship.pilot? and $ship.pilot.exists then $ship.pilot else $pilot"/>
+              <set_value name="$rescuedImmediate" exact="false"/>
+              <run_actions ref="md.GT_CoreSystem.ResolveRescueShipFromSpacesuitContext" result="$rescueShip">
                 <param name="spacesuit" value="$ship"/>
-                <param name="registryPilotHint" value="$pilot"/>
                 <param name="sector" value="$ejectSector"/>
-                <param name="source" value="'spacesuit_destroyed_gt_handler'"/>
               </run_actions>
+              <do_if value="$rescueShip? and $rescueShip.exists">
+                <run_actions ref="md.GT_CoreSystem.TryRescueEjectedPilotAtPickup" result="$rescuedImmediate">
+                  <param name="livePilot" value="$livePilot"/>
+                  <param name="rescueShip" value="$rescueShip"/>
+                  <param name="registryPilotHint" value="$pilot"/>
+                  <param name="spacesuit" value="$ship"/>
+                  <param name="source" value="'spacesuit_destroyed_pickup'"/>
+                </run_actions>
+              </do_if>
+              <do_if value="not $rescuedImmediate">
+                <run_actions ref="md.GT_CoreSystem.ScanPlayerFleetInSectorForEjectedPilot" result="$rescuedImmediate">
+                  <param name="sector" value="$ejectSector"/>
+                  <param name="registryPilotHint" value="$pilot"/>
+                  <param name="source" value="'spacesuit_destroyed_sector_scan'"/>
+                </run_actions>
+              </do_if>
+              <do_if value="not $rescuedImmediate">
+                <run_actions ref="md.GT_CoreSystem.QueueDelayedSpacesuitDestroyRescue">
+                  <param name="spacesuit" value="$ship"/>
+                  <param name="registryPilotHint" value="$pilot"/>
+                  <param name="sector" value="$ejectSector"/>
+                  <param name="source" value="'spacesuit_destroyed_gt_handler'"/>
+                </run_actions>
+              </do_if>
             </do_if>
             <do_elseif value="$ship.isclass.spacesuit">
               <run_actions ref="md.GT_CoreSystem.ProcessGTPilotEjectOnDestroy">
@@ -2655,7 +3211,7 @@
             </do_else>
           </do_if>
           <do_elseif value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Core] HandlePlayerOwnedShipDestroyedForGT: NO GT pilot resolved for ship=' + (if $destroyedShipID != '' then $destroyedShipID else 'NONE')" chance="100"/>
+            <debug_text text="'[GT-Core] HandlePlayerOwnedShipDestroyedForGT: NO GT pilot resolved for ship=' + (if $destroyDiagID != 'NONE' then $destroyDiagID else 'NONE')" chance="100"/>
           </do_elseif>
         </do_if>
       </actions>

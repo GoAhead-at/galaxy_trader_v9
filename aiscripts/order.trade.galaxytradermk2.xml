@@ -321,6 +321,14 @@
 
       <label name="main_loop"/>
 
+      <!-- Idle park timed release (trader keeps searching; hold expiry handled here). -->
+      <run_script name="'lib.gt.idlepark'">
+        <param name="handoffMode" value="'check_timed_release'"/>
+        <param name="handoffShip" value="this.ship"/>
+        <param name="home" value="if this.$homeStation? and this.$homeStation.exists then this.$homeStation else (if this.$homeSector? and this.$homeSector.exists then this.$homeSector else this.ship.sector)"/>
+        <param name="debugchance" value="if this.$debugchance? then this.$debugchance else 0"/>
+      </run_script>
+
       <!-- Unified ship name refresh (home sector, op-state, XP — content dedupe in MD) -->
       <run_script name="'lib.gt.attention.refresh_ship_name'">
         <param name="ship" value="this.ship"/>
@@ -1896,6 +1904,7 @@
         </do_if>
         <do_if value="global.$GT_IdleParkingHold? and global.$GT_IdleParkingHold.{this.ship}?">
           <remove_value name="global.$GT_IdleParkingHold.{this.ship}"/>
+          <set_value name="global.$GT_IdleParkingReleased.{this.ship}" exact="true"/>
         </do_if>
         <set_value name="this.$sourceUsage.{this.$mk2CycleBestTrade.$Source}" exact="if this.$sourceUsage? and this.$sourceUsage.{this.$mk2CycleBestTrade.$Source}? then this.$sourceUsage.{this.$mk2CycleBestTrade.$Source} + 1 else 1"/>
         <set_value name="this.$destUsage.{this.$mk2CycleBestTrade.$Destination}" exact="if this.$destUsage? and this.$destUsage.{this.$mk2CycleBestTrade.$Destination}? then this.$destUsage.{this.$mk2CycleBestTrade.$Destination} + 1 else 1"/>
@@ -2110,7 +2119,7 @@
         <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': retry backoff (count=' + this.$noTradeRetryCount + ', wait=' + (this.$retryMin / 1s)i + '-' + (this.$retryMax / 1s)i + 's)'" chance="this.$debugchance"/>
       </do_if>
       <wait min="this.$retryMin" max="this.$retryMax"/>
-      <do_if value="this.$idleParking and this.$noTradeRetryCount ge 5 and this.ship.cargo.count == 0 and (not global.$GT_IdleParkingReleased? or not global.$GT_IdleParkingReleased.{this.ship}?)">
+      <do_if value="this.$idleParking and this.$noTradeRetryCount ge 5 and this.ship.cargo.count == 0">
         <set_value name="$mk2IdleHome" exact="null"/>
         <do_if value="this.$homeStation? and this.$homeStation.exists">
           <set_value name="$mk2IdleHome" exact="this.$homeStation"/>
@@ -2119,12 +2128,12 @@
           <set_value name="$mk2IdleHome" exact="this.$homeSector"/>
         </do_elseif>
         <do_if value="$mk2IdleHome? and $mk2IdleHome != null">
-          <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': idle parking threshold reached - parking at ' + $mk2IdleHome.knownname" chance="this.$debugchance"/>
-          <create_order object="this.ship" id="'GTIdlePark'" immediate="true">
+          <run_script name="'lib.gt.idlepark'">
+            <param name="handoffMode" value="'trigger'"/>
+            <param name="handoffShip" value="this.ship"/>
             <param name="home" value="$mk2IdleHome"/>
             <param name="debugchance" value="this.$debugchance"/>
-          </create_order>
-          <return/>
+          </run_script>
         </do_if>
       </do_if>
       <set_value name="this.$noTradeRetryCount" exact="[this.$noTradeRetryCount + 1, 5].min"/>
@@ -2133,6 +2142,37 @@
   </attention>
 
   <on_abort>
+    <!-- Intentional handoff: idle parking delegates to GTIdlePark for visible queued docking. -->
+    <set_value name="$isIdleParkHandoff" exact="false"/>
+    <do_if value="global.$GT_IdleParkingHold? and global.$GT_IdleParkingHold.{this.ship}?">
+      <set_value name="$isIdleParkHandoff" exact="true"/>
+    </do_if>
+    <do_if value="not $isIdleParkHandoff and this.ship.order? and @this.ship.order.id == 'GTIdlePark'">
+      <set_value name="$isIdleParkHandoff" exact="true"/>
+    </do_if>
+    <do_if value="not $isIdleParkHandoff and this.ship.order? and @this.ship.order.id == 'DockAndWait' and this.ship.order.$callerid? and @this.ship.order.$callerid.id == 'GTIdlePark'">
+      <set_value name="$isIdleParkHandoff" exact="true"/>
+    </do_if>
+    <do_if value="not $isIdleParkHandoff and this.ship.orders.count gt 0">
+      <do_all exact="this.ship.orders.count" counter="$ipoi">
+        <set_value name="$ipOrder" exact="this.ship.orders.{$ipoi}"/>
+        <do_if value="@$ipOrder.id == 'GTIdlePark'">
+          <set_value name="$isIdleParkHandoff" exact="true"/>
+          <break/>
+        </do_if>
+        <do_elseif value="@$ipOrder.id == 'DockAndWait' and $ipOrder.$callerid? and @$ipOrder.$callerid.id == 'GTIdlePark'">
+          <set_value name="$isIdleParkHandoff" exact="true"/>
+          <break/>
+        </do_elseif>
+      </do_all>
+    </do_if>
+    <do_if value="$isIdleParkHandoff">
+      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': on_abort skipped (handoff to GTIdlePark)'" chance="100"/>
+      </do_if>
+      <return/>
+    </do_if>
+
     <!-- Bridge MK2 aborts into MD cleanup pipeline (name restore, registry cleanup, etc.). -->
     <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}.$ActiveTradePolicy?">
       <remove_value name="global.$GT_Ships.{this.ship}.$ActiveTradePolicy"/>

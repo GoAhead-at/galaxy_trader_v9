@@ -1393,6 +1393,17 @@
         </do_if>
         <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Distance Penalty', $Status = 'INFO', $Detail = $distancePenaltyDetail]"/>
 
+        <!-- Ship proximity nudge at validation (MK3/MK4 — global only, mirrors lib.gt.score.selection_sort). -->
+        <set_value name="$diagShipProxWeight" exact="0.04"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Trading? and global.$GT_GlobalSettings.$Trading.$ShipProximityWeight?">
+          <set_value name="$diagShipProxWeight" exact="@global.$GT_GlobalSettings.$Trading.$ShipProximityWeight"/>
+        </do_if>
+        <set_value name="$shipProxDetail" exact="'' + $diagShipProxWeight + ' (validation sort: score / (1 + ship→buy × weight); 0=off)'"/>
+        <do_if value="$orderId == 'GalaxyTraderMK1' or $orderId == 'GalaxyTraderMK2' or $orderId == 'GalaxyMiner'">
+          <set_value name="$shipProxDetail" exact="'N/A'"/>
+        </do_if>
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Ship Proximity Weight', $Status = 'INFO', $Detail = $shipProxDetail]"/>
+
         <!-- Sector Whitelist (sectors exempt from threat blacklist) -->
         <run_actions ref="md.GT_Libraries_Blacklist.GT_GetSectorWhitelist" result="$sectorWhitelist">
           <param name="ship" value="$ship"/>
@@ -3097,7 +3108,17 @@
               <do_if value="not $entryProfit?">
                 <set_value name="$entryProfit" exact="0"/>
               </do_if>
-              <set_value name="$detailStr" exact="$entryWareName + ' | ' + $entryBuyStation + ' -> ' + $entrySellStation + ' | ' + ($entryProfit / 100) + 'Cr | ROI ' + $entryROI + '% | ' + $entryAge + 's'"/>
+              <set_value name="$entryDistDetail" exact="''"/>
+              <do_if value="$entry.$HomeToBuyDistance? and $entry.$RouteDistance?">
+                <set_value name="$entryDistDetail" exact="' | Dist H→B ' + $entry.$HomeToBuyDistance + ' + route ' + $entry.$RouteDistance"/>
+                <do_if value="$entry.$Distance?">
+                  <set_value name="$entryDistDetail" exact="$entryDistDetail + ' = ' + $entry.$Distance + 'j'"/>
+                </do_if>
+              </do_if>
+              <do_elseif value="$entry.$Distance?">
+                <set_value name="$entryDistDetail" exact="' | Dist ' + $entry.$Distance + 'j'"/>
+              </do_elseif>
+              <set_value name="$detailStr" exact="$entryWareName + ' | ' + $entryBuyStation + ' -> ' + $entrySellStation + ' | ' + ($entryProfit / 100) + 'Cr | ROI ' + $entryROI + '% | Score ' + ($entryScore)i + $entryDistDetail + ' | ' + $entryAge + 's'"/>
               <do_if value="$shipFailed == 'YES'">
                 <set_value name="$detailStr" exact="$detailStr + ' | FAILED'"/>
               </do_if>
@@ -3733,6 +3754,17 @@
         <set_value name="$diagRuntimeBestDispatch" exact="'none'"/>
         <set_value name="$diagRuntimeBatchPreview" exact="'none'"/>
         <set_value name="$diagRouteFilterActive" exact="$allowIllegal and $enforceRouteIllegalLegality"/>
+        <set_value name="$diagUseSelectionSort" exact="false"/>
+        <do_if value="$orderId == 'GalaxyTraderMK3' or $orderId == 'GalaxyTraderMK4' or $orderId == 'GalaxyTraderMK4Supply'">
+          <set_value name="$diagUseSelectionSort" exact="true"/>
+        </do_if>
+        <set_value name="$diagPriorityMultPct" exact="125"/>
+        <do_if value="$gtOrder? and $gtOrder.$priorityscoremultiplier?">
+          <set_value name="$diagPriorityMultPct" exact="[$gtOrder.$priorityscoremultiplier, 125].max"/>
+        </do_if>
+        <do_if value="$diagPriorityMultPct gt 300">
+          <set_value name="$diagPriorityMultPct" exact="300"/>
+        </do_if>
         <!-- Performance caps for generic trader pair scan (MK1 uses dedicated export path above). -->
         <set_value name="$diagPairEvalCap" exact="1000"/>
         <set_value name="$diagPairDisplayCap" exact="80"/>
@@ -3971,9 +4003,13 @@
                  path checks fire keep $pairScore = 0 and naturally sort to the bottom of the
                  score-ranked Pair Details table. -->
             <set_value name="$pairScore" exact="0"/>
+            <set_value name="$pairSelectionScore" exact="0"/>
+            <set_value name="$pdSortKey" exact="0"/>
             <set_value name="$pairHasDistances" exact="false"/>
             <set_value name="$buyDist" exact="-1"/>
             <set_value name="$sellDist" exact="-1"/>
+            <set_value name="$homeToSellDist" exact="-1"/>
+            <set_value name="$scoreDistance" exact="-1"/>
 
             <set_value name="$buyStation" exact="null"/>
             <do_if value="$sellOffer?">
@@ -4320,6 +4356,8 @@
                 <param name="useEscapeMode" value="false"/>
               </run_actions>
               <set_value name="$pairHasDistances" exact="true"/>
+              <set_value name="$diagHomeForDist" exact="if $homeSector? and $homeSector.exists then $homeSector else $ship.sector"/>
+              <set_value name="$homeToSellDist" exact="$diagHomeForDist.gatedistance.{$sellStation}"/>
 
               <do_if value="$buyDist lt 0">
                 <set_value name="$pairVerdict" exact="'FAIL'"/>
@@ -4436,9 +4474,14 @@
                 <set_value name="$pairReason" exact="'buy_distance_exceeded (' + $buyDist + ' gt ' + $maxBuy + ' from home)'"/>
                 <set_value name="$rejectDistance" operation="add"/>
               </do_if>
-              <do_elseif value="$sellDist gt $maxSell">
+              <do_elseif value="$homeToSellDist lt 0">
                 <set_value name="$pairVerdict" exact="'FAIL'"/>
-                <set_value name="$pairReason" exact="'sell_distance_exceeded (' + $sellDist + ' gt ' + $maxSell + ' from home)'"/>
+                <set_value name="$pairReason" exact="'sell_distance_unreachable (home→sell blocked)'"/>
+                <set_value name="$rejectDistance" operation="add"/>
+              </do_elseif>
+              <do_elseif value="$homeToSellDist gt $maxSell">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'sell_distance_exceeded (' + $homeToSellDist + ' gt ' + $maxSell + ' from home)'"/>
                 <set_value name="$rejectDistance" operation="add"/>
               </do_elseif>
             </do_if>
@@ -4556,9 +4599,11 @@
                  default $pairScore = 0 and cluster at the bottom of the score-ranked list.
 
                  Sell-mode (MK1/MK2/MK3, default trader):
-                   distance       = max(buyDist, sellDist)              [worst-case leg]
+                   homeToBuy      = home→buy station (path distance)
+                   routeLeg       = buy→sell sector (path distance; 0 when same sector)
+                   scoreDistance  = homeToBuy + routeLeg              [route-aware sum]
                    gt_distpenalty = order.distancepenalty / 50.0          [runtime conversion]
-                   distanceFactor = 1.0 + distance * gt_distpenalty
+                   distanceFactor = 1.0 + scoreDistance * gt_distpenalty
                    grossProfitCr  = totalProfit / 100   (Cr units, integer)
                    score          = grossProfitCr / distanceFactor
                    factionBonus   = 1.1 if factionPriority and either station player-owned
@@ -4570,9 +4615,16 @@
                    (demand-based; unit price does not affect supply ranking)
 
                  Player-free-supplier (IPP) reuses sell-mode but $totalProfit is already the
-                 gross sell income, so the formula picks it up automatically. -->
+                 gross sell income, so the formula picks it up automatically.
+
+                 MK3/MK4 validation sort: selectionScore = adjustedScore / (1 + ship→buy × weight)
+                 after optional priority-ware multiplier (mirrors lib.gt.score.trades + selection_sort). -->
             <do_if value="$pairHasDistances and $buyDist ge 0 and $sellDist ge 0">
-              <set_value name="$scoreDistance" exact="[$buyDist, $sellDist].max"/>
+              <set_value name="$routeLeg" exact="if $buyStation.sector == $sellStation.sector then 0 else $sellDist"/>
+              <do_if value="$routeLeg lt 0">
+                <set_value name="$routeLeg" exact="0"/>
+              </do_if>
+              <set_value name="$scoreDistance" exact="$buyDist + $routeLeg"/>
               <set_value name="$gtDistPenalty" exact="$distancePenalty / 50.0"/>
               <set_value name="$scoreDistanceFactor" exact="1.0 + ($scoreDistance * $gtDistPenalty)"/>
               <do_if value="$scoreDistanceFactor le 0">
@@ -4606,40 +4658,79 @@
               </do_else>
             </do_if>
 
-            <!-- Record pass / track best (kept by score, not by raw profit, so the headline
-                 'Best Passing Pair' line matches what the runtime would actually pick first). -->
+            <!-- Priority-ware boost then validation selection score (MK3/MK4 — mirrors score.trades + selection_sort). -->
+            <set_value name="$pairAdjustedScore" exact="$pairScore"/>
+            <set_value name="$pairSelectionScore" exact="$pairScore"/>
+            <set_value name="$pdSortKey" exact="$pairScore"/>
+            <do_if value="$diagUseSelectionSort and $pairScore gt 0">
+              <do_if value="$priorityWares.count gt 0 and $pairWare?">
+                <do_all exact="$priorityWares.count" counter="$diagPwIdx">
+                  <do_if value="$priorityWares.{$diagPwIdx} == $pairWare">
+                    <set_value name="$pairAdjustedScore" exact="$pairScore * ($diagPriorityMultPct / 100.0)"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+              </do_if>
+              <set_value name="$pairSelectionScore" exact="$pairAdjustedScore"/>
+              <do_if value="$diagShipProxWeight gt 0 and $buyStation? and $buyStation.sector? and $ship? and $ship.sector?">
+                <set_value name="$diagShipToBuy" exact="-1"/>
+                <do_if value="$buyStation.sector == $ship.sector">
+                  <set_value name="$diagShipToBuy" exact="0"/>
+                </do_if>
+                <do_elseif value="$blacklistgroup? and $blacklistgroup != null">
+                  <set_value name="$diagShipToBuy" exact="$ship.gatedistance.{$buyStation.sector}.{$blacklistgroup}.{$ship}"/>
+                </do_elseif>
+                <do_else>
+                  <set_value name="$diagShipToBuy" exact="$ship.gatedistance.{$buyStation.sector}"/>
+                </do_else>
+                <do_if value="$diagShipToBuy ge 0">
+                  <set_value name="$diagProxFactor" exact="1.0 + ($diagShipToBuy * $diagShipProxWeight)"/>
+                  <do_if value="$diagProxFactor gt 0">
+                    <set_value name="$pairSelectionScore" exact="$pairAdjustedScore / $diagProxFactor"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+              <set_value name="$pdSortKey" exact="$pairSelectionScore"/>
+            </do_if>
+            <set_value name="$pairShowSel" exact="false"/>
+            <do_if value="$diagUseSelectionSort and $pairSelectionScore != $pairScore">
+              <set_value name="$pairShowSel" exact="true"/>
+            </do_if>
+
+            <!-- Record pass / track best (sort key matches runtime validation order on MK3/MK4). -->
             <do_if value="$pairVerdict == 'PASS'">
               <set_value name="$passCount" operation="add"/>
-              <set_value name="$drPassDesc" exact="$pairWare.name + ': ' + $buyStation.knownname + ' -> ' + $sellStation.knownname + ' (Score ' + ($pairScore)i + ', ' + ($totalProfit / 100) + ' Cr)'"/>
-              <append_to_list name="$diagRuntimePassPairs" exact="table[$Score = $pairScore, $SellOffer = $sellOffer, $BuyOffer = $buyOffer, $Ware = $pairWare, $Desc = $drPassDesc]"/>
-              <do_if value="$pairScore gt $bestDiagProfit">
-                <set_value name="$bestDiagProfit" exact="$pairScore"/>
+              <set_value name="$drPassDesc" exact="$pairWare.name + ': ' + $buyStation.knownname + ' -> ' + $sellStation.knownname + ' (Score ' + ($pairScore)i + (if $pairShowSel then (' · sel ' + ($pairSelectionScore)i) else '') + ', ' + ($totalProfit / 100) + ' Cr)'"/>
+              <append_to_list name="$diagRuntimePassPairs" exact="table[$Score = $pairScore, $SelectionScore = $pairSelectionScore, $SortKey = $pdSortKey, $SellOffer = $sellOffer, $BuyOffer = $buyOffer, $Ware = $pairWare, $Desc = $drPassDesc]"/>
+              <do_if value="$pdSortKey gt $bestDiagProfit">
+                <set_value name="$bestDiagProfit" exact="$pdSortKey"/>
                 <!-- IPP best-pair description: tag the route as a player-free-supplier sale and
                      show 'free' in place of an arithmetic ROI (which would otherwise read as 0). -->
-                <set_value name="$bestDiagPairDesc" exact="$pairWare.name + ': ' + $buyStation.knownname + ' -> ' + $sellStation.knownname + ' (' + ($totalProfit / 100) + ' Cr, ROI ' + (if $diagPairPlayerFreeSupplier then 'n/a (free)' else ('' + $roi + '%')) + (if $diagPairPlayerFreeSupplier then ' [IPP gross]' else '') + ', Score ' + ($pairScore)i + ')'"/>
+                <set_value name="$bestDiagPairDesc" exact="$pairWare.name + ': ' + $buyStation.knownname + ' -> ' + $sellStation.knownname + ' (' + ($totalProfit / 100) + ' Cr, ROI ' + (if $diagPairPlayerFreeSupplier then 'n/a (free)' else ('' + $roi + '%')) + (if $diagPairPlayerFreeSupplier then ' [IPP gross]' else '') + ', Score ' + ($pairScore)i + (if $pairShowSel then (' · sel ' + ($pairSelectionScore)i) else '') + ')'"/>
               </do_if>
               <do_if value="$ignorePlayerPricing and $orderId == 'GalaxyTraderMK3' and $diagPairPlayerFreeSupplier">
-                <do_if value="$pairScore gt $bestIppPairScore">
-                  <set_value name="$bestIppPairScore" exact="$pairScore"/>
-                  <set_value name="$bestIppPairDesc" exact="$pairWare.name + ': ' + $buyStation.knownname + ' -> ' + $sellStation.knownname + ' (Score ' + ($pairScore)i + ', ~' + ($totalProfit / 100) + ' Cr gross)'"/>
+                <do_if value="$pdSortKey gt $bestIppPairScore">
+                  <set_value name="$bestIppPairScore" exact="$pdSortKey"/>
+                  <set_value name="$bestIppPairDesc" exact="$pairWare.name + ': ' + $buyStation.knownname + ' -> ' + $sellStation.knownname + ' (Score ' + ($pairScore)i + (if $pairShowSel then (' · sel ' + ($pairSelectionScore)i) else '') + ', ~' + ($totalProfit / 100) + ' Cr gross)'"/>
                 </do_if>
               </do_if>
               <do_elseif value="$ignorePlayerPricing and $orderId == 'GalaxyTraderMK3' and not $mk4SupplierIsPlayerOwned">
-                <do_if value="$pairScore gt $bestNpcSupplierPairScore">
-                  <set_value name="$bestNpcSupplierPairScore" exact="$pairScore"/>
-                  <set_value name="$bestNpcSupplierPairDesc" exact="$pairWare.name + ': ' + $buyStation.knownname + ' -> ' + $sellStation.knownname + ' (Score ' + ($pairScore)i + ', ' + ($totalProfit / 100) + ' Cr profit)'"/>
+                <do_if value="$pdSortKey gt $bestNpcSupplierPairScore">
+                  <set_value name="$bestNpcSupplierPairScore" exact="$pdSortKey"/>
+                  <set_value name="$bestNpcSupplierPairDesc" exact="$pairWare.name + ': ' + $buyStation.knownname + ' -> ' + $sellStation.knownname + ' (Score ' + ($pairScore)i + (if $pairShowSel then (' · sel ' + ($pairSelectionScore)i) else '') + ', ' + ($totalProfit / 100) + ' Cr profit)'"/>
                 </do_if>
               </do_elseif>
             </do_if>
 
-            <!-- Record pair details: Ware | Route | Profit (incl. ROI) | Score | Reason.
-                 ROI is folded into the Profit cell to free Col5 for Score - the prioritisation
-                 metric the trader actually uses to pick the next trade. Sort key is $pairScore
-                 (numeric); the post-loop selection sort below orders rows by score desc. -->
+            <!-- Record pair details: Ware | Route | Profit (incl. ROI) | Score/Sel | Reason. -->
             <set_value name="$pdRoute" exact="$buyStation.knownname + (if $mk4SupplierIsPlayerOwned then ' [player]' else ' [NPC]') + ' -> ' + $sellStation.knownname"/>
+            <do_if value="$pairHasDistances and $scoreDistance ge 0">
+              <set_value name="$pdRouteLeg" exact="if $routeLeg? then $routeLeg else $sellDist"/>
+              <set_value name="$pdRoute" exact="$pdRoute + ' [H→B ' + $buyDist + '+route ' + $pdRouteLeg + '=' + $scoreDistance + 'j]'"/>
+            </do_if>
             <set_value name="$pdROIPart" exact="if $diagPairPlayerFreeSupplier then 'IPP gross' else ('ROI ' + $roi + '%')"/>
             <set_value name="$pdProfitStr" exact="(if $diagPairPlayerFreeSupplier then ('buy ' + ($buyPrice / 100) + 'Cr/u eff 0 · ~') else '') + ($totalProfit / 100) + 'Cr' + ' &#183; ' + $pdROIPart"/>
-            <set_value name="$pdScoreStr" exact="if not $pairHasDistances then '-' else ('' + ($pairScore)i)"/>
+            <set_value name="$pdScoreStr" exact="if not $pairHasDistances then '-' else ('' + ($pairScore)i + (if $pairShowSel then (' · sel ' + ($pairSelectionScore)i) else ''))"/>
             <set_value name="$pdStatus" exact="$pairVerdict"/>
             <do_if value="$diagPairPlayerFreeSupplier">
               <set_value name="$pdStatus" exact="$pairVerdict + ' [IPP]'"/>
@@ -4652,7 +4743,7 @@
               <set_value name="$pdReason" exact="'IPP: gross sell income; profit/ROI/money gates bypassed'"/>
             </do_elseif>
             <do_if value="$pairDetails.count lt $diagPairDisplayCap">
-              <append_to_list name="$pairDetails" exact="table[$Check = $pairWare.name, $Status = $pdStatus, $Detail = $pdRoute, $Col4 = $pdProfitStr, $Col5 = $pdScoreStr, $Col6 = $pdReason, $SortKey = $pairScore]"/>
+              <append_to_list name="$pairDetails" exact="table[$Check = $pairWare.name, $Status = $pdStatus, $Detail = $pdRoute, $Col4 = $pdProfitStr, $Col5 = $pdScoreStr, $Col6 = $pdReason, $SortKey = $pdSortKey]"/>
             </do_if>
           </do_all>
         </do_all>
@@ -4663,8 +4754,8 @@
              $rscWareRows sort earlier in this file). MD has no insert_in_list / list.sort,
              so we walk the source list once per output row, picking the highest-key entry
              that has not been claimed yet. A boolean parallel list $pdClaimed marks emitted
-             rows. Score is the same metric the runtime trader uses to pick its next trade,
-             so this puts the most attractive pairs at the top of the Pair Details table. -->
+             rows. Sort key is tradematch score on MK1/MK2; on MK3/MK4 it is validation selection
+             score (after priority-ware boost and ship-proximity nudge). -->
         <do_if value="$pairDetails.count gt 1">
           <set_value name="$pdClaimed" exact="[]"/>
           <do_all exact="$pairDetails.count" counter="$pdci">
@@ -4719,7 +4810,7 @@
               <do_all exact="$diagRuntimePassPairs.count" counter="$drsk">
                 <do_if value="not $drClaimed.{$drsk}">
                   <set_value name="$drRow" exact="$diagRuntimePassPairs.{$drsk}"/>
-                  <set_value name="$drRowScore" exact="if $drRow.$Score? then $drRow.$Score else 0"/>
+                  <set_value name="$drRowScore" exact="if $drRow.$SortKey? then $drRow.$SortKey else (if $drRow.$Score? then $drRow.$Score else 0)"/>
                   <do_if value="$drRowScore gt $drBestScore">
                     <set_value name="$drBestScore" exact="$drRowScore"/>
                     <set_value name="$drBestIdx" exact="$drsk"/>
@@ -4778,6 +4869,7 @@
         </do_if>
 
         <!-- Add pair evaluation summary -->
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Scoring Model', $Status = 'INFO', $Detail = 'Score distance = home→buy + buy→sell (route-aware)' + (if $diagUseSelectionSort then ('; validation sort = score / (1 + ship→buy × ' + $diagShipProxWeight + ') after priority boost') else '')]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Total Pairs Evaluated', $Status = 'INFO', $Detail = '' + $pairCount + (if $diagHitEvalCap then (' (cap ' + $diagPairEvalCap + ' reached — counts may be truncated)') else '')]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Pairs Passing All Checks', $Status = if $passCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $passCount + ' / ' + $pairCount + ' (executable parity — mirrors trade_found validation)']"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Runtime Dispatch (fresh-offer filter)', $Status = if $diagRuntimeDispatchCount gt 0 then 'PASS' else (if $passCount gt 0 then 'WARN' else 'FAIL'), $Detail = '' + $diagRuntimeDispatchCount + ' / ' + $passCount + ' passing pairs would reach validation (mirrors live pipeline)']"/>

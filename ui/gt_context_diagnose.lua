@@ -364,14 +364,14 @@ function gtDiagnose.populateFrame(frame)
                 "Extra",
             })
         elseif isPairDetails then
-            -- Pair Details: Status=6%, Ware=10%, Route=30%, Profit=12%, ROI=8%, Reason=flexible
-            GT_UI.setColPercents(contentTable, { 6, 10, 30, 12, 8 })
+            -- Pair Details: Status=6%, Ware=10%, Route=28%, Profit=12%, Score/Sel=10%, Reason=flexible
+            GT_UI.setColPercents(contentTable, { 6, 10, 28, 12, 10 })
             GT_UI.addHeaderRow(contentTable, {
                 { text = "Status", halign = "center" },
                 "Ware",
                 "Route",
                 { text = "Profit (incl. ROI)", halign = "right" },
-                { text = "Score", halign = "right" },
+                { text = "Score · Sel", halign = "right" },
                 "Reason",
             })
         elseif isClearance then

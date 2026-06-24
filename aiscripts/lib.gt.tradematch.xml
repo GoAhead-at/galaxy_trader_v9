@@ -41,6 +41,37 @@
     <param name="reservedCount" default="0"/>
     <param name="alreadyReservedByThisShip" default="false"/>
     <param name="fairnessCap" default="2"/>
+    <param name="synthesizeAmount" default="0"/>
+    <param name="tradeOffer" default="null"/>
+    <param name="operation" default="'find'"/>
+    <param name="wareExchangeLegs" default="[]"/>
+    <param name="sourceRatio" default="0"/>
+    <param name="sourceOfferAmount" default="0"/>
+    <param name="destOfferAmount" default="0"/>
+    <param name="sourceStorageDiscovery" default="false"/>
+    <param name="destStorageDiscovery" default="false"/>
+    <param name="mk2StaticStorage" default="0"/>
+    <param name="mk2MinStorage" default="0"/>
+    <param name="mk2MaxStorage" default="0"/>
+    <param name="pilotLevelProfile" default="1"/>
+    <param name="routeAlpha" default="0"/>
+    <param name="routeBeta" default="0"/>
+    <param name="routeLaneBonus" default="1"/>
+    <param name="minCargoFillPercent" default="25"/>
+    <param name="allowLowVolume" default="false"/>
+    <param name="lowVolumeFloorEffPercent" default="50"/>
+    <param name="bidirectional" default="false"/>
+    <param name="fleetCoordination" default="false"/>
+    <param name="sourceUsageCount" default="0"/>
+    <param name="destUsageCount" default="0"/>
+    <param name="stickyCyclesLeft" default="0"/>
+    <param name="stickySource" default="null"/>
+    <param name="stickyDestination" default="null"/>
+    <param name="stickyWare" default="null"/>
+    <param name="lastTradeDestination" default="null"/>
+    <param name="sourceStationRef" default="null"/>
+    <param name="mk2SourceOffer" default="null"/>
+    <param name="mk2DestOffer" default="null"/>
     <!-- MK4 compatibility params (accepted for call-site compatibility) -->
     <param name="mk4AllowResources" default="true"/>
     <param name="mk4AllowIntermediates" default="true"/>
@@ -62,6 +93,7 @@
          negative/zero/min-profit rejections for player-sourced trades and scores them by gross sell income (sellPrice * amount).
          NPC-sourced trades in the same scan continue to use the normal profit gates and scoring. -->
     <param name="playerSupplierFreeProduction" default="false"/>
+    <param name="allowStorageDock" default="false"/>
   </params>
   <!-- v3: restore outer-loop cooperative wait (blocking action index 1 for save compat).
        v4: save/load resume at that wait skips setup; this.$ is not persisted on library contexts. -->
@@ -185,6 +217,281 @@
           <set_value name="$detail" exact="$station.knownname + ' [' + $station.idcode + ']:' + $wareText + ' owner=' + $ownerText + ' mode=' + $diagMode + ' offer(unavailable=' + $unavailableFlag + ',amount=' + $amountText + ') altWithRules(unavailable=' + $altUnavailableFlag + ',amount=' + $altAmountText + ')'"/>
         </do_else>
         <return value="$detail"/>
+      </do_if>
+
+      <!-- MK2 player-station offer resolve: extended find fallbacks. -->
+      <do_if value="$mode == 'mk2_ware_exchange_invoke'">
+        <set_value name="$mk2WxRequestId" exact="$ship.idcode + '|WX|' + (player.age / 1ms)i"/>
+        <set_value name="player.entity.$GT_MK2_WareExchangeRequest" exact="table[$RequestId = $mk2WxRequestId, $Ship = $ship, $ShipIdCode = $ship.idcode, $Legs = $wareExchangeLegs]"/>
+        <raise_lua_event name="'gt.mk2QueueWareExchange'" param="$mk2WxRequestId"/>
+        <set_value name="$mk2WxSuccess" exact="false"/>
+        <set_value name="$mk2WxError" exact="'timeout'"/>
+        <set_value name="$mk2WxQueueLegs" exact="[]"/>
+        <set_value name="$mk2WxQueued" exact="0"/>
+        <wait max="5s">
+          <interrupt>
+            <conditions>
+              <event_object_signalled object="$ship" param="'gt_mk2_ware_exchange_done'"/>
+            </conditions>
+            <actions>
+              <set_value name="$mk2WxResult" exact="player.entity.$GT_MK2_WareExchangeResult"/>
+              <do_if value="$mk2WxResult? and $mk2WxResult.$RequestId == $mk2WxRequestId">
+                <do_if value="$mk2WxResult.$Success? and $mk2WxResult.$Success">
+                  <set_value name="$mk2WxSuccess" exact="true"/>
+                  <set_value name="$mk2WxError" exact="''"/>
+                  <do_if value="$mk2WxResult.$Queued?">
+                    <set_value name="$mk2WxQueued" exact="$mk2WxResult.$Queued"/>
+                  </do_if>
+                  <do_if value="$mk2WxResult.$QueueLegs?">
+                    <set_value name="$mk2WxQueueLegs" exact="$mk2WxResult.$QueueLegs"/>
+                  </do_if>
+                </do_if>
+                <do_elseif value="$mk2WxResult.$Error?">
+                  <set_value name="$mk2WxError" exact="$mk2WxResult.$Error"/>
+                </do_elseif>
+              </do_if>
+            </actions>
+          </interrupt>
+        </wait>
+        <remove_value name="player.entity.$GT_MK2_WareExchangeRequest"/>
+        <remove_value name="player.entity.$GT_MK2_WareExchangeResult"/>
+        <return value="table[
+          $Success = $mk2WxSuccess,
+          $Error = $mk2WxError,
+          $Queued = $mk2WxQueued,
+          $QueueLegs = $mk2WxQueueLegs
+        ]"/>
+      </do_if>
+
+      <do_if value="$mode == 'mk2_player_offer'">
+        <set_value name="$mk2OfferResult" exact="null"/>
+        <set_value name="$mk2OfferFound" exact="false"/>
+        <set_value name="$mk2OfferSynthetic" exact="false"/>
+        <!-- operation == 'find' (default) -->
+        <do_if value="$ignoreTradeRules and $station.isplayerowned">
+          <do_if value="$lineType == 'dest'">
+            <find_buy_offer buyer="$station" wares="$wareText" result="$mk2OfferResult"/>
+            <do_if value="$mk2OfferResult == null">
+              <find_buy_offer tradepartner="$ship" buyer="$station" wares="$wareText" result="$mk2OfferResult"/>
+            </do_if>
+            <do_if value="$mk2OfferResult == null">
+              <find_buy_offer buyer="$station" wares="$wareText" excludeempty="false" result="$mk2OfferResult"/>
+            </do_if>
+            <do_if value="$mk2OfferResult == null">
+              <find_buy_offer tradepartner="$ship" buyer="$station" wares="$wareText" excludeempty="false" result="$mk2OfferResult"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <find_sell_offer seller="$station" wares="$wareText" result="$mk2OfferResult"/>
+            <do_if value="$mk2OfferResult == null">
+              <find_sell_offer tradepartner="$ship" seller="$station" wares="$wareText" result="$mk2OfferResult"/>
+            </do_if>
+            <do_if value="$mk2OfferResult == null">
+              <find_sell_offer seller="$station" wares="$wareText" excludeempty="false" result="$mk2OfferResult"/>
+            </do_if>
+            <do_if value="$mk2OfferResult == null">
+              <find_sell_offer tradepartner="$ship" seller="$station" wares="$wareText" excludeempty="false" result="$mk2OfferResult"/>
+            </do_if>
+          </do_else>
+        </do_if>
+        <do_else>
+          <do_if value="$lineType == 'dest'">
+            <find_buy_offer tradepartner="$ship" buyer="$station" wares="$wareText" result="$mk2OfferResult"/>
+          </do_if>
+          <do_else>
+            <find_sell_offer tradepartner="$ship" seller="$station" wares="$wareText" result="$mk2OfferResult"/>
+          </do_else>
+        </do_else>
+        <do_if value="$mk2OfferResult != null">
+          <set_value name="$mk2OfferFound" exact="true"/>
+        </do_if>
+        <return value="table[
+          $Offer = $mk2OfferResult,
+          $Found = $mk2OfferFound,
+          $Synthetic = $mk2OfferSynthetic
+        ]"/>
+      </do_if>
+
+      <do_if value="$mode == 'mk2_can_dock'">
+        <set_value name="$mk2CanDockResult" exact="false"/>
+        <find_dockingbay name="$mk2DockBay" object="$station" checkoperational="true" multiple="false">
+          <match_dock size="$ship.docksize" trading="true" storage="false"/>
+          <match_relation_to object="$ship" comparison="not" relation="enemy"/>
+        </find_dockingbay>
+        <do_if value="$mk2DockBay">
+          <set_value name="$mk2CanDockResult" exact="true"/>
+        </do_if>
+        <do_elseif value="$allowStorageDock and $station.isplayerowned">
+          <find_dockingbay name="$mk2StorageDockBay" object="$station" checkoperational="true" multiple="false">
+            <match_dock size="$ship.docksize" storage="true"/>
+            <match_relation_to object="$ship" comparison="not" relation="enemy"/>
+          </find_dockingbay>
+          <do_if value="$mk2StorageDockBay">
+            <set_value name="$mk2CanDockResult" exact="true"/>
+          </do_if>
+        </do_elseif>
+        <return value="table[$CanDock = $mk2CanDockResult]"/>
+      </do_if>
+
+      <do_if value="$mode == 'mk2_storage_pair_score'">
+        <set_value name="$mk2TradeEntry" exact="null"/>
+        <set_value name="$mk2SkipType" exact="'none'"/>
+        <set_value name="$needBucket" exact="'none'"/>
+        <set_value name="$bucketWeight" exact="1.0"/>
+        <set_value name="$isCriticalNeed" exact="false"/>
+        <set_value name="$shouldDistribute" exact="false"/>
+        <do_if value="$pilotLevelProfile ge 4">
+          <do_if value="$cargoRatio le 5">
+            <set_value name="$needBucket" exact="'A'"/>
+            <set_value name="$bucketWeight" exact="3.0"/>
+            <set_value name="$isCriticalNeed" exact="true"/>
+            <set_value name="$shouldDistribute" exact="true"/>
+          </do_if>
+          <do_elseif value="$cargoRatio le 20">
+            <set_value name="$needBucket" exact="'B'"/>
+            <set_value name="$bucketWeight" exact="2.0"/>
+            <set_value name="$shouldDistribute" exact="true"/>
+          </do_elseif>
+          <do_elseif value="$cargoRatio le $mk2MinStorage">
+            <set_value name="$needBucket" exact="'C'"/>
+            <set_value name="$bucketWeight" exact="1.4"/>
+            <set_value name="$shouldDistribute" exact="true"/>
+          </do_elseif>
+          <do_elseif value="$sourceRatio gt $mk2MaxStorage and $sourceRatio gt ($cargoRatio + 10)">
+            <set_value name="$needBucket" exact="'D'"/>
+            <set_value name="$bucketWeight" exact="1.0"/>
+            <set_value name="$shouldDistribute" exact="true"/>
+          </do_elseif>
+        </do_if>
+        <do_else>
+          <do_if value="$cargoRatio le 5">
+            <set_value name="$needBucket" exact="'A'"/>
+            <set_value name="$bucketWeight" exact="2.4"/>
+            <set_value name="$isCriticalNeed" exact="true"/>
+            <set_value name="$shouldDistribute" exact="true"/>
+          </do_if>
+          <do_elseif value="$cargoRatio le $mk2MinStorage">
+            <set_value name="$needBucket" exact="'C'"/>
+            <set_value name="$bucketWeight" exact="1.2"/>
+            <set_value name="$shouldDistribute" exact="true"/>
+          </do_elseif>
+          <do_elseif value="$sourceRatio gt $mk2MaxStorage and $sourceRatio gt ($cargoRatio + 10)">
+            <set_value name="$needBucket" exact="'D'"/>
+            <set_value name="$bucketWeight" exact="1.0"/>
+            <set_value name="$shouldDistribute" exact="true"/>
+          </do_elseif>
+        </do_else>
+        <do_if value="not $shouldDistribute">
+          <set_value name="$mk2SkipType" exact="'noNeed'"/>
+          <return value="table[$TradeEntry = null, $SkipType = $mk2SkipType]"/>
+        </do_if>
+        <set_value name="$cargoCapacity" exact="$ship.cargo.{$wareText}.max"/>
+        <set_value name="$incomingReservedAmount" exact="0"/>
+        <set_value name="$reservedShipCount" exact="0"/>
+        <set_value name="$effectiveDestOfferAmount" exact="$destOfferAmount"/>
+        <do_if value="$fleetCoordination and $station? and $station.exists">
+          <get_ware_reservation object="$station" ware="$wareText" type="sell" virtual="false" result="$incomingReservedAmount"/>
+          <set_value name="$reservedShipCount" exact="(($incomingReservedAmount + [1, (($cargoCapacity * $minCargoFillPercent) / 100)i].max - 1) / [1, (($cargoCapacity * $minCargoFillPercent) / 100)i].max)i"/>
+        </do_if>
+        <set_value name="$shipChunkAmount" exact="[1, (($cargoCapacity * $minCargoFillPercent) / 100)i].max"/>
+        <set_value name="$effectiveNeedAmount" exact="[$destOfferAmount - 0, 0].max"/>
+        <set_value name="$maxShipsForWare" exact="0"/>
+        <do_if value="$effectiveNeedAmount gt 0">
+          <set_value name="$maxShipsForWare" exact="(($effectiveNeedAmount + $shipChunkAmount - 1) / $shipChunkAmount)i"/>
+        </do_if>
+        <set_value name="$effectiveDestOfferAmount" exact="$effectiveNeedAmount"/>
+        <do_if value="$effectiveDestOfferAmount le 0">
+          <set_value name="$mk2SkipType" exact="'reserved'"/>
+          <return value="table[$TradeEntry = null, $SkipType = $mk2SkipType]"/>
+        </do_if>
+        <set_value name="$tradeAmount" exact="[$ship.cargo.{$wareText}.free, $sourceOfferAmount, $effectiveDestOfferAmount].min"/>
+        <set_value name="$normalMinimumTrade" exact="[1, (($cargoCapacity * $minCargoFillPercent) / 100)i].max"/>
+        <set_value name="$minimumTrade" exact="$normalMinimumTrade"/>
+        <set_value name="$usedLowVolume" exact="false"/>
+        <set_value name="$canLowVolume" exact="false"/>
+        <do_if value="$allowLowVolume">
+          <do_if value="$pilotLevelProfile ge 6 or $isCriticalNeed">
+            <set_value name="$canLowVolume" exact="true"/>
+          </do_if>
+        </do_if>
+        <do_if value="$canLowVolume">
+          <set_value name="$minimumTrade" exact="[1, (($cargoCapacity * $lowVolumeFloorEffPercent) / 100)i].max"/>
+          <do_if value="$isCriticalNeed">
+            <set_value name="$minimumTrade" exact="[1, ($minimumTrade / 2)i].max"/>
+          </do_if>
+          <set_value name="$usedLowVolume" exact="true"/>
+        </do_if>
+        <do_if value="$tradeAmount lt $minimumTrade">
+          <set_value name="$mk2SkipType" exact="'minTrade'"/>
+          <return value="table[$TradeEntry = null, $SkipType = $mk2SkipType]"/>
+        </do_if>
+        <set_value name="$urgencyMultiplier" exact="$bucketWeight"/>
+        <set_value name="$balanceFactor" exact="[0, ($sourceRatio - $cargoRatio)].max / 100"/>
+        <set_value name="$baseScore" exact="(($sourceRatio - $mk2StaticStorage) * $urgencyMultiplier * ($tradeAmount / [$cargoCapacity, 1].max)) + $balanceFactor - (($sourceUsageCount + $destUsageCount) * 0.2)"/>
+        <set_value name="$shipToSourceGates" exact="$ship.gatedistance.{$sourceStation}"/>
+        <set_value name="$sourceToDestGates" exact="$sourceStation.gatedistance.{$station}"/>
+        <set_value name="$forwardGates" exact="[0, $shipToSourceGates].max + [0, $sourceToDestGates].max"/>
+        <set_value name="$baselineGates" exact="$forwardGates"/>
+        <do_if value="$sourceStationRef? and $sourceStationRef.exists and $lastTradeDestination? and $lastTradeDestination.exists">
+          <set_value name="$baseShipToSourceGates" exact="$ship.gatedistance.{$sourceStationRef}"/>
+          <set_value name="$baseSourceToDestGates" exact="$sourceStationRef.gatedistance.{$lastTradeDestination}"/>
+          <do_if value="$baseShipToSourceGates ge 0 and $baseSourceToDestGates ge 0">
+            <set_value name="$baselineGates" exact="$baseShipToSourceGates + $baseSourceToDestGates"/>
+          </do_if>
+        </do_if>
+        <set_value name="$deltaGates" exact="[0, $forwardGates - $baselineGates].max"/>
+        <set_value name="$backtrackPenalty" exact="0"/>
+        <do_if value="$lastTradeDestination? and $lastTradeDestination.exists">
+          <set_value name="$prevToDestGates" exact="$lastTradeDestination.gatedistance.{$station}"/>
+          <set_value name="$prevToSourceGates" exact="$lastTradeDestination.gatedistance.{$sourceStation}"/>
+          <do_if value="$prevToDestGates ge 0 and $prevToSourceGates ge 0 and $prevToDestGates gt ($prevToSourceGates + 1)">
+            <set_value name="$backtrackPenalty" exact="1"/>
+          </do_if>
+        </do_if>
+        <set_value name="$laneBonus" exact="1.0"/>
+        <do_if value="$stickyCyclesLeft gt 0 and $stickySource? and $stickyDestination? and $stickyWare? and $stickySource == $sourceStation and $stickyDestination == $station and $stickyWare == $wareText">
+          <set_value name="$laneBonus" exact="$routeLaneBonus"/>
+        </do_if>
+        <set_value name="$returnBonus" exact="1.0"/>
+        <do_if value="$bidirectional and $pilotLevelProfile ge 6">
+          <set_value name="$returnSourceTarget" exact="[$station.cargo.{$wareText}.target, 1].max"/>
+          <set_value name="$returnDestTarget" exact="[$sourceStation.cargo.{$wareText}.target, 1].max"/>
+          <set_value name="$returnSourceRatio" exact="($station.cargo.{$wareText}.count * 100) / $returnSourceTarget"/>
+          <set_value name="$returnDestRatio" exact="($sourceStation.cargo.{$wareText}.count * 100) / $returnDestTarget"/>
+          <do_if value="$returnSourceRatio gt $mk2MaxStorage and $returnDestRatio le $mk2MinStorage">
+            <set_value name="$returnBonus" exact="if $pilotLevelProfile ge 11 then 1.10 else 1.05"/>
+          </do_if>
+        </do_if>
+        <set_value name="$costFactor" exact="1.0"/>
+        <do_if value="$pilotLevelProfile ge 4">
+          <set_value name="$costFactor" exact="1.0 + ($routeAlpha * $deltaGates) + ($routeBeta * $backtrackPenalty)"/>
+        </do_if>
+        <do_else>
+          <set_value name="$costFactor" exact="1.0 + (0.20 * $forwardGates)"/>
+        </do_else>
+        <set_value name="$score" exact="($baseScore * $laneBonus * $returnBonus) / [1.0, $costFactor].max"/>
+        <set_value name="$mk2TradeEntry" exact="table[
+          $Ware = $wareText,
+          $Source = $sourceStation,
+          $Destination = $station,
+          $Amount = $tradeAmount,
+          $Urgent = $isCriticalNeed,
+          $NeedBucket = $needBucket,
+          $Score = $score,
+          $SourceOffer = $mk2SourceOffer,
+          $DestOffer = $mk2DestOffer,
+          $SourceOfferAmount = $sourceOfferAmount,
+          $DestOfferAmount = $destOfferAmount,
+          $EffectiveDestOfferAmount = $effectiveDestOfferAmount,
+          $IncomingReservedAmount = $incomingReservedAmount,
+          $NormalMinimumTrade = $normalMinimumTrade,
+          $UsedLowVolume = $usedLowVolume,
+          $DeltaGates = $deltaGates,
+          $BacktrackPenalty = $backtrackPenalty,
+          $SourceStorageDiscovery = $sourceStorageDiscovery,
+          $DestStorageDiscovery = $destStorageDiscovery
+        ]"/>
+        <return value="table[$TradeEntry = $mk2TradeEntry, $SkipType = $mk2SkipType]"/>
       </do_if>
 
       <!-- Read AI yield interval from global settings (persisted to instance var to survive waits) -->

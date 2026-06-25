@@ -1438,35 +1438,11 @@
           <set_value name="$wareIsDiscoverable" exact="not this.ship.isplayerowned"/>
           <do_for_each name="$gatherSectorEval" in="this.$minerScoreGatherSpaces">
             <do_if value="$gatherSectorEval? and $gatherSectorEval.exists and $gatherSectorEval.isclass.sector and $gatherSectorEval.resources.{$wareEval}.exists">
-              <set_value name="$sectorYieldRating" exact="@$gatherSectorEval.yieldrating.{$wareEval}"/>
               <set_value name="$wareIsReachable" exact="true"/>
-              <!-- Engine call mirrors vanilla player-ship routing. Do not gate this on
-                   sectorYieldRating: zero aggregate yield is exactly the case where the
-                   engine call must decide whether a discovered field is still usable. -->
-              <do_if value="this.ship.isplayerowned and not $wareIsDiscoverable">
-                <set_value name="$discTrySec" exact="null"/>
-                <set_value name="$discTryPos" exact="null"/>
-                <find_closest_resource sector="$discTrySec" position="$discTryPos" ware="$wareEval" refobject="$gatherSectorEval" minamount="1"/>
-                <do_if value="$discTrySec? and @$discTrySec.exists">
-                  <set_value name="$wareIsDiscoverable" exact="true"/>
-                </do_if>
-                <do_if value="$discTrySec?"><remove_value name="$discTrySec"/></do_if>
-                <do_if value="$discTryPos?"><remove_value name="$discTryPos"/></do_if>
-              </do_if>
-              <do_if value="$wareIsReachable and $wareIsDiscoverable">
-                <break/>
-              </do_if>
-              <do_if value="$sectorYieldRating?"><remove_value name="$sectorYieldRating"/></do_if>
+              <break/>
             </do_if>
           </do_for_each>
           <do_if value="$gatherSectorEval?"><remove_value name="$gatherSectorEval"/></do_if>
-          <!-- Vanilla mining for player ships requires discovered asteroids; if the engine
-               could not find one in any safe-sector probe, the ware is not actually
-               mineable even though resources.exists was true somewhere. NPC ships have
-               $wareIsDiscoverable initialized true so this gate never fires for them. -->
-          <do_if value="$wareIsReachable and not $wareIsDiscoverable">
-            <set_value name="$wareIsReachable" exact="false"/>
-          </do_if>
           <do_if value="$wareEval?">
             <set_value name="this.$minerScoreWareReachable.{$wareEval}" exact="$wareIsReachable"/>
             <set_value name="this.$minerScoreWareDiscoverable.{$wareEval}" exact="$wareIsDiscoverable"/>
@@ -1532,13 +1508,20 @@
         </do_all>
         <set_value name="this.$minerScoreIndex" exact="$chunkEnd + 1"/>
         <do_if value="this.$minerScoreIndex? and this.$minerScoreCandidateWares? and this.$minerScoreIndex le this.$minerScoreCandidateWares.count">
-          <wait exact="1ms"/>
+          <set_value name="$scoreChunkYieldMs" exact="15"/>
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$ResourceSearchYieldMs?">
+            <set_value name="$scoreChunkYieldMs" exact="[global.$GT_GlobalSettings.$Performance.$ResourceSearchYieldMs, 1].max"/>
+          </do_if>
+          <wait exact="$scoreChunkYieldMs * 1ms"/>
+          <remove_value name="$scoreChunkYieldMs"/>
         </do_if>
       </do_while>
       <set_value name="$wareUrgency" exact="this.$minerScoreWareUrgency"/>
       <set_value name="$wareHasPrimaryCapacity" exact="this.$minerScoreWareHasPrimaryCapacity"/>
       <set_value name="$wareReachable" exact="this.$minerScoreWareReachable"/>
       <set_value name="$wareDiscoverable" exact="this.$minerScoreWareDiscoverable"/>
+      <!-- Persist gather-sector list for the post-select locate pass (same footprint as scoring). -->
+      <set_value name="this.$minerSliceGatherSpaces" exact="this.$minerScoreGatherSpaces"/>
       <!-- Persist the per-ware discoverability map on a blackboard variable so it survives the
            wait yields between this scoring pass and the diag snapshot publish further down. The
            diag tool reads this through the snapshot to show the engine's authoritative
@@ -2413,12 +2396,79 @@
       <remove_value name="$physGateAltCandidate"/>
       <remove_value name="$physGateOuter"/>
 
+      <!-- Single engine locate for the selected ware (scoring uses resources.exists only). -->
+      <set_value name="$resolvedSector" exact="null"/>
+      <set_value name="$resolvedPos" exact="null"/>
+      <set_value name="$sliceGatherSpaces" exact="if this.$minerSliceGatherSpaces? then this.$minerSliceGatherSpaces else []"/>
+      <do_if value="this.ship.cargo.free.all gt 0 and $selectedWare? and $selectedWare != null and $sliceGatherSpaces.count gt 0">
+        <include_interrupt_actions ref="GetBlacklistgroup"/>
+        <set_value name="$locateBlacklistGroup" exact="if $blacklistgroup? then $blacklistgroup else null"/>
+        <set_value name="$searchYieldMs" exact="15"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$ResourceSearchYieldMs?">
+          <set_value name="$searchYieldMs" exact="global.$GT_GlobalSettings.$Performance.$ResourceSearchYieldMs"/>
+        </do_if>
+        <do_if value="$searchYieldMs lt 1">
+          <set_value name="$searchYieldMs" exact="1"/>
+        </do_if>
+        <do_if value="$searchYieldMs gt 100">
+          <set_value name="$searchYieldMs" exact="100"/>
+        </do_if>
+        <!-- Desync fleet locate bursts (ship components have no numeric .id). -->
+        <wait min="1ms" max="19ms"/>
+        <run_script name="'lib.gt.miner_find_target'" result="$locateResult">
+          <param name="ship" value="this.ship"/>
+          <param name="ware" value="$selectedWare"/>
+          <param name="gatherSpaces" value="$sliceGatherSpaces"/>
+          <param name="minrating" value="3"/>
+          <param name="searchYieldMs" value="$searchYieldMs"/>
+          <param name="staggerMs" value="0"/>
+          <param name="blacklistgroup" value="$locateBlacklistGroup"/>
+          <param name="debugchance" value="this.$debugchance"/>
+        </run_script>
+        <do_if value="$locateResult.$Found? and $locateResult.$Found and $locateResult.$Sector? and @$locateResult.$Sector.exists">
+          <set_value name="$resolvedSector" exact="$locateResult.$Sector"/>
+          <set_value name="$resolvedPos" exact="$locateResult.$Pos"/>
+          <do_if value="not this.$activeMiningWareDiscoverable?">
+            <set_value name="this.$activeMiningWareDiscoverable" exact="table[]"/>
+          </do_if>
+          <set_value name="this.$activeMiningWareDiscoverable.{$selectedWare}" exact="if $locateResult.$Discoverable? then $locateResult.$Discoverable else true"/>
+          <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Located target ware=' + $selectedWare.name + ' sector=' + $resolvedSector.knownname" chance="this.$debugchance"/>
+        </do_if>
+        <do_elseif value="this.ship.isplayerowned">
+          <do_if value="not this.$activeMiningWareDiscoverable?">
+            <set_value name="this.$activeMiningWareDiscoverable" exact="table[]"/>
+          </do_if>
+          <set_value name="this.$activeMiningWareDiscoverable.{$selectedWare}" exact="false"/>
+          <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': No discovered asteroid for selected ware=' + $selectedWare.name + ' in gather range. Standing by ' + this.$demandRecheckInterval + 's.'" chance="this.$debugchance"/>
+          <set_command_action commandaction="commandaction.standingby"/>
+          <remove_value name="$locateResult"/>
+          <remove_value name="$locateBlacklistGroup"/>
+          <remove_value name="$searchYieldMs"/>
+          <remove_value name="$sliceGatherSpaces"/>
+          <do_if value="$blacklistgroup?">
+            <remove_value name="$blacklistgroup"/>
+          </do_if>
+          <wait exact="this.$demandRecheckInterval"/>
+          <resume label="main_loop"/>
+        </do_elseif>
+        <remove_value name="$locateResult"/>
+        <remove_value name="$locateBlacklistGroup"/>
+        <remove_value name="$searchYieldMs"/>
+        <do_if value="$blacklistgroup?">
+          <remove_value name="$blacklistgroup"/>
+        </do_if>
+      </do_if>
+      <remove_value name="$sliceGatherSpaces"/>
+
       <!-- Run GT mining routine fork in time slices so GT maintenance/training can run between cycles -->
       <set_value name="$strictGatherSector" exact="if this.$stayAtHome and this.$homeSector? and this.$homeSector.exists then this.$homeSector else null"/>
       <run_script name="'order.mining.routine.gt'">
         <param name="warebasket" value="$runWareBasket"/>
         <param name="range" value="$range"/>
         <param name="strictgathersector" value="$strictGatherSector"/>
+        <param name="precomputedgatherspaces" value="if this.$minerSliceGatherSpaces? then this.$minerSliceGatherSpaces else []"/>
+        <param name="resolvedsector" value="$resolvedSector"/>
+        <param name="resolvedpos" value="$resolvedPos"/>
         <param name="playerStationsOnly" value="this.$playerStationsOnly"/>
         <param name="primaryTargetStations" value="$demandStations"/>
         <param name="blockedstations" value="if this.$effectiveBlockedStations? then this.$effectiveBlockedStations else []"/>
@@ -2438,6 +2488,9 @@
         <param name="duration" value="this.$demandRecheckInterval"/>
         <param name="debugchance" value="this.$debugchance"/>
       </run_script>
+      <remove_value name="this.$minerSliceGatherSpaces"/>
+      <remove_value name="$resolvedSector"/>
+      <remove_value name="$resolvedPos"/>
 
       <!-- Detect delivery completion and emit one XP event per delivery slice -->
       <set_value name="$cargoAfterDelivery" exact="0"/>
@@ -2664,6 +2717,7 @@
     <do_if value="this.$minerGatherFilterIndex?"><remove_value name="this.$minerGatherFilterIndex"/></do_if>
     <do_if value="this.$minerScoreCandidateWares?"><remove_value name="this.$minerScoreCandidateWares"/></do_if>
     <do_if value="this.$minerScoreGatherSpaces?"><remove_value name="this.$minerScoreGatherSpaces"/></do_if>
+    <do_if value="this.$minerSliceGatherSpaces?"><remove_value name="this.$minerSliceGatherSpaces"/></do_if>
     <do_if value="this.$minerScoreDemandStations?"><remove_value name="this.$minerScoreDemandStations"/></do_if>
     <do_if value="this.$minerScoreWareUrgency?"><remove_value name="this.$minerScoreWareUrgency"/></do_if>
     <do_if value="this.$minerScoreWareHasPrimaryCapacity?"><remove_value name="this.$minerScoreWareHasPrimaryCapacity"/></do_if>

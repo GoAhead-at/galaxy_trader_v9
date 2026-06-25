@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="utf-8"?>
+<aiscript name="lib.gt.miner_find_target" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <!--
+    Single-pass miner resource locate: one do_for_each over gather sectors with early break,
+    optional per-sector resource-probe branch, cooperative yield after each engine call.
+    Replaces the vanilla routine's separate probe pre-scan + ware×sector do_all loops + old-method fallback.
+  -->
+  <params>
+    <param name="ship" default="this.ship"/>
+    <param name="ware" default="null"/>
+    <param name="gatherSpaces" default="[]"/>
+    <param name="minrating" default="3"/>
+    <param name="deepspace" default="false"/>
+    <param name="preferownspace" default="false"/>
+    <param name="effectiveskill" default="100"/>
+    <param name="secwares" default="[]"/>
+    <param name="searchYieldMs" default="15"/>
+    <param name="staggerMs" default="0"/>
+    <param name="blacklistgroup" default="null"/>
+    <param name="debugchance" default="0"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <set_value name="$result" exact="table[$Found = false, $Discoverable = not $ship.isplayerowned]"/>
+      <do_if value="not $ware? or $ware == null">
+        <return value="$result"/>
+      </do_if>
+      <do_if value="not $gatherSpaces? or $gatherSpaces.count le 0">
+        <return value="$result"/>
+      </do_if>
+
+      <set_value name="$yieldMs" exact="if $searchYieldMs? and $searchYieldMs gt 0 then $searchYieldMs else 15"/>
+      <set_value name="$yieldMaxMs" exact="[$yieldMs * 3, $yieldMs + 1].max"/>
+      <set_value name="$yieldMinTime" exact="$yieldMs * 1ms"/>
+      <set_value name="$yieldMaxTime" exact="$yieldMaxMs * 1ms"/>
+      <do_if value="$staggerMs? and $staggerMs gt 0">
+        <set_value name="$staggerWait" exact="$staggerMs * 1ms"/>
+        <wait exact="$staggerWait"/>
+        <remove_value name="$staggerWait"/>
+      </do_if>
+
+      <set_value name="$trySector" exact="null"/>
+      <set_value name="$tryPos" exact="null"/>
+      <set_value name="$hostileSector" exact="null"/>
+      <set_value name="$hostilePos" exact="null"/>
+      <set_value name="$relaxedPass" exact="false"/>
+      <set_value name="$passDone" exact="false"/>
+
+      <label name="search_pass"/>
+      <do_for_each name="$gatherSpace" in="$gatherSpaces">
+        <do_if value="$passDone">
+          <break/>
+        </do_if>
+        <do_if value="not $gatherSpace? or not $gatherSpace.exists">
+          <continue/>
+        </do_if>
+
+        <set_value name="$baserating" exact="$minrating"/>
+        <do_if value="$gatherSpace.isclass.sector">
+          <set_value name="$locyieldrating" exact="@$gatherSpace.yieldrating.{$ware}"/>
+          <do_if value="not $relaxedPass">
+            <set_value name="$baserating" min="$baserating" max="[$baserating, (($locyieldrating)f * ($ship.combinedskill / 100.0))i].max"/>
+          </do_if>
+          <do_else>
+            <set_value name="$baserating" exact="1"/>
+          </do_else>
+          <do_if value="$baserating gt 6">
+            <set_value name="$baserating" exact="6"/>
+          </do_if>
+          <remove_value name="$locyieldrating"/>
+        </do_if>
+        <do_elseif value="$relaxedPass">
+          <set_value name="$baserating" exact="1"/>
+        </do_elseif>
+
+        <set_value name="$sectorSafeForSearch" exact="false"/>
+        <do_if value="$gatherSpace.isclass.sector">
+          <set_value name="$sectorSafeForSearch" exact="true"/>
+          <do_if value="$gatherSpace == $ship.sector or ($ship.commander? and $ship.commander.exists and $ship.commander.sector? and $gatherSpace == @ship.commander.sector)">
+            <!-- always search current / commander sector -->
+          </do_if>
+          <do_else>
+            <do_if value="$gatherSpace.owner? and $ship.hasrelation.enemy.{$gatherSpace.owner}">
+              <set_value name="$sectorSafeForSearch" exact="false"/>
+            </do_if>
+            <do_if value="$sectorSafeForSearch and $gatherSpace.hashazardousregion and not $gatherSpace.containsthewave and $ship.takesregiondamage">
+              <set_value name="$sectorSafeForSearch" exact="false"/>
+            </do_if>
+            <do_if value="$sectorSafeForSearch and $gatherSpace.iscontested and not $gatherSpace.contestingfactions.indexof.{$ship.owner}">
+              <do_for_each name="$contestingFaction" in="$gatherSpace.contestingfactions">
+                <do_if value="$contestingFaction.mayattack.{$ship}">
+                  <set_value name="$sectorSafeForSearch" exact="false"/>
+                  <break/>
+                </do_if>
+              </do_for_each>
+            </do_if>
+            <do_if value="$sectorSafeForSearch and $ship.isplayerowned and $blacklistgroup? and $ship.hasblacklist.{blacklisttype.sectoractivity}.{$blacklistgroup} and $gatherSpace.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship}">
+              <set_value name="$sectorSafeForSearch" exact="false"/>
+            </do_if>
+          </do_else>
+        </do_if>
+
+        <do_if value="$gatherSpace.isclass.sector and $sectorSafeForSearch and (not $preferownspace or $gatherSpace.owner == $ship.trueowner) and $gatherSpace.resources.{$ware}.exists">
+          <set_value name="$trySector" exact="null"/>
+          <set_value name="$tryPos" exact="null"/>
+
+          <do_if value="$ship.isplayerowned">
+            <find_object name="$sectorProbes" class="class.resourceprobe" space="$gatherSpace" owner="$ship.owner" multiple="true"/>
+            <do_if value="$sectorProbes.count">
+              <set_value name="$bestProbeYield" exact="0"/>
+              <do_for_each name="$sectorProbe" in="$sectorProbes">
+                <do_if value="$sectorProbe.isoperational">
+                  <set_value name="$probeYield" exact="@$sectorProbe.bestyieldrating.{$ware}"/>
+                  <do_if value="$probeYield and $probeYield ge $baserating and (not $bestProbeYield? or $probeYield gt $bestProbeYield)">
+                    <set_value name="$bestProbeYield" exact="$probeYield"/>
+                    <find_closest_resource sector="$trySector" position="$tryPos" wares="$secwares" distance="$probeDistance" ware="$ware" refobject="$gatherSpace" minrating="$probeYield">
+                      <refposition value="$gatherSpace.coreposition" object="$gatherSpace" max="$gatherSpace.coresize / 4m"/>
+                    </find_closest_resource>
+                    <wait min="$yieldMinTime" max="$yieldMaxTime"/>
+                    <remove_value name="$probeDistance"/>
+                  </do_if>
+                  <remove_value name="$probeYield"/>
+                </do_if>
+              </do_for_each>
+              <remove_value name="$bestProbeYield"/>
+            </do_if>
+            <remove_value name="$sectorProbes"/>
+          </do_if>
+
+          <do_if value="not $trySector? or not @$trySector.exists">
+            <do_if value="$ship.hascontext.{$gatherSpace}">
+              <do_if value="$ship.isplayerowned and $ship.attention ge attention.visible and $ware.hastag.mineral">
+                <find_asteroid_with_yield_in_sector name="$closestAsteroid" sector="$ship.sector" refobject="$ship" canpickup="false" maxdistance="120km" ware="$ware"/>
+                <do_if value="@$closestAsteroid.hascontext.{$gatherSpace}">
+                  <set_value name="$trySector" exact="$closestAsteroid.sector"/>
+                  <create_position name="$tryPos" space="$trySector" object="$closestAsteroid"/>
+                </do_if>
+                <remove_value name="$closestAsteroid"/>
+              </do_if>
+              <do_if value="not $trySector? or not @$trySector.exists">
+                <find_closest_resource sector="$trySector" position="$tryPos" wares="$secwares" ware="$ware" refobject="$ship" minrating="$baserating"/>
+                <wait min="$yieldMinTime" max="$yieldMaxTime"/>
+              </do_if>
+            </do_if>
+            <do_else>
+              <find_closest_resource sector="$trySector" position="$tryPos" wares="$secwares" ware="$ware" refobject="$gatherSpace" minrating="$baserating">
+                <refposition value="$gatherSpace.coreposition" object="$gatherSpace" max="$gatherSpace.coresize / 4m"/>
+              </find_closest_resource>
+              <wait min="$yieldMinTime" max="$yieldMaxTime"/>
+            </do_else>
+          </do_if>
+
+          <do_if value="$trySector? and @$trySector.exists and $gatherSpaces.indexof.{$trySector}">
+            <set_value name="$mineSafe" exact="true"/>
+            <do_if value="($trySector.hashazardousregion and not $trySector.containsthewave and $ship.takesregiondamage) or ($trySector.owner? and $ship.hasrelation.enemy.{$trySector.owner}) or ($trySector.policefaction? and not ($ship.owner == $trySector.policefaction) and $ware.illegalto.{$trySector.policefaction}.{$ship.owner})">
+              <set_value name="$mineSafe" exact="false"/>
+            </do_if>
+            <do_if value="$mineSafe and $trySector.iscontested and not $trySector.contestingfactions.indexof.{$ship.owner}">
+              <do_for_each name="$locfaction" in="$trySector.contestingfactions">
+                <do_if value="$locfaction.mayattack.{$ship}">
+                  <set_value name="$mineSafe" exact="false"/>
+                  <break/>
+                </do_if>
+              </do_for_each>
+            </do_if>
+            <do_if value="$mineSafe">
+              <set_value name="$result" exact="table[$Found = true, $Sector = $trySector, $Pos = $tryPos, $Discoverable = true, $Ware = $ware]"/>
+              <set_value name="$passDone" exact="true"/>
+              <break/>
+            </do_if>
+            <do_if value="not $ship.isplayerowned or ($ship.hasblacklist.{blacklisttype.sectoractivity}.{$blacklistgroup} and not $trySector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{$ship})">
+              <set_value name="$hostileSector" exact="$trySector"/>
+              <set_value name="$hostilePos" exact="$tryPos"/>
+            </do_if>
+          </do_if>
+          <remove_value name="$trySector"/>
+          <remove_value name="$tryPos"/>
+        </do_if>
+        <do_elseif value="not $gatherSpace.isclass.sector and $gatherSpace.resources.{$ware}.exists">
+          <do_if value="$ship.hascontext.{$gatherSpace}">
+            <find_resource sector="$trySector" position="$tryPos" wares="$secwares" ware="$ware" refobject="$ship" minrating="$baserating"/>
+          </do_if>
+          <do_else>
+            <find_resource sector="$trySector" position="$tryPos" wares="$secwares" ware="$ware" refobject="$gatherSpace" minrating="$baserating"/>
+          </do_else>
+          <wait min="$yieldMinTime" max="$yieldMaxTime"/>
+          <do_if value="$trySector? and @$trySector.exists">
+            <set_value name="$result" exact="table[$Found = true, $Sector = $trySector, $Pos = $tryPos, $Discoverable = not $ship.isplayerowned, $Ware = $ware]"/>
+            <set_value name="$passDone" exact="true"/>
+            <break/>
+          </do_if>
+          <remove_value name="$trySector"/>
+          <remove_value name="$tryPos"/>
+        </do_elseif>
+        <remove_value name="$sectorSafeForSearch"/>
+      </do_for_each>
+
+      <do_if value="not $passDone and not $relaxedPass">
+        <set_value name="$relaxedPass" exact="true"/>
+        <resume label="search_pass"/>
+      </do_if>
+
+      <do_if value="not $result.$Found and $hostileSector? and @$hostileSector.exists">
+        <set_value name="$result" exact="table[$Found = true, $Sector = $hostileSector, $Pos = $hostilePos, $Discoverable = not $ship.isplayerowned, $Ware = $ware, $HostileFallback = true]"/>
+      </do_if>
+
+      <remove_value name="$trySector"/>
+      <remove_value name="$tryPos"/>
+      <remove_value name="$hostileSector"/>
+      <remove_value name="$hostilePos"/>
+      <remove_value name="$relaxedPass"/>
+      <remove_value name="$passDone"/>
+      <remove_value name="$yieldMinTime"/>
+      <remove_value name="$yieldMaxTime"/>
+      <remove_value name="$gatherSpace"/>
+      <remove_value name="$baserating"/>
+      <return value="$result"/>
+    </actions>
+  </attention>
+</aiscript>

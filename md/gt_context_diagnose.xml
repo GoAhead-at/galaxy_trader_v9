@@ -358,6 +358,25 @@
             <set_value name="$activityDesc" exact="'Ship is currently executing a trade order (buying or selling at a station). This is a sub-order created by GalaxyTrader.'"/>
             <set_value name="$activityStatus" exact="'PASS'"/>
           </do_elseif>
+          <do_elseif value="$cargoUsed gt 0 and ($activeOrderId == 'TradeSell' or $activeOrderId == 'DockAt' or $activeOrderId == 'DockAndWait')">
+            <set_value name="$activityMinerDelivering" exact="false"/>
+            <do_if value="$ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyMiner'">
+              <set_value name="$activityMinerDelivering" exact="true"/>
+            </do_if>
+            <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.exists and $ship.commander.defaultorder? and @$ship.commander.defaultorder.id == 'GalaxyMiner'">
+              <set_value name="$activityMinerDelivering" exact="true"/>
+            </do_elseif>
+            <do_if value="$activityMinerDelivering">
+              <set_value name="$activityState" exact="'DELIVERING CARGO'"/>
+              <set_value name="$activityDesc" exact="'Galaxy Miner is executing a sell leg (' + $activeOrderId + ') with cargo on board — docking or trading at the buyer station.'"/>
+              <set_value name="$activityStatus" exact="'PASS'"/>
+            </do_if>
+            <do_else>
+              <set_value name="$activityState" exact="'OTHER ORDER: ' + $activeOrderId"/>
+              <set_value name="$activityDesc" exact="'Ship is executing a non-GT order (' + $activeOrderId + '). This order may have been queued externally or by another mod.'"/>
+              <set_value name="$activityStatus" exact="'INFO'"/>
+            </do_else>
+          </do_elseif>
           <do_elseif value="$activeOrderId == 'Equip' or $activeOrderId == 'Resupply'">
             <set_value name="$activityState" exact="'RESUPPLY'"/>
             <set_value name="$activityDesc" exact="'Ship is resupplying (ammunition, deployables, etc.) at a station. Trading resumes after resupply is complete.'"/>
@@ -892,7 +911,7 @@
                2) Fallback to 1000 (historical default if settings have not populated yet)
              Previously read from global.$GT_AIParameters.{ship}.$MinPlayerMoney, which was never
              populated for MK3/MK4/Miner - only $IgnoreBuildStorage / $IgnoreCarrierAux / $HomeBase
-             / $TraceId / $DistancePenalty / $AutoDeployResourceProbes / $MaxDistance keys are written
+             / $TraceId / $DistancePenalty / $MaxDistance keys are written
              into $GT_AIParameters by GT_RequestRegistry_Acquire - so the gate threshold defaulted
              to 100000 Cr regardless of the user's actual fleet setting and made the "money gate"
              verdict misleading. The legacy read is kept as an upper-bound fallback for the rare
@@ -1679,6 +1698,8 @@
         <set_value name="$diagMinerFullBayNeedsClearance" exact="false"/>
         <set_value name="$diagMinerHasUnsellableCargo" exact="false"/>
         <set_value name="$diagMinerUnsellableCargoDetail" exact="''"/>
+        <set_value name="$diagMinerOnSellRun" exact="false"/>
+        <set_value name="$diagMinerSellRunDetail" exact="''"/>
         <do_if value="$orderId == 'GalaxyMiner'">
           <set_value name="$diagMinerOfferWaresDetail" exact="'none (no mineable cargo and no active mining ware snapshot)'"/>
           <do_if value="$gtOrder? and $gtOrder.$playerStationsOnly?">
@@ -5806,6 +5827,55 @@
             </do_if>
           </do_if>
 
+          <!-- Active sell/delivery leg: runtime may already have queued a trade or be
+               docking/in transit while static clearance scans still show 0 policy matches. -->
+          <do_if value="$orderId == 'GalaxyMiner' and $cargoUsed gt 0">
+            <set_value name="$diagMinerImmOrder" exact="if $ship.order? then @$ship.order.id else null"/>
+            <do_if value="$ship.tradeorders? and $ship.tradeorders.count gt 0">
+              <set_value name="$diagMinerOnSellRun" exact="true"/>
+              <set_value name="$diagTo0" exact="$ship.tradeorders.{1}"/>
+              <set_value name="$diagMinerSellRunDetail" exact="'queued trade: ' + (if $diagTo0? and $diagTo0.ware? and $diagTo0.ware.name? then @$diagTo0.ware.name else '?') + ' x' + (if $diagTo0? and $diagTo0.amount? then $diagTo0.amount else '?') + ' -> ' + (if $diagTo0? and $diagTo0.buyer? and $diagTo0.buyer.exists then @$diagTo0.buyer.knownname else '?')"/>
+            </do_if>
+            <do_if value="not $diagMinerOnSellRun and $diagMinerImmOrder?">
+              <do_if value="$diagMinerImmOrder == 'TradePerform' or $diagMinerImmOrder == 'TradeSell' or $diagMinerImmOrder == 'DockAt' or $diagMinerImmOrder == 'DockAndWait'">
+                <set_value name="$diagMinerOnSellRun" exact="true"/>
+                <set_value name="$diagMinerSellRunDetail" exact="'immediate order: ' + $diagMinerImmOrder"/>
+              </do_if>
+              <do_elseif value="$cargoFree le 0 and ($diagMinerImmOrder == 'MoveToZone' or $diagMinerImmOrder == 'FlyToZone' or $diagMinerImmOrder == 'MoveWait' or $diagMinerImmOrder == 'Jump' or $diagMinerImmOrder == 'UseElevator' or $diagMinerImmOrder == 'MoveToObject')">
+                <set_value name="$diagMinerOnSellRun" exact="true"/>
+                <set_value name="$diagMinerSellRunDetail" exact="'in transit (full bay): ' + $diagMinerImmOrder"/>
+              </do_elseif>
+            </do_if>
+            <do_if value="not $diagMinerOnSellRun and global.$GT_MinerIntents? and global.$GT_MinerIntents.keys.count gt 0">
+              <do_all exact="global.$GT_MinerIntents.keys.count" counter="$msellsi">
+                <do_if value="not $diagMinerOnSellRun">
+                  <set_value name="$msellStation" exact="global.$GT_MinerIntents.keys.{$msellsi}"/>
+                  <do_if value="global.$GT_MinerIntents.{$msellStation}? and global.$GT_MinerIntents.{$msellStation}.keys.count gt 0">
+                    <do_all exact="global.$GT_MinerIntents.{$msellStation}.keys.count" counter="$msellwi">
+                      <do_if value="not $diagMinerOnSellRun">
+                        <set_value name="$msellWare" exact="global.$GT_MinerIntents.{$msellStation}.keys.{$msellwi}"/>
+                        <do_if value="global.$GT_MinerIntents.{$msellStation}.{$msellWare}? and global.$GT_MinerIntents.{$msellStation}.{$msellWare}.{$ship}?">
+                          <set_value name="$msellIntent" exact="global.$GT_MinerIntents.{$msellStation}.{$msellWare}.{$ship}"/>
+                          <do_if value="$msellIntent? and $msellIntent.$phase? and ($msellIntent.$phase == 'delivering' or ($msellIntent.$phase == 'hauling' and $cargoFree le 0))">
+                            <set_value name="$diagMinerOnSellRun" exact="true"/>
+                            <set_value name="$diagMinerSellRunDetail" exact="'fleet intent phase: ' + $msellIntent.$phase + ' -> ' + (if $msellStation? and $msellStation.exists then @$msellStation.knownname else '?')"/>
+                          </do_if>
+                        </do_if>
+                      </do_if>
+                    </do_all>
+                  </do_if>
+                </do_if>
+              </do_all>
+            </do_if>
+            <do_if value="not $diagMinerOnSellRun and global.$GT_MinerDiag? and global.$GT_MinerDiag.{$ship}? and global.$GT_MinerDiag.{$ship}.$IntentPhase?">
+              <set_value name="$diagMinerSnapPhase" exact="'' + global.$GT_MinerDiag.{$ship}.$IntentPhase"/>
+              <do_if value="$diagMinerSnapPhase == 'delivering' or ($diagMinerSnapPhase == 'hauling' and $cargoFree le 0)">
+                <set_value name="$diagMinerOnSellRun" exact="true"/>
+                <set_value name="$diagMinerSellRunDetail" exact="'snapshot intent phase: ' + $diagMinerSnapPhase"/>
+              </do_if>
+            </do_if>
+          </do_if>
+
           <append_to_list name="$report.$Sections" exact="$secCL"/>
         </do_if>
 
@@ -6137,6 +6207,13 @@
             <append_to_list name="$suggestions" exact="'Check if sectors have operational stations'"/>
           </do_else>
         </do_elseif>
+        <!-- Priority 4a0: Miner is actively executing a sell/delivery leg (not stuck). -->
+        <do_elseif value="$orderId == 'GalaxyMiner' and $diagMinerOnSellRun? and $diagMinerOnSellRun">
+          <set_value name="$verdict" exact="'MINER DELIVERING: cargo on board (' + $cargoUsed + '/' + $cargoCap + '). Ship is actively executing a sell leg (' + $diagMinerSellRunDetail + ') — not stuck. Clearance/policy rows in this report are a static re-scan and may show 0 matches even while the runtime sell pipeline already selected a buyer.'"/>
+          <do_if value="$selWBest != null">
+            <set_value name="$verdict" exact="$verdict + ' After delivery, would mine ' + $selWBest + ' (urgency ' + $selWBestUrgency + ').'"/>
+          </do_if>
+        </do_elseif>
         <!-- Priority 4a: Miner has selectable demand but is stuck (overflow wait). -->
         <do_elseif value="$orderId == 'GalaxyMiner' and $selWStalled? and $selWStalled">
           <set_value name="$verdict" exact="'MINER STALLED (overflow wait): ' + $selWStallCandidate + ' is the highest-urgency reachable ware (urgency ' + $selWStallUrgency + '), but every primary station is at or above the overflow threshold for it (worst fill ' + $selWStallStorageMax + '% ge ' + $diagMinerOverflowThreshold + '%) and Overflow → Sell To Other Stations is DISABLED. The miner is looping in the demand-recheck wait at order.trade.galaxyminer.xml:1309 and will not deliver until something below changes.'"/>
@@ -6433,6 +6510,9 @@
           <set_value name="$verdictStatus" exact="'PASS'"/>
         </do_elseif>
         <do_elseif value="not $isClearanceMode and $passCount gt 0 and $orderId == 'GalaxyMiner'">
+          <set_value name="$verdictStatus" exact="'PASS'"/>
+        </do_elseif>
+        <do_elseif value="not $isClearanceMode and $orderId == 'GalaxyMiner' and $diagMinerOnSellRun? and $diagMinerOnSellRun">
           <set_value name="$verdictStatus" exact="'PASS'"/>
         </do_elseif>
         <do_elseif value="not $isClearanceMode and $orderId == 'GalaxyMiner' and $diagMinerCargoBlocksMining">

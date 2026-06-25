@@ -1629,8 +1629,10 @@
         </do_if>
       </do_if>
 
-      <do_if value="this.$allowmultitrade and $fillPercent lt this.$selltarget and $allTrades.count gt 1">
-        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Cargo fill ' + $fillPercent + '% lt selltarget ' + this.$selltarget + '% — checking for secondary wares'" chance="this.$debugchance"/>
+      <do_if value="this.$allowmultitrade and this.$selltarget gt 0 and $fillPercent lt this.$selltarget and $allTrades.count gt 1">
+        <set_value name="$mk1TargetVolume" exact="this.$selltarget * $cargoCapacity / 100"/>
+        <set_value name="$mk1MinLegVolume" exact="$mk1TargetVolume / 3"/>
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Cargo fill ' + $fillPercent + '% lt selltarget ' + this.$selltarget + '% — checking for secondary wares (MIN_LEG_VOLUME floor=' + $mk1MinLegVolume + ')'" chance="this.$debugchance"/>
 
         <!-- Try to add up to 2 more wares (max 3 total) -->
         <set_value name="$additionalCount" exact="0"/>
@@ -1638,6 +1640,7 @@
         <do_while value="$additionalCount lt 2 and $remainingRouteVolume gt 0">
           <set_value name="$bestSecondaryTrade" exact="null"/>
           <set_value name="$bestSecondaryAmount" exact="0"/>
+          <set_value name="$bestSecondaryPlannedVolume" exact="0"/>
           <set_value name="$bestSecondaryFillPct" exact="-1"/>
           <set_value name="$bestSecondaryScore" exact="-1"/>
 
@@ -1689,20 +1692,41 @@
               <continue/>
             </do_if>
 
-            <!-- Check remaining cargo capacity -->
+            <!-- Max feasible load (includes home load offer; gate uses volume before buyer cap). -->
+            <set_value name="$secondaryLoadOfferAmount" exact="if $candidateTrade.$BuyOffer? and @$candidateTrade.$BuyOffer.exists then @$candidateTrade.$BuyOffer.offeramount.{this.ship} else 0"/>
+            <do_if value="$secondaryLoadOfferAmount == null">
+              <set_value name="$secondaryLoadOfferAmount" exact="0"/>
+            </do_if>
+            <set_value name="$secondaryBuyerDemand" exact="if $candidateTrade.$SellOffer? and @$candidateTrade.$SellOffer.exists then @$candidateTrade.$SellOffer.offeramount.{this.ship} else 0"/>
+            <do_if value="$secondaryBuyerDemand == null">
+              <set_value name="$secondaryBuyerDemand" exact="0"/>
+            </do_if>
             <set_value name="$remainingCargo" exact="this.ship.cargo.{$candidateTrade.$Ware}.free"/>
-            <set_value name="$secondaryAmount" exact="[$candidateTrade.$Amount, $remainingCargo].min"/>
+            <set_value name="$maxFeasibleAmount" exact="[$candidateTrade.$Amount, $secondaryLoadOfferAmount, $remainingCargo].min"/>
             <do_if value="$candidateTrade.$Ware.volume gt 0">
               <set_value name="$secondaryMaxByVolume" exact="($remainingRouteVolume / $candidateTrade.$Ware.volume)i"/>
-              <set_value name="$secondaryAmount" exact="[$secondaryAmount, $secondaryMaxByVolume].min"/>
+              <set_value name="$maxFeasibleAmount" exact="[$maxFeasibleAmount, $secondaryMaxByVolume].min"/>
             </do_if>
-            <do_if value="$secondaryAmount le 0">
+            <do_if value="$maxFeasibleAmount le 0">
+              <continue/>
+            </do_if>
+            <set_value name="$maxFeasibleVolume" exact="if $candidateTrade.$Ware.volume gt 0 then ($maxFeasibleAmount * $candidateTrade.$Ware.volume) else 0"/>
+            <do_if value="$maxFeasibleVolume le 0">
+              <continue/>
+            </do_if>
+            <set_value name="$plannedAmount" exact="[$maxFeasibleAmount, $secondaryBuyerDemand].min"/>
+            <do_if value="$plannedAmount le 0">
+              <continue/>
+            </do_if>
+            <set_value name="$plannedVolume" exact="$plannedAmount * $candidateTrade.$Ware.volume"/>
+
+            <!-- MIN_LEG_VOLUME: each extra leg must carry at least selltarget/3 of hold volume. -->
+            <do_if value="$mk1MinLegVolume gt 0 and $maxFeasibleVolume lt $mk1MinLegVolume">
+              <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Secondary ' + $candidateTrade.$Ware.name + ' → ' + $candidateTrade.$SellStation.knownname + ' REJECTED (MIN_LEG_VOLUME: feasibleVol=' + $maxFeasibleVolume + ' minLeg=' + $mk1MinLegVolume + ' selltarget=' + this.$selltarget + '%)'" chance="this.$debugchance"/>
               <continue/>
             </do_if>
 
-            <!-- Secondary selection:
-                 prioritize fill contribution (secondaryAmount) in both modes so the
-                 route can actually reach selltarget; then use mode-specific tie-breaks. -->
+            <!-- Secondary selection: highest planned volume among admitted candidates; mode tie-breaks. -->
             <do_if value="this.$sellselectionmode == 1">
               <set_value name="$candidateTarget" exact="this.$homeStation.cargo.{$candidateTrade.$Ware}.target"/>
               <set_value name="$candidateCount" exact="this.$homeStation.cargo.{$candidateTrade.$Ware}.count"/>
@@ -1711,20 +1735,19 @@
               <set_value name="$candidateReservedOther" exact="[($candidateReservedTotal - $candidateReservedSelf), 0].max"/>
               <set_value name="$candidateEffectiveCount" exact="[($candidateCount - $candidateReservedOther), 0].max"/>
               <set_value name="$candidateFillPct" exact="if $candidateTarget gt 0 then (($candidateEffectiveCount * 100) / $candidateTarget) else 0"/>
-              <do_if value="$secondaryAmount gt $bestSecondaryAmount or ($secondaryAmount == $bestSecondaryAmount and ($candidateFillPct gt $bestSecondaryFillPct or ($candidateFillPct == $bestSecondaryFillPct and $candidateTrade.$Score gt $bestSecondaryScore)))">
+              <do_if value="$plannedVolume gt $bestSecondaryPlannedVolume or ($plannedVolume == $bestSecondaryPlannedVolume and ($candidateFillPct gt $bestSecondaryFillPct or ($candidateFillPct == $bestSecondaryFillPct and $candidateTrade.$Score gt $bestSecondaryScore)))">
                 <set_value name="$bestSecondaryTrade" exact="$candidateTrade"/>
-                <set_value name="$bestSecondaryAmount" exact="$secondaryAmount"/>
+                <set_value name="$bestSecondaryAmount" exact="$plannedAmount"/>
+                <set_value name="$bestSecondaryPlannedVolume" exact="$plannedVolume"/>
                 <set_value name="$bestSecondaryFillPct" exact="$candidateFillPct"/>
                 <set_value name="$bestSecondaryScore" exact="$candidateTrade.$Score"/>
               </do_if>
             </do_if>
             <do_else>
-              <!-- Profit mode: choose the best secondary candidate by fill contribution
-                   (amount loaded), then tie-break by trade score.
-                   Using first-valid candidate can underfill cargo and fail hard selltarget. -->
-              <do_if value="$secondaryAmount gt $bestSecondaryAmount or ($secondaryAmount == $bestSecondaryAmount and $candidateTrade.$Score gt $bestSecondaryScore)">
+              <do_if value="$plannedVolume gt $bestSecondaryPlannedVolume or ($plannedVolume == $bestSecondaryPlannedVolume and $candidateTrade.$Score gt $bestSecondaryScore)">
                 <set_value name="$bestSecondaryTrade" exact="$candidateTrade"/>
-                <set_value name="$bestSecondaryAmount" exact="$secondaryAmount"/>
+                <set_value name="$bestSecondaryAmount" exact="$plannedAmount"/>
+                <set_value name="$bestSecondaryPlannedVolume" exact="$plannedVolume"/>
                 <set_value name="$bestSecondaryScore" exact="$candidateTrade.$Score"/>
               </do_if>
             </do_else>
@@ -1743,7 +1766,7 @@
           </do_if>
           <set_value name="$currentRouteFillPct" exact="if $cargoCapacity gt 0 then ((($cargoCapacity - $remainingRouteVolume) * 100) / $cargoCapacity) else 100"/>
 
-          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Added secondary: ' + $bestSecondaryTrade.$Ware.name + ' → ' + $bestSecondaryTrade.$SellStation.knownname + ' (amount: ' + $bestSecondaryAmount + ')'" chance="this.$debugchance"/>
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Secondary ' + $bestSecondaryTrade.$Ware.name + ' → ' + $bestSecondaryTrade.$SellStation.knownname + ' ADMIT_MIN_LEG SELECT_FILL (amount: ' + $bestSecondaryAmount + ', vol: ' + $bestSecondaryPlannedVolume + ')'" chance="this.$debugchance"/>
           <!-- Route builder is "up to 3 trades":
                stop early once selltarget is reached, so 2 trades can be enough. -->
           <do_if value="$currentRouteFillPct ge this.$selltarget">

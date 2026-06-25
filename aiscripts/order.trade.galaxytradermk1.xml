@@ -324,6 +324,14 @@
       <!-- ================================================================ -->
       <label name="main_loop"/>
 
+      <!-- Drop orphaned live-search scratch if this order resumes at loop top after save/load. -->
+      <do_if value="global.$GT_LiveSearchScratch? and global.$GT_LiveSearchScratch.{this.ship}?">
+        <remove_value name="global.$GT_LiveSearchScratch.{this.ship}"/>
+      </do_if>
+      <do_if value="global.$GT_LiveSearchActiveShip? and global.$GT_LiveSearchActiveShip == this.ship">
+        <remove_value name="global.$GT_LiveSearchActiveShip"/>
+      </do_if>
+
       <!-- Unified ship name refresh (home sector, op-state, XP — content dedupe in MD) -->
       <run_script name="'lib.gt.attention.refresh_ship_name'">
         <param name="ship" value="this.ship"/>
@@ -528,7 +536,6 @@
       <!-- ============================================================== -->
       <!-- STEP 1c: Home trading dock required for load/supply legs       -->
       <!-- ============================================================== -->
-      <set_value name="this.$mk1_dockCache" exact="table[]"/>
       <run_script name="'lib.gt.tradematch'" result="$mk1HomeDockGate">
         <param name="mode" value="'mk2_can_dock'"/>
         <param name="ship" value="this.ship"/>
@@ -536,7 +543,6 @@
         <param name="allowStorageDock" value="false"/>
       </run_script>
       <set_value name="this.$mk1_homeCanDock" exact="$mk1HomeDockGate.$CanDock"/>
-      <set_value name="this.$mk1_dockCache.{this.$homeStation}" exact="this.$mk1_homeCanDock"/>
       <do_if value="not this.$mk1_homeCanDock">
         <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': no operational trading dock at home ' + this.$homeStation.knownname + ' — skipping supply/export until dock available (size=' + this.ship.docksize + ')'" chance="this.$debugchance"/>
         <set_command_action commandaction="commandaction.orderfailed"/>
@@ -552,13 +558,126 @@
 
       <!-- Leftover cargo must be cleared before supply or export search — otherwise cancelled
            load/sell pairs leave cargo aboard and STEP 2c/4+ queue fresh buy/sell orders. -->
-      <do_if value="this.ship.cargo.count gt 0">
-        <resume label="mk1_clearance"/>
+      <!-- ============================================================== -->
+      <!-- STEP 3: Handle leftover cargo from interrupted trades          -->
+      <!-- ============================================================== -->
+      <do_while value="this.ship.cargo.count gt 0">
+        <set_command_action commandaction="commandaction.executingtrade"/>
+        <!-- Mirror GT naming-state behavior: mark ship as being in clearance mode while disposing leftover cargo. -->
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}?">
+          <set_value name="global.$GT_Ships.{this.ship}.$CargoDisposal" exact="true"/>
+        </do_if>
+        <do_if value="@this.ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}?">
+          <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
+            $Ship = this.ship,
+            $pilot = this.ship.pilot,
+            $xp = global.$GT_Pilots.{this.ship.pilot}.$XP,
+            $level = global.$GT_Pilots.{this.ship.pilot}.$Level,
+            $rank = @global.$GT_Pilots.{this.ship.pilot}.$CurrentRank,
+            $nameType = 'trader'
+          ]"/>
+        </do_if>
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Leftover cargo detected — selling at nearest buyer'" chance="this.$debugchance"/>
+
+        <!-- Build sector list for leftover cargo clearance -->
+        <create_list name="$clearSectors"/>
+        <append_to_list name="$clearSectors" exact="this.ship.sector"/>
+        <do_if value="this.$maxsell gt 0">
+          <find_sector name="$clearNearbySectors" space="player.galaxy" multiple="true">
+            <match_gate_distance object="this.ship.sector" min="0" max="this.$maxsell"/>
+          </find_sector>
+          <do_if value="$clearNearbySectors? and $clearNearbySectors.count gt 0">
+            <do_all exact="$clearNearbySectors.count" counter="$csi">
+              <do_if value="$clearNearbySectors.{$csi} != this.ship.sector">
+                <append_to_list name="$clearSectors" exact="$clearNearbySectors.{$csi}"/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_if>
+
+        <!-- For each ware in cargo, find nearest NPC buyer and sell -->
+        <set_value name="$cargoWares" exact="this.ship.cargo.list"/>
+        <do_all exact="$cargoWares.count" counter="$mk1ClrWareIdx">
+          <set_value name="$cWare" exact="$cargoWares.{$mk1ClrWareIdx}"/>
+          <set_value name="$cAmount" exact="this.ship.cargo.{$cWare}.count"/>
+          <do_if value="$cAmount gt 0">
+            <!-- Find nearest buyer for this ware across sectors in range -->
+            <set_value name="$clearBuyOffer" exact="null"/>
+            <do_all exact="$clearSectors.count" counter="$csi">
+              <find_buy_offer wares="$cWare" space="$clearSectors.{$csi}" tradepartner="this.ship" result="$secClearOffer">
+                <match_buyer tradesknownto="this.ship.owner" owner="faction.player" negateownerfilter="true">
+                  <match_relation_to object="this.ship" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="this.ship.owner" relation="enemy" comparison="not"/>
+                </match_buyer>
+                <amount min="1"/>
+              </find_buy_offer>
+              <do_if value="$secClearOffer.available">
+                <do_if value="this.$ignoretraderules or $secClearOffer.cantradewith.{this.$homeStation}">
+                  <set_value name="$clearBuyOffer" exact="$secClearOffer"/>
+                  <break/>
+                </do_if>
+              </do_if>
+            </do_all>
+            <do_if value="$clearBuyOffer? and $clearBuyOffer != null and $clearBuyOffer.available">
+              <set_value name="$clearAmount" exact="[$cAmount, $clearBuyOffer.amount].min"/>
+              <do_if value="global.$GT_ReturnHomeHold? and global.$GT_ReturnHomeHold.{this.ship}?">
+                <remove_value name="global.$GT_ReturnHomeHold.{this.ship}"/>
+                <do_if value="global.$GT_ReturnHomeHoldUntil? and global.$GT_ReturnHomeHoldUntil.{this.ship}?">
+                  <remove_value name="global.$GT_ReturnHomeHoldUntil.{this.ship}"/>
+                </do_if>
+              </do_if>
+              <do_if value="global.$GT_MK1DockedSince? and global.$GT_MK1DockedSince.{this.ship}?">
+                <remove_value name="global.$GT_MK1DockedSince.{this.ship}"/>
+              </do_if>
+              <do_if value="global.$GT_MK1ReturnHomeReleased? and global.$GT_MK1ReturnHomeReleased.{this.ship}?">
+                <remove_value name="global.$GT_MK1ReturnHomeReleased.{this.ship}"/>
+              </do_if>
+              <remove_value name="this.$mk1_dockedSince"/>
+              <remove_value name="this.$mk1_returnhomeReleased"/>
+              <create_trade_order object="this.ship" tradeoffer="$clearBuyOffer" amount="$clearAmount" immediate="true" internal="false"/>
+              <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Clearing leftover ' + $clearAmount + ' ' + $cWare.name + ' at ' + $clearBuyOffer.owner.knownname" chance="this.$debugchance"/>
+            </do_if>
+          </do_if>
+        </do_all>
+        <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield after clearance ware scan"/>
+
+        <!-- Wait for trade orders to execute -->
+        <do_if value="this.ship.orders.count gt 0">
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Waiting for leftover cargo clearance...'" chance="this.$debugchance"/>
+          <wait>
+            <interrupt>
+              <conditions>
+                <event_object_order_ready object="this.ship"/>
+              </conditions>
+            </interrupt>
+          </wait>
+        </do_if>
+        <!-- Orders finished or cancelled but cargo remains — retry clearance; do not export/supply. -->
+        <do_if value="this.ship.cargo.count gt 0">
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Leftover cargo remains after clearance attempt — retrying (skip export/supply until empty)'" chance="this.$debugchance"/>
+          <wait exact="10s" comment="Backoff before retrying clearance buyer search"/>
+        </do_if>
+      </do_while>
+
+      <!-- Clear clearance flag as soon as cargo is empty so ship state/name reverts immediately. -->
+      <do_if value="this.ship.cargo.count == 0 and global.$GT_Ships? and global.$GT_Ships.{this.ship}? and global.$GT_Ships.{this.ship}.$CargoDisposal?">
+        <remove_value name="global.$GT_Ships.{this.ship}.$CargoDisposal"/>
+        <do_if value="@this.ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}?">
+          <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
+            $Ship = this.ship,
+            $pilot = this.ship.pilot,
+            $xp = global.$GT_Pilots.{this.ship.pilot}.$XP,
+            $level = global.$GT_Pilots.{this.ship.pilot}.$Level,
+            $rank = @global.$GT_Pilots.{this.ship.pilot}.$CurrentRank,
+            $nameType = 'trader'
+          ]"/>
+        </do_if>
       </do_if>
 
       <!-- ============================================================== -->
       <!-- STEP 2b: Supply mode — affordability + threshold check         -->
       <!-- ============================================================== -->
+      <do_if value="this.ship.cargo.count == 0">
       <set_value name="this.$supplyPriority" exact="false"/>
       <set_value name="this.$supplySkipped" exact="false"/>
 
@@ -660,6 +779,9 @@
           <param name="buyPriceMin" value="$mk1BuyPriceMin"/>
           <param name="debugchance" value="this.$debugchance"/>
         </run_script>
+        <set_value name="this.$mk1_supplyLiveResult" exact="$supplyLiveResult"/>
+        <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield after supply live search"/>
+        <set_value name="$supplyLiveResult" exact="this.$mk1_supplyLiveResult"/>
 
         <!-- Safety filter: supply mode must not buy from the same home station.
              This prevents degenerate self-trades (buy+deliver on identical station). -->
@@ -696,18 +818,23 @@
           <param name="allowIllegal" value="this.$allowillegal"/>
           <param name="enforceRouteIllegalLegality" value="this.$enforceRouteIllegalLegality"/>
         </run_script>
+        <set_value name="this.$mk1_supplyMatchResult" exact="$supplyMatchResult"/>
         <wait exact="this.$gt_yieldMs * 1ms" comment="Yield after shared tradematch call"/>
+        <set_value name="$supplyMatchResult" exact="this.$mk1_supplyMatchResult"/>
 
         <set_value name="$bestSupplyTrade" exact="null"/>
         <set_value name="$bestSupplyScore" exact="-1"/>
+        <set_value name="this.$mk1_bestSupplyScore" exact="-1"/>
+        <remove_value name="this.$mk1_bestSupplyTrade"/>
         <set_value name="$availableSupplyTradeWaresCount" exact="0"/>
         <do_if value="$supplyMatchResult.$Found and $supplyMatchResult.$TradeList? and $supplyMatchResult.$TradeList.count gt 0">
           <run_script name="'lib.gt.tradematch'" result="$mk1DistinctWaresResult">
             <param name="mode" value="'count_distinct_wares'"/>
             <param name="tradeListInput" value="$supplyMatchResult.$TradeList"/>
           </run_script>
+          <set_value name="this.$mk1_distinctWaresCount" exact="if $mk1DistinctWaresResult.$DistinctCount? then $mk1DistinctWaresResult.$DistinctCount else 0"/>
           <wait exact="this.$gt_yieldMs * 1ms" comment="Yield after distinct-ware helper call"/>
-          <set_value name="$availableSupplyTradeWaresCount" exact="if $mk1DistinctWaresResult.$DistinctCount? then $mk1DistinctWaresResult.$DistinctCount else 0"/>
+          <set_value name="$availableSupplyTradeWaresCount" exact="this.$mk1_distinctWaresCount"/>
 
           <do_if value="this.$debuglevel ge 1">
             <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': supply candidate wares available now=' + $availableSupplyTradeWaresCount" chance="this.$debugchance"/>
@@ -736,16 +863,13 @@
 
             <set_value name="$supCandSellerStation" exact="if $candidateCoreTrade.$SellOffer? and $candidateCoreTrade.$SellOffer.owner? and $candidateCoreTrade.$SellOffer.owner.exists then $candidateCoreTrade.$SellOffer.owner else null"/>
             <do_if value="$supCandSellerStation? and $supCandSellerStation.exists">
-              <do_if value="not this.$mk1_dockCache.{$supCandSellerStation}?">
-                <run_script name="'lib.gt.tradematch'" result="$mk1SupCandDockCheck">
-                  <param name="mode" value="'mk2_can_dock'"/>
-                  <param name="ship" value="this.ship"/>
-                  <param name="station" value="$supCandSellerStation"/>
-                  <param name="allowStorageDock" value="false"/>
-                </run_script>
-                <set_value name="this.$mk1_dockCache.{$supCandSellerStation}" exact="$mk1SupCandDockCheck.$CanDock"/>
-              </do_if>
-              <do_if value="not this.$mk1_dockCache.{$supCandSellerStation}">
+              <run_script name="'lib.gt.tradematch'" result="$mk1SupCandDockCheck">
+                <param name="mode" value="'mk2_can_dock'"/>
+                <param name="ship" value="this.ship"/>
+                <param name="station" value="$supCandSellerStation"/>
+                <param name="allowStorageDock" value="false"/>
+              </run_script>
+              <do_if value="not $mk1SupCandDockCheck.$CanDock">
                 <continue/>
               </do_if>
             </do_if>
@@ -798,13 +922,13 @@
                 <param name="alreadyReservedByThisShip" value="$alreadyReservedByThisShip"/>
                 <param name="fairnessCap" value="2"/>
               </run_script>
-              <wait exact="this.$gt_yieldMs * 1ms" comment="Yield after fairness helper call"/>
               <set_value name="$effectiveNeedAmount" exact="$mk1FairnessResult.$EffectiveNeedAmount"/>
               <set_value name="$maxShipsForWare" exact="$mk1FairnessResult.$MaxShipsForWare"/>
               <set_value name="$reservationAllowsTrade" exact="$mk1FairnessResult.$ReservationAllowsTrade"/>
               <set_value name="$candidateAmount" exact="[$candidateAmount, $effectiveNeedAmount].min"/>
 
-              <do_if value="$candidateAmount gt 0 and $candidateCoreTrade.$Score gt $bestSupplyScore">
+              <do_if value="$candidateAmount gt 0 and $candidateCoreTrade.$Score gt this.$mk1_bestSupplyScore">
+                <set_value name="this.$mk1_bestSupplyScore" exact="$candidateCoreTrade.$Score"/>
                 <set_value name="$bestSupplyScore" exact="$candidateCoreTrade.$Score"/>
                 <set_value name="$bestSupplyTrade" exact="table[
                   $Ware = $candidateCoreTrade.$Ware,
@@ -819,19 +943,22 @@
                   $NeedAmount = $needAmount,
                   $EffectiveNeedAmount = $effectiveNeedAmount
                 ]"/>
+                <set_value name="this.$mk1_bestSupplyTrade" exact="$bestSupplyTrade"/>
               </do_if>
             </do_if>
+            <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield after supply candidate evaluation"/>
           </do_all>
         </do_if>
 
-        <do_if value="$bestSupplyTrade != null">
+        <do_if value="this.$mk1_bestSupplyTrade?">
+          <set_value name="$bestSupplyTrade" exact="this.$mk1_bestSupplyTrade"/>
           <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply trade found: buy ' + $bestSupplyTrade.$Amount + ' ' + $bestSupplyTrade.$Ware.name + ' from ' + $bestSupplyTrade.$SellerStation.knownname + ' (dist: ' + $bestSupplyTrade.$Distance + ', slots: ' + $bestSupplyTrade.$ReservedCount + '/' + $bestSupplyTrade.$MaxShipsForWare + ', incoming=' + $bestSupplyTrade.$IncomingReservedAmount + ', need=' + $bestSupplyTrade.$NeedAmount + ', effectiveNeed=' + $bestSupplyTrade.$EffectiveNeedAmount + ')'" chance="this.$debugchance"/>
 
           <!-- Create BOTH trade orders upfront so reservations are visible immediately.
                Pattern matches vanilla order.trade.routine: "create_trade_order adds the reservation automatically".
                The engine executes queued orders in sequence (buy first, then deliver). -->
           <set_command_action commandaction="commandaction.flying"/>
-          <set_value name="$supplyOrdersCreated" exact="false"/>
+          <set_value name="this.$mk1_supplyOrdersCreated" exact="0"/>
 
           <do_if value="$bestSupplyTrade.$BuyOffer? and @$bestSupplyTrade.$BuyOffer.exists and $bestSupplyTrade.$SellOffer? and @$bestSupplyTrade.$SellOffer.exists and $bestSupplyTrade.$SellOffer.available and $bestSupplyTrade.$BuyOffer.available">
             <set_value name="$supOfferAmount" exact="@$bestSupplyTrade.$BuyOffer.offeramount.{this.ship}"/>
@@ -844,7 +971,7 @@
               <set_value name="$supBuyAmount" exact="[$supBuyAmount, $supAffordableAmount].min"/>
             </do_if>
             <do_if value="$supBuyAmount gt 0">
-              <set_value name="$supRouteOk" exact="true"/>
+              <set_value name="this.$mk1_supRouteOk" exact="true"/>
               <do_if value="this.$allowillegal and this.$enforceRouteIllegalLegality and @$bestSupplyTrade.$Ware.illegal gt 0">
                 <run_script name="'lib.gt.pathfinding'" result="$supRouteLegality">
                   <param name="mode" value="'route_legality'"/>
@@ -858,27 +985,24 @@
                   <param name="ware" value="$bestSupplyTrade.$Ware"/>
                 </run_script>
                 <do_if value="not $supRouteLegality.$IsLegal">
-                  <set_value name="$supRouteOk" exact="false"/>
+                  <set_value name="this.$mk1_supRouteOk" exact="false"/>
                 </do_if>
               </do_if>
-              <do_if value="$supRouteOk">
+              <do_if value="this.$mk1_supRouteOk">
               <set_value name="$supSellerStation" exact="if $bestSupplyTrade.$SellOffer? and $bestSupplyTrade.$SellOffer.owner? and $bestSupplyTrade.$SellOffer.owner.exists then $bestSupplyTrade.$SellOffer.owner else null"/>
               <do_if value="$supSellerStation? and $supSellerStation.exists">
-                <do_if value="not this.$mk1_dockCache.{$supSellerStation}?">
-                  <run_script name="'lib.gt.tradematch'" result="$mk1SupSellerDockCheck">
-                    <param name="mode" value="'mk2_can_dock'"/>
-                    <param name="ship" value="this.ship"/>
-                    <param name="station" value="$supSellerStation"/>
-                    <param name="allowStorageDock" value="false"/>
-                  </run_script>
-                  <set_value name="this.$mk1_dockCache.{$supSellerStation}" exact="$mk1SupSellerDockCheck.$CanDock"/>
-                </do_if>
-                <do_if value="not this.$mk1_dockCache.{$supSellerStation}">
+                <run_script name="'lib.gt.tradematch'" result="$mk1SupSellerDockCheck">
+                  <param name="mode" value="'mk2_can_dock'"/>
+                  <param name="ship" value="this.ship"/>
+                  <param name="station" value="$supSellerStation"/>
+                  <param name="allowStorageDock" value="false"/>
+                </run_script>
+                <do_if value="not $mk1SupSellerDockCheck.$CanDock">
                   <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply skipped — no trading dock at source ' + $supSellerStation.knownname" chance="this.$debugchance"/>
-                  <set_value name="$supRouteOk" exact="false"/>
+                  <set_value name="this.$mk1_supRouteOk" exact="false"/>
                 </do_if>
               </do_if>
-              <do_if value="$supRouteOk">
+              <do_if value="this.$mk1_supRouteOk">
               <do_if value="global.$GT_ReturnHomeHold? and global.$GT_ReturnHomeHold.{this.ship}?">
                 <remove_value name="global.$GT_ReturnHomeHold.{this.ship}"/>
                 <do_if value="global.$GT_ReturnHomeHoldUntil? and global.$GT_ReturnHomeHoldUntil.{this.ship}?">
@@ -922,7 +1046,7 @@
                 </do_if>
               </do_if>
 
-              <set_value name="$supplyOrdersCreated" exact="true"/>
+              <set_value name="this.$mk1_supplyOrdersCreated" exact="1"/>
               <do_if value="this.$allowillegal and this.$enforceRouteIllegalLegality">
                 <do_if value="not global.$GT_Ships?">
                   <set_value name="global.$GT_Ships" exact="table[]"/>
@@ -948,12 +1072,14 @@
           </do_if>
           </do_if>
 
-          <do_if value="not $supplyOrdersCreated">
+          <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield after supply order queue attempt"/>
+
+          <do_if value="not this.$mk1_supplyOrdersCreated? or this.$mk1_supplyOrdersCreated == 0">
             <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply trade offers no longer available — skipping'" chance="this.$debugchance"/>
           </do_if>
 
           <!-- Wait for both orders to complete (buy + deliver) -->
-          <do_if value="$supplyOrdersCreated">
+          <do_if value="this.$mk1_supplyOrdersCreated? and this.$mk1_supplyOrdersCreated == 1">
             <do_while value="this.ship.orders.count gt 0">
               <wait exact="5s">
                 <interrupt>
@@ -969,13 +1095,13 @@
           </do_if>
 
           <!-- Logbook and XP only if supply orders were actually created and executed -->
-          <do_if value="$supplyOrdersCreated">
-            <do_if value="this.$logbookentries">
-              <set_value name="$supLogMsg" exact="'Supplied ' + $bestSupplyTrade.$Amount + ' ' + $bestSupplyTrade.$Ware.name + ' to ' + this.$homeStation.knownname + ' from ' + $bestSupplyTrade.$SellerStation.knownname"/>
+          <do_if value="this.$mk1_supplyOrdersCreated? and this.$mk1_supplyOrdersCreated == 1">
+            <do_if value="this.$logbookentries and this.$mk1_bestSupplyTrade?">
+              <set_value name="$supLogMsg" exact="'Supplied ' + this.$mk1_bestSupplyTrade.$Amount + ' ' + this.$mk1_bestSupplyTrade.$Ware.name + ' to ' + this.$homeStation.knownname + ' from ' + this.$mk1_bestSupplyTrade.$SellerStation.knownname"/>
               <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
                 $Message = $supLogMsg,
                 $Category = 'upkeep',
-                $Title = 'MK1 Supply: ' + $bestSupplyTrade.$Ware.name,
+                $Title = 'MK1 Supply: ' + this.$mk1_bestSupplyTrade.$Ware.name,
                 $Object = this.ship,
                 $CheckGlobalSettings = false
               ]"/>
@@ -1000,128 +1126,6 @@
           <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': No supply trades found — falling through to sell phase'" chance="this.$debugchance"/>
         </do_else>
       </do_if>
-
-      <!-- ============================================================== -->
-      <!-- STEP 3: Handle leftover cargo from interrupted trades          -->
-      <!-- ============================================================== -->
-      <label name="mk1_clearance"/>
-      <set_value name="$hasLeftoverCargo" exact="this.ship.cargo.count gt 0"/>
-      <do_if value="$hasLeftoverCargo">
-        <set_command_action commandaction="commandaction.executingtrade"/>
-        <!-- Mirror GT naming-state behavior: mark ship as being in clearance mode while disposing leftover cargo. -->
-        <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}?">
-          <set_value name="global.$GT_Ships.{this.ship}.$CargoDisposal" exact="true"/>
-        </do_if>
-        <do_if value="@this.ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}?">
-          <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
-            $Ship = this.ship,
-            $pilot = this.ship.pilot,
-            $xp = global.$GT_Pilots.{this.ship.pilot}.$XP,
-            $level = global.$GT_Pilots.{this.ship.pilot}.$Level,
-            $rank = @global.$GT_Pilots.{this.ship.pilot}.$CurrentRank,
-            $nameType = 'trader'
-          ]"/>
-        </do_if>
-        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Leftover cargo detected — selling at nearest buyer'" chance="this.$debugchance"/>
-
-        <!-- Build sector list for leftover cargo clearance -->
-        <create_list name="$clearSectors"/>
-        <append_to_list name="$clearSectors" exact="this.ship.sector"/>
-        <do_if value="this.$maxsell gt 0">
-          <find_sector name="$clearNearbySectors" space="player.galaxy" multiple="true">
-            <match_gate_distance object="this.ship.sector" min="0" max="this.$maxsell"/>
-          </find_sector>
-          <do_if value="$clearNearbySectors? and $clearNearbySectors.count gt 0">
-            <do_all exact="$clearNearbySectors.count" counter="$csi">
-              <do_if value="$clearNearbySectors.{$csi} != this.ship.sector">
-                <append_to_list name="$clearSectors" exact="$clearNearbySectors.{$csi}"/>
-              </do_if>
-            </do_all>
-          </do_if>
-        </do_if>
-
-        <!-- For each ware in cargo, find nearest NPC buyer and sell -->
-        <set_value name="$cargoWares" exact="this.ship.cargo.list"/>
-        <do_all exact="$cargoWares.count" counter="$ci">
-          <set_value name="$cWare" exact="$cargoWares.{$ci}"/>
-          <set_value name="$cAmount" exact="this.ship.cargo.{$cWare}.count"/>
-          <do_if value="$cAmount gt 0">
-            <!-- Find nearest buyer for this ware across sectors in range -->
-            <set_value name="$clearBuyOffer" exact="null"/>
-            <do_all exact="$clearSectors.count" counter="$csi">
-              <find_buy_offer wares="$cWare" space="$clearSectors.{$csi}" tradepartner="this.ship" result="$secClearOffer">
-                <match_buyer tradesknownto="this.ship.owner" owner="faction.player" negateownerfilter="true">
-                  <match_relation_to object="this.ship" relation="dock" comparison="ge"/>
-                  <match_relation_to faction="this.ship.owner" relation="enemy" comparison="not"/>
-                </match_buyer>
-                <amount min="1"/>
-              </find_buy_offer>
-              <do_if value="$secClearOffer.available">
-                <do_if value="this.$ignoretraderules or $secClearOffer.cantradewith.{this.$homeStation}">
-                  <set_value name="$clearBuyOffer" exact="$secClearOffer"/>
-                  <break/>
-                </do_if>
-              </do_if>
-            </do_all>
-            <do_if value="$clearBuyOffer? and $clearBuyOffer != null and $clearBuyOffer.available">
-              <set_value name="$clearAmount" exact="[$cAmount, $clearBuyOffer.amount].min"/>
-              <do_if value="global.$GT_ReturnHomeHold? and global.$GT_ReturnHomeHold.{this.ship}?">
-                <remove_value name="global.$GT_ReturnHomeHold.{this.ship}"/>
-                <do_if value="global.$GT_ReturnHomeHoldUntil? and global.$GT_ReturnHomeHoldUntil.{this.ship}?">
-                  <remove_value name="global.$GT_ReturnHomeHoldUntil.{this.ship}"/>
-                </do_if>
-              </do_if>
-              <do_if value="global.$GT_MK1DockedSince? and global.$GT_MK1DockedSince.{this.ship}?">
-                <remove_value name="global.$GT_MK1DockedSince.{this.ship}"/>
-              </do_if>
-              <do_if value="global.$GT_MK1ReturnHomeReleased? and global.$GT_MK1ReturnHomeReleased.{this.ship}?">
-                <remove_value name="global.$GT_MK1ReturnHomeReleased.{this.ship}"/>
-              </do_if>
-              <remove_value name="this.$mk1_dockedSince"/>
-              <remove_value name="this.$mk1_returnhomeReleased"/>
-              <create_trade_order object="this.ship" tradeoffer="$clearBuyOffer" amount="$clearAmount" immediate="true" internal="false"/>
-              <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Clearing leftover ' + $clearAmount + ' ' + $cWare.name + ' at ' + $clearBuyOffer.owner.knownname" chance="this.$debugchance"/>
-              <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield"/>
-            </do_if>
-          </do_if>
-        </do_all>
-
-        <!-- Wait for trade orders to execute -->
-        <do_if value="this.ship.orders.count gt 0">
-          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Waiting for leftover cargo clearance...'" chance="this.$debugchance"/>
-          <wait>
-            <interrupt>
-              <conditions>
-                <event_object_order_ready object="this.ship"/>
-              </conditions>
-            </interrupt>
-          </wait>
-        </do_if>
-        <!-- Orders finished or cancelled but cargo remains — retry clearance; do not export/supply. -->
-        <do_if value="this.ship.cargo.count gt 0">
-          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Leftover cargo remains after clearance attempt — retrying (skip export/supply until empty)'" chance="this.$debugchance"/>
-          <wait exact="10s" comment="Backoff before retrying clearance buyer search"/>
-          <resume label="main_loop"/>
-        </do_if>
-      </do_if>
-
-      <!-- Clear clearance flag as soon as cargo is empty so ship state/name reverts immediately. -->
-      <do_if value="this.ship.cargo.count == 0 and global.$GT_Ships? and global.$GT_Ships.{this.ship}? and global.$GT_Ships.{this.ship}.$CargoDisposal?">
-        <remove_value name="global.$GT_Ships.{this.ship}.$CargoDisposal"/>
-        <do_if value="@this.ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}?">
-          <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
-            $Ship = this.ship,
-            $pilot = this.ship.pilot,
-            $xp = global.$GT_Pilots.{this.ship.pilot}.$XP,
-            $level = global.$GT_Pilots.{this.ship.pilot}.$Level,
-            $rank = @global.$GT_Pilots.{this.ship.pilot}.$CurrentRank,
-            $nameType = 'trader'
-          ]"/>
-        </do_if>
-      </do_if>
-
-      <do_if value="this.ship.cargo.count gt 0">
-        <resume label="main_loop"/>
       </do_if>
 
       <!-- ============================================================== -->
@@ -1393,6 +1397,9 @@
         <param name="distancePenalty" value="0.1"/>
         <param name="debugchance" value="this.$debugchance"/>
       </run_script>
+      <set_value name="this.$mk1_sellLiveResult" exact="$sellLiveResult"/>
+      <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield after sell live search"/>
+      <set_value name="$sellLiveResult" exact="this.$mk1_sellLiveResult"/>
 
       <!-- Enforce home-station trade rules when ignoretraderules=false.
            Candidate buyers must be valid with the station as tradepartner,
@@ -1446,7 +1453,9 @@
         <param name="allowIllegal" value="this.$allowillegal"/>
         <param name="enforceRouteIllegalLegality" value="this.$enforceRouteIllegalLegality"/>
       </run_script>
+      <set_value name="this.$mk1_matchResult" exact="$matchResult"/>
       <wait exact="this.$gt_yieldMs * 1ms" comment="Yield after shared tradematch call"/>
+      <set_value name="$matchResult" exact="this.$mk1_matchResult"/>
 
       <create_list name="$allTrades"/>
       <set_value name="$matchedTrades" exact="[]"/>
@@ -1511,16 +1520,13 @@
             </do_if>
             <do_all exact="$mk1DockStations.count" counter="$mdci">
               <set_value name="$mk1DockStation" exact="$mk1DockStations.{$mdci}"/>
-              <do_if value="not this.$mk1_dockCache.{$mk1DockStation}?">
-                <run_script name="'lib.gt.tradematch'" result="$mk1DockCheck">
-                  <param name="mode" value="'mk2_can_dock'"/>
-                  <param name="ship" value="this.ship"/>
-                  <param name="station" value="$mk1DockStation"/>
-                  <param name="allowStorageDock" value="false"/>
-                </run_script>
-                <set_value name="this.$mk1_dockCache.{$mk1DockStation}" exact="$mk1DockCheck.$CanDock"/>
-              </do_if>
-              <do_if value="not this.$mk1_dockCache.{$mk1DockStation}">
+              <run_script name="'lib.gt.tradematch'" result="$mk1DockCheck">
+                <param name="mode" value="'mk2_can_dock'"/>
+                <param name="ship" value="this.ship"/>
+                <param name="station" value="$mk1DockStation"/>
+                <param name="allowStorageDock" value="false"/>
+              </run_script>
+              <do_if value="not $mk1DockCheck.$CanDock">
                 <set_value name="$keepTrade" exact="false"/>
                 <break/>
               </do_if>
@@ -1531,6 +1537,7 @@
           <do_if value="$keepTrade">
             <append_to_list name="$allTrades" exact="$trade"/>
           </do_if>
+          <wait exact="this.$gt_yieldMs * 1ms" comment="Yield after export trade dock filter"/>
         </do_all>
       </do_if>
 
@@ -1988,19 +1995,13 @@
             </do_if>
             <do_all exact="$mk1QueueDockStations.count" counter="$mqdci">
               <set_value name="$mk1QueueDockStation" exact="$mk1QueueDockStations.{$mqdci}"/>
-              <do_if value="not this.$mk1_dockCache?">
-                <set_value name="this.$mk1_dockCache" exact="table[]"/>
-              </do_if>
-              <do_if value="not this.$mk1_dockCache.{$mk1QueueDockStation}?">
-                <run_script name="'lib.gt.tradematch'" result="$mk1QueueDockCheck">
-                  <param name="mode" value="'mk2_can_dock'"/>
-                  <param name="ship" value="this.ship"/>
-                  <param name="station" value="$mk1QueueDockStation"/>
-                  <param name="allowStorageDock" value="false"/>
-                </run_script>
-                <set_value name="this.$mk1_dockCache.{$mk1QueueDockStation}" exact="$mk1QueueDockCheck.$CanDock"/>
-              </do_if>
-              <do_if value="not this.$mk1_dockCache.{$mk1QueueDockStation}">
+              <run_script name="'lib.gt.tradematch'" result="$mk1QueueDockCheck">
+                <param name="mode" value="'mk2_can_dock'"/>
+                <param name="ship" value="this.ship"/>
+                <param name="station" value="$mk1QueueDockStation"/>
+                <param name="allowStorageDock" value="false"/>
+              </run_script>
+              <do_if value="not $mk1QueueDockCheck.$CanDock">
                 <set_value name="$mk1QueueDockOk" exact="false"/>
                 <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Queue skip — no trading dock at ' + $mk1QueueDockStation.knownname + ' for ' + $rt.$Ware.name" chance="this.$debugchance"/>
                 <break/>
@@ -2017,6 +2018,7 @@
           </do_if>
         </do_if>
       </do_all>
+      <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield after queue dock filter"/>
 
       <!-- Execution-order compaction by SELL destination sector:
            1) collapse A->B->A into grouped sector blocks

@@ -1,0 +1,191 @@
+<?xml version="1.0" encoding="utf-8"?>
+<aiscript name="lib.gt.dockcheck" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <!--
+    Unified dock preflight (DOCS/Spec/improvements/FEATURE_UNIFY_DOCKING_CHECKS.md).
+    Read-only probe — returns $CanDock + $Reason; never writes globals.
+    Paired MD implementation: GT_CanDock in gt_libraries_general.xml.
+    Cooperative yield before return prevents AIDirector infinite-wake loops in hot paths.
+  -->
+  <params>
+    <param name="ship" default="this.ship"/>
+    <param name="station" default="null"/>
+    <param name="purpose" default="'trade'"/>
+    <param name="allowStorageDock" default="false"/>
+    <param name="allowPlayerOnly" default="false"/>
+    <param name="checkOperational" default="true"/>
+    <param name="useMemo" default="false" comment="Cache on this.$gt_dockMemo per search pass (caller clears memo)"/>
+    <param name="debugchance" default="0"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <set_value name="$yieldMs" exact="1"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$AIYieldInterval?">
+        <set_value name="$yieldMs" exact="[1, @global.$GT_GlobalSettings.$Performance.$AIYieldInterval].max"/>
+      </do_if>
+
+      <set_value name="$canDock" exact="false"/>
+      <set_value name="$reason" exact="'invalid_station'"/>
+      <set_value name="$usedStorageFallback" exact="false"/>
+      <set_value name="$bay" exact="null"/>
+      <set_value name="$memoHit" exact="false"/>
+
+      <!-- Per-search memo (D8): skip redundant find_dockingbay when same station revisited -->
+      <do_if value="$useMemo and $station? and $station.exists">
+        <do_if value="this.$gt_dockMemo? and this.$gt_dockMemo.{$station}?">
+          <set_value name="$memoEntry" exact="this.$gt_dockMemo.{$station}"/>
+          <do_if value="$memoEntry.$Purpose == $purpose and $memoEntry.$AllowStorageDock == $allowStorageDock and $memoEntry.$AllowPlayerOnly == $allowPlayerOnly">
+            <set_value name="$canDock" exact="$memoEntry.$CanDock"/>
+            <set_value name="$reason" exact="$memoEntry.$Reason"/>
+            <set_value name="$usedStorageFallback" exact="$memoEntry.$UsedStorageFallback"/>
+            <set_value name="$bay" exact="$memoEntry.$Bay"/>
+            <set_value name="$memoHit" exact="true"/>
+          </do_if>
+        </do_if>
+      </do_if>
+
+      <do_if value="not $memoHit">
+        <do_if value="$station? and $station.exists">
+          <set_value name="$reason" exact="'no_bay'"/>
+
+          <!-- ================================================================= -->
+          <!-- purpose=trade — Trading dock probe + storage fallback + capital park -->
+          <!-- ================================================================= -->
+          <do_if value="$purpose == 'trade'">
+            <find_dockingbay name="$bay" object="$station" checkoperational="$checkOperational" multiple="false">
+              <match_dock size="$ship.docksize" trading="true" storage="false" allowplayeronly="$allowPlayerOnly"/>
+              <match_relation_to object="$ship" comparison="not" relation="enemy"/>
+            </find_dockingbay>
+            <do_if value="$bay">
+              <set_value name="$canDock" exact="true"/>
+              <set_value name="$reason" exact="'ok'"/>
+            </do_if>
+            <do_elseif value="$allowStorageDock and $station.isplayerowned and not $station.isclass.buildstorage">
+              <find_dockingbay name="$bay" object="$station" checkoperational="$checkOperational" multiple="false">
+                <match_dock size="$ship.docksize" storage="true"/>
+                <match_relation_to object="$ship" comparison="not" relation="enemy"/>
+              </find_dockingbay>
+              <do_if value="$bay">
+                <set_value name="$canDock" exact="true"/>
+                <set_value name="$reason" exact="'ok'"/>
+                <set_value name="$usedStorageFallback" exact="true"/>
+              </do_if>
+              <do_else>
+                <set_value name="$reason" exact="'no_trading_bay'"/>
+              </do_else>
+            </do_elseif>
+            <do_else>
+              <do_if value="((@$station.type == shiptype.resupplier) or (@$station.type == shiptype.carrier)) and not $ship.hasrelation.enemy.{$station} and $ship.iscapitalship and not $station.zone.isclass.highway">
+                <set_value name="$canDock" exact="true"/>
+                <set_value name="$reason" exact="'capital_park'"/>
+              </do_if>
+              <do_else>
+                <set_value name="$reason" exact="'no_trading_bay'"/>
+              </do_else>
+            </do_else>
+          </do_if>
+
+          <!-- ================================================================= -->
+          <!-- purpose=service | service_ai — Service dock probe -->
+          <!-- ================================================================= -->
+          <do_elseif value="$purpose == 'service' or $purpose == 'service_ai'">
+            <do_if value="not $ship.iscapitalship or $station.isclass.station">
+              <find_dockingbay name="$bay" object="$station" checkoperational="$checkOperational" multiple="false">
+                <match_dock size="$ship.docksize" storage="false"/>
+              </find_dockingbay>
+              <do_if value="$bay">
+                <set_value name="$canDock" exact="true"/>
+                <set_value name="$reason" exact="'ok'"/>
+              </do_if>
+              <do_else>
+                <set_value name="$reason" exact="'no_service_bay'"/>
+              </do_else>
+            </do_if>
+            <do_else>
+              <set_value name="$canDock" exact="true"/>
+              <set_value name="$reason" exact="'capital_skip'"/>
+            </do_else>
+          </do_elseif>
+
+          <!-- ================================================================= -->
+          <!-- purpose=permission_only — Docking permission gate -->
+          <!-- ================================================================= -->
+          <do_elseif value="$purpose == 'permission_only'">
+            <do_if value="@$station.type == shiptype.resupplier">
+              <set_value name="$canDock" exact="true"/>
+              <set_value name="$reason" exact="'ok'"/>
+            </do_if>
+            <do_else>
+              <set_value name="$checkPolicy" exact="not $ship.iscapitalship or $station.isclass.station"/>
+              <do_if value="not $checkPolicy or $station.dockingallowed.{$ship}">
+                <set_value name="$canDock" exact="true"/>
+                <set_value name="$reason" exact="'ok'"/>
+              </do_if>
+              <do_else>
+                <set_value name="$reason" exact="'docking_denied'"/>
+              </do_else>
+            </do_else>
+          </do_elseif>
+
+          <!-- ================================================================= -->
+          <!-- purpose=dual — Service dual probe (bay + permission + resupplier) -->
+          <!-- ================================================================= -->
+          <do_elseif value="$purpose == 'dual'">
+            <find_dockingbay name="$bay" object="$station" checkoperational="$checkOperational" multiple="false">
+              <match_dock size="$ship.docksize" storage="false"/>
+            </find_dockingbay>
+            <do_if value="not $bay">
+              <set_value name="$reason" exact="'no_service_bay'"/>
+            </do_if>
+            <do_elseif value="@$station.type == shiptype.resupplier">
+              <set_value name="$canDock" exact="true"/>
+              <set_value name="$reason" exact="'ok'"/>
+            </do_elseif>
+            <do_else>
+              <set_value name="$checkPolicy" exact="not $ship.iscapitalship or $station.isclass.station"/>
+              <do_if value="not $checkPolicy or $station.dockingallowed.{$ship}">
+                <set_value name="$canDock" exact="true"/>
+                <set_value name="$reason" exact="'ok'"/>
+              </do_if>
+              <do_else>
+                <set_value name="$reason" exact="'docking_denied'"/>
+              </do_else>
+            </do_else>
+          </do_elseif>
+
+          <do_else>
+            <set_value name="$reason" exact="'unknown_purpose'"/>
+          </do_else>
+        </do_if>
+
+        <do_if value="$useMemo and $station? and $station.exists">
+          <do_if value="not this.$gt_dockMemo?">
+            <set_value name="this.$gt_dockMemo" exact="table[]"/>
+          </do_if>
+          <set_value name="this.$gt_dockMemo.{$station}" exact="table[
+            $Purpose = $purpose,
+            $AllowStorageDock = $allowStorageDock,
+            $AllowPlayerOnly = $allowPlayerOnly,
+            $CanDock = $canDock,
+            $Reason = $reason,
+            $UsedStorageFallback = $usedStorageFallback,
+            $Bay = $bay
+          ]"/>
+        </do_if>
+      </do_if>
+
+      <do_if value="$debugchance gt 0">
+        <debug_text text="'[GT-DockCheck] ' + $ship.idcode + ' @ ' + (if $station? and $station.exists then $station.knownname else 'null') + ' purpose=' + $purpose + ' canDock=' + $canDock + ' reason=' + $reason + (if $memoHit then ' (memo)' else '')" chance="$debugchance"/>
+      </do_if>
+
+      <!-- Required in hot loops: run_script without yield triggers AIDirector infinite-wake errors -->
+      <wait exact="$yieldMs * 1ms"/>
+
+      <return value="table[
+        $CanDock = $canDock,
+        $Reason = $reason,
+        $UsedStorageFallback = $usedStorageFallback,
+        $Bay = $bay
+      ]"/>
+    </actions>
+  </attention>
+</aiscript>

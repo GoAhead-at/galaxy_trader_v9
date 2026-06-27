@@ -1,0 +1,753 @@
+<?xml version="1.0" encoding="utf-8"?>
+<aiscript name="lib.gt.mk42.cache.search" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="4">
+  <params>
+    <param name="ship" default="this.ship"/>
+    <param name="searchMode" default="'buy_and_sell'"/>
+    <param name="homeSector" default="this.ship.sector"/>
+    <param name="maxDistance" default="0"/>
+    <param name="wareBasket" default="[]"/>
+    <param name="minROI" default="0"/>
+    <param name="minAbsoluteProfit" default="0"/>
+    <param name="ignoreBuildStorage" default="false"/>
+    <param name="ignoreCarrierAux" default="false"/>
+    <param name="maxEntries" default="100"/>
+    <param name="cacheMaxAge" default="300s"/> <!-- Matches $Fleet.$CacheTTL default -->
+    <param name="cacheDropoffTolerance" default="15"/> <!-- Max % profit drop from cached value before rejection (0 = disabled) -->
+    <param name="minCargoUtilPercent" default="10"/> <!-- Hard minimum cargo utilization threshold (10-100) -->
+    <param name="enableMinCargoUtil" default="true"/>
+    <!-- MK4 compatibility params (accepted for call-site compatibility; current cache filter logic is generic) -->
+    <param name="mk4AllowResources" default="true"/>
+    <param name="mk4AllowIntermediates" default="true"/>
+    <param name="mk4AllowTradewares" default="true"/>
+    <param name="mk4DedicatedServe" default="false"/>
+    <param name="mk4AnchorHome" default="null"/>
+    <param name="mk4BuildStorageOnlyMode" default="false"/>
+    <param name="maxDistanceBuy" default="0"/>
+    <param name="maxDistanceSell" default="0"/>
+    <param name="requirePlayerDeliveryStation" default="false"/>
+    <param name="requirePlayerSupplierStation" default="false"/>
+    <param name="requireNonPlayerSupplierStation" default="false"/>
+    <!-- MK3 'Ignore Player Pricing' companion filter: when true, drop cache entries whose delivery (customer) station is player-owned. -->
+    <param name="requireNonPlayerDeliveryStation" default="false"/>
+    <param name="debugchance" default="0"/>
+    <param name="mk42Priorities" default="table[]" comment="Class sliders table"/>
+  </params>
+  <patch sinceversion="3">
+    <do_if value="not this.$gt_yieldMs?">
+      <set_value name="this.$gt_yieldMs" exact="1"/>
+    </do_if>
+  </patch>
+  <attention min="unknown">
+    <actions>
+      <create_list name="$tradeList"/>
+      <set_value name="$bestTrade" exact="null"/>
+      <set_value name="$bestScore" exact="0"/>
+
+      <!-- Read AI yield interval from global settings (persisted to instance var to survive waits) -->
+      <set_value name="this.$gt_yieldMs" exact="1"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$AIYieldInterval?">
+        <set_value name="this.$gt_yieldMs" exact="[1, @global.$GT_GlobalSettings.$Performance.$AIYieldInterval].max"/>
+      </do_if>
+
+      <set_value name="this.$gt_mk42Only" exact="true"/>
+      <set_value name="$cacheHomeKey" exact="$homeSector"/>
+      <set_value name="$homeCache" exact="null"/>
+      <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK42.{$homeSector}"/>
+      <set_value name="$homeCacheCount" exact="0"/>
+      <do_if value="$homeCache?">
+        <set_value name="$homeCacheCount" exact="@$homeCache.count"/>
+      </do_if>
+      <!-- Sector table-key reconciliation: lookup can miss when homeSector ref differs from writer key. -->
+      <do_if value="$homeCacheCount == 0 and true and global.$GT_TradeCacheMK42? and $homeSector? and $homeSector.exists">
+        <set_value name="$mk4CacheKeyCount" exact="0"/>
+        <do_if value="global.$GT_TradeCacheMK42.keys?">
+          <set_value name="$mk4CacheKeys" exact="global.$GT_TradeCacheMK42.keys.list"/>
+          <set_value name="$mk4CacheKeyCount" exact="$mk4CacheKeys.count"/>
+        </do_if>
+        <do_if value="$mk4CacheKeyCount gt 0">
+          <do_all exact="$mk4CacheKeyCount" counter="$cki">
+            <set_value name="$ckiSector" exact="@$mk4CacheKeys.{$cki}"/>
+            <do_if value="$ckiSector? and $ckiSector.exists and $ckiSector == $homeSector">
+              <set_value name="$cacheHomeKey" exact="$ckiSector"/>
+              <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK42.{$ckiSector}"/>
+              <break/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <do_if value="$homeCache?">
+          <set_value name="$homeCacheCount" exact="@$homeCache.count"/>
+        </do_if>
+      </do_if>
+      <set_value name="$purgedStaleCount" exact="0"/>
+      <do_if value="$homeCacheCount == 0">
+        <return value="table[
+          $Found = false,
+          $BestTrade = null,
+          $BestScore = 0,
+          $TradeList = $tradeList,
+          $PurgedStale = 0,
+          $PoolSizeAfter = 0
+        ]"/>
+      </do_if>
+
+      <set_value name="this.$cleanupBatchSize" exact="50"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$CacheCleanupBatchSize?">
+        <set_value name="this.$cleanupBatchSize" exact="[10, @global.$GT_GlobalSettings.$Performance.$CacheCleanupBatchSize].max"/>
+      </do_if>
+      <set_value name="this.$cleanupBatchSize" exact="(this.$cleanupBatchSize)i"/>
+      <set_value name="$now" exact="player.age"/>
+      <!-- Read-time purge: remove universally stale rows (mirrors lib.gt.cache.write cleanup).
+           Dead delivery refs inflate pool size and block mk4live from refreshing via live search. -->
+      <do_all exact="$homeCacheCount" counter="$pci" reverse="true">
+        <set_value name="$purgeEntry" exact="null"/>
+        <do_if value="true">
+          <set_value name="$purgeEntry" exact="@global.$GT_TradeCacheMK42.{$cacheHomeKey}.{$pci}"/>
+        </do_if>
+        <do_else>
+          <set_value name="$purgeEntry" exact="@global.$GT_TradeCache.{$cacheHomeKey}.{$pci}"/>
+        </do_else>
+        <set_value name="$purgeRemove" exact="false"/>
+        <do_if value="not $purgeEntry?">
+          <set_value name="$purgeRemove" exact="true"/>
+        </do_if>
+        <do_if value="not $purgeRemove and (not $purgeEntry.$Score? or $purgeEntry.$Score le 0)">
+          <set_value name="$purgeRemove" exact="true"/>
+        </do_if>
+        <set_value name="$purgeTs" exact="null"/>
+        <do_if value="not $purgeRemove">
+          <set_value name="$purgeTs" exact="@$purgeEntry.$CachedAt"/>
+          <do_if value="$purgeTs == null">
+            <set_value name="$purgeTs" exact="@$purgeEntry.$Timestamp"/>
+          </do_if>
+          <do_if value="$purgeTs != null and ($now - $purgeTs) gt $cacheMaxAge">
+            <set_value name="$purgeRemove" exact="true"/>
+          </do_if>
+        </do_if>
+        <do_if value="not $purgeRemove and @$purgeEntry.$BuyOffer != null and not @$purgeEntry.$BuyOffer.exists">
+          <set_value name="$purgeRemove" exact="true"/>
+        </do_if>
+        <do_if value="not $purgeRemove and @$purgeEntry.$SellOffer != null and not @$purgeEntry.$SellOffer.exists">
+          <set_value name="$purgeRemove" exact="true"/>
+        </do_if>
+        <do_if value="not $purgeRemove and @$purgeEntry.$SellStation != null and not @$purgeEntry.$SellStation.exists">
+          <set_value name="$purgeRemove" exact="true"/>
+        </do_if>
+        <!-- Universal station resolution: drop rows no ship can use (dead delivery/supplier refs). -->
+        <do_if value="not $purgeRemove">
+          <set_value name="$purgeSellStation" exact="null"/>
+          <do_if value="$purgeEntry.$SellOffer? and @$purgeEntry.$SellOffer.exists and $purgeEntry.$SellOffer.buyer? and @$purgeEntry.$SellOffer.buyer.exists">
+            <set_value name="$purgeSellStation" exact="@$purgeEntry.$SellOffer.buyer"/>
+          </do_if>
+          <do_if value="not $purgeSellStation? and $purgeEntry.$SellStation? and @$purgeEntry.$SellStation.exists">
+            <set_value name="$purgeSellStation" exact="$purgeEntry.$SellStation"/>
+          </do_if>
+          <do_if value="not $purgeSellStation? and $purgeEntry.$SellOffer? and @$purgeEntry.$SellOffer.exists and $purgeEntry.$SellOffer.owner? and @$purgeEntry.$SellOffer.owner.exists">
+            <set_value name="$purgeSellStation" exact="@$purgeEntry.$SellOffer.owner"/>
+          </do_if>
+          <do_if value="not $purgeSellStation? or not @$purgeSellStation.exists">
+            <set_value name="$purgeRemove" exact="true"/>
+          </do_if>
+          <do_if value="not $purgeRemove and not ($purgeEntry.$IsSellOnly? and $purgeEntry.$IsSellOnly)">
+            <set_value name="$purgeBuyStation" exact="null"/>
+            <do_if value="$purgeEntry.$BuyStation? and @$purgeEntry.$BuyStation.exists">
+              <set_value name="$purgeBuyStation" exact="$purgeEntry.$BuyStation"/>
+            </do_if>
+            <do_if value="not $purgeBuyStation? and $purgeEntry.$BuyOffer? and @$purgeEntry.$BuyOffer.exists">
+              <do_if value="$purgeEntry.$BuyOffer.seller? and @$purgeEntry.$BuyOffer.seller.exists">
+                <set_value name="$purgeBuyStation" exact="@$purgeEntry.$BuyOffer.seller"/>
+              </do_if>
+              <do_elseif value="$purgeEntry.$BuyOffer.owner? and @$purgeEntry.$BuyOffer.owner.exists">
+                <set_value name="$purgeBuyStation" exact="@$purgeEntry.$BuyOffer.owner"/>
+              </do_elseif>
+            </do_if>
+            <do_if value="not $purgeBuyStation? or not @$purgeBuyStation.exists">
+              <set_value name="$purgeRemove" exact="true"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        <do_if value="$purgeRemove">
+          <do_if value="true">
+            <remove_value name="global.$GT_TradeCacheMK42.{$cacheHomeKey}.{$pci}"/>
+          </do_if>
+          <do_else>
+            <remove_value name="global.$GT_TradeCache.{$cacheHomeKey}.{$pci}"/>
+          </do_else>
+          <set_value name="$purgedStaleCount" operation="add"/>
+        </do_if>
+        <set_value name="$pciInt" exact="($pci)i"/>
+        <do_if value="($pciInt % this.$cleanupBatchSize) == 0">
+          <wait exact="this.$gt_yieldMs * 1ms" comment="Yield read-time purge loop"/>
+        </do_if>
+      </do_all>
+      <do_if value="$purgedStaleCount gt 0">
+        <set_value name="$homeCache" exact="null"/>
+        <do_if value="true">
+          <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK42.{$cacheHomeKey}"/>
+        </do_if>
+        <do_else>
+          <set_value name="$homeCache" exact="@global.$GT_TradeCache.{$cacheHomeKey}"/>
+        </do_else>
+        <set_value name="$homeCacheCount" exact="0"/>
+        <do_if value="$homeCache?">
+          <set_value name="$homeCacheCount" exact="@$homeCache.count"/>
+        </do_if>
+        <set_value name="$poolLabel" exact="if true then 'MK42' else 'MK3'"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-CacheSearch] ' + $ship.idcode + ': (' + $poolLabel + ') Read-time purge removed ' + $purgedStaleCount + ' stale entries from ' + $cacheHomeKey.knownname + ' (remaining: ' + $homeCacheCount + ')'" chance="100"/>
+        </do_if>
+      </do_if>
+      <do_if value="$homeCacheCount == 0">
+        <return value="table[
+          $Found = false,
+          $BestTrade = null,
+          $BestScore = 0,
+          $TradeList = $tradeList,
+          $PurgedStale = $purgedStaleCount,
+          $PoolSizeAfter = 0
+        ]"/>
+      </do_if>
+
+      <set_value name="$maxDistanceBuyLeg" exact="if $maxDistanceBuy? and $maxDistanceBuy gt 0 then $maxDistanceBuy else $maxDistance"/>
+      <set_value name="$maxDistanceSellLeg" exact="if $maxDistanceSell? and $maxDistanceSell gt 0 then $maxDistanceSell else $maxDistance"/>
+      <!-- If cache was populated with a smaller search radius than this ship needs, treat as miss
+           so live search (with completion pass) can find trades outside the cached radius. -->
+      <set_value name="$foundCount" exact="0"/>
+      <set_value name="$isSellOnlySearch" exact="$searchMode == 'sell_only'"/>
+      <set_value name="$wareBasketCount" exact="if $wareBasket? and typeof $wareBasket == datatype.list then $wareBasket.count else 0"/>
+      <set_value name="$isIsolatedMode" exact="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?"/>
+      <set_value name="$cargoUtilThresholdPct" exact="[10,[$minCargoUtilPercent,100].min].max"/>
+      <!-- Per-ware diversification: each ware gets a slice of the result window so low-score
+           wares (e.g. small remainder deliveries) are not crowded out by a few dominant wares. -->
+      <set_value name="$foundPerWare" exact="table[]"/>
+      <set_value name="$maxTradesPerWareSetting" exact="20"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxTradesPerWare?">
+        <set_value name="$maxTradesPerWareSetting" exact="@global.$GT_GlobalSettings.$Performance.$MaxTradesPerWare"/>
+      </do_if>
+      <do_if value="$maxTradesPerWareSetting lt 1">
+        <set_value name="$maxTradesPerWareSetting" exact="1"/>
+      </do_if>
+      <set_value name="$perWareCap" exact="$maxTradesPerWareSetting"/>
+      <do_if value="$wareBasketCount gt 0">
+        <set_value name="$perWareCapFromBudget" exact="[1, ($maxEntries / $wareBasketCount)i].max"/>
+        <set_value name="$perWareCap" exact="[$perWareCapFromBudget, $maxTradesPerWareSetting].min"/>
+      </do_if>
+      <do_else>
+        <set_value name="$perWareCap" exact="[2, [$maxTradesPerWareSetting, 5].min].max"/>
+      </do_else>
+      <!-- Iterate start-to-end (cache is sorted by Score descending via lib.gt.cache.write).
+           Collect up to $perWareCap valid trades per ware until $maxEntries total OR cache exhausted. -->
+      <!-- NOTE: $homeCacheCount is a snapshot; the list can shrink mid-loop (MD purge/cleanup
+           runs while this AI script yields). Guard with bounds check before access. -->
+      <do_all exact="$homeCacheCount" counter="$i">
+        <!-- Bounds guard: list may have shrunk since $homeCacheCount was captured -->
+        <do_if value="$i gt $homeCache.count">
+          <break/>
+        </do_if>
+        <set_value name="$entry" exact="@$homeCache.{$i}"/>
+        <!-- Initialize per-entry offer capacities to avoid undefined-variable lookups -->
+        <set_value name="$preCheckBuyAmt" exact="0"/>
+        <set_value name="$preCheckSellAmt" exact="0"/>
+        <!-- Resolve supplier/delivery stations: cached component refs go stale (0x0L) when
+             stations are destroyed; prefer live offer seller/buyer when the stored ref is dead. -->
+        <set_value name="$entryBuyStation" exact="null"/>
+        <do_if value="$entry.$BuyStation? and @$entry.$BuyStation.exists">
+          <set_value name="$entryBuyStation" exact="$entry.$BuyStation"/>
+        </do_if>
+        <do_if value="not $entryBuyStation? and $entry.$BuyOffer? and @$entry.$BuyOffer.exists">
+          <do_if value="$entry.$BuyOffer.seller? and @$entry.$BuyOffer.seller.exists">
+            <set_value name="$entryBuyStation" exact="@$entry.$BuyOffer.seller"/>
+          </do_if>
+          <do_elseif value="$entry.$BuyOffer.owner? and @$entry.$BuyOffer.owner.exists">
+            <set_value name="$entryBuyStation" exact="@$entry.$BuyOffer.owner"/>
+          </do_elseif>
+        </do_if>
+        <set_value name="$entrySellStationFromBuyer" exact="null"/>
+        <do_if value="$entry.$SellOffer? and @$entry.$SellOffer.exists and $entry.$SellOffer.buyer? and @$entry.$SellOffer.buyer.exists">
+          <set_value name="$entrySellStationFromBuyer" exact="@$entry.$SellOffer.buyer"/>
+        </do_if>
+        <set_value name="$entrySellStation" exact="null"/>
+        <!-- MK4 BS-only: delivery buy-offer buyer is authoritative (stored SellStation may be parent HQ). -->
+        <do_if value="$mk4BuildStorageOnlyMode and $entrySellStationFromBuyer? and @$entrySellStationFromBuyer.exists">
+          <set_value name="$entrySellStation" exact="$entrySellStationFromBuyer"/>
+        </do_if>
+        <do_if value="not $entrySellStation? and $entry.$SellStation? and @$entry.$SellStation.exists">
+          <set_value name="$entrySellStation" exact="$entry.$SellStation"/>
+        </do_if>
+        <!-- Prefer buildstorage buyer when stored component ref is parent station. -->
+        <do_if value="$entrySellStation? and @$entrySellStation.exists and not @$entrySellStation.isclass.buildstorage and $entrySellStationFromBuyer? and @$entrySellStationFromBuyer.isclass.buildstorage">
+          <set_value name="$entrySellStation" exact="$entrySellStationFromBuyer"/>
+        </do_if>
+        <do_if value="not $entrySellStation? and $entrySellStationFromBuyer?">
+          <set_value name="$entrySellStation" exact="$entrySellStationFromBuyer"/>
+        </do_if>
+        <do_if value="not $entrySellStation? and $entry.$SellOffer? and @$entry.$SellOffer.exists and $entry.$SellOffer.owner? and @$entry.$SellOffer.owner.exists">
+          <set_value name="$entrySellStation" exact="@$entry.$SellOffer.owner"/>
+        </do_if>
+
+        <!-- Basic validity -->
+        <do_if value="not $entry? or not $entry.$Score? or $entry.$Score le 0">
+          <continue/>
+        </do_if>
+
+        <!-- Ship-scoped cache failure: skip entries this ship already rejected (S1b). -->
+        <do_if value="$entry.$FailedShips? and $entry.$FailedShips.count gt 0">
+          <set_value name="$shipFailedOnEntry" exact="false"/>
+          <do_all exact="$entry.$FailedShips.count" counter="$fsi">
+            <do_if value="$entry.$FailedShips.{$fsi} == $ship">
+              <set_value name="$shipFailedOnEntry" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+          <do_if value="$shipFailedOnEntry">
+            <continue/>
+          </do_if>
+        </do_if>
+
+        <!-- Search-mode guard:
+             - sell_only: only sell-only entries for wares this ship is currently carrying
+             - buy_and_sell: never pick sell-only disposal entries -->
+        <do_if value="$isSellOnlySearch">
+          <do_if value="not $entry.$IsSellOnly? or not $entry.$IsSellOnly">
+            <continue/>
+          </do_if>
+          <do_if value="not $entry.$Ware? or $ship.cargo.{$entry.$Ware}.count le 0">
+            <continue/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <do_if value="$entry.$IsSellOnly? and $entry.$IsSellOnly">
+            <continue/>
+          </do_if>
+        </do_else>
+
+        <!-- Cargo bay compatibility: shared MK4 pool may contain trades from solid/liquid ships;
+             skip wares this ship cannot carry (mirrors trade_found + GT_FilterTrade).
+             $CargoWareTransport on MK4 entries survives stale ware refs. -->
+        <do_if value="not $isSellOnlySearch">
+          <set_value name="$cargoCompatWare" exact="if $entry.$Ware? then $entry.$Ware else null"/>
+          <do_if value="$cargoCompatWare == null and $entry.$BuyOffer? and @$entry.$BuyOffer.exists and @$entry.$BuyOffer.ware != null">
+            <set_value name="$cargoCompatWare" exact="@$entry.$BuyOffer.ware"/>
+          </do_if>
+          <do_if value="$cargoCompatWare == null and $entry.$SellOffer? and @$entry.$SellOffer.exists and @$entry.$SellOffer.ware != null">
+            <set_value name="$cargoCompatWare" exact="@$entry.$SellOffer.ware"/>
+          </do_if>
+          <set_value name="$entryCargoTransport" exact="null"/>
+          <do_if value="$entry.$CargoWareTransport?">
+            <set_value name="$entryCargoTransport" exact="@$entry.$CargoWareTransport"/>
+          </do_if>
+          <do_elseif value="$cargoCompatWare?">
+            <set_value name="$entryCargoTransport" exact="@$cargoCompatWare.waretransport"/>
+          </do_elseif>
+          <set_value name="$cargoHoldOk" exact="false"/>
+          <do_if value="$cargoCompatWare? and @$ship.cargo.{$cargoCompatWare}.max gt 0">
+            <set_value name="$cargoHoldOk" exact="true"/>
+          </do_if>
+          <do_elseif value="$entryCargoTransport? and $ship.waretransport.indexof.{$entryCargoTransport}">
+            <set_value name="$cargoHoldOk" exact="true"/>
+          </do_elseif>
+          <do_if value="not $cargoHoldOk">
+            <continue/>
+          </do_if>
+        </do_if>
+
+        <!-- Ware basket filter (applies to all cache search modes when basket is non-empty). -->
+        <do_if value="$wareBasketCount gt 0">
+          <set_value name="$entryWare" exact="if $entry.$Ware? then $entry.$Ware else null"/>
+          <do_if value="$entryWare == null and $entry.$BuyOffer? and @$entry.$BuyOffer.exists and @$entry.$BuyOffer.ware != null">
+            <set_value name="$entryWare" exact="@$entry.$BuyOffer.ware"/>
+          </do_if>
+          <do_if value="$entryWare == null and $entry.$SellOffer? and @$entry.$SellOffer.exists and @$entry.$SellOffer.ware != null">
+            <set_value name="$entryWare" exact="@$entry.$SellOffer.ware"/>
+          </do_if>
+          <set_value name="$wareAllowed" exact="false"/>
+          <do_all exact="$wareBasketCount" counter="$wbIdx">
+            <do_if value="$wareBasket.{$wbIdx} == $entryWare">
+              <set_value name="$wareAllowed" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+          <do_if value="not $wareAllowed">
+            <continue/>
+          </do_if>
+        </do_if>
+
+        <!-- TTL / age check -->
+        <do_if value="$entry.$CachedAt? and ($now - $entry.$CachedAt) gt $cacheMaxAge">
+          <continue/>
+        </do_if>
+
+        <!-- Station existence (before distance / MK4 ware-type property access on station). -->
+        <do_if value="not $entry.$IsSellOnly?">
+          <do_if value="not $entryBuyStation? or not @$entryBuyStation.exists">
+            <continue/>
+          </do_if>
+        </do_if>
+        <do_if value="not $entrySellStation? or not @$entrySellStation.exists">
+          <continue/>
+        </do_if>
+
+        <!-- MK4 policy filters (no-op for callers that don't pass these flags). -->
+        <do_if value="not $entry.$IsSellOnly?">
+          <do_if value="$requirePlayerDeliveryStation">
+            <set_value name="$mk4DeliveryPlayerOk" exact="false"/>
+            <do_if value="$entrySellStation? and @$entrySellStation.exists and @$entrySellStation.isplayerowned">
+              <set_value name="$mk4DeliveryPlayerOk" exact="true"/>
+            </do_if>
+            <do_elseif value="$entrySellStation? and $entrySellStation.isclass.buildstorage and $entrySellStation.base? and @$entrySellStation.base.isplayerowned">
+              <set_value name="$mk4DeliveryPlayerOk" exact="true"/>
+            </do_elseif>
+            <do_if value="not $mk4DeliveryPlayerOk">
+              <continue/>
+            </do_if>
+          </do_if>
+          <do_if value="$requirePlayerSupplierStation and (not $entryBuyStation? or not @$entryBuyStation.isplayerowned)">
+            <continue/>
+          </do_if>
+          <do_if value="$requireNonPlayerSupplierStation and (not $entryBuyStation? or @$entryBuyStation.isplayerowned)">
+            <continue/>
+          </do_if>
+        </do_if>
+        <!-- 'Ignore Player Pricing' companion filter: drop any entry (including sell-only disposal)
+             whose delivery destination is a player-owned station. -->
+        <do_if value="$requireNonPlayerDeliveryStation and $entrySellStation? and @$entrySellStation.isplayerowned">
+          <continue/>
+        </do_if>
+        <!-- MK4 serveHomeOnly: delivery must match home anchor (station + build storage, or sector). -->
+        <do_if value="$mk4DedicatedServe and not $mk4BuildStorageOnlyMode">
+          <set_value name="$serveHomeAnchor" exact="if $mk4AnchorHome? and $mk4AnchorHome.exists then $mk4AnchorHome else $homeSector"/>
+          <set_value name="$serveHomeSector" exact="if $serveHomeAnchor? and $serveHomeAnchor.isclass.sector then $serveHomeAnchor else (if $serveHomeAnchor? and $serveHomeAnchor.sector? then @$serveHomeAnchor.sector else $homeSector)"/>
+          <set_value name="$serveHomeMatch" exact="false"/>
+          <do_if value="$serveHomeAnchor? and $serveHomeAnchor.isclass.station">
+            <do_if value="$entrySellStation? and $entrySellStation.exists and $serveHomeAnchor.exists">
+              <do_if value="$entrySellStation == $serveHomeAnchor">
+                <set_value name="$serveHomeMatch" exact="true"/>
+              </do_if>
+              <do_elseif value="$serveHomeAnchor.buildstorage? and $serveHomeAnchor.buildstorage.exists and $entrySellStation == $serveHomeAnchor.buildstorage">
+                <set_value name="$serveHomeMatch" exact="true"/>
+              </do_elseif>
+              <do_elseif value="$entrySellStation.isclass.buildstorage and $entrySellStation.base? and $entrySellStation.base.exists and $entrySellStation.base == $serveHomeAnchor">
+                <set_value name="$serveHomeMatch" exact="true"/>
+              </do_elseif>
+              <do_elseif value="$entrySellStation.hascontext.{$serveHomeAnchor}">
+                <set_value name="$serveHomeMatch" exact="true"/>
+              </do_elseif>
+              <do_elseif value="$serveHomeAnchor.hascontext.{$entrySellStation}">
+                <set_value name="$serveHomeMatch" exact="true"/>
+              </do_elseif>
+            </do_if>
+            <do_if value="not $serveHomeMatch">
+              <continue/>
+            </do_if>
+          </do_if>
+          <do_elseif value="$serveHomeSector? and $serveHomeSector.exists">
+            <do_if value="not $entrySellStation? or not $entrySellStation.sector? or @$entrySellStation.sector != $serveHomeSector">
+              <continue/>
+            </do_if>
+          </do_elseif>
+        </do_if>
+        <!-- MK4 build-storage-only mode: BS buyers within jumpDistanceCoverage; no BS supplier legs. -->
+        <do_if value="$mk4BuildStorageOnlyMode and not $entry.$IsSellOnly?">
+          <do_if value="$entryBuyStation? and @$entryBuyStation.isclass.buildstorage">
+            <continue/>
+          </do_if>
+          <do_if value="not $entrySellStation? or not @$entrySellStation.isclass.buildstorage">
+            <continue/>
+          </do_if>
+          <!-- BS-only delivery scope: player build storage within jumpDistanceCoverage from home. -->
+          <set_value name="$mk4BsoCoverageMax" exact="if $maxDistanceSell? and $maxDistanceSell gt 0 then $maxDistanceSell else $maxDistance"/>
+          <set_value name="$mk4BsoInScope" exact="false"/>
+          <set_value name="$mk4BsoDist" exact="if $homeSector? and $entrySellStation? and $entrySellStation.sector? then $homeSector.gatedistance.{$entrySellStation.sector} else -1"/>
+          <do_if value="$mk4BsoDist ge 0 and ($mk4BsoCoverageMax le 0 or $mk4BsoDist le $mk4BsoCoverageMax)">
+            <set_value name="$mk4BsoInScope" exact="true"/>
+          </do_if>
+          <do_if value="not $mk4BsoInScope">
+            <continue/>
+          </do_if>
+        </do_if>
+        <!-- MK4 ware-type policy filter (cache-phase parity with match-phase). -->
+        <do_if value="not $entry.$IsSellOnly? and $entrySellStation? and (not $entrySellStation.isclass.buildstorage or $ignoreBuildStorage)">
+          <set_value name="$entryTypeWare" exact="if $entry.$Ware? then $entry.$Ware else null"/>
+          <do_if value="$entryTypeWare == null and $entry.$BuyOffer? and @$entry.$BuyOffer.exists and @$entry.$BuyOffer.ware != null">
+            <set_value name="$entryTypeWare" exact="@$entry.$BuyOffer.ware"/>
+          </do_if>
+          <do_if value="$entryTypeWare == null and $entry.$SellOffer? and @$entry.$SellOffer.exists and @$entry.$SellOffer.ware != null">
+            <set_value name="$entryTypeWare" exact="@$entry.$SellOffer.ware"/>
+          </do_if>
+          <do_if value="$entryTypeWare?">
+            <set_value name="$mk4IsTradeWare" exact="$entrySellStation.tradewares.{$entryTypeWare}.exists"/>
+            <set_value name="$mk4IsResource" exact="$entrySellStation.resources.{$entryTypeWare}.exists"/>
+            <set_value name="$mk4IsProduct" exact="$entrySellStation.products.{$entryTypeWare}.exists"/>
+            <set_value name="$mk4IsIntermediate" exact="false"/>
+            <do_if value="$entrySellStation.resources.{$entryTypeWare}.exists and @$entrySellStation.resources.{$entryTypeWare}.intermediate">
+              <set_value name="$mk4IsIntermediate" exact="true"/>
+            </do_if>
+            <do_if value="$entrySellStation.products.{$entryTypeWare}.exists and @$entrySellStation.products.{$entryTypeWare}.intermediate">
+              <set_value name="$mk4IsIntermediate" exact="true"/>
+            </do_if>
+            <set_value name="$mk4IsPureResource" exact="$mk4IsResource and not $mk4IsIntermediate"/>
+            <set_value name="$mk4IsIntermediateOrProduct" exact="$mk4IsIntermediate or $mk4IsProduct"/>
+            <set_value name="$mk4HasKnownType" exact="$mk4IsTradeWare or $mk4IsResource or $mk4IsProduct"/>
+            <set_value name="$mk4AllowedByType" exact="false"/>
+            <do_if value="$mk4IsTradeWare and $mk4AllowTradewares">
+              <set_value name="$mk4AllowedByType" exact="true"/>
+            </do_if>
+            <do_if value="not $mk4AllowedByType and $mk4IsPureResource and $mk4AllowResources">
+              <set_value name="$mk4AllowedByType" exact="true"/>
+            </do_if>
+            <do_if value="not $mk4AllowedByType and $mk4IsIntermediateOrProduct and $mk4AllowIntermediates">
+              <set_value name="$mk4AllowedByType" exact="true"/>
+            </do_if>
+            <do_if value="$mk4HasKnownType and not $mk4AllowedByType">
+              <continue/>
+            </do_if>
+          </do_if>
+        </do_if>
+
+        <!-- Distance check with per-leg limits (sector-to-sector; station refs break gatedistance). -->
+        <do_if value="$maxDistanceBuyLeg gt 0 and $entryBuyStation?">
+          <set_value name="$distBuy" exact="-1"/>
+          <do_if value="$entryBuyStation.sector? and $entryBuyStation.sector == $homeSector">
+            <set_value name="$distBuy" exact="0"/>
+          </do_if>
+          <do_elseif value="$entryBuyStation.sector?">
+            <set_value name="$distBuy" exact="$homeSector.gatedistance.{$entryBuyStation.sector}"/>
+          </do_elseif>
+          <do_if value="$distBuy lt 0 or $distBuy gt $maxDistanceBuyLeg">
+            <continue/>
+          </do_if>
+        </do_if>
+        <do_if value="$maxDistanceSellLeg gt 0 and $entrySellStation?">
+          <set_value name="$distSell" exact="-1"/>
+          <do_if value="$entrySellStation.sector? and $entrySellStation.sector == $homeSector">
+            <set_value name="$distSell" exact="0"/>
+          </do_if>
+          <do_elseif value="$entrySellStation.sector?">
+            <set_value name="$distSell" exact="$homeSector.gatedistance.{$entrySellStation.sector}"/>
+          </do_elseif>
+          <do_if value="$distSell lt 0 or $distSell gt $maxDistanceSellLeg">
+            <continue/>
+          </do_if>
+        </do_if>
+
+        <!-- ROI / absolute profit check (sell-mode trades only) -->
+        <do_if value="not $entry.$IsSellOnly?">
+          <do_if value="$minAbsoluteProfit gt 0 and $entry.$Profit? and $entry.$Profit lt $minAbsoluteProfit">
+            <continue/>
+          </do_if>
+          <do_if value="$minROI gt 0 and $entry.$BuyPrice? and $entry.$BuyPrice gt 0">
+            <set_value name="$entryROI" exact="($entry.$UnitProfit * 100) / $entry.$BuyPrice"/>
+            <do_if value="$entryROI lt $minROI">
+              <continue/>
+            </do_if>
+          </do_if>
+        </do_if>
+
+        <!-- Cache Dropoff Tolerance: reject if profit dropped too much since caching -->
+        <do_if value="$cacheDropoffTolerance gt 0 and not $entry.$IsSellOnly? and $entry.$UnitProfit? and $entry.$UnitProfit gt 0 and $entry.$BuyOffer? and $entry.$SellOffer?">
+          <!-- Only check if both offers still exist (otherwise station-existence check will catch it) -->
+          <do_if value="@$entry.$BuyOffer.exists and @$entry.$SellOffer.exists">
+            <set_value name="$currentBuyPrice" exact="@$entry.$BuyOffer.unitprice"/>
+            <set_value name="$currentSellPrice" exact="@$entry.$SellOffer.unitprice"/>
+            <do_if value="$currentBuyPrice? and $currentSellPrice? and $currentBuyPrice gt 0">
+              <set_value name="$currentUnitProfit" exact="$currentSellPrice - $currentBuyPrice"/>
+              <!-- Calculate how much profit has dropped as % of original -->
+              <do_if value="$currentUnitProfit le 0">
+                <!-- Profit went negative — always reject -->
+                <continue/>
+              </do_if>
+              <set_value name="$profitDropPct" exact="(($entry.$UnitProfit - $currentUnitProfit) * 100) / $entry.$UnitProfit"/>
+              <do_if value="$profitDropPct gt $cacheDropoffTolerance">
+                <continue/>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_if>
+
+        <!-- Build storage exclusion (legacy — skipped when MK4-2 priorities active). -->
+        <do_if value="not $mk42Priorities? and $ignoreBuildStorage">
+          <do_if value="($entryBuyStation? and @$entryBuyStation.isclass.buildstorage) or ($entrySellStation? and @$entrySellStation.isclass.buildstorage)">
+            <continue/>
+          </do_if>
+        </do_if>
+
+        <!-- MK4-2 class-at-0 filter on cached delivery customer. -->
+        <do_if value="$mk42Priorities? and $entrySellStation? and @$entrySellStation.exists">
+          <run_script name="'lib.gt.mk42.classify'" result="$mk42CacheCls">
+            <param name="customer" value="$entrySellStation"/>
+            <param name="priorities" value="$mk42Priorities"/>
+          </run_script>
+          <do_if value="not $mk42CacheCls.$Eligible? or not @$mk42CacheCls.$Eligible">
+            <continue/>
+          </do_if>
+        </do_if>
+
+        <!-- Carrier / auxiliary exclusion (legacy — skipped when MK4-2 priorities active). -->
+        <do_if value="not $mk42Priorities? and $ignoreCarrierAux">
+          <do_if value="($entryBuyStation? and @$entryBuyStation.isclass.ship and (@$entryBuyStation.type == shiptype.carrier or @$entryBuyStation.type == shiptype.resupplier)) or ($entrySellStation? and @$entrySellStation.isclass.ship and (@$entrySellStation.type == shiptype.carrier or @$entrySellStation.type == shiptype.resupplier))">
+            <continue/>
+          </do_if>
+        </do_if>
+
+        <!-- Offer amount pre-filter (CHEAP: universal amount check; do NOT gate on .available alone).
+             Build-storage delivery buy-offers often keep .available=false while cargo deficit exists. -->
+        <do_if value="not $entry.$IsSellOnly?">
+          <do_if value="$entry.$BuyOffer? and @$entry.$BuyOffer.exists">
+            <set_value name="$preBuyAmtQuick" exact="@$entry.$BuyOffer.amount"/>
+            <do_if value="not $preBuyAmtQuick? or $preBuyAmtQuick le 0">
+              <set_value name="$preBuyAmtQuick" exact="0"/>
+              <do_if value="$entryBuyStation? and @$entryBuyStation.exists">
+                <set_value name="$preBuyWareQuick" exact="if $entry.$Ware? then $entry.$Ware else null"/>
+                <do_if value="not $preBuyWareQuick? and @$entry.$BuyOffer.ware != null">
+                  <set_value name="$preBuyWareQuick" exact="@$entry.$BuyOffer.ware"/>
+                </do_if>
+                <do_if value="$preBuyWareQuick?">
+                  <get_ware_reservation object="$entryBuyStation" ware="$preBuyWareQuick" type="buy" virtual="false" result="$preBuyResQuick"/>
+                  <set_value name="$preBuyAmtQuick" exact="[$entryBuyStation.cargo.{$preBuyWareQuick}.count - $preBuyResQuick, 0].max"/>
+                </do_if>
+              </do_if>
+            </do_if>
+            <do_if value="not $preBuyAmtQuick? or $preBuyAmtQuick le 0">
+              <continue/>
+            </do_if>
+          </do_if>
+        </do_if>
+        <do_if value="$entry.$SellOffer? and @$entry.$SellOffer.exists">
+          <do_if value="@$entry.$SellOffer.amount le 0">
+            <set_value name="$sellOfferDemandFallback" exact="0"/>
+            <do_if value="$entrySellStation? and @$entrySellStation.exists">
+              <set_value name="$sellOfferDemandWare" exact="if $entry.$Ware? then $entry.$Ware else null"/>
+              <do_if value="not $sellOfferDemandWare? and @$entry.$SellOffer.ware != null">
+                <set_value name="$sellOfferDemandWare" exact="@$entry.$SellOffer.ware"/>
+              </do_if>
+              <do_if value="$sellOfferDemandWare?">
+                <set_value name="$sellOfferDemandFallback" exact="[0, $entrySellStation.cargo.{$sellOfferDemandWare}.target - $entrySellStation.cargo.{$sellOfferDemandWare}.count].max"/>
+              </do_if>
+            </do_if>
+            <do_if value="$sellOfferDemandFallback le 0">
+              <continue/>
+            </do_if>
+          </do_if>
+        </do_if>
+
+        <!-- Offer capacity check (EXPENSIVE: per-ship, considers pending trade reservations).
+             Skip entries where offeramount.{ship} is 0 — station capacity is fully reserved
+             by other ships' pending trades. Without this check, the scanner would return 50
+             entries all pointing to saturated stations while valid entries deeper in the cache
+             go unseen. Per-ware quota below restores diversification without skipping saturated entries entirely. -->
+        <do_if value="not $entry.$IsSellOnly?">
+          <do_if value="$entry.$BuyOffer? and @$entry.$BuyOffer.exists">
+            <set_value name="$preCheckBuyAmt" exact="@$entry.$BuyOffer.offeramount.{$ship}"/>
+            <do_if value="(not $preCheckBuyAmt? or $preCheckBuyAmt le 0) and @$entry.$BuyOffer.amount gt 0">
+              <set_value name="$preCheckBuyAmt" exact="@$entry.$BuyOffer.amount"/>
+            </do_if>
+            <!-- Target-count demand fallback (mirrors lib.gt.tradematch + gt_context_diagnose). -->
+            <do_if value="(not $preCheckBuyAmt? or $preCheckBuyAmt le 0) and $entrySellStation? and $entrySellStation.exists">
+              <set_value name="$preCheckBuyWare" exact="if $entry.$Ware? then $entry.$Ware else null"/>
+              <do_if value="not $preCheckBuyWare? and @$entry.$BuyOffer.ware != null">
+                <set_value name="$preCheckBuyWare" exact="@$entry.$BuyOffer.ware"/>
+              </do_if>
+              <do_if value="$preCheckBuyWare?">
+                <set_value name="$preCheckBuyAmt" exact="[0, $entrySellStation.cargo.{$preCheckBuyWare}.target - $entrySellStation.cargo.{$preCheckBuyWare}.count].max"/>
+              </do_if>
+            </do_if>
+            <do_if value="not $preCheckBuyAmt? or $preCheckBuyAmt le 0">
+              <continue/>
+            </do_if>
+          </do_if>
+        </do_if>
+        <do_if value="$entry.$SellOffer? and @$entry.$SellOffer.exists">
+          <set_value name="$preCheckSellAmt" exact="@$entry.$SellOffer.offeramount.{$ship}"/>
+          <do_if value="(not $preCheckSellAmt? or $preCheckSellAmt le 0) and @$entry.$SellOffer.amount gt 0">
+            <set_value name="$preCheckSellAmt" exact="@$entry.$SellOffer.amount"/>
+          </do_if>
+          <!-- Target-count demand fallback (mirrors lib.gt.tradematch + gt_context_diagnose). -->
+          <do_if value="(not $preCheckSellAmt? or $preCheckSellAmt le 0) and $entrySellStation? and $entrySellStation.exists">
+            <set_value name="$preCheckSellWare" exact="if $entry.$Ware? then $entry.$Ware else null"/>
+            <do_if value="not $preCheckSellWare? and @$entry.$SellOffer.ware != null">
+              <set_value name="$preCheckSellWare" exact="@$entry.$SellOffer.ware"/>
+            </do_if>
+            <do_if value="$preCheckSellWare?">
+              <set_value name="$preCheckSellAmt" exact="[0, $entrySellStation.cargo.{$preCheckSellWare}.target - $entrySellStation.cargo.{$preCheckSellWare}.count].max"/>
+            </do_if>
+          </do_if>
+          <do_if value="not $preCheckSellAmt? or $preCheckSellAmt le 0">
+            <continue/>
+          </do_if>
+        </do_if>
+
+        <!-- Hard minimum cargo utilization pre-filter (cache path only, excluded in isolated mode).
+             Uses available reserved-aware offer amounts to estimate max feasible load. -->
+        <do_if value="$enableMinCargoUtil and not $isIsolatedMode and not $entry.$IsSellOnly?">
+          <set_value name="$minUtilVolumePerUnit" exact="1"/>
+          <do_if value="$entry.$Ware? and $entry.$Ware.volume?">
+            <set_value name="$minUtilVolumePerUnit" exact="$entry.$Ware.volume"/>
+          </do_if>
+          <set_value name="$minUtilAmountLimit" exact="$preCheckSellAmt"/>
+          <do_if value="$preCheckBuyAmt? and $preCheckBuyAmt lt $minUtilAmountLimit">
+            <set_value name="$minUtilAmountLimit" exact="$preCheckBuyAmt"/>
+          </do_if>
+          <set_value name="$minUtilTradeVolume" exact="$minUtilAmountLimit * $minUtilVolumePerUnit"/>
+          <set_value name="$minUtilRequiredVolume" exact="($ship.cargo.capacity.all * $cargoUtilThresholdPct) / 100.0"/>
+          <do_if value="$minUtilTradeVolume lt $minUtilRequiredVolume">
+            <continue/>
+          </do_if>
+        </do_if>
+
+        <!-- Reservation check: skip trades reserved by other ships (same rule as MD reservations).
+             Uses SellOffer object as key (Method B from GT_GenerateTradeKey — most reliable, offer.id often unavailable). -->
+        <do_if value="global.$GT_Reservations? and $entry.$SellOffer?">
+          <set_value name="$resKey" exact="$entry.$SellOffer"/>
+          <do_if value="global.$GT_Reservations.{$resKey}?">
+            <set_value name="$resData" exact="global.$GT_Reservations.{$resKey}"/>
+            <!-- Only skip if reservation is unexpired AND belongs to a different ship -->
+            <do_if value="$resData.$Until? and player.age lt @$resData.$Until and $resData.$Ship? and @$resData.$Ship != $ship">
+              <continue/>
+            </do_if>
+          </do_if>
+        </do_if>
+
+        <!-- Per-ware quota gate (after all filters — only count shippable candidates). -->
+        <set_value name="$quotaWare" exact="if $entry.$Ware? then $entry.$Ware else null"/>
+        <do_if value="not $quotaWare? and $entry.$BuyOffer? and @$entry.$BuyOffer.exists and @$entry.$BuyOffer.ware != null">
+          <set_value name="$quotaWare" exact="@$entry.$BuyOffer.ware"/>
+        </do_if>
+        <do_if value="not $quotaWare? and $entry.$SellOffer? and @$entry.$SellOffer.exists and @$entry.$SellOffer.ware != null">
+          <set_value name="$quotaWare" exact="@$entry.$SellOffer.ware"/>
+        </do_if>
+        <do_if value="$quotaWare?">
+          <set_value name="$quotaWareFoundCount" exact="if $foundPerWare.{$quotaWare}? then $foundPerWare.{$quotaWare} else 0"/>
+          <do_if value="$quotaWareFoundCount ge $perWareCap">
+            <continue/>
+          </do_if>
+        </do_if>
+
+        <!-- Entry passed all filters -->
+        <append_to_list name="$tradeList" exact="$entry"/>
+        <set_value name="$foundCount" operation="add"/>
+        <do_if value="$quotaWare?">
+          <set_value name="$foundPerWare.{$quotaWare}" exact="if $foundPerWare.{$quotaWare}? then ($foundPerWare.{$quotaWare} + 1) else 1"/>
+        </do_if>
+        <do_if value="$entry.$Score gt $bestScore">
+          <set_value name="$bestScore" exact="$entry.$Score"/>
+          <set_value name="$bestTrade" exact="$entry"/>
+        </do_if>
+        <!-- Stop once we have enough valid trades -->
+        <do_if value="$foundCount ge $maxEntries">
+          <break/>
+        </do_if>
+        <do_if value="($i % 10) == 0">
+          <wait exact="this.$gt_yieldMs * 1ms" comment="Yield cache scan loop"/>
+        </do_if>
+      </do_all>
+
+      <return value="table[
+        $Found = ($bestTrade != null),
+        $BestTrade = $bestTrade,
+        $BestScore = $bestScore,
+        $TradeList = $tradeList,
+        $PurgedStale = $purgedStaleCount,
+        $PoolSizeAfter = $homeCacheCount
+      ]"/>
+    </actions>
+  </attention>
+</aiscript>

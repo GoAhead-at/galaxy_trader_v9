@@ -1,0 +1,374 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_TradeSearch_Scheduler_MK42" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/md.xsd">
+  <cues>
+    <cue name="InitMK42Semaphore" instantiate="true" version="1">
+      <conditions>
+        <check_any>
+          <event_game_loaded/>
+          <event_player_created/>
+        </check_any>
+      </conditions>
+      <actions>
+        <do_if value="not global.$GT_SearchSemaphore?">
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.InitSearchSemaphore"/>
+        </do_if>
+        <set_value name="global.$GT_SearchSemaphore.$MK42LiveQueueByHome" exact="table[]"/>
+        <set_value name="global.$GT_SearchSemaphore.$MK42LiveHomesQueue" exact="[]"/>
+        <set_value name="global.$GT_SearchSemaphore.$MK42LiveHomesQueued" exact="table[]"/>
+        <set_value name="global.$GT_SearchSemaphore.$MK42LiveQueued" exact="table[]"/>
+        <set_value name="global.$GT_SearchSemaphore.$MK42LiveActiveShips" exact="table[]"/>
+        <set_value name="global.$GT_SearchSemaphore.$MK42LiveActive" exact="0"/>
+        <set_value name="global.$GT_SearchSemaphore.$MK42LiveHomeActive" exact="table[]"/>
+        <set_value name="global.$GT_SearchSemaphore.$MaxConcurrentMK42Live" exact="2"/>
+        <set_value name="global.$GT_SearchSemaphore.$MK42LiveDispatchScheduled" exact="false"/>
+        <set_value name="global.$GT_SearchSemaphore.$MK42LiveWaitersByHome" exact="table[]"/>
+        <set_value name="global.$GT_SearchSemaphore.$MK42LiveWaiterQueuedByHome" exact="table[]"/>
+        <set_value name="global.$GT_SearchSemaphore.$MK42LiveWaiterStartedAt" exact="table[]"/>
+        <set_value name="global.$GT_SearchSemaphore.$MK42LiveWaiterTickScheduled" exact="false"/>
+      </actions>
+    </cue>
+<cue name="DispatchMK42LiveSearchGoDelayed" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay min="200ms" max="1000ms"/>
+      <actions>
+        <do_if value="global.$GT_SearchSemaphore?">
+          <set_value name="global.$GT_SearchSemaphore.$MK42LiveDispatchScheduled" exact="false"/>
+        </do_if>
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK42.DispatchMK42LiveSearchGo"/>
+      </actions>
+    </cue>
+<cue name="DispatchMK42LiveSearchGo" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <do_if value="not global.$GT_SearchSemaphore?">
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK42.InitSearchSemaphore"/>
+        </do_if>
+        <!-- Global self-heal for stale MK42 live-active slots.
+             Needed when legacy/aborted entries keep MK42LiveActive at capacity and block all new dispatches. -->
+        <do_if value="global.$GT_SearchSemaphore.$MK42LiveActiveShips? and global.$GT_SearchSemaphore.$MK42LiveActiveShips.keys.count gt 0">
+          <set_value name="$mk42ActiveKeys" exact="global.$GT_SearchSemaphore.$MK42LiveActiveShips.keys.list"/>
+          <do_all exact="$mk42ActiveKeys.count" counter="$maki">
+            <set_value name="$mk42ActiveShip" exact="$mk42ActiveKeys.{$maki}"/>
+            <set_value name="$mk42ActiveEntry" exact="if $mk42ActiveShip? and global.$GT_SearchSemaphore.$MK42LiveActiveShips.{$mk42ActiveShip}? then @global.$GT_SearchSemaphore.$MK42LiveActiveShips.{$mk42ActiveShip} else null"/>
+            <set_value name="$mk42ActiveStartedAt" exact="if $mk42ActiveEntry? and $mk42ActiveEntry.$StartedAt? then @$mk42ActiveEntry.$StartedAt else null"/>
+            <set_value name="$mk42ActiveStale" exact="false"/>
+            <do_if value="not $mk42ActiveShip? or ($mk42ActiveShip? and not $mk42ActiveShip.exists)">
+              <set_value name="$mk42ActiveStale" exact="true"/>
+            </do_if>
+            <do_if value="not $mk42ActiveStale and ($mk42ActiveStartedAt == null or (player.age - $mk42ActiveStartedAt) gt 60s)">
+              <set_value name="$mk42ActiveStale" exact="true"/>
+            </do_if>
+            <do_if value="$mk42ActiveStale">
+              <do_if value="$mk42ActiveShip? and global.$GT_SearchSemaphore.$MK42LiveActiveShips.{$mk42ActiveShip}?">
+                <remove_value name="global.$GT_SearchSemaphore.$MK42LiveActiveShips.{$mk42ActiveShip}"/>
+              </do_if>
+              <do_if value="global.$GT_SearchSemaphore.$MK42LiveActive gt 0">
+                <set_value name="global.$GT_SearchSemaphore.$MK42LiveActive" operation="subtract"/>
+              </do_if>
+              <do_if value="$mk42ActiveEntry? and $mk42ActiveEntry.$HomeSector? and global.$GT_SearchSemaphore.$MK42LiveHomeActive? and global.$GT_SearchSemaphore.$MK42LiveHomeActive.{$mk42ActiveEntry.$HomeSector}? and @global.$GT_SearchSemaphore.$MK42LiveHomeActive.{$mk42ActiveEntry.$HomeSector} == $mk42ActiveShip">
+                <remove_value name="global.$GT_SearchSemaphore.$MK42LiveHomeActive.{$mk42ActiveEntry.$HomeSector}"/>
+              </do_if>
+              <do_if value="$mk42ActiveShip? and global.$GT_SearchSemaphore.$PhaseStateByShip? and global.$GT_SearchSemaphore.$PhaseStateByShip.{$mk42ActiveShip}? and @global.$GT_SearchSemaphore.$PhaseStateByShip.{$mk42ActiveShip} == 'mk42live_active'">
+                <remove_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$mk42ActiveShip}"/>
+              </do_if>
+              <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Scheduler] DispatchMK42LiveSearchGo: Cleared stale MK42 active slot owner=' + (if $mk42ActiveShip? then $mk42ActiveShip.idcode else 'null') + ' startedAt=' + (if $mk42ActiveStartedAt? then $mk42ActiveStartedAt else 'null') + ' age=' + player.age" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+
+        <!-- Self-heal orphaned MK42LiveHomeActive slots (parity with MK3 LiveHomeActive). -->
+        <set_value name="$mk42LiveStaleThreshold" exact="120s"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$StaleThresholdSeconds?">
+          <set_value name="$mk42LiveStaleThreshold" exact="@global.$GT_GlobalSettings.$Performance.$StaleThresholdSeconds"/>
+        </do_if>
+        <do_if value="global.$GT_SearchSemaphore.$MK42LiveHomeActive? and global.$GT_SearchSemaphore.$MK42LiveHomeActive.keys.count gt 0">
+          <set_value name="$mk42OrphanHomeKeys" exact="global.$GT_SearchSemaphore.$MK42LiveHomeActive.keys.list"/>
+          <do_all exact="$mk42OrphanHomeKeys.count" counter="$mk42ohi">
+            <set_value name="$mk42OrphanHome" exact="$mk42OrphanHomeKeys.{$mk42ohi}"/>
+            <set_value name="$mk42OrphanOwner" exact="if $mk42OrphanHome? and global.$GT_SearchSemaphore.$MK42LiveHomeActive.{$mk42OrphanHome}? then @global.$GT_SearchSemaphore.$MK42LiveHomeActive.{$mk42OrphanHome} else null"/>
+            <set_value name="$mk42OrphanHomeStale" exact="false"/>
+            <do_if value="not $mk42OrphanOwner? or not $mk42OrphanOwner.exists">
+              <set_value name="$mk42OrphanHomeStale" exact="true"/>
+            </do_if>
+            <do_if value="not $mk42OrphanHomeStale and global.$GT_SearchSemaphore.$MK42LiveActiveShips? and not global.$GT_SearchSemaphore.$MK42LiveActiveShips.{$mk42OrphanOwner}?">
+              <set_value name="$mk42OrphanHomeStale" exact="true"/>
+            </do_if>
+            <do_if value="not $mk42OrphanHomeStale and global.$GT_SearchSemaphore.$MK42LiveActiveShips? and global.$GT_SearchSemaphore.$MK42LiveActiveShips.{$mk42OrphanOwner}?">
+              <set_value name="$mk42OrphanOwnerEntry" exact="@global.$GT_SearchSemaphore.$MK42LiveActiveShips.{$mk42OrphanOwner}"/>
+              <set_value name="$mk42OrphanOwnerStartedAt" exact="if $mk42OrphanOwnerEntry? and $mk42OrphanOwnerEntry.$StartedAt? then @$mk42OrphanOwnerEntry.$StartedAt else null"/>
+              <do_if value="$mk42OrphanOwnerStartedAt == null or (player.age - $mk42OrphanOwnerStartedAt) gt $mk42LiveStaleThreshold">
+                <set_value name="$mk42OrphanHomeStale" exact="true"/>
+              </do_if>
+            </do_if>
+            <do_if value="$mk42OrphanHomeStale">
+              <remove_value name="global.$GT_SearchSemaphore.$MK42LiveHomeActive.{$mk42OrphanHome}"/>
+              <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Scheduler] DispatchMK42LiveSearchGo: Cleared orphaned MK42LiveHomeActive home=' + (if $mk42OrphanHome? and $mk42OrphanHome.knownname? then @$mk42OrphanHome.knownname else '?') + ' owner=' + (if $mk42OrphanOwner? then $mk42OrphanOwner.idcode else 'null')" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+
+        <do_if value="global.$GT_SearchSemaphore.$MK42LiveHomesQueue.count gt 0 and global.$GT_SearchSemaphore.$MK42LiveActive ge global.$GT_SearchSemaphore.$MaxConcurrentMK42Live">
+          <do_if value="not global.$GT_SearchSemaphore.$MK42LiveDispatchScheduled">
+            <set_value name="global.$GT_SearchSemaphore.$MK42LiveDispatchScheduled" exact="true"/>
+            <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK42.DispatchMK42LiveSearchGoDelayed"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <!-- Fair round-robin by home sector -->
+          <set_value name="$mk42HomeScanBudget" exact="global.$GT_SearchSemaphore.$MK42LiveHomesQueue.count"/>
+          <do_while value="$mk42HomeScanBudget gt 0 and global.$GT_SearchSemaphore.$MK42LiveActive lt global.$GT_SearchSemaphore.$MaxConcurrentMK42Live and global.$GT_SearchSemaphore.$MK42LiveHomesQueue.count gt 0">
+            <set_value name="$homeSector" exact="global.$GT_SearchSemaphore.$MK42LiveHomesQueue.{1}"/>
+            <remove_from_list name="global.$GT_SearchSemaphore.$MK42LiveHomesQueue" exact="$homeSector"/>
+            <remove_value name="global.$GT_SearchSemaphore.$MK42LiveHomesQueued.{$homeSector}"/>
+            <set_value name="$mk42HomeScanBudget" operation="subtract"/>
+
+            <!-- Skip homes that are currently active; requeue to tail -->
+            <do_if value="global.$GT_SearchSemaphore.$MK42LiveHomeActive? and global.$GT_SearchSemaphore.$MK42LiveHomeActive.{$homeSector}?">
+              <do_if value="not global.$GT_SearchSemaphore.$MK42LiveHomesQueued.{$homeSector}?">
+                <append_to_list name="global.$GT_SearchSemaphore.$MK42LiveHomesQueue" exact="$homeSector"/>
+                <set_value name="global.$GT_SearchSemaphore.$MK42LiveHomesQueued.{$homeSector}" exact="true"/>
+              </do_if>
+              <continue/>
+            </do_if>
+
+            <do_if value="not global.$GT_SearchSemaphore.$MK42LiveQueueByHome? or not global.$GT_SearchSemaphore.$MK42LiveQueueByHome.{$homeSector}? or global.$GT_SearchSemaphore.$MK42LiveQueueByHome.{$homeSector}.count le 0">
+              <continue/>
+            </do_if>
+
+            <set_value name="$entry" exact="global.$GT_SearchSemaphore.$MK42LiveQueueByHome.{$homeSector}.{1}"/>
+            <remove_value name="global.$GT_SearchSemaphore.$MK42LiveQueueByHome.{$homeSector}.{1}"/>
+
+            <set_value name="$ship" exact="@$entry.$Ship"/>
+            <set_value name="$params" exact="@$entry.$Params"/>
+            <set_value name="$dispatchParams" exact="if $params? then $params else table[]"/>
+            <set_value name="$dispatchParams.$Phase" exact="'mk42live'"/>
+            <set_value name="$dispatchParams.$HomeSector" exact="$homeSector"/>
+            <set_value name="$dispatchParams.$SearchPool" exact="'mk4_supply_v2'"/>
+            <set_value name="$dispatchForceLive" exact="true"/>
+            <do_if value="$homeSector? and $homeSector.exists and global.$GT_TradeCacheMK42? and global.$GT_TradeCacheMK42.{$homeSector}? and global.$GT_TradeCacheMK42.{$homeSector}.count gt 0">
+              <set_value name="$dispatchForceLive" exact="false"/>
+            </do_if>
+            <set_value name="$dispatchParams.$ForceLiveSearch" exact="$dispatchForceLive"/>
+
+            <do_if value="$ship? and $ship.exists">
+              <set_value name="global.$GT_SearchSemaphore.$MK42LiveActive" operation="add"/>
+              <set_value name="global.$GT_SearchSemaphore.$MK42LiveActiveShips.{$ship}" exact="table[
+                $StartedAt = player.age,
+                $Params = $dispatchParams,
+                $HomeSector = $homeSector
+              ]"/>
+              <set_value name="global.$GT_SearchSemaphore.$MK42LiveHomeActive.{$homeSector}" exact="$ship"/>
+              <remove_value name="global.$GT_SearchSemaphore.$MK42LiveQueued.{$ship}"/>
+              <set_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}" exact="'mk42live_active'"/>
+              <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Scheduler] DispatchMK42LiveSearchGo: Sending GT_Search_Go to ' + $ship.idcode + ' (age=' + player.age + ', mk42live)'" chance="100"/>
+              </do_if>
+              <signal_objects object="$ship" param="'GT_Search_Go'" param2="$dispatchParams" delay="1ms"/>
+            </do_if>
+            <do_else>
+              <do_if value="$ship? and global.$GT_SearchSemaphore.$MK42LiveQueued? and global.$GT_SearchSemaphore.$MK42LiveQueued.{$ship}?">
+                <remove_value name="global.$GT_SearchSemaphore.$MK42LiveQueued.{$ship}"/>
+              </do_if>
+              <do_if value="$ship? and global.$GT_SearchSemaphore.$PhaseStateByShip? and global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}?">
+                <remove_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}"/>
+              </do_if>
+            </do_else>
+
+            <!-- Keep home queued if there are still pending MK42 live entries for this home -->
+            <do_if value="global.$GT_SearchSemaphore.$MK42LiveQueueByHome? and global.$GT_SearchSemaphore.$MK42LiveQueueByHome.{$homeSector}? and global.$GT_SearchSemaphore.$MK42LiveQueueByHome.{$homeSector}.count gt 0">
+              <do_if value="not global.$GT_SearchSemaphore.$MK42LiveHomesQueued.{$homeSector}?">
+                <append_to_list name="global.$GT_SearchSemaphore.$MK42LiveHomesQueue" exact="$homeSector"/>
+                <set_value name="global.$GT_SearchSemaphore.$MK42LiveHomesQueued.{$homeSector}" exact="true"/>
+              </do_if>
+            </do_if>
+          </do_while>
+        </do_else>
+      </actions>
+    </cue>
+<cue name="NotifyMK42LiveWaitersTick" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="20s"/>
+      <actions>
+        <set_value name="$hasAnyMK42ActiveWaiters" exact="false"/>
+        <set_value name="$mk42WaiterStaleThreshold" exact="120s"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$StaleThresholdSeconds?">
+          <set_value name="$mk42WaiterStaleThreshold" exact="@global.$GT_GlobalSettings.$Performance.$StaleThresholdSeconds"/>
+        </do_if>
+        <do_if value="global.$GT_SearchSemaphore? and global.$GT_SearchSemaphore.$MK42LiveWaitersByHome? and global.$GT_SearchSemaphore.$MK42LiveWaitersByHome.keys.count gt 0">
+          <set_value name="$mk42HomeKeys" exact="global.$GT_SearchSemaphore.$MK42LiveWaitersByHome.keys.list"/>
+          <do_all exact="$mk42HomeKeys.count" counter="$mk42hki">
+            <set_value name="$mk42HomeSector" exact="$mk42HomeKeys.{$mk42hki}"/>
+            <do_if value="$mk42HomeSector? and global.$GT_SearchSemaphore.$MK42LiveWaitersByHome.{$mk42HomeSector}? and global.$GT_SearchSemaphore.$MK42LiveWaitersByHome.{$mk42HomeSector}.count gt 0">
+              <set_value name="$mk42HomeOwner" exact="if global.$GT_SearchSemaphore.$MK42LiveHomeActive? and global.$GT_SearchSemaphore.$MK42LiveHomeActive.{$mk42HomeSector}? then @global.$GT_SearchSemaphore.$MK42LiveHomeActive.{$mk42HomeSector} else null"/>
+              <set_value name="$mk42HomeOwnerStale" exact="false"/>
+              <do_if value="not $mk42HomeOwner? or not $mk42HomeOwner.exists">
+                <set_value name="$mk42HomeOwnerStale" exact="true"/>
+              </do_if>
+              <do_if value="not $mk42HomeOwnerStale and global.$GT_SearchSemaphore.$MK42LiveActiveShips? and not global.$GT_SearchSemaphore.$MK42LiveActiveShips.{$mk42HomeOwner}?">
+                <set_value name="$mk42HomeOwnerStale" exact="true"/>
+              </do_if>
+              <do_if value="not $mk42HomeOwnerStale and global.$GT_SearchSemaphore.$MK42LiveActiveShips? and global.$GT_SearchSemaphore.$MK42LiveActiveShips.{$mk42HomeOwner}?">
+                <set_value name="$mk42HomeOwnerEntry" exact="@global.$GT_SearchSemaphore.$MK42LiveActiveShips.{$mk42HomeOwner}"/>
+                <set_value name="$mk42HomeOwnerStartedAt" exact="if $mk42HomeOwnerEntry? and $mk42HomeOwnerEntry.$StartedAt? then @$mk42HomeOwnerEntry.$StartedAt else null"/>
+                <do_if value="$mk42HomeOwnerStartedAt == null or (player.age - $mk42HomeOwnerStartedAt) gt $mk42WaiterStaleThreshold">
+                  <set_value name="$mk42HomeOwnerStale" exact="true"/>
+                </do_if>
+              </do_if>
+              <do_if value="$mk42HomeOwnerStale and global.$GT_SearchSemaphore.$MK42LiveHomeActive? and global.$GT_SearchSemaphore.$MK42LiveHomeActive.{$mk42HomeSector}?">
+                <remove_value name="global.$GT_SearchSemaphore.$MK42LiveHomeActive.{$mk42HomeSector}"/>
+              </do_if>
+              <do_if value="$mk42HomeOwnerStale and $mk42HomeOwner? and global.$GT_SearchSemaphore.$MK42LiveActiveShips? and global.$GT_SearchSemaphore.$MK42LiveActiveShips.{$mk42HomeOwner}?">
+                <remove_value name="global.$GT_SearchSemaphore.$MK42LiveActiveShips.{$mk42HomeOwner}"/>
+                <do_if value="global.$GT_SearchSemaphore.$MK42LiveActive gt 0">
+                  <set_value name="global.$GT_SearchSemaphore.$MK42LiveActive" operation="subtract"/>
+                </do_if>
+              </do_if>
+
+              <do_all exact="global.$GT_SearchSemaphore.$MK42LiveWaitersByHome.{$mk42HomeSector}.count" counter="$mk42wi" reverse="true">
+                <set_value name="$mk42wShip" exact="global.$GT_SearchSemaphore.$MK42LiveWaitersByHome.{$mk42HomeSector}.{$mk42wi}"/>
+                <do_if value="not $mk42wShip? or not $mk42wShip.exists">
+                  <remove_value name="global.$GT_SearchSemaphore.$MK42LiveWaitersByHome.{$mk42HomeSector}.{$mk42wi}"/>
+                  <continue/>
+                </do_if>
+                <set_value name="$mk42WaiterAge" exact="0s"/>
+                <do_if value="global.$GT_SearchSemaphore.$MK42LiveWaiterStartedAt? and global.$GT_SearchSemaphore.$MK42LiveWaiterStartedAt.{$mk42HomeSector}? and global.$GT_SearchSemaphore.$MK42LiveWaiterStartedAt.{$mk42HomeSector}.{$mk42wShip}?">
+                  <set_value name="$mk42WaiterAge" exact="player.age - @global.$GT_SearchSemaphore.$MK42LiveWaiterStartedAt.{$mk42HomeSector}.{$mk42wShip}"/>
+                </do_if>
+                <set_value name="$mk42PromoteWaiter" exact="false"/>
+                <do_if value="$mk42HomeOwnerStale or $mk42WaiterAge gt $mk42WaiterStaleThreshold">
+                  <set_value name="$mk42PromoteWaiter" exact="true"/>
+                </do_if>
+                <do_if value="$mk42PromoteWaiter">
+                  <remove_value name="global.$GT_SearchSemaphore.$MK42LiveWaitersByHome.{$mk42HomeSector}.{$mk42wi}"/>
+                  <do_if value="global.$GT_SearchSemaphore.$MK42LiveWaiterQueuedByHome? and global.$GT_SearchSemaphore.$MK42LiveWaiterQueuedByHome.{$mk42HomeSector}? and global.$GT_SearchSemaphore.$MK42LiveWaiterQueuedByHome.{$mk42HomeSector}.{$mk42wShip}?">
+                    <remove_value name="global.$GT_SearchSemaphore.$MK42LiveWaiterQueuedByHome.{$mk42HomeSector}.{$mk42wShip}"/>
+                  </do_if>
+                  <do_if value="global.$GT_SearchSemaphore.$MK42LiveWaiterStartedAt? and global.$GT_SearchSemaphore.$MK42LiveWaiterStartedAt.{$mk42HomeSector}? and global.$GT_SearchSemaphore.$MK42LiveWaiterStartedAt.{$mk42HomeSector}.{$mk42wShip}?">
+                    <remove_value name="global.$GT_SearchSemaphore.$MK42LiveWaiterStartedAt.{$mk42HomeSector}.{$mk42wShip}"/>
+                  </do_if>
+                  <set_value name="global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$mk42wShip}" exact="true"/>
+                  <signal_objects object="$mk42wShip" param="'GT_TradeSearch_Reset'" delay="1ms"/>
+                  <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Scheduler] NotifyMK42LiveWaitersTick: Promoted starved MK42 waiter ' + $mk42wShip.idcode + ' home=' + (if $mk42HomeSector.knownname? then @$mk42HomeSector.knownname else '?') + ' waiterAge=' + $mk42WaiterAge + ' homeOwnerStale=' + $mk42HomeOwnerStale" chance="100"/>
+                  </do_if>
+                </do_if>
+              </do_all>
+
+              <do_if value="global.$GT_SearchSemaphore.$MK42LiveWaitersByHome.{$mk42HomeSector}? and global.$GT_SearchSemaphore.$MK42LiveWaitersByHome.{$mk42HomeSector}.count gt 0 and global.$GT_SearchSemaphore.$MK42LiveHomeActive? and global.$GT_SearchSemaphore.$MK42LiveHomeActive.{$mk42HomeSector}?">
+                <set_value name="$hasAnyMK42ActiveWaiters" exact="true"/>
+                <do_all exact="global.$GT_SearchSemaphore.$MK42LiveWaitersByHome.{$mk42HomeSector}.count" counter="$mk42wi">
+                  <set_value name="$mk42wShip" exact="global.$GT_SearchSemaphore.$MK42LiveWaitersByHome.{$mk42HomeSector}.{$mk42wi}"/>
+                  <do_if value="$mk42wShip? and $mk42wShip.exists">
+                    <signal_objects object="$mk42wShip" param="'GT_TradeSearch_InProgress'" delay="1ms"/>
+                  </do_if>
+                </do_all>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+
+        <do_if value="$hasAnyMK42ActiveWaiters">
+          <set_value name="global.$GT_SearchSemaphore.$MK42LiveWaiterTickScheduled" exact="true"/>
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK42.NotifyMK42LiveWaitersTick"/>
+        </do_if>
+        <do_else>
+          <set_value name="global.$GT_SearchSemaphore.$MK42LiveWaiterTickScheduled" exact="false"/>
+        </do_else>
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK42.DispatchMK42LiveSearchGo"/>
+      </actions>
+    </cue>
+<cue name="HandleMK42CacheUpdated" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_MK42_Cache_Updated'"/>
+      </conditions>
+      <actions>
+        <set_value name="$data" exact="event.param2"/>
+        <set_value name="$homeSector" exact="@$data.$HomeSector"/>
+        <set_value name="$updatedMaxDistance" exact="if $data? and $data.$MaxDistance? then @$data.$MaxDistance else 0"/>
+        <do_if value="not global.$GT_SearchSemaphore?">
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK42.InitSearchSemaphore"/>
+        </do_if>
+        <do_if value="$homeSector? and $homeSector.exists and global.$GT_SearchSemaphore?">
+          <set_value name="$mk42CacheEntryCount" exact="0"/>
+          <do_if value="global.$GT_TradeCacheMK42? and global.$GT_TradeCacheMK42.{$homeSector}?">
+            <set_value name="$mk42CacheEntryCount" exact="@global.$GT_TradeCacheMK42.{$homeSector}.count"/>
+          </do_if>
+          <do_if value="$mk42CacheEntryCount gt 0 and $data? and $data.$Written? and $data.$Written gt 0">
+            <!-- Fresh cache writes supersede prior per-ship skip markers on all entries. -->
+            <do_all exact="global.$GT_TradeCacheMK42.{$homeSector}.count" counter="$mk42clrCi">
+              <set_value name="$mk42clrEntry" exact="global.$GT_TradeCacheMK42.{$homeSector}.{$mk42clrCi}"/>
+              <do_if value="$mk42clrEntry? and $mk42clrEntry.$FailedShips? and $mk42clrEntry.$FailedShips.count gt 0">
+                <set_value name="$mk42clrEntry.$FailedShips" exact="[]"/>
+                <set_value name="global.$GT_TradeCacheMK42.{$homeSector}.{$mk42clrCi}" exact="$mk42clrEntry"/>
+              </do_if>
+            </do_all>
+            <set_value name="$mk42WakeShips" exact="[]"/>
+            <set_value name="$mk42WakeShipSeen" exact="table[]"/>
+            <!-- MK42 live queue waiters -->
+            <do_if value="global.$GT_SearchSemaphore.$MK42LiveQueueByHome? and global.$GT_SearchSemaphore.$MK42LiveQueueByHome.{$homeSector}? and global.$GT_SearchSemaphore.$MK42LiveQueueByHome.{$homeSector}.count gt 0">
+              <do_all exact="global.$GT_SearchSemaphore.$MK42LiveQueueByHome.{$homeSector}.count" counter="$mk42cwi">
+                <set_value name="$mk42cwEntry" exact="@global.$GT_SearchSemaphore.$MK42LiveQueueByHome.{$homeSector}.{$mk42cwi}"/>
+                <set_value name="$mk42cwShip" exact="if $mk42cwEntry? and $mk42cwEntry.$Ship? then @$mk42cwEntry.$Ship else null"/>
+                <do_if value="$mk42cwShip? and $mk42cwShip.exists and not $mk42WakeShipSeen.{$mk42cwShip}?">
+                  <append_to_list name="$mk42WakeShips" exact="$mk42cwShip"/>
+                  <set_value name="$mk42WakeShipSeen.{$mk42cwShip}" exact="true"/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <!-- Legacy live queue (mk42PolicyNeedsLiveSearch path) -->
+            <do_if value="global.$GT_SearchSemaphore.$LiveQueueByHome? and global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}? and global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.count gt 0">
+              <do_all exact="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.count" counter="$lcwi">
+                <set_value name="$lcwEntry" exact="@global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.{$lcwi}"/>
+                <set_value name="$lcwShip" exact="if $lcwEntry? and $lcwEntry.$Ship? then @$lcwEntry.$Ship else null"/>
+                <do_if value="$lcwShip? and $lcwShip.exists and not $mk42WakeShipSeen.{$lcwShip}?">
+                  <append_to_list name="$mk42WakeShips" exact="$lcwShip"/>
+                  <set_value name="$mk42WakeShipSeen.{$lcwShip}" exact="true"/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <!-- MK42 live refresh waiters (blocked on same-home active slot) -->
+            <do_if value="global.$GT_SearchSemaphore.$MK42LiveWaitersByHome? and global.$GT_SearchSemaphore.$MK42LiveWaitersByHome.{$homeSector}? and global.$GT_SearchSemaphore.$MK42LiveWaitersByHome.{$homeSector}.count gt 0">
+              <do_all exact="global.$GT_SearchSemaphore.$MK42LiveWaitersByHome.{$homeSector}.count" counter="$mk42wwi">
+                <set_value name="$mk42wwShip" exact="@global.$GT_SearchSemaphore.$MK42LiveWaitersByHome.{$homeSector}.{$mk42wwi}"/>
+                <do_if value="$mk42wwShip? and $mk42wwShip.exists and not $mk42WakeShipSeen.{$mk42wwShip}?">
+                  <append_to_list name="$mk42WakeShips" exact="$mk42wwShip"/>
+                  <set_value name="$mk42WakeShipSeen.{$mk42wwShip}" exact="true"/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <!-- Cache-phase queue for same home -->
+            <do_if value="global.$GT_SearchSemaphore.$CacheQueue? and global.$GT_SearchSemaphore.$CacheQueue.count gt 0">
+              <do_all exact="global.$GT_SearchSemaphore.$CacheQueue.count" counter="$ccwi">
+                <set_value name="$ccwEntry" exact="@global.$GT_SearchSemaphore.$CacheQueue.{$ccwi}"/>
+                <set_value name="$ccwShip" exact="if $ccwEntry? and $ccwEntry.$Ship? then @$ccwEntry.$Ship else null"/>
+                <set_value name="$ccwHome" exact="if $ccwEntry? and $ccwEntry.$HomeSector? then @$ccwEntry.$HomeSector else null"/>
+                <do_if value="$ccwShip? and $ccwShip.exists and $ccwHome? and $ccwHome == $homeSector and not $mk42WakeShipSeen.{$ccwShip}?">
+                  <append_to_list name="$mk42WakeShips" exact="$ccwShip"/>
+                  <set_value name="$mk42WakeShipSeen.{$ccwShip}" exact="true"/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <do_all exact="$mk42WakeShips.count" counter="$mk42wsi">
+              <set_value name="$mk42wShip" exact="$mk42WakeShips.{$mk42wsi}"/>
+              <signal_objects object="player.galaxy" param="'GT_Search_Abort'" param2="table[$Ship = $mk42wShip]" delay="1ms"/>
+              <signal_objects object="$mk42wShip" param="'GT_TradeSearch_Reset'" delay="2ms"/>
+            </do_all>
+            <do_if value="$mk42WakeShips.count gt 0 and global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Scheduler] HandleMK42CacheUpdated: Woke ' + $mk42WakeShips.count + ' waiting ships to retry cache home=' + (if $homeSector.knownname? then @$homeSector.knownname else '?') + ' pool=' + $mk42CacheEntryCount + ' maxDist=' + $updatedMaxDistance" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+  </cues>
+</mdscript>

@@ -165,6 +165,9 @@
         <!-- Only set the interrupt flag if we actually have trades to process.
              Empty signals cause pointless trade_found processing with 0 trades. -->
         <do_if value="$signalTradeList != null and $signalTradeList.count gt 0">
+          <do_if value="$signalSearchMethod? and ($signalSearchMethod == 'LIVE' or $signalSearchMethod == 'live' or $signalSearchMethod == 'mk4live')">
+            <set_value name="this.$mk4PolicyNeedsLiveSearch" exact="false"/>
+          </do_if>
           <set_value name="this.$tradeFoundViaInterrupt" exact="true"/>
           <set_value name="this.$tradeListFromSignal" exact="$signalTradeList"/>
           <set_value name="this.$searchMethodFromSignal" exact="if $signalSearchMethod != null and $signalSearchMethod != '' then $signalSearchMethod else ''"/>
@@ -724,6 +727,26 @@
     
     <!-- Store as script variable for persistence throughout execution -->
     <set_value name="this.$effectiveHome" exact="$effectiveHome"/>
+    <!-- Order restart (trade revoke / maintenance transition): drop stale force-live flags and
+         per-ship cache skip markers so a fresh search can use repopulated MK4 cache immediately. -->
+    <set_value name="this.$mk4PolicyNeedsLiveSearch" exact="false"/>
+    <set_value name="this.$forceLiveAfterLiveReject" exact="false"/>
+    <set_value name="$initMk4HomeSector" exact="if this.$effectiveHome? and this.$effectiveHome.isclass.sector then this.$effectiveHome else (if this.$effectiveHome? and this.$effectiveHome.sector? then @this.$effectiveHome.sector else null)"/>
+    <do_if value="$initMk4HomeSector? and $initMk4HomeSector.exists and global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$initMk4HomeSector}?">
+      <do_all exact="global.$GT_TradeCacheMK4.{$initMk4HomeSector}.count" counter="$initCi">
+        <set_value name="$initEntry" exact="global.$GT_TradeCacheMK4.{$initMk4HomeSector}.{$initCi}"/>
+        <do_if value="$initEntry? and $initEntry.$FailedShips? and $initEntry.$FailedShips.count gt 0">
+          <set_value name="$initNewFailed" exact="[]"/>
+          <do_all exact="$initEntry.$FailedShips.count" counter="$initFsi">
+            <do_if value="$initEntry.$FailedShips.{$initFsi} != this.ship">
+              <append_to_list name="$initNewFailed" exact="$initEntry.$FailedShips.{$initFsi}"/>
+            </do_if>
+          </do_all>
+          <set_value name="$initEntry.$FailedShips" exact="$initNewFailed"/>
+          <set_value name="global.$GT_TradeCacheMK4.{$initMk4HomeSector}.{$initCi}" exact="$initEntry"/>
+        </do_if>
+      </do_all>
+    </do_if>
     
     <!-- ============================================================================= -->
     <!-- STATION ASSIGNMENT: If home is a station, assign ship as station subordinate -->
@@ -987,6 +1010,10 @@
     <set_value name="$mk4AllowIntermediates" exact="if $allowIntermediates? then $allowIntermediates else true"/>
     <set_value name="$mk4AllowTradewares" exact="if $allowTradewares? then $allowTradewares else true"/>
     <set_value name="$mk4PlayerBuyMod" exact="if $playerBuyMod? then $playerBuyMod else 0"/>
+    <set_value name="$mk4BuildStorageOnlyMode" exact="false"/>
+    <do_if value="not $effectiveIgnoreBuildStorage and not $mk4AllowResources and not $mk4AllowIntermediates and not $mk4AllowTradewares">
+      <set_value name="$mk4BuildStorageOnlyMode" exact="true"/>
+    </do_if>
     <do_if value="$isSubordinate and $commanderOrder">
       <do_if value="$commanderOrder.$maxTrades?">
         <set_value name="$effectiveMaxTrades" exact="[1, [3, $commanderOrder.$maxTrades].min].max"/>
@@ -1054,6 +1081,7 @@
     <set_value name="this.$mk4AllowIntermediates" exact="$mk4AllowIntermediates"/>
     <set_value name="this.$mk4AllowTradewares" exact="$mk4AllowTradewares"/>
     <set_value name="this.$mk4PlayerBuyMod" exact="$mk4PlayerBuyMod"/>
+    <set_value name="this.$mk4BuildStorageOnlyMode" exact="$mk4BuildStorageOnlyMode"/>
     
     <!-- Debug message for subordinates showing inherited settings -->
     <!-- PERFORMANCE: Only build inherited settings string if debug logging is enabled -->
@@ -1683,6 +1711,13 @@
       <do_if value="not $mk4PlayerBuyMod?">
         <set_value name="$mk4PlayerBuyMod" exact="if this.$mk4PlayerBuyMod? then this.$mk4PlayerBuyMod else (if $playerBuyMod? then $playerBuyMod else 0)"/>
       </do_if>
+      <do_if value="not $effectiveIgnoreBuildStorage?">
+        <set_value name="$effectiveIgnoreBuildStorage" exact="if this.$effectiveIgnoreBuildStorage? then this.$effectiveIgnoreBuildStorage else false"/>
+      </do_if>
+      <set_value name="$mk4BuildStorageOnlyMode" exact="false"/>
+      <do_if value="not $effectiveIgnoreBuildStorage and not $mk4AllowResources and not $mk4AllowIntermediates and not $mk4AllowTradewares">
+        <set_value name="$mk4BuildStorageOnlyMode" exact="true"/>
+      </do_if>
       <do_if value="not $effectiveIgnoreTradeRules?">
         <set_value name="$effectiveIgnoreTradeRules" exact="if this.$effectiveIgnoreTradeRules? then this.$effectiveIgnoreTradeRules else false"/>
       </do_if>
@@ -1747,6 +1782,7 @@
       <set_value name="this.$mk4AllowIntermediates" exact="$mk4AllowIntermediates"/>
       <set_value name="this.$mk4AllowTradewares" exact="$mk4AllowTradewares"/>
       <set_value name="this.$mk4PlayerBuyMod" exact="$mk4PlayerBuyMod"/>
+      <set_value name="this.$mk4BuildStorageOnlyMode" exact="$mk4BuildStorageOnlyMode"/>
       
       <!-- Initialize subordinate count tracking -->
       <!-- Track when this ship becomes a commander (gets subordinates) -->
@@ -2748,6 +2784,12 @@
           <set_value name="$_cmdMaxBuy" exact="if $_commanderOrderNow.$jumpDistanceBuy? then $_commanderOrderNow.$jumpDistanceBuy else $effectiveMaxBuy"/>
           <set_value name="$_cmdMaxSell" exact="if $_commanderOrderNow.$jumpDistanceCoverage? then $_commanderOrderNow.$jumpDistanceCoverage else $effectiveMaxSell"/>
           <set_value name="$_cmdSectorWhitelist" exact="if $_commanderOrderNow.$sectorwhitelist? then $_commanderOrderNow.$sectorwhitelist else $effectiveSectorWhitelist"/>
+          <set_value name="$_cmdM4Res" exact="if $_commanderOrderNow.$allowResources? then $_commanderOrderNow.$allowResources else (if this.$mk4AllowResources? then this.$mk4AllowResources else true)"/>
+          <set_value name="$_cmdM4Int" exact="if $_commanderOrderNow.$allowIntermediates? then $_commanderOrderNow.$allowIntermediates else (if this.$mk4AllowIntermediates? then this.$mk4AllowIntermediates else true)"/>
+          <set_value name="$_cmdM4Tw" exact="if $_commanderOrderNow.$allowTradewares? then $_commanderOrderNow.$allowTradewares else (if this.$mk4AllowTradewares? then this.$mk4AllowTradewares else true)"/>
+          <set_value name="$_cmdM4Aps" exact="if $_commanderOrderNow.$buyFromPlayer? then $_commanderOrderNow.$buyFromPlayer else (if $_commanderOrderNow.$allowPlayerSuppliers? then $_commanderOrderNow.$allowPlayerSuppliers else (if this.$mk4AllowPlayerSuppliers? then this.$mk4AllowPlayerSuppliers else true))"/>
+          <set_value name="$_cmdM4Aas" exact="if $_commanderOrderNow.$buyFromFaction? then $_commanderOrderNow.$buyFromFaction else (if $_commanderOrderNow.$allowAiSuppliers? then $_commanderOrderNow.$allowAiSuppliers else (if this.$mk4AllowAiSuppliers? then this.$mk4AllowAiSuppliers else true))"/>
+          <set_value name="$_cmdM4Ded" exact="if $_commanderOrderNow.$serveHomeOnly? then $_commanderOrderNow.$serveHomeOnly else (if $_commanderOrderNow.$dedicatedServe? then $_commanderOrderNow.$dedicatedServe else (if this.$mk4DedicatedServe? then this.$mk4DedicatedServe else false))"/>
           
           <!-- IMPORTANT:
                In X4 AI script expressions, `?` checks existence, NOT null, and boolean `and` is not safe to rely on for short-circuiting.
@@ -2783,6 +2825,12 @@
             + '|DL=' + $_cmdDebugLevel
             + '|TE=' + $_cmdTradeEval
             + '|PL=' + $_pilotLevelSig
+            + '|M4R=' + $_cmdM4Res
+            + '|M4I=' + $_cmdM4Int
+            + '|M4T=' + $_cmdM4Tw
+            + '|M4APS=' + $_cmdM4Aps
+            + '|M4AAS=' + $_cmdM4Aas
+            + '|M4DED=' + $_cmdM4Ded
             + '|SW='"/>
 
           <!-- Include sector whitelist content -->
@@ -2827,6 +2875,53 @@
             <set_value name="$effectiveDebugLevel" exact="$_cmdDebugLevel"/>
             <set_value name="$effectiveTradeEval" exact="$_cmdTradeEval"/>
             <set_value name="$effectiveSectorWhitelist" exact="$_cmdSectorWhitelist"/>
+            <set_value name="$mk4AllowResources" exact="$_cmdM4Res"/>
+            <set_value name="$mk4AllowIntermediates" exact="$_cmdM4Int"/>
+            <set_value name="$mk4AllowTradewares" exact="$_cmdM4Tw"/>
+            <set_value name="$mk4AllowPlayerSuppliers" exact="$_cmdM4Aps"/>
+            <set_value name="$mk4AllowAiSuppliers" exact="$_cmdM4Aas"/>
+            <set_value name="$mk4DedicatedServe" exact="$_cmdM4Ded"/>
+            <set_value name="this.$mk4AllowResources" exact="$mk4AllowResources"/>
+            <set_value name="this.$mk4AllowIntermediates" exact="$mk4AllowIntermediates"/>
+            <set_value name="this.$mk4AllowTradewares" exact="$mk4AllowTradewares"/>
+            <set_value name="this.$mk4AllowPlayerSuppliers" exact="$mk4AllowPlayerSuppliers"/>
+            <set_value name="this.$mk4AllowAiSuppliers" exact="$mk4AllowAiSuppliers"/>
+            <set_value name="this.$mk4DedicatedServe" exact="$mk4DedicatedServe"/>
+            <set_value name="$mk4BuildStorageOnlyMode" exact="false"/>
+            <do_if value="not $effectiveIgnoreBuildStorage and not $mk4AllowResources and not $mk4AllowIntermediates and not $mk4AllowTradewares">
+              <set_value name="$mk4BuildStorageOnlyMode" exact="true"/>
+            </do_if>
+            <set_value name="this.$mk4BuildStorageOnlyMode" exact="$mk4BuildStorageOnlyMode"/>
+            <set_value name="$mk4PolicySigNow" exact="'DED=' + (if this.$mk4DedicatedServe? then this.$mk4DedicatedServe else false) + '|BSO=' + (if this.$mk4BuildStorageOnlyMode? then this.$mk4BuildStorageOnlyMode else false) + '|APS=' + (if this.$mk4AllowPlayerSuppliers? then this.$mk4AllowPlayerSuppliers else true) + '|AAS=' + (if this.$mk4AllowAiSuppliers? then this.$mk4AllowAiSuppliers else true) + '|RES=' + (if this.$mk4AllowResources? then this.$mk4AllowResources else true) + '|INT=' + (if this.$mk4AllowIntermediates? then this.$mk4AllowIntermediates else true) + '|TW=' + (if this.$mk4AllowTradewares? then this.$mk4AllowTradewares else true)"/>
+            <set_value name="$mk4PolicyChangedInCmd" exact="not this.$lastMk4PolicySig? or this.$lastMk4PolicySig != $mk4PolicySigNow"/>
+            <do_if value="$mk4PolicyChangedInCmd">
+              <set_value name="$mk4PolicyHome" exact="$_cmdHome"/>
+              <set_value name="$mk4PolicyHomeSector" exact="if $mk4PolicyHome? and $mk4PolicyHome.isclass.sector then $mk4PolicyHome else (if $mk4PolicyHome? and $mk4PolicyHome.sector? then @$mk4PolicyHome.sector else null)"/>
+              <set_value name="$mk4PolicyCacheEmpty" exact="true"/>
+              <do_if value="$mk4PolicyHomeSector? and $mk4PolicyHomeSector.exists and global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$mk4PolicyHomeSector}? and global.$GT_TradeCacheMK4.{$mk4PolicyHomeSector}.count gt 0">
+                <set_value name="$mk4PolicyCacheEmpty" exact="false"/>
+              </do_if>
+              <do_if value="$mk4PolicyCacheEmpty">
+                <set_value name="this.$mk4PolicyNeedsLiveSearch" exact="true"/>
+              </do_if>
+              <do_else>
+                <set_value name="this.$mk4PolicyNeedsLiveSearch" exact="false"/>
+                <!-- Policy widened but cache still valid — clear this ship from FailedShips only (do not nuke shared pool). -->
+                <do_all exact="global.$GT_TradeCacheMK4.{$mk4PolicyHomeSector}.count" counter="$polFsiCmd">
+                  <set_value name="$polEntryCmd" exact="global.$GT_TradeCacheMK4.{$mk4PolicyHomeSector}.{$polFsiCmd}"/>
+                  <do_if value="$polEntryCmd? and $polEntryCmd.$FailedShips? and $polEntryCmd.$FailedShips.count gt 0">
+                    <set_value name="$polNewFailedCmd" exact="[]"/>
+                    <do_all exact="$polEntryCmd.$FailedShips.count" counter="$polFsi2Cmd">
+                      <do_if value="$polEntryCmd.$FailedShips.{$polFsi2Cmd} != this.ship">
+                        <append_to_list name="$polNewFailedCmd" exact="$polEntryCmd.$FailedShips.{$polFsi2Cmd}"/>
+                      </do_if>
+                    </do_all>
+                    <set_value name="$polEntryCmd.$FailedShips" exact="$polNewFailedCmd"/>
+                  </do_if>
+                </do_all>
+              </do_else>
+            </do_if>
+            <set_value name="this.$lastMk4PolicySig" exact="$mk4PolicySigNow"/>
 
             <!-- Home base affects distance filtering/scoring; ensure both local and persisted value update -->
             <do_if value="$_cmdHome?">
@@ -2908,6 +3003,82 @@
       <!-- Initialize retry counter if not exists -->
       <do_if value="not this.$searchFailed?">
         <set_value name="this.$searchFailed" exact="0"/>
+      </do_if>
+
+      <!-- Sync MK4 supply policy from live order object (UI edits update defaultorder, not this.$ copies). -->
+      <set_value name="$mk4PolicyOrder" exact="null"/>
+      <do_if value="this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship and not this.ship.commander.isclass.station">
+        <set_value name="$mk4PolicyOrder" exact="this.ship.commander.defaultorder"/>
+      </do_if>
+      <do_else>
+        <set_value name="$mk4PolicyOrder" exact="if this.ship.defaultorder? then this.ship.defaultorder else null"/>
+      </do_else>
+      <do_if value="$mk4PolicyOrder? and @$mk4PolicyOrder.id == 'GalaxyTraderMK4Supply'">
+        <do_if value="$mk4PolicyOrder.$allowBuildstorage?">
+          <set_value name="this.$effectiveIgnoreBuildStorage" exact="not $mk4PolicyOrder.$allowBuildstorage"/>
+          <set_value name="$effectiveIgnoreBuildStorage" exact="this.$effectiveIgnoreBuildStorage"/>
+        </do_if>
+        <do_if value="$mk4PolicyOrder.$allowResources?">
+          <set_value name="this.$mk4AllowResources" exact="$mk4PolicyOrder.$allowResources"/>
+        </do_if>
+        <do_if value="$mk4PolicyOrder.$allowIntermediates?">
+          <set_value name="this.$mk4AllowIntermediates" exact="$mk4PolicyOrder.$allowIntermediates"/>
+        </do_if>
+        <do_if value="$mk4PolicyOrder.$allowTradewares?">
+          <set_value name="this.$mk4AllowTradewares" exact="$mk4PolicyOrder.$allowTradewares"/>
+        </do_if>
+        <do_if value="$mk4PolicyOrder.$buyFromPlayer?">
+          <set_value name="this.$mk4AllowPlayerSuppliers" exact="$mk4PolicyOrder.$buyFromPlayer"/>
+        </do_if>
+        <do_elseif value="$mk4PolicyOrder.$allowPlayerSuppliers?">
+          <set_value name="this.$mk4AllowPlayerSuppliers" exact="$mk4PolicyOrder.$allowPlayerSuppliers"/>
+        </do_elseif>
+        <do_if value="$mk4PolicyOrder.$buyFromFaction?">
+          <set_value name="this.$mk4AllowAiSuppliers" exact="$mk4PolicyOrder.$buyFromFaction"/>
+        </do_if>
+        <do_elseif value="$mk4PolicyOrder.$allowAiSuppliers?">
+          <set_value name="this.$mk4AllowAiSuppliers" exact="$mk4PolicyOrder.$allowAiSuppliers"/>
+        </do_elseif>
+        <do_if value="$mk4PolicyOrder.$serveHomeOnly?">
+          <set_value name="this.$mk4DedicatedServe" exact="$mk4PolicyOrder.$serveHomeOnly"/>
+        </do_if>
+        <do_elseif value="$mk4PolicyOrder.$dedicatedServe?">
+          <set_value name="this.$mk4DedicatedServe" exact="$mk4PolicyOrder.$dedicatedServe"/>
+        </do_elseif>
+        <set_value name="this.$mk4BuildStorageOnlyMode" exact="false"/>
+        <do_if value="not this.$effectiveIgnoreBuildStorage and not this.$mk4AllowResources and not this.$mk4AllowIntermediates and not this.$mk4AllowTradewares">
+          <set_value name="this.$mk4BuildStorageOnlyMode" exact="true"/>
+        </do_if>
+        <set_value name="$mk4PolicySigNow" exact="'DED=' + (if this.$mk4DedicatedServe? then this.$mk4DedicatedServe else false) + '|BSO=' + (if this.$mk4BuildStorageOnlyMode? then this.$mk4BuildStorageOnlyMode else false) + '|APS=' + (if this.$mk4AllowPlayerSuppliers? then this.$mk4AllowPlayerSuppliers else true) + '|AAS=' + (if this.$mk4AllowAiSuppliers? then this.$mk4AllowAiSuppliers else true) + '|RES=' + (if this.$mk4AllowResources? then this.$mk4AllowResources else true) + '|INT=' + (if this.$mk4AllowIntermediates? then this.$mk4AllowIntermediates else true) + '|TW=' + (if this.$mk4AllowTradewares? then this.$mk4AllowTradewares else true)"/>
+        <set_value name="$mk4PolicyChangedNow" exact="this.$lastMk4PolicySig? and this.$lastMk4PolicySig != $mk4PolicySigNow"/>
+        <do_if value="$mk4PolicyChangedNow">
+          <set_value name="$mk4PolicyHome" exact="if this.$effectiveHome? then this.$effectiveHome else (if this.ship.defaultorder? and this.ship.defaultorder.$home? then @this.ship.defaultorder.$home else this.ship.sector)"/>
+          <set_value name="$mk4PolicyHomeSector" exact="if $mk4PolicyHome? and $mk4PolicyHome.isclass.sector then $mk4PolicyHome else (if $mk4PolicyHome? and $mk4PolicyHome.sector? then @$mk4PolicyHome.sector else null)"/>
+          <set_value name="$mk4PolicyCacheEmpty" exact="true"/>
+          <do_if value="$mk4PolicyHomeSector? and $mk4PolicyHomeSector.exists and global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$mk4PolicyHomeSector}? and global.$GT_TradeCacheMK4.{$mk4PolicyHomeSector}.count gt 0">
+            <set_value name="$mk4PolicyCacheEmpty" exact="false"/>
+          </do_if>
+          <do_if value="$mk4PolicyCacheEmpty">
+            <set_value name="this.$mk4PolicyNeedsLiveSearch" exact="true"/>
+          </do_if>
+          <do_else>
+            <set_value name="this.$mk4PolicyNeedsLiveSearch" exact="false"/>
+            <!-- Policy widened but cache still valid — clear this ship from FailedShips on all home entries. -->
+            <do_all exact="global.$GT_TradeCacheMK4.{$mk4PolicyHomeSector}.count" counter="$polFsi">
+              <set_value name="$polEntry" exact="global.$GT_TradeCacheMK4.{$mk4PolicyHomeSector}.{$polFsi}"/>
+              <do_if value="$polEntry? and $polEntry.$FailedShips? and $polEntry.$FailedShips.count gt 0">
+                <set_value name="$polNewFailed" exact="[]"/>
+                <do_all exact="$polEntry.$FailedShips.count" counter="$polFsi2">
+                  <do_if value="$polEntry.$FailedShips.{$polFsi2} != this.ship">
+                    <append_to_list name="$polNewFailed" exact="$polEntry.$FailedShips.{$polFsi2}"/>
+                  </do_if>
+                </do_all>
+                <set_value name="$polEntry.$FailedShips" exact="$polNewFailed"/>
+              </do_if>
+            </do_all>
+          </do_else>
+        </do_if>
+        <set_value name="this.$lastMk4PolicySig" exact="$mk4PolicySigNow"/>
       </do_if>
 
       <!-- Handle pending scheduler grant before issuing a fresh request.
@@ -3161,8 +3332,22 @@
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': SENDING GT_Search_Request signal to MD at game time ' + player.age" chance="100"/>
           </do_if>
           <set_value name="$requestForceLiveSearch" exact="false"/>
+          <set_value name="$requestLiveSearchPriority" exact="false"/>
+          <do_if value="this.$mk4PolicyNeedsLiveSearch? and this.$mk4PolicyNeedsLiveSearch">
+            <set_value name="$mk4PolicyHomeBase" exact="if this.$effectiveHome? then this.$effectiveHome else (if this.ship.defaultorder and this.ship.defaultorder.$home? then @this.ship.defaultorder.$home else this.ship.sector)"/>
+            <set_value name="$mk4PolicyHomeSector" exact="if $mk4PolicyHomeBase? and $mk4PolicyHomeBase.isclass.sector then $mk4PolicyHomeBase else (if $mk4PolicyHomeBase? and $mk4PolicyHomeBase.sector? then @$mk4PolicyHomeBase.sector else null)"/>
+            <set_value name="$mk4PolicyCacheEmpty" exact="true"/>
+            <do_if value="$mk4PolicyHomeSector? and $mk4PolicyHomeSector.exists and global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$mk4PolicyHomeSector}? and global.$GT_TradeCacheMK4.{$mk4PolicyHomeSector}.count gt 0">
+              <set_value name="$mk4PolicyCacheEmpty" exact="false"/>
+            </do_if>
+            <do_if value="$mk4PolicyCacheEmpty">
+              <set_value name="$requestForceLiveSearch" exact="true"/>
+              <set_value name="$requestLiveSearchPriority" exact="true"/>
+            </do_if>
+          </do_if>
           <do_if value="this.$forceLiveAfterLiveReject? and this.$forceLiveAfterLiveReject">
             <set_value name="$requestForceLiveSearch" exact="true"/>
+            <set_value name="$requestLiveSearchPriority" exact="true"/>
             <set_value name="this.$forceLiveAfterLiveReject" exact="false"/>
           </do_if>
           <signal_objects object="player.galaxy" param="'GT_Search_Request'" param2="table[
@@ -3183,7 +3368,8 @@
             $IgnoreMK1Supply = if this.$effectiveIgnoreMK1Supply? then this.$effectiveIgnoreMK1Supply else true,
             $SearchPool = 'mk4_supply',
             $SearchDepth = if this.$effectiveSearchDepth? then this.$effectiveSearchDepth else 30,
-            $ForceLiveSearch = $requestForceLiveSearch
+            $ForceLiveSearch = $requestForceLiveSearch,
+            $LiveSearchPriority = $requestLiveSearchPriority
           ]"/>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GT_Search_Request signal SENT, now at game time ' + player.age" chance="100"/>
@@ -3306,7 +3492,57 @@
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <debug_text text="'[GT-AI] ' + this.ship.idcode + ': INTERRUPT FIRED: GT_TradeSearch_Reset received at game time ' + player.age + ' - retrying request immediately (no backoff)'" chance="100"/>
               </do_if>
-              <resume label="main_loop"/>
+              <!-- Stay in scheduler wait when already queued/active — avoid duplicate cache requests that lose mk4live queue position. -->
+              <set_value name="$resetStillScheduled" exact="false"/>
+              <do_if value="global.$GT_SearchSemaphore?">
+                <do_if value="global.$GT_SearchSemaphore.$CacheQueued? and global.$GT_SearchSemaphore.$CacheQueued.{this.ship}?">
+                  <set_value name="$resetStillScheduled" exact="true"/>
+                </do_if>
+                <do_if value="not $resetStillScheduled and global.$GT_SearchSemaphore.$LiveQueued? and global.$GT_SearchSemaphore.$LiveQueued.{this.ship}?">
+                  <set_value name="$resetStillScheduled" exact="true"/>
+                </do_if>
+                <do_if value="not $resetStillScheduled and global.$GT_SearchSemaphore.$MK4LiveQueued? and global.$GT_SearchSemaphore.$MK4LiveQueued.{this.ship}?">
+                  <set_value name="$resetStillScheduled" exact="true"/>
+                </do_if>
+                <do_if value="not $resetStillScheduled and global.$GT_SearchSemaphore.$ClearanceQueued? and global.$GT_SearchSemaphore.$ClearanceQueued.{this.ship}?">
+                  <set_value name="$resetStillScheduled" exact="true"/>
+                </do_if>
+                <do_if value="not $resetStillScheduled and global.$GT_SearchSemaphore.$CacheActiveShips? and global.$GT_SearchSemaphore.$CacheActiveShips.{this.ship}?">
+                  <set_value name="$resetStillScheduled" exact="true"/>
+                </do_if>
+                <do_if value="not $resetStillScheduled and global.$GT_SearchSemaphore.$LiveActiveShips? and global.$GT_SearchSemaphore.$LiveActiveShips.{this.ship}?">
+                  <set_value name="$resetStillScheduled" exact="true"/>
+                </do_if>
+                <do_if value="not $resetStillScheduled and global.$GT_SearchSemaphore.$MK4LiveActiveShips? and global.$GT_SearchSemaphore.$MK4LiveActiveShips.{this.ship}?">
+                  <set_value name="$resetStillScheduled" exact="true"/>
+                </do_if>
+                <do_if value="not $resetStillScheduled and global.$GT_SearchSemaphore.$LiveWaiterWakePending? and global.$GT_SearchSemaphore.$LiveWaiterWakePending.{this.ship}?">
+                  <set_value name="$resetStillScheduled" exact="true"/>
+                </do_if>
+                <do_if value="not $resetStillScheduled and global.$GT_SearchSemaphore.$MK4LiveWaitersByHome? and global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.keys.count gt 0">
+                  <set_value name="$resetWaiterHomeKeys" exact="global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.keys.list"/>
+                  <do_all exact="$resetWaiterHomeKeys.count" counter="$rwhi">
+                    <set_value name="$rwhHome" exact="$resetWaiterHomeKeys.{$rwhi}"/>
+                    <do_if value="$rwhHome? and global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.{$rwhHome}?">
+                      <do_all exact="global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.{$rwhHome}.count" counter="$rwwi">
+                        <do_if value="@global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.{$rwhHome}.{$rwwi} == this.ship">
+                          <set_value name="$resetStillScheduled" exact="true"/>
+                          <break/>
+                        </do_if>
+                      </do_all>
+                    </do_if>
+                    <do_if value="$resetStillScheduled">
+                      <break/>
+                    </do_if>
+                  </do_all>
+                </do_if>
+              </do_if>
+              <do_if value="$resetStillScheduled">
+                <resume label="wait_for_response_continue"/>
+              </do_if>
+              <do_else>
+                <resume label="main_loop"/>
+              </do_else>
             </do_elseif>
             <do_elseif value="event.param == 'GT_No_Trade_Found'">
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -3437,29 +3673,76 @@
         <set_value name="$searchMode" exact="if $searchParams.$SearchMode? then @$searchParams.$SearchMode else 'buy_and_sell'"/>
         <set_value name="$forceLiveSearch" exact="if $searchParams.$ForceLiveSearch? then @$searchParams.$ForceLiveSearch else false"/>
         <set_value name="$searchPhase" exact="if $searchParams.$Phase? then @$searchParams.$Phase else 'live'"/>
-        <set_value name="$skipCacheRead" exact="if $searchParams.$CachePhaseMiss? and $searchParams.$CachePhaseMiss then true else false"/>
-        <!-- Explicit live/mk4live phase from scheduler must never re-enter cache path. -->
+        <set_value name="$skipCacheRead" exact="false"/>
+        <set_value name="$mk4HomeCacheCount" exact="0"/>
+        <do_if value="$searchHomeSector? and $searchHomeSector.exists and global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$searchHomeSector}?">
+          <set_value name="$mk4HomeCacheCount" exact="@global.$GT_TradeCacheMK4.{$searchHomeSector}.count"/>
+        </do_if>
+        <!-- Only skip cache re-read when prior cache phase missed AND pool is still empty. -->
+        <do_if value="$searchParams.$CachePhaseMiss? and $searchParams.$CachePhaseMiss and $mk4HomeCacheCount == 0">
+          <set_value name="$skipCacheRead" exact="true"/>
+        </do_if>
+        <!-- mk4live/live slot: after cache phase miss, force live refresh instead of retrying a dead pool. -->
         <do_if value="$searchPhase == 'live' or $searchPhase == 'mk4live'">
-          <set_value name="$forceLiveSearch" exact="true"/>
+          <do_if value="($searchParams.$ForceLiveSearch? and $searchParams.$ForceLiveSearch) or $mk4HomeCacheCount == 0">
+            <set_value name="$forceLiveSearch" exact="true"/>
+          </do_if>
+          <do_elseif value="$searchParams.$CachePhaseMiss? and $searchParams.$CachePhaseMiss">
+            <set_value name="$forceLiveSearch" exact="true"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$forceLiveSearch" exact="false"/>
+          </do_else>
         </do_if>
 
-        <!-- Derive minROI/minAbsoluteProfit from pilot skill level -->
+        <!-- MK4 supply: score + price profile gate trades — no pilot ROI or profit floor. -->
         <set_value name="$searchMinROI" exact="0"/>
         <set_value name="$searchMinAbsoluteProfit" exact="0"/>
-        <do_if value="this.ship.pilot? and global.$GT_Pilots.{this.ship.pilot}?">
-          <set_value name="$pilotLevel" exact="@global.$GT_Pilots.{this.ship.pilot}.$Level"/>
-          <!-- Higher skill pilots demand higher ROI -->
-          <do_if value="$pilotLevel ge 5">
-            <set_value name="$searchMinROI" exact="($pilotLevel - 4) * 2"/>
-          </do_if>
-        </do_if>
-        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Trading? and global.$GT_GlobalSettings.$Trading.$MinAbsoluteProfit?">
-          <set_value name="$searchMinAbsoluteProfit" exact="@global.$GT_GlobalSettings.$Trading.$MinAbsoluteProfit"/>
-        </do_if>
 
         <!-- Priority wares change detection:
              only clear cache when an existing signature changed (real order-setup delta).
              First-time baseline initialization must not invalidate cache. -->
+        <!-- Belt-and-suspenders: re-sync MK4 policy from live order before cache/live (diag reads defaultorder; this.$ can lag UI edits). -->
+        <set_value name="$mk4PolicyOrder" exact="null"/>
+        <do_if value="this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship and not this.ship.commander.isclass.station">
+          <set_value name="$mk4PolicyOrder" exact="this.ship.commander.defaultorder"/>
+        </do_if>
+        <do_else>
+          <set_value name="$mk4PolicyOrder" exact="if this.ship.defaultorder? then this.ship.defaultorder else null"/>
+        </do_else>
+        <do_if value="$mk4PolicyOrder? and @$mk4PolicyOrder.id == 'GalaxyTraderMK4Supply'">
+          <do_if value="$mk4PolicyOrder.$allowBuildstorage?">
+            <set_value name="this.$effectiveIgnoreBuildStorage" exact="not $mk4PolicyOrder.$allowBuildstorage"/>
+            <set_value name="$effectiveIgnoreBuildStorage" exact="this.$effectiveIgnoreBuildStorage"/>
+          </do_if>
+          <do_if value="$mk4PolicyOrder.$allowResources?">
+            <set_value name="this.$mk4AllowResources" exact="$mk4PolicyOrder.$allowResources"/>
+          </do_if>
+          <do_if value="$mk4PolicyOrder.$allowIntermediates?">
+            <set_value name="this.$mk4AllowIntermediates" exact="$mk4PolicyOrder.$allowIntermediates"/>
+          </do_if>
+          <do_if value="$mk4PolicyOrder.$allowTradewares?">
+            <set_value name="this.$mk4AllowTradewares" exact="$mk4PolicyOrder.$allowTradewares"/>
+          </do_if>
+          <do_if value="$mk4PolicyOrder.$buyFromPlayer?">
+            <set_value name="this.$mk4AllowPlayerSuppliers" exact="$mk4PolicyOrder.$buyFromPlayer"/>
+          </do_if>
+          <do_elseif value="$mk4PolicyOrder.$allowPlayerSuppliers?">
+            <set_value name="this.$mk4AllowPlayerSuppliers" exact="$mk4PolicyOrder.$allowPlayerSuppliers"/>
+          </do_elseif>
+          <do_if value="$mk4PolicyOrder.$buyFromFaction?">
+            <set_value name="this.$mk4AllowAiSuppliers" exact="$mk4PolicyOrder.$buyFromFaction"/>
+          </do_if>
+          <do_elseif value="$mk4PolicyOrder.$allowAiSuppliers?">
+            <set_value name="this.$mk4AllowAiSuppliers" exact="$mk4PolicyOrder.$allowAiSuppliers"/>
+          </do_elseif>
+          <do_if value="$mk4PolicyOrder.$serveHomeOnly?">
+            <set_value name="this.$mk4DedicatedServe" exact="$mk4PolicyOrder.$serveHomeOnly"/>
+          </do_if>
+          <do_elseif value="$mk4PolicyOrder.$dedicatedServe?">
+            <set_value name="this.$mk4DedicatedServe" exact="$mk4PolicyOrder.$dedicatedServe"/>
+          </do_elseif>
+        </do_if>
         <set_value name="$pwSig" exact="'0|' + (if $effectivePriorityScoreMultiplier? then $effectivePriorityScoreMultiplier else 125)"/>
         <do_if value="$effectivePriorityWares? and typeof $effectivePriorityWares == datatype.list and $effectivePriorityWares.count gt 0">
           <set_value name="$pwSig" exact="'' + $effectivePriorityWares.count + '|' + (if $effectivePriorityScoreMultiplier? then $effectivePriorityScoreMultiplier else 125) + '|'"/>
@@ -3469,12 +3752,17 @@
           </do_all>
         </do_if>
         <set_value name="$priorityWaresChanged" exact="this.$lastPriorityWaresSig? and this.$lastPriorityWaresSig != $pwSig"/>
+        <!-- Re-derive implicit build-storage-only mode before each search (toggle combo may have changed). -->
+        <set_value name="this.$mk4BuildStorageOnlyMode" exact="false"/>
+        <do_if value="not this.$effectiveIgnoreBuildStorage and not this.$mk4AllowResources and not this.$mk4AllowIntermediates and not this.$mk4AllowTradewares">
+          <set_value name="this.$mk4BuildStorageOnlyMode" exact="true"/>
+        </do_if>
         <!-- Also invalidate cache when MK4 policy knobs change, so cache/live behavior stays consistent. -->
-        <set_value name="$mk4PolicySig" exact="'DED=' + (if this.$mk4DedicatedServe? then this.$mk4DedicatedServe else false) + '|APS=' + (if this.$mk4AllowPlayerSuppliers? then this.$mk4AllowPlayerSuppliers else true) + '|AAS=' + (if this.$mk4AllowAiSuppliers? then this.$mk4AllowAiSuppliers else true) + '|RES=' + (if this.$mk4AllowResources? then this.$mk4AllowResources else true) + '|INT=' + (if this.$mk4AllowIntermediates? then this.$mk4AllowIntermediates else true) + '|TW=' + (if this.$mk4AllowTradewares? then this.$mk4AllowTradewares else true)"/>
+        <set_value name="$mk4PolicySig" exact="'DED=' + (if this.$mk4DedicatedServe? then this.$mk4DedicatedServe else false) + '|BSO=' + (if this.$mk4BuildStorageOnlyMode? then this.$mk4BuildStorageOnlyMode else false) + '|APS=' + (if this.$mk4AllowPlayerSuppliers? then this.$mk4AllowPlayerSuppliers else true) + '|AAS=' + (if this.$mk4AllowAiSuppliers? then this.$mk4AllowAiSuppliers else true) + '|RES=' + (if this.$mk4AllowResources? then this.$mk4AllowResources else true) + '|INT=' + (if this.$mk4AllowIntermediates? then this.$mk4AllowIntermediates else true) + '|TW=' + (if this.$mk4AllowTradewares? then this.$mk4AllowTradewares else true)"/>
         <set_value name="$mk4PolicyChanged" exact="this.$lastMk4PolicySig? and this.$lastMk4PolicySig != $mk4PolicySig"/>
-        <set_value name="$invalidateSearchCache" exact="$priorityWaresChanged or $mk4PolicyChanged"/>
-        <do_if value="$invalidateSearchCache and $searchHomeSector? and $searchHomeSector.exists">
-          <!-- Clear MK4 cache for this home sector only (MK3 cache is unaffected). -->
+        <set_value name="$invalidateSearchCache" exact="$priorityWaresChanged"/>
+        <do_if value="$priorityWaresChanged and $searchHomeSector? and $searchHomeSector.exists">
+          <!-- Priority-ware signature changed: home cache may no longer match basket — clear MK4 pool only. -->
           <do_if value="global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$searchHomeSector}?">
             <remove_value name="global.$GT_TradeCacheMK4.{$searchHomeSector}"/>
             <do_if value="global.$GT_TradeCacheMK4ByWare? and global.$GT_TradeCacheMK4ByWare.{$searchHomeSector}?">
@@ -3484,10 +3772,33 @@
               <remove_value name="global.$GT_TradeCacheMK4MaxDistance.{$searchHomeSector}"/>
             </do_if>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <set_value name="$cacheClearReason" exact="if $priorityWaresChanged and $mk4PolicyChanged then 'priority wares + MK4 policy changed' else (if $priorityWaresChanged then 'priority wares changed' else 'MK4 policy changed')"/>
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ' + $cacheClearReason + ' - cleared cache for home sector ' + (if $searchHomeSector.knownname? then @$searchHomeSector.knownname else '?') + ' (next search will run live)'" chance="100"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': priority wares changed - cleared cache for home sector ' + (if $searchHomeSector.knownname? then @$searchHomeSector.knownname else '?') + ' (next search will run live)'" chance="100"/>
             </do_if>
           </do_if>
+        </do_if>
+        <do_if value="$mk4PolicyChanged and $searchHomeSector? and $searchHomeSector.exists">
+          <set_value name="$mk4PolicyCacheEmpty" exact="true"/>
+          <do_if value="global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$searchHomeSector}? and global.$GT_TradeCacheMK4.{$searchHomeSector}.count gt 0">
+            <set_value name="$mk4PolicyCacheEmpty" exact="false"/>
+          </do_if>
+          <do_if value="$mk4PolicyCacheEmpty">
+            <set_value name="this.$mk4PolicyNeedsLiveSearch" exact="true"/>
+          </do_if>
+          <do_else>
+            <set_value name="this.$mk4PolicyNeedsLiveSearch" exact="false"/>
+            <do_all exact="global.$GT_TradeCacheMK4.{$searchHomeSector}.count" counter="$polFsiPipe">
+              <set_value name="$polEntryPipe" exact="global.$GT_TradeCacheMK4.{$searchHomeSector}.{$polFsiPipe}"/>
+              <do_if value="$polEntryPipe? and $polEntryPipe.$FailedShips? and $polEntryPipe.$FailedShips.count gt 0">
+                <set_value name="$polNewFailedPipe" exact="[]"/>
+                <do_all exact="$polEntryPipe.$FailedShips.count" counter="$polFsi2Pipe">
+                  <do_if value="$polEntryPipe.$FailedShips.{$polFsi2Pipe} != this.ship">
+                    <append_to_list name="$polNewFailedPipe" exact="$polEntryPipe.$FailedShips.{$polFsi2Pipe}"/>
+                  </do_if>
+                </do_all>
+                <set_value name="$polEntryPipe.$FailedShips" exact="$polNewFailedPipe"/>
+              </do_if>
+            </do_all>
+          </do_else>
         </do_if>
         <!-- Always update baselines after evaluation (prevents false "changed" on first run/restart). -->
         <set_value name="this.$lastPriorityWaresSig" exact="$pwSig"/>
@@ -3527,6 +3838,7 @@
               <param name="mk4AllowResources" value="if this.$mk4AllowResources? then this.$mk4AllowResources else true"/>
               <param name="mk4AllowIntermediates" value="if this.$mk4AllowIntermediates? then this.$mk4AllowIntermediates else true"/>
               <param name="mk4AllowTradewares" value="if this.$mk4AllowTradewares? then this.$mk4AllowTradewares else true"/>
+              <param name="mk4BuildStorageOnlyMode" value="if this.$mk4BuildStorageOnlyMode? then this.$mk4BuildStorageOnlyMode else false"/>
             </run_script>
             <do_if value="$cacheFoundOnlyResult? and $cacheFoundOnlyResult.$Found?">
               <set_value name="$cacheFoundOnly" exact="@$cacheFoundOnlyResult.$Found"/>
@@ -3534,11 +3846,31 @@
             <do_if value="$cacheFoundOnly and $cacheFoundOnlyResult? and $cacheFoundOnlyResult.$TradeList?">
               <set_value name="$cacheFoundOnlyTradeList" exact="@$cacheFoundOnlyResult.$TradeList"/>
             </do_if>
+            <do_if value="$cacheFoundOnly and $cacheFoundOnlyTradeList? and $cacheFoundOnlyTradeList.count gt 0">
+              <set_value name="this.$mk4PolicyNeedsLiveSearch" exact="false"/>
+            </do_if>
+            <!-- Pool has entries but this ship got zero: clear stale per-ship failure flags. -->
+            <do_if value="not $cacheFoundOnly and $mk4HomeCacheCount gt 0 and $searchHomeSector? and $searchHomeSector.exists and global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$searchHomeSector}?">
+              <do_all exact="global.$GT_TradeCacheMK4.{$searchHomeSector}.count" counter="$cacheMissFsi">
+                <set_value name="$cacheMissEntry" exact="global.$GT_TradeCacheMK4.{$searchHomeSector}.{$cacheMissFsi}"/>
+                <do_if value="$cacheMissEntry? and $cacheMissEntry.$FailedShips? and $cacheMissEntry.$FailedShips.count gt 0">
+                  <set_value name="$cacheMissNewFailed" exact="[]"/>
+                  <do_all exact="$cacheMissEntry.$FailedShips.count" counter="$cacheMissFsi2">
+                    <do_if value="$cacheMissEntry.$FailedShips.{$cacheMissFsi2} != this.ship">
+                      <append_to_list name="$cacheMissNewFailed" exact="$cacheMissEntry.$FailedShips.{$cacheMissFsi2}"/>
+                    </do_if>
+                  </do_all>
+                  <set_value name="$cacheMissEntry.$FailedShips" exact="$cacheMissNewFailed"/>
+                </do_if>
+              </do_all>
+            </do_if>
           </do_if>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <set_value name="$cachePhaseCount" exact="if $cacheFoundOnlyTradeList? then $cacheFoundOnlyTradeList.count else 0"/>
             <set_value name="$cachePhaseOutcome" exact="if $cachePhaseSkipped then 'SKIP' else (if $cacheFoundOnly then 'HIT' else 'MISS')"/>
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache phase ' + $cachePhaseOutcome + ' (mode=' + $searchMode + ', trades=' + $cachePhaseCount + ', home=' + (if $searchHomeSector? and $searchHomeSector.exists then $searchHomeSector.knownname else 'null') + ')'" chance="100"/>
+            <set_value name="$cachePhasePoolCount" exact="if $cacheFoundOnlyResult? and $cacheFoundOnlyResult.$PoolSizeAfter? then @$cacheFoundOnlyResult.$PoolSizeAfter else (if $mk4HomeCacheCount? then $mk4HomeCacheCount else 0)"/>
+            <set_value name="$cachePhasePurged" exact="if $cacheFoundOnlyResult? and $cacheFoundOnlyResult.$PurgedStale? then @$cacheFoundOnlyResult.$PurgedStale else 0"/>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache phase ' + $cachePhaseOutcome + ' (mode=' + $searchMode + ', trades=' + $cachePhaseCount + ', pool=' + $cachePhasePoolCount + (if $cachePhasePurged gt 0 then (', purged=' + $cachePhasePurged) else '') + ', home=' + (if $searchHomeSector? and $searchHomeSector.exists then $searchHomeSector.knownname else 'null') + ')'" chance="100"/>
           </do_if>
           <signal_objects object="player.galaxy" param="'GT_Search_Done'" param2="table[
             $Ship = this.ship,
@@ -3584,6 +3916,7 @@
             <param name="mk4AllowResources" value="if this.$mk4AllowResources? then this.$mk4AllowResources else true"/>
             <param name="mk4AllowIntermediates" value="if this.$mk4AllowIntermediates? then this.$mk4AllowIntermediates else true"/>
             <param name="mk4AllowTradewares" value="if this.$mk4AllowTradewares? then this.$mk4AllowTradewares else true"/>
+            <param name="mk4BuildStorageOnlyMode" value="if this.$mk4BuildStorageOnlyMode? then this.$mk4BuildStorageOnlyMode else false"/>
           </run_script>
         </do_if>
         <!-- SAVEGAME GUARD: If save/load interrupted the run_script above, all locals are lost.
@@ -3601,6 +3934,9 @@
           <set_value name="$pipelineFound" exact="true"/>
           <set_value name="$pipelineSearchMethod" exact="'cache'"/>
           <set_value name="$pipelineTradeList" exact="if $cacheSearchResult.$TradeList? then @$cacheSearchResult.$TradeList else []"/>
+          <do_if value="$pipelineTradeList? and $pipelineTradeList.count gt 0">
+            <set_value name="this.$mk4PolicyNeedsLiveSearch" exact="false"/>
+          </do_if>
         </do_if>
         <do_else>
           <!-- 2) Pathfinding -->
@@ -3642,6 +3978,9 @@
             <param name="buyPriceMin" value="$searchBuyPriceMin"/>
             <param name="priorityWares" value="if $effectivePriorityWares? then $effectivePriorityWares else []"/>
             <param name="demandLedSupplierScan" value="if $searchMode? and $searchMode == 'buy_and_sell' then true else false"/>
+            <param name="mk4BuildStorageOnlyMode" value="if this.$mk4BuildStorageOnlyMode? then this.$mk4BuildStorageOnlyMode else false"/>
+            <param name="mk4AnchorHome" value="if this.$effectiveHome? then this.$effectiveHome else $searchHome"/>
+            <param name="maxDistanceSell" value="$searchMaxSell"/>
             <param name="debugchance" value="@this.$debugchance"/>
           </run_script>
           <!-- SAVEGAME GUARD -->
@@ -3685,7 +4024,7 @@
                 <set_value name="$mk4SecSample" exact="$mk4SecSample + (if $mk4si gt 1 then ',' else '') + (if $mk4s.knownname? then @$mk4s.knownname else '?')"/>
               </do_all>
             </do_if>
-            <debug_text text="'[GT-MK4-Supply] ' + this.ship.idcode + ': CONDITIONS homeSector=' + $mk4HomeLabel + ' effectiveHome=' + $mk4EffHomeLabel + ' priceProfile=' + $mk4PriceProfile + ' SellPriceMax(rel)=' + $searchSellPriceMax + ' BuyPriceMin(rel)=' + $searchBuyPriceMin + ' ignoreTradeRules=' + $searchIgnoreTradeRules + ' allowIllegal=' + $searchAllowIllegal + ' enforceRouteIllegal=' + $searchEnforceRouteIllegalLegality + ' minROI=' + $searchMinROI + ' minAbsProfit=' + $searchMinAbsoluteProfit + ' maxJumpBuy=' + $searchMaxBuy + ' maxJumpCoverage(delivery)=' + $searchMaxSell + ' pathRadiusMax=' + $searchRadiusMax + ' pathIsolated=' + $mk4PathIso + ' searchSectors=' + $mk4BSn + '/' + $mk4SSn + ' sampleSectors=[' + $mk4SecSample + ']'" chance="100"/>
+            <debug_text text="'[GT-MK4-Supply] ' + this.ship.idcode + ': CONDITIONS homeSector=' + $mk4HomeLabel + ' effectiveHome=' + $mk4EffHomeLabel + ' priceProfile=' + $mk4PriceProfile + ' SellPriceMax(rel)=' + $searchSellPriceMax + ' BuyPriceMin(rel)=' + $searchBuyPriceMin + ' ignoreTradeRules=' + $searchIgnoreTradeRules + ' allowIllegal=' + $searchAllowIllegal + ' enforceRouteIllegal=' + $searchEnforceRouteIllegalLegality + ' maxJumpBuy=' + $searchMaxBuy + ' maxJumpCoverage(delivery)=' + $searchMaxSell + ' pathRadiusMax=' + $searchRadiusMax + ' pathIsolated=' + $mk4PathIso + ' searchSectors=' + $mk4BSn + '/' + $mk4SSn + ' sampleSectors=[' + $mk4SecSample + ']'" chance="100"/>
             <debug_text text="'[GT-MK4-Supply] ' + this.ship.idcode + ': WARES autowares=' + $mk4AutoW + ' manualBasketCount=' + $mk4BasketN + ' manualBasket=[' + $mk4BasketStr + '] priorityWares=' + (if $effectivePriorityWares? and $effectivePriorityWares.count? then $effectivePriorityWares.count else 0)" chance="100"/>
             <set_value name="$mk4PlSup" exact="if this.$mk4AllowPlayerSuppliers? then this.$mk4AllowPlayerSuppliers else true"/>
             <set_value name="$mk4AiSup" exact="if this.$mk4AllowAiSuppliers? then this.$mk4AllowAiSuppliers else true"/>
@@ -3693,8 +4032,9 @@
             <set_value name="$mk4Res" exact="if this.$mk4AllowResources? then this.$mk4AllowResources else true"/>
             <set_value name="$mk4Int" exact="if this.$mk4AllowIntermediates? then this.$mk4AllowIntermediates else true"/>
             <set_value name="$mk4Tw" exact="if this.$mk4AllowTradewares? then this.$mk4AllowTradewares else true"/>
+            <set_value name="$mk4Bso" exact="if this.$mk4BuildStorageOnlyMode? then this.$mk4BuildStorageOnlyMode else false"/>
             <set_value name="$mk4Pbm" exact="if this.$mk4PlayerBuyMod? then this.$mk4PlayerBuyMod else 0"/>
-            <debug_text text="'[GT-MK4-Supply] ' + this.ship.idcode + ': MK4FILTERS customerMustBePlayer=true allowPlayerSuppliers=' + $mk4PlSup + ' allowAiSuppliers=' + $mk4AiSup + ' dedicatedServe=' + $mk4Ded + ' allowRes/int/tw=' + $mk4Res + '/' + $mk4Int + '/' + $mk4Tw + ' foreignBuyModPct=' + $mk4Pbm" chance="100"/>
+            <debug_text text="'[GT-MK4-Supply] ' + this.ship.idcode + ': MK4FILTERS customerMustBePlayer=true allowPlayerSuppliers=' + $mk4PlSup + ' allowAiSuppliers=' + $mk4AiSup + ' dedicatedServe=' + $mk4Ded + ' buildStorageOnly=' + $mk4Bso + ' allowRes/int/tw=' + $mk4Res + '/' + $mk4Int + '/' + $mk4Tw + ' foreignBuyModPct=' + $mk4Pbm" chance="100"/>
             <set_value name="$mk4SellC" exact="if $liveResult? and $liveResult.$SellOfferCount? then @$liveResult.$SellOfferCount else (if $liveResult? and $liveResult.$SellOffers? then $liveResult.$SellOffers.count else 0)"/>
             <set_value name="$mk4BuyC" exact="if $liveResult? and $liveResult.$BuyOfferCount? then @$liveResult.$BuyOfferCount else (if $liveResult? and $liveResult.$BuyOffers? then $liveResult.$BuyOffers.count else 0)"/>
             <set_value name="$mk4SWk" exact="if $liveResult? and $liveResult.$SellWaresFound? then @$liveResult.$SellWaresFound else 0"/>
@@ -3715,7 +4055,17 @@
                 <do_elseif value="$mk4bo.owner?">
                   <set_value name="$mk4boCustomer" exact="@$mk4bo.owner"/>
                 </do_elseif>
-                <do_if value="not $mk4boCustomer? or not @$mk4boCustomer.isplayerowned">
+                <do_if value="not $mk4boCustomer? or not @$mk4boCustomer.exists">
+                  <continue/>
+                </do_if>
+                <set_value name="$mk4boPlayerOk" exact="false"/>
+                <do_if value="@$mk4boCustomer.isplayerowned">
+                  <set_value name="$mk4boPlayerOk" exact="true"/>
+                </do_if>
+                <do_elseif value="$mk4boCustomer.isclass.buildstorage and $mk4boCustomer.base? and @$mk4boCustomer.base.isplayerowned">
+                  <set_value name="$mk4boPlayerOk" exact="true"/>
+                </do_elseif>
+                <do_if value="not $mk4boPlayerOk">
                   <continue/>
                 </do_if>
                 <set_value name="$mk4PlayerBuyTotal" operation="add"/>
@@ -3866,6 +4216,7 @@
               <param name="mk4AllowResources" value="if this.$mk4AllowResources? then this.$mk4AllowResources else true"/>
               <param name="mk4AllowIntermediates" value="if this.$mk4AllowIntermediates? then this.$mk4AllowIntermediates else true"/>
               <param name="mk4AllowTradewares" value="if this.$mk4AllowTradewares? then this.$mk4AllowTradewares else true"/>
+              <param name="mk4BuildStorageOnlyMode" value="if this.$mk4BuildStorageOnlyMode? then this.$mk4BuildStorageOnlyMode else false"/>
               <param name="mk4PlayerBuyModPct" value="if this.$mk4PlayerBuyMod? then this.$mk4PlayerBuyMod else 0"/>
             </run_script>
             <!-- SAVEGAME GUARD -->
@@ -3890,9 +4241,10 @@
               <set_value name="$mk4MrjType" exact="if $matchResult? and $matchResult.$TradesRejectedMk4TypePolicy? then @$matchResult.$TradesRejectedMk4TypePolicy else -1"/>
               <set_value name="$mk4MrjDem" exact="if $matchResult? and $matchResult.$TradesRejectedMk4DemandGate? then @$matchResult.$TradesRejectedMk4DemandGate else -1"/>
               <set_value name="$mk4MrjPc" exact="if $matchResult? and $matchResult.$TradesRejectedMk4PriceCap? then @$matchResult.$TradesRejectedMk4PriceCap else -1"/>
+              <set_value name="$mk4MrjBso" exact="if $matchResult? and $matchResult.$TradesRejectedMk4BuildStorageOnly? then @$matchResult.$TradesRejectedMk4BuildStorageOnly else -1"/>
               <set_value name="$mk4MrjDist" exact="if $matchResult? and $matchResult.$TradesRejectedDistance? then @$matchResult.$TradesRejectedDistance else -1"/>
               <set_value name="$mk4Mfound" exact="if $matchResult? and $matchResult.$Found? then @$matchResult.$Found else false"/>
-              <debug_text text="'[GT-MK4-Supply] ' + this.ship.idcode + ': TRADEMATCH supply-mode rawListCount=' + $matchTradeList.count + ' bestFound=' + $mk4Mfound + ' pairsEvaluated=' + $mk4Mev + ' pairsRejected=' + $mk4Mrj + ' routeIllegalRejected=' + $mk4Mri + ' rej(customer/supplier/type/demand/pricecap/dist)=' + $mk4MrjCust + '/' + $mk4MrjSupp + '/' + $mk4MrjType + '/' + $mk4MrjDem + '/' + $mk4MrjPc + '/' + $mk4MrjDist" chance="100"/>
+              <debug_text text="'[GT-MK4-Supply] ' + this.ship.idcode + ': TRADEMATCH supply-mode rawListCount=' + $matchTradeList.count + ' bestFound=' + $mk4Mfound + ' pairsEvaluated=' + $mk4Mev + ' pairsRejected=' + $mk4Mrj + ' routeIllegalRejected=' + $mk4Mri + ' rej(customer/supplier/type/demand/pricecap/bso/dist)=' + $mk4MrjCust + '/' + $mk4MrjSupp + '/' + $mk4MrjType + '/' + $mk4MrjDem + '/' + $mk4MrjPc + '/' + $mk4MrjBso + '/' + $mk4MrjDist" chance="100"/>
             </do_if>
             <run_script name="'lib.gt.score.trades'" result="$scoreResult">
               <param name="tradeList" value="$matchTradeList"/>
@@ -3932,10 +4284,10 @@
           <set_value name="$pipelineSearchMethod" exact="'live'"/>
         </do_if>
 
-        <!-- serveHomeOnly strict scope:
-             - Home is station  => home station + its build storage (vanilla: station.buildstorage / buildstorage.base)
-             - Home is sector   => delivery must be inside that sector -->
-        <do_if value="$pipelineFound and $pipelineTradeList.count gt 0 and (if this.$mk4DedicatedServe? then this.$mk4DedicatedServe else false)">
+        <!-- serveHomeOnly / build-storage-only home-anchor scope:
+             - buildStorageOnly => player BS within jumpDistanceCoverage from home
+             - serveHomeOnly (non-BSO) => home station + its BS, or home sector -->
+        <do_if value="$pipelineFound and $pipelineTradeList.count gt 0 and ((if this.$mk4DedicatedServe? then this.$mk4DedicatedServe else false) or (if this.$mk4BuildStorageOnlyMode? then this.$mk4BuildStorageOnlyMode else false))">
           <set_value name="$serveHomeAnchor" exact="if this.$effectiveHome? then this.$effectiveHome else $searchHome"/>
           <set_value name="$serveHomeSector" exact="if $serveHomeAnchor? and $serveHomeAnchor.isclass.sector then $serveHomeAnchor else (if $serveHomeAnchor? and $serveHomeAnchor.sector? then @$serveHomeAnchor.sector else $searchHomeSector)"/>
           <set_value name="$serveHomeBeforeCount" exact="$pipelineTradeList.count"/>
@@ -3952,7 +4304,30 @@
                 <set_value name="$shrDeliveryStation" exact="@$shrTrade.$SellOffer.owner"/>
               </do_elseif>
             </do_if>
-            <do_if value="$serveHomeAnchor? and $serveHomeAnchor.isclass.station">
+            <do_if value="if this.$mk4BuildStorageOnlyMode? then this.$mk4BuildStorageOnlyMode else false">
+              <set_value name="$shrSupplierStation" exact="if $shrTrade.$BuyStation? then $shrTrade.$BuyStation else null"/>
+              <do_if value="not $shrSupplierStation? and $shrTrade.$BuyOffer?">
+                <do_if value="$shrTrade.$BuyOffer.seller? and @$shrTrade.$BuyOffer.seller.exists">
+                  <set_value name="$shrSupplierStation" exact="@$shrTrade.$BuyOffer.seller"/>
+                </do_if>
+                <do_elseif value="$shrTrade.$BuyOffer.owner?">
+                  <set_value name="$shrSupplierStation" exact="@$shrTrade.$BuyOffer.owner"/>
+                </do_elseif>
+              </do_if>
+              <do_if value="$shrSupplierStation? and @$shrSupplierStation.isclass.buildstorage">
+                <set_value name="$shrKeep" exact="false"/>
+              </do_if>
+              <do_if value="$shrKeep and (not $shrDeliveryStation? or not @$shrDeliveryStation.isclass.buildstorage)">
+                <set_value name="$shrKeep" exact="false"/>
+              </do_if>
+              <do_if value="$shrKeep">
+                <set_value name="$shrBsoDist" exact="if $searchHomeSector? and $shrDeliveryStation? and $shrDeliveryStation.sector? then $searchHomeSector.gatedistance.{$shrDeliveryStation.sector} else -1"/>
+                <do_if value="$shrBsoDist lt 0 or ($searchMaxSell gt 0 and $shrBsoDist gt $searchMaxSell)">
+                  <set_value name="$shrKeep" exact="false"/>
+                </do_if>
+              </do_if>
+            </do_if>
+            <do_if value="$shrKeep and not (if this.$mk4BuildStorageOnlyMode? then this.$mk4BuildStorageOnlyMode else false) and (if this.$mk4DedicatedServe? then this.$mk4DedicatedServe else false) and $serveHomeAnchor? and $serveHomeAnchor.isclass.station">
               <set_value name="$shrServeHomeMatch" exact="false"/>
               <do_if value="$shrDeliveryStation? and $shrDeliveryStation.exists and $serveHomeAnchor.exists">
                 <do_if value="$shrDeliveryStation == $serveHomeAnchor">
@@ -3975,11 +4350,11 @@
                 <set_value name="$shrKeep" exact="false"/>
               </do_if>
             </do_if>
-            <do_elseif value="$serveHomeSector? and $serveHomeSector.exists">
+            <do_if value="$shrKeep and not (if this.$mk4BuildStorageOnlyMode? then this.$mk4BuildStorageOnlyMode else false) and (if this.$mk4DedicatedServe? then this.$mk4DedicatedServe else false) and $serveHomeSector? and $serveHomeSector.exists and (not $serveHomeAnchor? or not $serveHomeAnchor.isclass.station)">
               <do_if value="not $shrDeliveryStation? or not $shrDeliveryStation.sector? or @$shrDeliveryStation.sector != $serveHomeSector">
                 <set_value name="$shrKeep" exact="false"/>
               </do_if>
-            </do_elseif>
+            </do_if>
             <do_if value="$shrKeep">
               <append_to_list name="$pipelineTradeListServeHomeFiltered" exact="$shrTrade"/>
             </do_if>
@@ -3987,7 +4362,7 @@
           <set_value name="$pipelineTradeList" exact="$pipelineTradeListServeHomeFiltered"/>
           <set_value name="$pipelineFound" exact="$pipelineTradeList.count gt 0"/>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': serveHomeOnly filter: before=' + $serveHomeBeforeCount + ', after=' + $pipelineTradeList.count + ', homeType=' + (if $serveHomeAnchor? and $serveHomeAnchor.isclass.station then 'station' else 'sector') + ', home=' + (if $serveHomeAnchor? and $serveHomeAnchor.exists then @$serveHomeAnchor.knownname else 'null')" chance="100"/>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': homeScope filter: before=' + $serveHomeBeforeCount + ', after=' + $pipelineTradeList.count + ', dedicatedServe=' + (if this.$mk4DedicatedServe? then this.$mk4DedicatedServe else false) + ', buildStorageOnly=' + (if this.$mk4BuildStorageOnlyMode? then this.$mk4BuildStorageOnlyMode else false) + ', homeType=' + (if $serveHomeAnchor? and $serveHomeAnchor.isclass.station then 'station' else 'sector') + ', home=' + (if $serveHomeAnchor? and $serveHomeAnchor.exists then @$serveHomeAnchor.knownname else 'null')" chance="100"/>
           </do_if>
         </do_if>
 
@@ -4232,6 +4607,7 @@
         </do_if>
 
         <!-- Notify scheduler that this ship finished its search slot (semaphore release + dispatch) -->
+        <set_value name="this.$mk4PolicyNeedsLiveSearch" exact="false"/>
         <signal_objects object="player.galaxy" param="'GT_Search_Done'" param2="table[
           $Ship = this.ship,
           $Found = $pipelineFound,
@@ -4292,6 +4668,7 @@
       <set_value name="$validTradesFound" exact="0"/>
       <create_list name="$validatedTradeCandidates"/>
       <set_value name="$selectedCurrentSectorIsBlacklisted" exact="false"/>
+      <set_value name="$searchHomeSector" exact="if this.$lastPriorityWaresHome? and this.$lastPriorityWaresHome.exists then this.$lastPriorityWaresHome else (if this.$effectiveHome? and this.$effectiveHome.isclass.sector then this.$effectiveHome else (if this.$effectiveHome? and this.$effectiveHome.sector? then @this.$effectiveHome.sector else this.ship.sector))"/>
       
       <!-- Iterate through trade list and validate each one -->
       <!-- Priority order: Signal param2 (from cache search work unit or live search) > Global storage (for threat intelligence compatibility) -->
@@ -4325,6 +4702,27 @@
       <do_if value="typeof $tradeList != datatype.list">
         <!-- Backward compat: single trade stored as table -->
         <set_value name="$tradeList" exact="[$tradeList]"/>
+      </do_if>
+
+      <!-- Cache path: drop cargo-incompatible rows before validation (avoids FailedShips poisoning). -->
+      <do_if value="$searchMethod == 'cache' and $tradeList? and $tradeList.count gt 0">
+        <create_list name="$cargoFilteredTradeList"/>
+        <do_all exact="$tradeList.count" counter="$cargoFilterIdx">
+          <set_value name="$cargoFilterTrade" exact="$tradeList.{$cargoFilterIdx}"/>
+          <set_value name="$cargoFilterWare" exact="if $cargoFilterTrade.$Ware? then $cargoFilterTrade.$Ware else (if $cargoFilterTrade.$BuyOffer? then @$cargoFilterTrade.$BuyOffer.ware else null)"/>
+          <set_value name="$cargoFilterTransport" exact="if $cargoFilterTrade.$CargoWareTransport? then @$cargoFilterTrade.$CargoWareTransport else (if $cargoFilterWare? then @$cargoFilterWare.waretransport else null)"/>
+          <set_value name="$cargoFilterOk" exact="false"/>
+          <do_if value="$cargoFilterWare? and this.ship.cargo.{$cargoFilterWare}.max gt 0">
+            <set_value name="$cargoFilterOk" exact="true"/>
+          </do_if>
+          <do_elseif value="$cargoFilterTransport? and this.ship.waretransport.indexof.{$cargoFilterTransport}">
+            <set_value name="$cargoFilterOk" exact="true"/>
+          </do_elseif>
+          <do_if value="$cargoFilterOk">
+            <append_to_list name="$cargoFilteredTradeList" exact="$cargoFilterTrade"/>
+          </do_if>
+        </do_all>
+        <set_value name="$tradeList" exact="$cargoFilteredTradeList"/>
       </do_if>
       
       <!-- Use safe access for debug text -->
@@ -5731,6 +6129,9 @@
               
               <do_if value="$ware? and $ware != null">
                 <set_value name="$canCarryWareType" exact="this.ship.cargo.{$ware}.max gt 0"/>
+                <do_if value="not $canCarryWareType and $currentTrade.$CargoWareTransport?">
+                  <set_value name="$canCarryWareType" exact="this.ship.waretransport.indexof.{@$currentTrade.$CargoWareTransport}"/>
+                </do_if>
                 
                 <do_if value="not $canCarryWareType">
                   <!-- SHIP CANNOT CARRY THIS WARE TYPE - Skip to next trade -->
@@ -5745,10 +6146,7 @@
                       chance="100"/>
                   </do_if>
                   
-                  <!-- Scenario 3: Flag ship-specific cargo incompatibility on cache entry -->
-                  <do_if value="$searchMethod == 'cache'">
-                    <signal_objects object="player.galaxy" param="'GT_Cache_Flag_Ship'" param2="table[$Ship = this.ship, $BuyOffer = @$currentTrade.$BuyOffer, $SellOffer = @$currentTrade.$SellOffer, $HomeSector = $searchHomeSector, $CachePool = 'mk4', $Reason = 'cargo_incompatible']"/>
-                  </do_if>
+                  <!-- Do NOT GT_Cache_Flag_Ship: hold-type mismatch is not a per-ship trade failure. -->
                   
                   <!-- Continue to next trade in list -->
                   <continue/>
@@ -5809,6 +6207,50 @@
                 <do_else>
                   <!-- Normal trade: check both offers -->
                   <do_if value="$currentTrade.$BuyOffer? and $currentTrade.$SellOffer?">
+                    <!-- Re-resolve stale supplier offer before validity check (mirrors final order validation). -->
+                    <set_value name="$preValBuyStation" exact="null"/>
+                    <set_value name="$preValBuyWare" exact="if $ware? then $ware else null"/>
+                    <do_if value="not $preValBuyWare? and $currentTrade.$BuyOffer.ware?">
+                      <set_value name="$preValBuyWare" exact="@$currentTrade.$BuyOffer.ware"/>
+                    </do_if>
+                    <do_if value="$currentTrade.$BuyStation? and @$currentTrade.$BuyStation.exists">
+                      <set_value name="$preValBuyStation" exact="$currentTrade.$BuyStation"/>
+                    </do_if>
+                    <do_elseif value="$currentTrade.$BuyOffer.seller? and @$currentTrade.$BuyOffer.seller.exists">
+                      <set_value name="$preValBuyStation" exact="@$currentTrade.$BuyOffer.seller"/>
+                    </do_elseif>
+                    <do_elseif value="$currentTrade.$BuyOffer.owner? and @$currentTrade.$BuyOffer.owner.exists">
+                      <set_value name="$preValBuyStation" exact="@$currentTrade.$BuyOffer.owner"/>
+                    </do_elseif>
+                    <do_if value="$preValBuyStation? and $preValBuyStation.exists and $preValBuyWare != null">
+                      <find_sell_offer seller="$preValBuyStation" wares="$preValBuyWare" tradepartner="this.ship" result="$preValFreshBuyOffer"/>
+                      <do_if value="$preValFreshBuyOffer?">
+                        <set_value name="$currentTrade.$BuyOffer" exact="$preValFreshBuyOffer"/>
+                      </do_if>
+                    </do_if>
+
+                    <!-- Re-resolve stale delivery offer before validity check (mirrors final order validation). -->
+                    <set_value name="$preValSellStation" exact="null"/>
+                    <set_value name="$preValSellWare" exact="if $ware? then $ware else null"/>
+                    <do_if value="not $preValSellWare? and $currentTrade.$SellOffer.ware?">
+                      <set_value name="$preValSellWare" exact="@$currentTrade.$SellOffer.ware"/>
+                    </do_if>
+                    <do_if value="$currentTrade.$SellStation? and @$currentTrade.$SellStation.exists">
+                      <set_value name="$preValSellStation" exact="$currentTrade.$SellStation"/>
+                    </do_if>
+                    <do_elseif value="$currentTrade.$SellOffer.buyer? and @$currentTrade.$SellOffer.buyer.exists">
+                      <set_value name="$preValSellStation" exact="@$currentTrade.$SellOffer.buyer"/>
+                    </do_elseif>
+                    <do_elseif value="$currentTrade.$SellOffer.owner? and @$currentTrade.$SellOffer.owner.exists">
+                      <set_value name="$preValSellStation" exact="@$currentTrade.$SellOffer.owner"/>
+                    </do_elseif>
+                    <do_if value="$preValSellStation? and $preValSellStation.exists and $preValSellWare != null">
+                      <find_buy_offer buyer="$preValSellStation" wares="$preValSellWare" tradepartner="this.ship" result="$preValFreshSellOffer"/>
+                      <do_if value="$preValFreshSellOffer?">
+                        <set_value name="$currentTrade.$SellOffer" exact="$preValFreshSellOffer"/>
+                      </do_if>
+                    </do_if>
+
                     <!-- Check buy offer: available AND has SOME amount (clamping will handle exact amount reduction) -->
                     <set_value name="$buyOfferAvailable" exact="$currentTrade.$BuyOffer.available"/>
                     <set_value name="$buyOfferAmount" exact="@$currentTrade.$BuyOffer.offeramount.{this.ship}"/>
@@ -5841,7 +6283,10 @@
                       </do_if>
                     </do_if>
                     <set_value name="$buyOfferOwnerValid" exact="false"/>
-                    <do_if value="$currentTrade.$BuyOffer.owner?">
+                    <do_if value="$currentTrade.$BuyOffer.seller? and @$currentTrade.$BuyOffer.seller.exists">
+                      <set_value name="$buyOfferOwnerValid" exact="true"/>
+                    </do_if>
+                    <do_if value="not $buyOfferOwnerValid and $currentTrade.$BuyOffer.owner?">
                       <set_value name="$buyOwnerTmp" exact="@$currentTrade.$BuyOffer.owner"/>
                       <do_if value="$buyOwnerTmp? and $buyOwnerTmp.exists">
                         <set_value name="$buyOfferOwnerValid" exact="true"/>
@@ -5849,25 +6294,6 @@
                     </do_if>
                     <!-- Only reject if offer is unavailable OR amount is 0/null - let clamping handle partial amounts -->
                     <set_value name="$buyOfferStillValid" exact="$buyOfferAvailable and ($buyOfferAmount? and $buyOfferAmount gt 0) and $buyOfferOwnerValid"/>
-                    
-                    <!-- Re-resolve stale delivery offer before validity check (mirrors final order validation). -->
-                    <set_value name="$preValSellStation" exact="null"/>
-                    <set_value name="$preValSellWare" exact="if $ware? then $ware else null"/>
-                    <do_if value="not $preValSellWare? and $currentTrade.$SellOffer.ware?">
-                      <set_value name="$preValSellWare" exact="@$currentTrade.$SellOffer.ware"/>
-                    </do_if>
-                    <do_if value="$currentTrade.$SellStation? and @$currentTrade.$SellStation.exists">
-                      <set_value name="$preValSellStation" exact="$currentTrade.$SellStation"/>
-                    </do_if>
-                    <do_elseif value="$currentTrade.$SellOffer.owner? and @$currentTrade.$SellOffer.owner.exists">
-                      <set_value name="$preValSellStation" exact="@$currentTrade.$SellOffer.owner"/>
-                    </do_elseif>
-                    <do_if value="$preValSellStation? and $preValSellStation.exists and $preValSellWare != null">
-                      <find_buy_offer buyer="$preValSellStation" wares="$preValSellWare" tradepartner="this.ship" result="$preValFreshSellOffer"/>
-                      <do_if value="$preValFreshSellOffer?">
-                        <set_value name="$currentTrade.$SellOffer" exact="$preValFreshSellOffer"/>
-                      </do_if>
-                    </do_if>
                     
                     <!-- Check sell offer: effective amount (clamping will handle exact amount reduction) -->
                     <set_value name="$sellOfferAvailable" exact="$currentTrade.$SellOffer.available"/>
@@ -5880,7 +6306,13 @@
                       <set_value name="$sellOfferAmount" exact="[0, $preValSellStation.cargo.{$preValSellWare}.target - $preValSellStation.cargo.{$preValSellWare}.count].max"/>
                     </do_if>
                     <set_value name="$sellOfferOwnerValid" exact="false"/>
-                    <do_if value="$currentTrade.$SellOffer.owner?">
+                    <do_if value="$currentTrade.$SellStation? and @$currentTrade.$SellStation.exists">
+                      <set_value name="$sellOfferOwnerValid" exact="true"/>
+                    </do_if>
+                    <do_if value="not $sellOfferOwnerValid and $currentTrade.$SellOffer.buyer? and @$currentTrade.$SellOffer.buyer.exists">
+                      <set_value name="$sellOfferOwnerValid" exact="true"/>
+                    </do_if>
+                    <do_if value="not $sellOfferOwnerValid and $currentTrade.$SellOffer.owner?">
                       <set_value name="$sellOwnerTmp" exact="@$currentTrade.$SellOffer.owner"/>
                       <do_if value="$sellOwnerTmp? and $sellOwnerTmp.exists">
                         <set_value name="$sellOfferOwnerValid" exact="true"/>
@@ -5942,18 +6374,24 @@
                     <do_else>
                       <set_value name="$buyInvalidReason" exact="'ok'"/>
                       <set_value name="$sellInvalidReason" exact="'ok'"/>
-                      <do_if value="not $buyOfferAvailable">
-                        <set_value name="$buyInvalidReason" exact="'buy_not_available'"/>
+                      <do_if value="not $buyOfferOwnerValid">
+                        <set_value name="$buyInvalidReason" exact="'buy_owner_missing'"/>
                       </do_if>
+                      <do_elseif value="not $buyOfferAvailable">
+                        <set_value name="$buyInvalidReason" exact="'buy_not_available'"/>
+                      </do_elseif>
                       <do_elseif value="not $buyOfferAmount?">
                         <set_value name="$buyInvalidReason" exact="'buy_amount_null'"/>
                       </do_elseif>
                       <do_elseif value="$buyOfferAmount lt $currentTrade.$Amount">
                         <set_value name="$buyInvalidReason" exact="'buy_amount_lt_needed'"/>
                       </do_elseif>
-                      <do_if value="not $sellOfferAvailable">
-                        <set_value name="$sellInvalidReason" exact="'sell_not_available'"/>
+                      <do_if value="not $sellOfferOwnerValid">
+                        <set_value name="$sellInvalidReason" exact="'sell_owner_missing'"/>
                       </do_if>
+                      <do_elseif value="not $sellOfferAvailable">
+                        <set_value name="$sellInvalidReason" exact="'sell_not_available'"/>
+                      </do_elseif>
                       <do_elseif value="not $sellOfferAmount?">
                         <set_value name="$sellInvalidReason" exact="'sell_amount_null'"/>
                       </do_elseif>
@@ -5985,7 +6423,10 @@
                       </do_if>
                     </do_if>
                     <do_if value="(not $sellOfferAvailable) or (not $sellOfferOwnerValid)">
-                      <set_value name="$universallyDead" exact="true"/>
+                      <!-- Build Storage delivery: .available may stay false while cargo deficit exists. -->
+                      <do_if value="not $sellOfferOwnerValid or not ($sellOfferAmount? and $sellOfferAmount gt 0)">
+                        <set_value name="$universallyDead" exact="true"/>
+                      </do_if>
                     </do_if>
                     
                     <do_if value="$universallyDead">
@@ -5999,10 +6440,17 @@
                         $Reason = 'offer_dead'
                       ]"/>
                     </do_if>
-                    <!-- If offers are alive but amount=0: fleet saturation (capacity reserved by
-                         other ships' pending trades). This is TRANSIENT — capacity frees up when
-                         trades complete. Do NOT flag or purge; just skip silently. Flagging would
-                         permanently blacklist this ship for a temporary condition. -->
+                    <do_else>
+                      <!-- Scenario 2: Transient saturation / per-ship amount — flag so next cache read tries another entry. -->
+                      <signal_objects object="player.galaxy" param="'GT_Cache_Flag_Ship'" param2="table[
+                        $Ship = this.ship,
+                        $BuyOffer = @$currentTrade.$BuyOffer,
+                        $SellOffer = @$currentTrade.$SellOffer,
+                        $HomeSector = $searchHomeSector,
+                        $CachePool = 'mk4',
+                        $Reason = 'offer_invalid'
+                      ]"/>
+                    </do_else>
                   </do_if>
                   
                   <!-- Continue to next trade in list -->
@@ -7135,14 +7583,13 @@
             <do_if value="not $mk4PrimaryBudgetBlocked and $pPairAmount gt 0 and $mk4PrimaryTrade.$SellOffer?">
               <set_value name="$pDestSellOffer" exact="$mk4PrimaryTrade.$SellOffer"/>
               <do_if value="not $mk4DeliveryBudgetBySellOffer.{$pDestSellOffer}?">
-                <set_value name="$pDestBudgetInit" exact="@$pDestSellOffer.offeramount.{this.ship}"/>
-                <do_if value="$pDestBudgetInit == null or $pDestBudgetInit le 0">
-                  <do_if value="$pDestSellOffer.amount?">
-                    <set_value name="$pDestBudgetInit" exact="@$pDestSellOffer.amount"/>
-                  </do_if>
-                  <do_else>
-                    <set_value name="$pDestBudgetInit" exact="0"/>
-                  </do_else>
+                <!-- Validated prep amount already reflects tradematch demand gate (vanilla
+                     incoming + GT reservations). Re-subtracting get_ware_reservation from raw
+                     offeramount double-counts in-flight deliveries on busy build storages. -->
+                <set_value name="$pDestBudgetInit" exact="$pSellAmount"/>
+                <set_value name="$pDestOfferAmt" exact="@$pDestSellOffer.offeramount.{this.ship}"/>
+                <do_if value="$pDestOfferAmt? and $pDestOfferAmt gt 0">
+                  <set_value name="$pDestBudgetInit" exact="[$pDestBudgetInit, $pDestOfferAmt].min"/>
                 </do_if>
                 <do_if value="global.$GT_Reservations? and global.$GT_Reservations.{$pDestSellOffer}?">
                   <set_value name="$pDestResData" exact="global.$GT_Reservations.{$pDestSellOffer}"/>
@@ -7150,20 +7597,6 @@
                     <set_value name="$pDestResAmt" exact="if $pDestResData.$Amount? and @$pDestResData.$Amount gt 0 then $pDestResData.$Amount else 1"/>
                     <set_value name="$pDestBudgetInit" exact="[($pDestBudgetInit - $pDestResAmt), 0].max"/>
                   </do_if>
-                </do_if>
-                <set_value name="$pDestStation" exact="if $mk4PrimaryTrade.$SellStation? and $mk4PrimaryTrade.$SellStation.exists then $mk4PrimaryTrade.$SellStation else null"/>
-                <do_if value="not $pDestStation? and $pDestSellOffer.buyer? and @$pDestSellOffer.buyer.exists">
-                  <set_value name="$pDestStation" exact="@$pDestSellOffer.buyer"/>
-                </do_if>
-                <do_if value="not $pDestStation? and $pDestSellOffer.owner?">
-                  <set_value name="$pDestStation" exact="@$pDestSellOffer.owner"/>
-                </do_if>
-                <set_value name="$pDestWare" exact="if $mk4PrimaryTrade.$Ware? then $mk4PrimaryTrade.$Ware else (if $pDestSellOffer.ware? then @$pDestSellOffer.ware else null)"/>
-                <do_if value="$pDestStation? and $pDestStation.exists and $pDestWare?">
-                  <get_ware_reservation object="$pDestStation" ware="$pDestWare" type="sell" virtual="false" result="$pDestIncomingTotal"/>
-                  <get_ware_reservation object="$pDestStation" ware="$pDestWare" type="sell" reserver="this.ship" virtual="false" result="$pDestIncomingSelf"/>
-                  <set_value name="$pDestIncomingOther" exact="[($pDestIncomingTotal - $pDestIncomingSelf), 0].max"/>
-                  <set_value name="$pDestBudgetInit" exact="[($pDestBudgetInit - $pDestIncomingOther), 0].max"/>
                 </do_if>
                 <set_value name="$mk4DeliveryBudgetBySellOffer.{$pDestSellOffer}" exact="$pDestBudgetInit"/>
               </do_if>
@@ -7344,14 +7777,10 @@
                 <do_if value="$scTrade.$SellOffer?">
                   <set_value name="$scDestSellOffer" exact="$scTrade.$SellOffer"/>
                   <do_if value="not $mk4DeliveryBudgetBySellOffer.{$scDestSellOffer}?">
-                    <set_value name="$scDestBudgetInit" exact="@$scDestSellOffer.offeramount.{this.ship}"/>
-                    <do_if value="$scDestBudgetInit == null or $scDestBudgetInit le 0">
-                      <do_if value="$scDestSellOffer.amount?">
-                        <set_value name="$scDestBudgetInit" exact="@$scDestSellOffer.amount"/>
-                      </do_if>
-                      <do_else>
-                        <set_value name="$scDestBudgetInit" exact="0"/>
-                      </do_else>
+                    <set_value name="$scDestBudgetInit" exact="$scPairAmount"/>
+                    <set_value name="$scDestOfferAmt" exact="@$scDestSellOffer.offeramount.{this.ship}"/>
+                    <do_if value="$scDestOfferAmt? and $scDestOfferAmt gt 0">
+                      <set_value name="$scDestBudgetInit" exact="[$scDestBudgetInit, $scDestOfferAmt].min"/>
                     </do_if>
                     <do_if value="global.$GT_Reservations? and global.$GT_Reservations.{$scDestSellOffer}?">
                       <set_value name="$scDestResData" exact="global.$GT_Reservations.{$scDestSellOffer}"/>
@@ -7359,20 +7788,6 @@
                         <set_value name="$scDestResAmt" exact="if $scDestResData.$Amount? and @$scDestResData.$Amount gt 0 then $scDestResData.$Amount else 1"/>
                         <set_value name="$scDestBudgetInit" exact="[($scDestBudgetInit - $scDestResAmt), 0].max"/>
                       </do_if>
-                    </do_if>
-                    <set_value name="$scDestStation" exact="if $scTrade.$SellStation? and $scTrade.$SellStation.exists then $scTrade.$SellStation else null"/>
-                    <do_if value="not $scDestStation? and $scDestSellOffer.buyer? and @$scDestSellOffer.buyer.exists">
-                      <set_value name="$scDestStation" exact="@$scDestSellOffer.buyer"/>
-                    </do_if>
-                    <do_if value="not $scDestStation? and $scDestSellOffer.owner?">
-                      <set_value name="$scDestStation" exact="@$scDestSellOffer.owner"/>
-                    </do_if>
-                    <set_value name="$scDestWare" exact="if $scTrade.$Ware? then $scTrade.$Ware else (if $scDestSellOffer.ware? then @$scDestSellOffer.ware else null)"/>
-                    <do_if value="$scDestStation? and $scDestStation.exists and $scDestWare?">
-                      <get_ware_reservation object="$scDestStation" ware="$scDestWare" type="sell" virtual="false" result="$scDestIncomingTotal"/>
-                      <get_ware_reservation object="$scDestStation" ware="$scDestWare" type="sell" reserver="this.ship" virtual="false" result="$scDestIncomingSelf"/>
-                      <set_value name="$scDestIncomingOther" exact="[($scDestIncomingTotal - $scDestIncomingSelf), 0].max"/>
-                      <set_value name="$scDestBudgetInit" exact="[($scDestBudgetInit - $scDestIncomingOther), 0].max"/>
                     </do_if>
                     <set_value name="$mk4DeliveryBudgetBySellOffer.{$scDestSellOffer}" exact="$scDestBudgetInit"/>
                   </do_if>
@@ -8376,41 +8791,97 @@
             <resume label="escape_from_blacklisted"/>
           </do_if>
           
-          <!-- Check if trades came from cache - if so, trigger live search instead of retrying cache -->
+          <!-- Cache exhausted: retry remaining cache entries before forcing mk4live when rejections
+               are transient-only (stale offers / demand saturation) and the home pool is larger. -->
           <do_if value="$searchMethod == 'cache'">
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache exhausted — all ' + $tradeListCountSafe + ' cache candidates failed validation, triggering LIVE market search' +
-                '\n  Rejection breakdown: Path=' + $tradesRejectedPathSafe + ', Docking=' + $tradesRejectedDockingSafe + ', OfferInvalid=' + $tradesRejectedOfferInvalidSafe + ', Distance=' + $tradesRejectedDistanceSafe + ', Cargo=' + $tradesRejectedCargoSafe + ', Restriction=' + $tradesRejectedRestrictionSafe + ', DemandReserved=' + $tradesRejectedDemandReservedSafe + ', Blacklist=' + $tradesBlacklistedSafe" chance="100"/>
+            <set_value name="$cacheHardRejectTotal" exact="$tradesRejectedPathSafe + $tradesRejectedDockingSafe + $tradesRejectedDistanceSafe + $tradesRejectedCargoSafe + $tradesRejectedRestrictionSafe + $tradesBlacklistedSafe"/>
+            <set_value name="$cacheTransientRejectTotal" exact="$tradesRejectedOfferInvalidSafe + $tradesRejectedDemandReservedSafe"/>
+            <set_value name="$cacheExhaustedTransientOnly" exact="$tradeListCountSafe gt 0 and $cacheHardRejectTotal == 0 and $cacheTransientRejectTotal == $tradeListCountSafe"/>
+            <set_value name="$cacheExhaustHomeSector" exact="if this.$lastPriorityWaresHome? and this.$lastPriorityWaresHome.exists then this.$lastPriorityWaresHome else (if this.$effectiveHome? and this.$effectiveHome.isclass.sector then this.$effectiveHome else (if this.$effectiveHome? and this.$effectiveHome.sector? then @this.$effectiveHome.sector else this.ship.sector))"/>
+            <set_value name="$cacheExhaustPoolSize" exact="0"/>
+            <do_if value="$cacheExhaustHomeSector? and $cacheExhaustHomeSector.exists and global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$cacheExhaustHomeSector}?">
+              <set_value name="$cacheExhaustPoolSize" exact="@global.$GT_TradeCacheMK4.{$cacheExhaustHomeSector}.count"/>
             </do_if>
-            <!-- Send signal to force live search (bypass cache) -->
-            <!-- Include MaxBuy/MaxSell - use effective values if available, otherwise use defaults from order params -->
-            <set_value name="$signalMaxBuy" exact="$maxbuy"/>
-            <set_value name="$signalMaxSell" exact="$maxsell"/>
-            <do_if value="this.$effectiveMaxBuy?">
-              <set_value name="$signalMaxBuy" exact="this.$effectiveMaxBuy"/>
+            <do_if value="$cacheExhaustedTransientOnly and $cacheExhaustPoolSize gt $tradeListCountSafe">
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache batch exhausted (transient-only) — retrying cache before live (' + $tradeListCountSafe + '/' + $cacheExhaustPoolSize + ' entries tried, home=' + (if $cacheExhaustHomeSector.knownname? then @$cacheExhaustHomeSector.knownname else '?') + ')'" chance="100"/>
+              </do_if>
+              <!-- Stale-offer rejections flag per-ship on entries; clear before retry so other pool rows can match. -->
+              <do_if value="$cacheExhaustHomeSector? and $cacheExhaustHomeSector.exists and global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$cacheExhaustHomeSector}?">
+                <do_all exact="global.$GT_TradeCacheMK4.{$cacheExhaustHomeSector}.count" counter="$cacheRetryFsi">
+                  <set_value name="$cacheRetryEntry" exact="global.$GT_TradeCacheMK4.{$cacheExhaustHomeSector}.{$cacheRetryFsi}"/>
+                  <do_if value="$cacheRetryEntry? and $cacheRetryEntry.$FailedShips? and $cacheRetryEntry.$FailedShips.count gt 0">
+                    <set_value name="$cacheRetryNewFailed" exact="[]"/>
+                    <do_all exact="$cacheRetryEntry.$FailedShips.count" counter="$cacheRetryFsi2">
+                      <do_if value="$cacheRetryEntry.$FailedShips.{$cacheRetryFsi2} != this.ship">
+                        <append_to_list name="$cacheRetryNewFailed" exact="$cacheRetryEntry.$FailedShips.{$cacheRetryFsi2}"/>
+                      </do_if>
+                    </do_all>
+                    <set_value name="$cacheRetryEntry.$FailedShips" exact="$cacheRetryNewFailed"/>
+                  </do_if>
+                </do_all>
+              </do_if>
+              <set_value name="$signalMaxBuy" exact="$maxbuy"/>
+              <set_value name="$signalMaxSell" exact="$maxsell"/>
+              <do_if value="this.$effectiveMaxBuy?">
+                <set_value name="$signalMaxBuy" exact="this.$effectiveMaxBuy"/>
+              </do_if>
+              <do_if value="this.$effectiveMaxSell?">
+                <set_value name="$signalMaxSell" exact="this.$effectiveMaxSell"/>
+              </do_if>
+              <signal_objects object="player.galaxy" param="'GT_Search_Request'" param2="table[
+                $Ship = this.ship,
+                $HomeBase = if this.$effectiveHome? then this.$effectiveHome else (if this.ship.defaultorder and this.ship.defaultorder.$home? then @this.ship.defaultorder.$home else this.ship.sector),
+                $MaxBuy = $signalMaxBuy,
+                $MaxSell = $signalMaxSell,
+                $IgnoreCarrierAux = @this.$effectiveIgnoreCarrierAux,
+                $IgnoreBuildStorage = @this.$effectiveIgnoreBuildStorage,
+                $IgnoreTradeRules = @this.$effectiveIgnoreTradeRules,
+                $IgnoreMK1Supply = if this.$effectiveIgnoreMK1Supply? then this.$effectiveIgnoreMK1Supply else true,
+                $SearchPool = 'mk4_supply',
+                $SearchDepth = if this.$effectiveSearchDepth? then this.$effectiveSearchDepth else 30,
+                $ForceLiveSearch = false,
+                $LiveSearchPriority = false
+              ]"/>
+              <resume label="wait_for_response"/>
             </do_if>
-            <do_if value="this.$effectiveMaxSell?">
-              <set_value name="$signalMaxSell" exact="this.$effectiveMaxSell"/>
-            </do_if>
-            <!-- effectiveIgnoreCarrierAux/BuildStorage/TradeRules initialized in <init> -->
-            
-            <signal_objects object="player.galaxy" param="'GT_Search_Request'" param2="table[
-              $Ship = this.ship,
-              $HomeBase = if this.$effectiveHome? then this.$effectiveHome else (if this.ship.defaultorder and this.ship.defaultorder.$home? then @this.ship.defaultorder.$home else this.ship.sector),
-              $MaxBuy = $signalMaxBuy,
-              $MaxSell = $signalMaxSell,
-              $IgnoreCarrierAux = @this.$effectiveIgnoreCarrierAux,
-              $IgnoreBuildStorage = @this.$effectiveIgnoreBuildStorage,
-              $IgnoreTradeRules = @this.$effectiveIgnoreTradeRules,
-              $IgnoreMK1Supply = if this.$effectiveIgnoreMK1Supply? then this.$effectiveIgnoreMK1Supply else true,
-              $SearchPool = 'mk4_supply',
-              $SearchDepth = if this.$effectiveSearchDepth? then this.$effectiveSearchDepth else 30,
-              $ForceLiveSearch = true
-            ]"/>
-            <!-- CRITICAL: Resume to wait_for_response instead of main_loop -->
-            <!-- This ensures the ship waits for the live search result instead of sending a duplicate request -->
-            <!-- The wait block will catch GT_Trade_Found signal when live search completes -->
-            <resume label="wait_for_response"/>
+            <do_else>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache exhausted — all ' + $tradeListCountSafe + ' cache candidates failed validation, triggering LIVE market search' +
+                  '\n  Rejection breakdown: Path=' + $tradesRejectedPathSafe + ', Docking=' + $tradesRejectedDockingSafe + ', OfferInvalid=' + $tradesRejectedOfferInvalidSafe + ', Distance=' + $tradesRejectedDistanceSafe + ', Cargo=' + $tradesRejectedCargoSafe + ', Restriction=' + $tradesRejectedRestrictionSafe + ', DemandReserved=' + $tradesRejectedDemandReservedSafe + ', Blacklist=' + $tradesBlacklistedSafe +
+                  (if $cacheExhaustPoolSize gt 0 then '\n  Home cache pool size: ' + $cacheExhaustPoolSize else '')" chance="100"/>
+              </do_if>
+              <!-- Send signal to force live search (bypass cache) -->
+              <!-- Include MaxBuy/MaxSell - use effective values if available, otherwise use defaults from order params -->
+              <set_value name="$signalMaxBuy" exact="$maxbuy"/>
+              <set_value name="$signalMaxSell" exact="$maxsell"/>
+              <do_if value="this.$effectiveMaxBuy?">
+                <set_value name="$signalMaxBuy" exact="this.$effectiveMaxBuy"/>
+              </do_if>
+              <do_if value="this.$effectiveMaxSell?">
+                <set_value name="$signalMaxSell" exact="this.$effectiveMaxSell"/>
+              </do_if>
+              <!-- effectiveIgnoreCarrierAux/BuildStorage/TradeRules initialized in <init> -->
+              
+              <signal_objects object="player.galaxy" param="'GT_Search_Request'" param2="table[
+                $Ship = this.ship,
+                $HomeBase = if this.$effectiveHome? then this.$effectiveHome else (if this.ship.defaultorder and this.ship.defaultorder.$home? then @this.ship.defaultorder.$home else this.ship.sector),
+                $MaxBuy = $signalMaxBuy,
+                $MaxSell = $signalMaxSell,
+                $IgnoreCarrierAux = @this.$effectiveIgnoreCarrierAux,
+                $IgnoreBuildStorage = @this.$effectiveIgnoreBuildStorage,
+                $IgnoreTradeRules = @this.$effectiveIgnoreTradeRules,
+                $IgnoreMK1Supply = if this.$effectiveIgnoreMK1Supply? then this.$effectiveIgnoreMK1Supply else true,
+                $SearchPool = 'mk4_supply',
+                $SearchDepth = if this.$effectiveSearchDepth? then this.$effectiveSearchDepth else 30,
+                $ForceLiveSearch = true,
+                $LiveSearchPriority = true
+              ]"/>
+              <!-- CRITICAL: Resume to wait_for_response instead of main_loop -->
+              <!-- This ensures the ship waits for the live search result instead of sending a duplicate request -->
+              <!-- The wait block will catch GT_Trade_Found signal when live search completes -->
+              <resume label="wait_for_response"/>
+            </do_else>
           </do_if>
           <do_elseif value="$searchMethod == 'live' or $searchMethod == 'live_sell_only' or $searchMethod == 'live_fallback'">
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -9502,8 +9973,8 @@
       <!-- Extract parameters -->
       <set_value name="$homeSector" exact="@$workUnit.$HomeSector"/>
       <set_value name="$maxDistance" exact="@$workUnit.$MaxDistance"/>
-      <set_value name="$minROI" exact="@$workUnit.$MinROI"/>
-      <set_value name="$minAbsoluteProfit" exact="@$workUnit.$MinAbsoluteProfit"/>
+      <set_value name="$minROI" exact="0"/>
+      <set_value name="$minAbsoluteProfit" exact="0"/>
       <set_value name="$wareBasket" exact="if $workUnit.$WareBasket? then $workUnit.$WareBasket else $warebasket"/>
       <set_value name="$ignoreBuildStorage" exact="if $workUnit.$IgnoreBuildStorage? then $workUnit.$IgnoreBuildStorage else false"/>
       <set_value name="$ignoreCarrierAux" exact="if $workUnit.$IgnoreCarrierAux? then $workUnit.$IgnoreCarrierAux else false"/>
@@ -9526,22 +9997,7 @@
         <set_value name="$rawCacheList" exact="global.$GT_TradeCacheMK4.{$homeSector}"/>
       </do_if>
       
-      <!-- CRITICAL: Check if cache max distance covers ship's required max distance -->
-      <!-- This prevents ships with larger max distance from using incomplete cache populated by ships with smaller max distance -->
-      <set_value name="$cacheMaxDistance" exact="0"/>
-      <do_if value="global.$GT_TradeCacheMK4MaxDistance? and global.$GT_TradeCacheMK4MaxDistance.{$homeSector}?">
-        <set_value name="$cacheMaxDistance" exact="global.$GT_TradeCacheMK4MaxDistance.{$homeSector}"/>
-      </do_if>
-      <!-- If cache was populated with smaller max distance than ship needs, treat as cache miss -->
-      <do_if value="$cacheMaxDistance gt 0 and $cacheMaxDistance lt $maxDistance">
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache max distance insufficient: cached=' + $cacheMaxDistance + ', required=' + $maxDistance + ' - returning empty results'" chance="100"/>
-        </do_if>
-        <!-- Legacy work-unit completion removed by AI pipeline migration -->
-        <!-- CRITICAL: Go to wait_for_response so AI catches MD's GT_Trade_Found/GT_No_Trade_Found -->
-        <resume label="wait_for_response"/>
-      </do_if>
-      
+      <!-- Per-entry distance limits apply in lib.gt.cache.search; do not reject the whole pool on metadata alone. -->
       <!-- CRITICAL: Load GT_FailedSectorPairs for ship's current sector (prefilter failed sector pairs) -->
       <!-- This prevents revalidating entries that previously failed due to blacklisted routes -->
       <!-- Ships in the same sector share failed sector pairs (same connectivity/blacklist context) -->
@@ -9619,6 +10075,7 @@
         $Distance = 0,
         $WareBasket = 0,
         $IllegalWare = 0,
+        $IncompatibleCargo = 0,
         $RouteIllegal = 0,
         $FactionBlacklist = 0,
         $TradeRules = 0,
@@ -9628,7 +10085,8 @@
         $MinCargoUtil = 0,
         $Mk4PlayerDelivery = 0,
         $Mk4SupplierPolicy = 0,
-        $Mk4DedicatedHome = 0
+        $Mk4DedicatedHome = 0,
+        $Mk4BuildStorageOnly = 0
       ]"/>
       <!-- Chunked pre-filter: process 50 entries per chunk with cooperative yielding to prevent frame spikes -->
       <set_value name="this.$pfProcessed" exact="0"/>
@@ -9725,6 +10183,29 @@
               </do_if>
             </do_if>
             
+            <!-- 2a. Cargo bay compatibility (solid vs container; shared MK4 pool is ship-agnostic). -->
+            <do_if value="$entryPassesFilters and not $rawEntry.$IsSellOnly?">
+              <set_value name="$cargoCompatWare" exact="if $rawEntry.$Ware? then $rawEntry.$Ware else null"/>
+              <do_if value="$cargoCompatWare == null">
+                <set_value name="$buyOffer" exact="@$rawEntry.$BuyOffer"/>
+                <do_if value="$buyOffer? and $buyOffer.exists and $buyOffer.ware?">
+                  <set_value name="$cargoCompatWare" exact="@$buyOffer.ware"/>
+                </do_if>
+              </do_if>
+              <set_value name="$cargoCompatTransport" exact="if $rawEntry.$CargoWareTransport? then @$rawEntry.$CargoWareTransport else (if $cargoCompatWare? then @$cargoCompatWare.waretransport else null)"/>
+              <set_value name="$cargoCompatOk" exact="false"/>
+              <do_if value="$cargoCompatWare? and this.ship.cargo.{$cargoCompatWare}.max gt 0">
+                <set_value name="$cargoCompatOk" exact="true"/>
+              </do_if>
+              <do_elseif value="$cargoCompatTransport? and this.ship.waretransport.indexof.{$cargoCompatTransport}">
+                <set_value name="$cargoCompatOk" exact="true"/>
+              </do_elseif>
+              <do_if value="not $cargoCompatOk">
+                <set_value name="$entryPassesFilters" exact="false"/>
+                <set_value name="$filterRejectCount.$IncompatibleCargo" operation="add"/>
+              </do_if>
+            </do_if>
+
             <!-- 2b. Illegal route filter — contraband only -->
             <set_value name="$buyOffer" exact="@$rawEntry.$BuyOffer"/>
             <set_value name="$sellOffer" exact="@$rawEntry.$SellOffer"/>
@@ -9880,16 +10361,63 @@
                   <set_value name="$pfDeliveryStation" exact="@$rawEntry.$SellOffer.owner"/>
                 </do_elseif>
               </do_if>
-              <do_if value="not $pfDeliveryStation? or not @$pfDeliveryStation.isplayerowned">
+              <set_value name="$pfMk4PlayerDeliveryOk" exact="false"/>
+              <do_if value="$pfDeliveryStation? and @$pfDeliveryStation.exists">
+                <do_if value="@$pfDeliveryStation.isplayerowned">
+                  <set_value name="$pfMk4PlayerDeliveryOk" exact="true"/>
+                </do_if>
+                <do_elseif value="$pfDeliveryStation.isclass.buildstorage and $pfDeliveryStation.base? and @$pfDeliveryStation.base.isplayerowned">
+                  <set_value name="$pfMk4PlayerDeliveryOk" exact="true"/>
+                </do_elseif>
+              </do_if>
+              <do_if value="not $pfMk4PlayerDeliveryOk">
                 <set_value name="$entryPassesFilters" exact="false"/>
                 <set_value name="$filterRejectCount.$Mk4PlayerDelivery" operation="add"/>
               </do_if>
             </do_if>
 
-            <!-- 9a. MK4 serveHomeOnly strict scope:
-                 station-home => home station + its build storage (vanilla: station.buildstorage / buildstorage.base)
-                 sector-home  => only stations in that sector -->
-            <do_if value="$entryPassesFilters and (if this.$mk4DedicatedServe? then this.$mk4DedicatedServe else false)">
+            <!-- 9a. MK4 home-anchor scope (serveHomeOnly and/or build-storage-only mode). -->
+            <do_if value="$entryPassesFilters and (if this.$mk4BuildStorageOnlyMode? then this.$mk4BuildStorageOnlyMode else false)">
+              <set_value name="$pfServeHomeAnchor" exact="if this.$effectiveHome? then this.$effectiveHome else (if this.ship.defaultorder and this.ship.defaultorder.$home? then @this.ship.defaultorder.$home else null)"/>
+              <set_value name="$pfServeHomeSector" exact="if $pfServeHomeAnchor? and $pfServeHomeAnchor.isclass.sector then $pfServeHomeAnchor else (if $pfServeHomeAnchor? and $pfServeHomeAnchor.sector? then @$pfServeHomeAnchor.sector else $homeSector)"/>
+              <do_if value="not $pfDeliveryStation?">
+                <set_value name="$pfDeliveryStation" exact="if $rawEntry.$SellStation? then @$rawEntry.$SellStation else null"/>
+                <do_if value="not $pfDeliveryStation? and $rawEntry.$SellOffer?">
+                  <do_if value="$rawEntry.$SellOffer.buyer? and @$rawEntry.$SellOffer.buyer.exists">
+                    <set_value name="$pfDeliveryStation" exact="@$rawEntry.$SellOffer.buyer"/>
+                  </do_if>
+                  <do_elseif value="$rawEntry.$SellOffer.owner?">
+                    <set_value name="$pfDeliveryStation" exact="@$rawEntry.$SellOffer.owner"/>
+                  </do_elseif>
+                </do_if>
+              </do_if>
+              <set_value name="$pfSuppStationBso" exact="null"/>
+              <do_if value="$rawEntry.$BuyOffer? and @$rawEntry.$BuyOffer.exists">
+                <do_if value="$rawEntry.$BuyOffer.seller? and @$rawEntry.$BuyOffer.seller.exists">
+                  <set_value name="$pfSuppStationBso" exact="@$rawEntry.$BuyOffer.seller"/>
+                </do_if>
+              </do_if>
+              <do_if value="not $pfSuppStationBso? and $rawEntry.$BuyStation?">
+                <set_value name="$pfSuppStationBso" exact="@$rawEntry.$BuyStation"/>
+              </do_if>
+              <do_if value="$pfSuppStationBso? and @$pfSuppStationBso.isclass.buildstorage">
+                <set_value name="$entryPassesFilters" exact="false"/>
+                <set_value name="$filterRejectCount.$Mk4BuildStorageOnly" operation="add"/>
+              </do_if>
+              <do_if value="$entryPassesFilters and (not $pfDeliveryStation? or not @$pfDeliveryStation.isclass.buildstorage)">
+                <set_value name="$entryPassesFilters" exact="false"/>
+                <set_value name="$filterRejectCount.$Mk4BuildStorageOnly" operation="add"/>
+              </do_if>
+              <do_if value="$entryPassesFilters">
+                <set_value name="$pfBsoDist" exact="if $homeSector? and $pfDeliveryStation? and $pfDeliveryStation.sector? then $homeSector.gatedistance.{$pfDeliveryStation.sector} else -1"/>
+                <set_value name="$pfBsoCoverageMax" exact="if this.$effectiveMaxSell? then this.$effectiveMaxSell else $maxDistance"/>
+                <do_if value="$pfBsoDist lt 0 or ($pfBsoCoverageMax gt 0 and $pfBsoDist gt $pfBsoCoverageMax)">
+                  <set_value name="$entryPassesFilters" exact="false"/>
+                  <set_value name="$filterRejectCount.$Mk4BuildStorageOnly" operation="add"/>
+                </do_if>
+              </do_if>
+            </do_if>
+            <do_if value="$entryPassesFilters and not (if this.$mk4BuildStorageOnlyMode? then this.$mk4BuildStorageOnlyMode else false) and (if this.$mk4DedicatedServe? then this.$mk4DedicatedServe else false)">
               <set_value name="$pfServeHomeAnchor" exact="if this.$effectiveHome? then this.$effectiveHome else (if this.ship.defaultorder and this.ship.defaultorder.$home? then @this.ship.defaultorder.$home else null)"/>
               <set_value name="$pfServeHomeSector" exact="if $pfServeHomeAnchor? and $pfServeHomeAnchor.isclass.sector then $pfServeHomeAnchor else (if $pfServeHomeAnchor? and $pfServeHomeAnchor.sector? then @$pfServeHomeAnchor.sector else $homeSector)"/>
               <do_if value="not $pfDeliveryStation?">
@@ -9992,7 +10520,7 @@
         </do_if>
       </do_if>
       
-      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache search params: homeSector=' + (if $homeSector? then $homeSector.knownname else 'null') + ', maxDistance=' + $maxDistance + ', cacheMaxDistance=' + $cacheMaxDistance + ', minProfit=' + $minAbsoluteProfit + ', minROI=' + $minROI + ', rawEntries=' + $rawCount + ', preFilteredEntries=' + $cacheList.count + ', routeMemoHits=' + (if this.$pfRouteMemoHits? then this.$pfRouteMemoHits else 0) + ', filterRejections: Distance=' + $filterRejectCount.$Distance + ', WareBasket=' + $filterRejectCount.$WareBasket + ', IllegalWare=' + $filterRejectCount.$IllegalWare + ', RouteIllegal=' + $filterRejectCount.$RouteIllegal + ', FactionBlacklist=' + $filterRejectCount.$FactionBlacklist + ', TradeRules=' + $filterRejectCount.$TradeRules + ', FailedSectorPairs=' + $filterRejectCount.$FailedSectorPairs + ', FailedShips=' + $filterRejectCount.$FailedShips + ', TargetType=' + $filterRejectCount.$TargetType + ', Mk4PlayerDelivery=' + $filterRejectCount.$Mk4PlayerDelivery + ', Mk4SupplierPolicy=' + $filterRejectCount.$Mk4SupplierPolicy + ', Mk4DedicatedHome=' + $filterRejectCount.$Mk4DedicatedHome" chance="100"/>
+      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache search params: homeSector=' + (if $homeSector? then $homeSector.knownname else 'null') + ', maxDistance=' + $maxDistance + ', cacheMaxDistance=' + $cacheMaxDistance + ', minProfit=' + $minAbsoluteProfit + ', minROI=' + $minROI + ', rawEntries=' + $rawCount + ', preFilteredEntries=' + $cacheList.count + ', routeMemoHits=' + (if this.$pfRouteMemoHits? then this.$pfRouteMemoHits else 0) + ', filterRejections: Distance=' + $filterRejectCount.$Distance + ', WareBasket=' + $filterRejectCount.$WareBasket + ', IllegalWare=' + $filterRejectCount.$IllegalWare + ', IncompatibleCargo=' + $filterRejectCount.$IncompatibleCargo + ', RouteIllegal=' + $filterRejectCount.$RouteIllegal + ', FactionBlacklist=' + $filterRejectCount.$FactionBlacklist + ', TradeRules=' + $filterRejectCount.$TradeRules + ', FailedSectorPairs=' + $filterRejectCount.$FailedSectorPairs + ', FailedShips=' + $filterRejectCount.$FailedShips + ', TargetType=' + $filterRejectCount.$TargetType + ', Mk4PlayerDelivery=' + $filterRejectCount.$Mk4PlayerDelivery + ', Mk4SupplierPolicy=' + $filterRejectCount.$Mk4SupplierPolicy + ', Mk4DedicatedHome=' + $filterRejectCount.$Mk4DedicatedHome + ', Mk4BuildStorageOnly=' + $filterRejectCount.$Mk4BuildStorageOnly" chance="100"/>
       <do_if value="this.$pfRouteMemoHits?">
         <remove_value name="this.$pfRouteMemoHits"/>
       </do_if>
@@ -10130,6 +10658,29 @@
                 <set_value name="$isValid" exact="false"/>
                 <set_value name="$rejectReason" exact="'station_not_operational'"/>
               </do_elseif>
+              
+              <!-- Cargo bay compatibility (solid vs container; shared MK4 pool). -->
+              <do_if value="$isValid and not $cacheEntry.$IsSellOnly?">
+                <set_value name="$cacheWorkCargoWare" exact="if $cacheEntry.$Ware? then $cacheEntry.$Ware else null"/>
+                <do_if value="not $cacheWorkCargoWare? and $buyOffer? and $buyOffer.exists and $buyOffer.ware?">
+                  <set_value name="$cacheWorkCargoWare" exact="@$buyOffer.ware"/>
+                </do_if>
+                <do_if value="not $cacheWorkCargoWare? and $sellOffer? and $sellOffer.exists and $sellOffer.ware?">
+                  <set_value name="$cacheWorkCargoWare" exact="@$sellOffer.ware"/>
+                </do_if>
+                <set_value name="$cacheWorkCargoTransport" exact="if $cacheEntry.$CargoWareTransport? then @$cacheEntry.$CargoWareTransport else (if $cacheWorkCargoWare? then @$cacheWorkCargoWare.waretransport else null)"/>
+                <set_value name="$cacheWorkCargoOk" exact="false"/>
+                <do_if value="$cacheWorkCargoWare? and this.ship.cargo.{$cacheWorkCargoWare}.max gt 0">
+                  <set_value name="$cacheWorkCargoOk" exact="true"/>
+                </do_if>
+                <do_elseif value="$cacheWorkCargoTransport? and this.ship.waretransport.indexof.{$cacheWorkCargoTransport}">
+                  <set_value name="$cacheWorkCargoOk" exact="true"/>
+                </do_elseif>
+                <do_if value="not $cacheWorkCargoOk">
+                  <set_value name="$isValid" exact="false"/>
+                  <set_value name="$rejectReason" exact="'incompatible_cargo'"/>
+                </do_if>
+              </do_if>
               
               <!-- MK4 Galaxy-Supply: delivery = cached $SellOffer (game buy offer); prefer buyer (lib.gt.tradematch). -->
               <do_if value="$isValid">
@@ -10624,8 +11175,8 @@
       <set_value name="$sellOffers" exact="@$workUnit.$SellOffers"/>
       <set_value name="$buyOffers" exact="@$workUnit.$BuyOffers"/>
       <set_value name="$homeSector" exact="@$workUnit.$HomeSector"/>
-      <set_value name="$minROI" exact="@$workUnit.$MinROI"/>
-      <set_value name="$minAbsoluteProfit" exact="@$workUnit.$MinAbsoluteProfit"/>
+      <set_value name="$minROI" exact="0"/>
+      <set_value name="$minAbsoluteProfit" exact="0"/>
       <set_value name="$distancePenaltyMultiplier" exact="if $workUnit.$DistancePenaltyMultiplier? then $workUnit.$DistancePenaltyMultiplier else 0.5"/>
       
       <!-- Resolve priority wares + multiplier ONCE per workunit so the per-pair scoring below can apply

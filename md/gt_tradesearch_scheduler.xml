@@ -206,15 +206,9 @@
           </do_if>
         </do_if>
 
-        <!-- Woken home refresh waiters skip cache and go straight to live (shared refresh did not help). -->
+        <!-- Woken home refresh waiters: retry cache first (pool may have been repopulated since parking). -->
         <do_if value="$ship? and global.$GT_SearchSemaphore? and global.$GT_SearchSemaphore.$LiveWaiterWakePending? and global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$ship}?">
           <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$ship}"/>
-          <set_value name="$targetPhase" exact="'live'"/>
-          <set_value name="$forceLiveSearch" exact="true"/>
-          <do_if value="$params?">
-            <set_value name="$params.$ForceLiveSearch" exact="true"/>
-            <set_value name="$params.$Phase" exact="'live'"/>
-          </do_if>
         </do_if>
 
         <!-- Force-live requests skip cache and go directly to normal live pool.
@@ -413,7 +407,8 @@
                 $HomeSector = $homeSector,
                 $EnqueuedAt = player.age
               ]"/>
-              <do_if value="$forceLiveSearch">
+              <set_value name="$liveSearchPriority" exact="$params? and $params.$LiveSearchPriority? and @$params.$LiveSearchPriority"/>
+              <do_if value="$forceLiveSearch and $liveSearchPriority">
                 <set_value name="$mk4LiveQueueMerged" exact="[$mk4LiveQueueEntry]"/>
                 <do_if value="global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}.count gt 0">
                   <do_all exact="global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}.count" counter="$mk4lqi">
@@ -443,7 +438,8 @@
                 $HomeSector = $homeSector,
                 $EnqueuedAt = player.age
               ]"/>
-              <do_if value="$forceLiveSearch">
+              <set_value name="$liveSearchPriority" exact="$params? and $params.$LiveSearchPriority? and @$params.$LiveSearchPriority"/>
+              <do_if value="$forceLiveSearch and $liveSearchPriority">
                 <set_value name="$liveQueueMerged" exact="[$liveQueueEntry]"/>
                 <do_if value="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.count gt 0">
                   <do_all exact="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.count" counter="$lqi">
@@ -484,6 +480,22 @@
             <param name="reason" value="'no_home_sector'"/>
           </run_actions>
           <signal_objects object="$ship" param="'GT_No_Trade_Found'" param2="'no_home_sector'" delay="1ms"/>
+        </do_if>
+        <!-- Ship already queued/active in scheduler: tell AI to keep waiting and nudge dispatch. -->
+        <do_if value="not $enqueueAllowed and $ship? and $ship.exists and ($rejectReason == 'CacheQueued' or $rejectReason == 'LiveQueued' or $rejectReason == 'MK4LiveQueued' or $rejectReason == 'ClearanceQueued' or $rejectReason == 'LiveActiveShips' or $rejectReason == 'MK4LiveActiveShips' or $rejectReason == 'ClearanceActiveShips')">
+          <signal_objects object="$ship" param="'GT_TradeSearch_InProgress'" delay="1ms"/>
+          <do_if value="$rejectReason == 'CacheQueued'">
+            <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.DispatchCacheSearchGo"/>
+          </do_if>
+          <do_elseif value="$rejectReason == 'MK4LiveQueued' or $rejectReason == 'MK4LiveActiveShips'">
+            <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.DispatchMK4LiveSearchGo"/>
+          </do_elseif>
+          <do_elseif value="$rejectReason == 'LiveQueued' or $rejectReason == 'LiveActiveShips'">
+            <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.DispatchLiveSearchGo"/>
+          </do_elseif>
+          <do_elseif value="$rejectReason == 'ClearanceQueued' or $rejectReason == 'ClearanceActiveShips'">
+            <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.DispatchClearanceSearchGo"/>
+          </do_elseif>
         </do_if>
       </actions>
     </cue>
@@ -694,7 +706,11 @@
             <set_value name="$dispatchParams.$Phase" exact="'mk4live'"/>
             <set_value name="$dispatchParams.$HomeSector" exact="$homeSector"/>
             <set_value name="$dispatchParams.$SearchPool" exact="'mk4_supply'"/>
-            <set_value name="$dispatchParams.$ForceLiveSearch" exact="true"/>
+            <set_value name="$dispatchForceLive" exact="true"/>
+            <do_if value="$homeSector? and $homeSector.exists and global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$homeSector}? and global.$GT_TradeCacheMK4.{$homeSector}.count gt 0">
+              <set_value name="$dispatchForceLive" exact="false"/>
+            </do_if>
+            <set_value name="$dispatchParams.$ForceLiveSearch" exact="$dispatchForceLive"/>
 
             <do_if value="$ship? and $ship.exists">
               <set_value name="global.$GT_SearchSemaphore.$MK4LiveActive" operation="add"/>
@@ -1755,6 +1771,91 @@
           </do_all>
         </do_if>
 
+      </actions>
+    </cue>
+
+    <!-- MK4 cache metadata grew: wake ships parked in MK4 live queue so they retry cache first. -->
+    <cue name="HandleMK4CacheUpdated" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_MK4_Cache_Updated'"/>
+      </conditions>
+      <actions>
+        <set_value name="$data" exact="event.param2"/>
+        <set_value name="$homeSector" exact="@$data.$HomeSector"/>
+        <set_value name="$updatedMaxDistance" exact="if $data? and $data.$MaxDistance? then @$data.$MaxDistance else 0"/>
+        <do_if value="not global.$GT_SearchSemaphore?">
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.InitSearchSemaphore"/>
+        </do_if>
+        <do_if value="$homeSector? and $homeSector.exists and global.$GT_SearchSemaphore?">
+          <set_value name="$mk4CacheEntryCount" exact="0"/>
+          <do_if value="global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$homeSector}?">
+            <set_value name="$mk4CacheEntryCount" exact="@global.$GT_TradeCacheMK4.{$homeSector}.count"/>
+          </do_if>
+          <do_if value="$mk4CacheEntryCount gt 0 and $data? and $data.$Written? and $data.$Written gt 0">
+            <!-- Fresh cache writes supersede prior per-ship skip markers on all entries. -->
+            <do_all exact="global.$GT_TradeCacheMK4.{$homeSector}.count" counter="$mk4clrCi">
+              <set_value name="$mk4clrEntry" exact="global.$GT_TradeCacheMK4.{$homeSector}.{$mk4clrCi}"/>
+              <do_if value="$mk4clrEntry? and $mk4clrEntry.$FailedShips? and $mk4clrEntry.$FailedShips.count gt 0">
+                <set_value name="$mk4clrEntry.$FailedShips" exact="[]"/>
+                <set_value name="global.$GT_TradeCacheMK4.{$homeSector}.{$mk4clrCi}" exact="$mk4clrEntry"/>
+              </do_if>
+            </do_all>
+            <set_value name="$mk4WakeShips" exact="[]"/>
+            <set_value name="$mk4WakeShipSeen" exact="table[]"/>
+            <!-- MK4 live queue waiters -->
+            <do_if value="global.$GT_SearchSemaphore.$MK4LiveQueueByHome? and global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}? and global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}.count gt 0">
+              <do_all exact="global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}.count" counter="$mk4cwi">
+                <set_value name="$mk4cwEntry" exact="@global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}.{$mk4cwi}"/>
+                <set_value name="$mk4cwShip" exact="if $mk4cwEntry? and $mk4cwEntry.$Ship? then @$mk4cwEntry.$Ship else null"/>
+                <do_if value="$mk4cwShip? and $mk4cwShip.exists and not $mk4WakeShipSeen.{$mk4cwShip}?">
+                  <append_to_list name="$mk4WakeShips" exact="$mk4cwShip"/>
+                  <set_value name="$mk4WakeShipSeen.{$mk4cwShip}" exact="true"/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <!-- Legacy live queue (mk4PolicyNeedsLiveSearch path) -->
+            <do_if value="global.$GT_SearchSemaphore.$LiveQueueByHome? and global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}? and global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.count gt 0">
+              <do_all exact="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.count" counter="$lcwi">
+                <set_value name="$lcwEntry" exact="@global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.{$lcwi}"/>
+                <set_value name="$lcwShip" exact="if $lcwEntry? and $lcwEntry.$Ship? then @$lcwEntry.$Ship else null"/>
+                <do_if value="$lcwShip? and $lcwShip.exists and not $mk4WakeShipSeen.{$lcwShip}?">
+                  <append_to_list name="$mk4WakeShips" exact="$lcwShip"/>
+                  <set_value name="$mk4WakeShipSeen.{$lcwShip}" exact="true"/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <!-- MK4 live refresh waiters (blocked on same-home active slot) -->
+            <do_if value="global.$GT_SearchSemaphore.$MK4LiveWaitersByHome? and global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.{$homeSector}? and global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.{$homeSector}.count gt 0">
+              <do_all exact="global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.{$homeSector}.count" counter="$mk4wwi">
+                <set_value name="$mk4wwShip" exact="@global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.{$homeSector}.{$mk4wwi}"/>
+                <do_if value="$mk4wwShip? and $mk4wwShip.exists and not $mk4WakeShipSeen.{$mk4wwShip}?">
+                  <append_to_list name="$mk4WakeShips" exact="$mk4wwShip"/>
+                  <set_value name="$mk4WakeShipSeen.{$mk4wwShip}" exact="true"/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <!-- Cache-phase queue for same home -->
+            <do_if value="global.$GT_SearchSemaphore.$CacheQueue? and global.$GT_SearchSemaphore.$CacheQueue.count gt 0">
+              <do_all exact="global.$GT_SearchSemaphore.$CacheQueue.count" counter="$ccwi">
+                <set_value name="$ccwEntry" exact="@global.$GT_SearchSemaphore.$CacheQueue.{$ccwi}"/>
+                <set_value name="$ccwShip" exact="if $ccwEntry? and $ccwEntry.$Ship? then @$ccwEntry.$Ship else null"/>
+                <set_value name="$ccwHome" exact="if $ccwEntry? and $ccwEntry.$HomeSector? then @$ccwEntry.$HomeSector else null"/>
+                <do_if value="$ccwShip? and $ccwShip.exists and $ccwHome? and $ccwHome == $homeSector and not $mk4WakeShipSeen.{$ccwShip}?">
+                  <append_to_list name="$mk4WakeShips" exact="$ccwShip"/>
+                  <set_value name="$mk4WakeShipSeen.{$ccwShip}" exact="true"/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <do_all exact="$mk4WakeShips.count" counter="$mk4wsi">
+              <set_value name="$mk4wShip" exact="$mk4WakeShips.{$mk4wsi}"/>
+              <signal_objects object="player.galaxy" param="'GT_Search_Abort'" param2="table[$Ship = $mk4wShip]" delay="1ms"/>
+              <signal_objects object="$mk4wShip" param="'GT_TradeSearch_Reset'" delay="2ms"/>
+            </do_all>
+            <do_if value="$mk4WakeShips.count gt 0 and global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Scheduler] HandleMK4CacheUpdated: Woke ' + $mk4WakeShips.count + ' waiting ships to retry cache home=' + (if $homeSector.knownname? then @$homeSector.knownname else '?') + ' pool=' + $mk4CacheEntryCount + ' maxDist=' + $updatedMaxDistance" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
       </actions>
     </cue>
 

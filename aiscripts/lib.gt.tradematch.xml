@@ -80,6 +80,7 @@
     <param name="mk4AllowTradewares" default="true"/>
     <param name="mk4DedicatedServe" default="false"/>
     <param name="mk4AnchorHome" default="null"/>
+    <param name="mk4BuildStorageOnlyMode" default="false"/>
     <param name="mk4AllowPlayerSuppliers" default="true"/>
     <param name="mk4AllowAiSuppliers" default="true"/>
     <param name="mk4CustomerMustBePlayer" default="false"/>
@@ -528,6 +529,7 @@
       <set_value name="this.$tm_tradesRejectedMk4TypePolicy" exact="0"/>
       <set_value name="this.$tm_tradesRejectedMk4DemandGate" exact="0"/>
       <set_value name="this.$tm_tradesRejectedMk4PriceCap" exact="0"/>
+      <set_value name="this.$tm_tradesRejectedMk4BuildStorageOnly" exact="0"/>
       <set_value name="this.$tm_tradesRejectedDistance" exact="0"/>
       <set_value name="this.$tm_tradesPerWare" exact="table[]"/>
       <set_value name="this.$tm_supplyScoreDiagCount" exact="0"/>
@@ -571,6 +573,9 @@
       </do_if>
       <do_if value="not this.$tm_tradesRejectedMk4PriceCap?">
         <set_value name="this.$tm_tradesRejectedMk4PriceCap" exact="0"/>
+      </do_if>
+      <do_if value="not this.$tm_tradesRejectedMk4BuildStorageOnly?">
+        <set_value name="this.$tm_tradesRejectedMk4BuildStorageOnly" exact="0"/>
       </do_if>
       <do_if value="not this.$tm_tradesRejectedDistance?">
         <set_value name="this.$tm_tradesRejectedDistance" exact="0"/>
@@ -779,6 +784,33 @@
             </do_if>
           </do_if>
 
+          <!-- MK4 build-storage-only mode (implicit: allowBuildstorage on, all ware-category toggles off):
+               delivery buyer must be player build storage within jumpDistanceCoverage; BS supplier legs blocked. -->
+          <do_if value="$scoreMode == 'supply' and $mk4CustomerMustBePlayer and $mk4BuildStorageOnlyMode">
+            <do_if value="$buyStation.isclass.buildstorage">
+              <set_value name="this.$tm_tradesRejected" operation="add"/>
+              <set_value name="this.$tm_tradesRejectedMk4BuildStorageOnly" operation="add"/>
+              <continue/>
+            </do_if>
+            <do_if value="not $sellStation.isclass.buildstorage">
+              <set_value name="this.$tm_tradesRejected" operation="add"/>
+              <set_value name="this.$tm_tradesRejectedMk4BuildStorageOnly" operation="add"/>
+              <continue/>
+            </do_if>
+            <!-- BS-only delivery scope: player build storage within jumpDistanceCoverage from home. -->
+            <set_value name="$mk4BsoCoverageMax" exact="if $maxDistanceSell? and $maxDistanceSell gt 0 then $maxDistanceSell else $maxDistance"/>
+            <set_value name="$mk4BsoInScope" exact="false"/>
+            <set_value name="$mk4BsoDist" exact="if $homeSector? and $sellStation? and $sellStation.sector? then $homeSector.gatedistance.{$sellStation.sector} else -1"/>
+            <do_if value="$mk4BsoDist ge 0 and ($mk4BsoCoverageMax le 0 or $mk4BsoDist le $mk4BsoCoverageMax)">
+              <set_value name="$mk4BsoInScope" exact="true"/>
+            </do_if>
+            <do_if value="not $mk4BsoInScope">
+              <set_value name="this.$tm_tradesRejected" operation="add"/>
+              <set_value name="this.$tm_tradesRejectedMk4BuildStorageOnly" operation="add"/>
+              <continue/>
+            </do_if>
+          </do_if>
+
           <!-- MK4 ware-type policy gate (evaluated against customer station context):
                - Resources: pure resources (non-intermediate)
                - Intermediates: intermediate wares and products
@@ -918,7 +950,20 @@
                Subtract incoming vanilla reservations from destination demand before scoring.
                Also subtract in-flight GT reservations for the same destination offer.
                If effective need is exhausted, skip this ware pair early so saturated wares
-               do not dominate top candidates and storage is not overfilled. -->
+               do not dominate top candidates and storage is not overfilled.
+               Baseline uses max(per-ship offeramount, raw offer.amount, cargo deficit) because
+               a single offer slice can understate build-storage / station need while
+               get_ware_reservation is station-wide for the ware. -->
+          <set_value name="$demandBaseline" exact="$buyOfferAmount"/>
+          <do_if value="$buyOffer? and $buyOffer.amount? and $buyOffer.amount gt $demandBaseline">
+            <set_value name="$demandBaseline" exact="$buyOffer.amount"/>
+          </do_if>
+          <do_if value="$sellStation? and $sellStation.exists and $ware?">
+            <set_value name="$cargoDeficit" exact="[0, $sellStation.cargo.{$ware}.target - $sellStation.cargo.{$ware}.count].max"/>
+            <do_if value="$cargoDeficit gt $demandBaseline">
+              <set_value name="$demandBaseline" exact="$cargoDeficit"/>
+            </do_if>
+          </do_if>
           <do_if value="$sellStation? and $sellStation.exists and $ware?">
             <set_value name="$incomingReservedAmount" exact="0"/>
             <get_ware_reservation object="$sellStation" ware="$ware" type="sell" virtual="false" result="$incomingReservedAmount"/>
@@ -940,7 +985,7 @@
                 </do_if>
               </do_if>
             </do_if>
-            <set_value name="$effectiveBuyNeedAmount" exact="[$buyOfferAmount - $incomingReservedAmount - $gtIncomingReservedAmount, 0].max"/>
+            <set_value name="$effectiveBuyNeedAmount" exact="[$demandBaseline - $incomingReservedAmount - $gtIncomingReservedAmount, 0].max"/>
             <do_if value="$effectiveBuyNeedAmount le 0">
               <set_value name="this.$tm_tradesRejected" operation="add"/>
               <do_if value="$scoreMode == 'supply' and $mk4CustomerMustBePlayer">
@@ -1158,6 +1203,7 @@
 
           <set_value name="$trade" exact="table[
             $Ware = $ware,
+            $CargoWareTransport = if $ware? then @$ware.waretransport else null,
             $BuyOffer = $sellOffer,
             $SellOffer = $buyOffer,
             $Amount = $tradeAmount,
@@ -1239,6 +1285,9 @@
       <do_if value="not this.$tm_tradesRejectedMk4PriceCap?">
         <set_value name="this.$tm_tradesRejectedMk4PriceCap" exact="0"/>
       </do_if>
+      <do_if value="not this.$tm_tradesRejectedMk4BuildStorageOnly?">
+        <set_value name="this.$tm_tradesRejectedMk4BuildStorageOnly" exact="0"/>
+      </do_if>
       <do_if value="not this.$tm_tradesRejectedDistance?">
         <set_value name="this.$tm_tradesRejectedDistance" exact="0"/>
       </do_if>
@@ -1255,6 +1304,7 @@
         $TradesRejectedMk4TypePolicy = this.$tm_tradesRejectedMk4TypePolicy,
         $TradesRejectedMk4DemandGate = this.$tm_tradesRejectedMk4DemandGate,
         $TradesRejectedMk4PriceCap = this.$tm_tradesRejectedMk4PriceCap,
+        $TradesRejectedMk4BuildStorageOnly = this.$tm_tradesRejectedMk4BuildStorageOnly,
         $TradesRejectedDistance = this.$tm_tradesRejectedDistance
       ]"/>
     </actions>

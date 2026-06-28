@@ -64,7 +64,7 @@ ffi.cdef[[
 local GT_Blacklist = {
     -- Configuration
     CONFIG = {
-        DEBUG_MODE = false,  -- Set to true to enable debug logging
+        DEBUG_MODE = false,  -- true: init/update/FFI trace + per-macro verbose dumps
         BLACKLIST_NAME_PREFIX = "GT_ThreatAvoid_",
         THREAT_LEVEL_THRESHOLD = 3,  -- Default: Blacklist sectors with threat >= 3 (overridden by MD settings)
         UPDATE_INTERVAL = 5.0,        -- Check for updates every 5 seconds
@@ -115,30 +115,87 @@ end
 -- UTILITY FUNCTIONS
 -- =============================================================================
 
--- Always-on load/init visibility (matches gt_mod_removal.lua; no debug flag required)
+-- Load/init visibility; INFO only when DEBUG_MODE (errors/warnings always)
 local function logLoad(message, level)
     level = level or "INFO"
+    if level ~= "ERROR" and level ~= "WARNING" and not GT_Blacklist.CONFIG.DEBUG_MODE then
+        return
+    end
+    local prefix = "[GT-Blacklist-Lua] "
+    DebugError(prefix .. message)
+end
+
+-- Runtime trace; INFO only when DEBUG_MODE (errors/warnings always)
+local function logTrace(message, level)
+    level = level or "INFO"
+    if level ~= "ERROR" and level ~= "WARNING" and not GT_Blacklist.CONFIG.DEBUG_MODE then
+        return
+    end
     local prefix = "[GT-Blacklist-Lua] "
     if level == "ERROR" or level == "WARNING" then
-        DebugError(prefix .. message)
+        DebugError(prefix .. level .. ": " .. message)
     else
         DebugError(prefix .. message)
     end
 end
 
-local function debugLog(message, level)
+local function logVerbose(message, level)
     if GT_Blacklist.CONFIG.DEBUG_MODE then
-        local prefix = level == "ERROR" and "❌" or level == "WARN" and "" or "🛡️"
-        local logText = string.format("[GT-Blacklist] %s %s", prefix, message)
-        
-        -- Only use DebugError for actual errors and warnings
+        local prefix = level == "ERROR" and "ERROR" or level == "WARN" and "WARN" or "DBG"
+        local logText = string.format("[GT-Blacklist-Lua] %s: %s", prefix, message)
         if level == "ERROR" or level == "WARN" then
             DebugError(logText)
         else
-            -- For info/success messages, use standard print (appears in Scripts log, not as error)
             print(logText)
         end
     end
+end
+
+-- Backward-compatible alias used throughout this file
+local function debugLog(message, level)
+    logVerbose(message, level)
+end
+
+local function summarizeMacroList(macros, max_show)
+    max_show = max_show or 5
+    if not macros or #macros == 0 then
+        return "(none)"
+    end
+    if #macros <= max_show then
+        return table.concat(macros, ", ")
+    end
+    local shown = {}
+    for i = 1, max_show do
+        shown[i] = macros[i]
+    end
+    return table.concat(shown, ", ") .. string.format(" ... +%d more", #macros - max_show)
+end
+
+local function logBlacklistVerify(blacklist_id, context)
+    if not blacklist_id or blacklist_id == 0 then
+        logTrace(string.format("%s: verify skipped (no blacklist id)", context), "WARNING")
+        return
+    end
+    if type(C.GetBlacklistInfo2) ~= "cdata" then
+        logTrace(string.format("%s: GetBlacklistInfo2 not available (id=%s)", context, tostring(blacklist_id)))
+        return
+    end
+    local verify_buf = ffi.new("BlacklistInfo2")
+    local ok, exists = pcall(function() return C.GetBlacklistInfo2(verify_buf, blacklist_id) end)
+    if not ok then
+        logTrace(string.format("%s: GetBlacklistInfo2 pcall failed for id=%s: %s", context, tostring(blacklist_id), tostring(exists)), "WARNING")
+        return
+    end
+    if not exists then
+        logTrace(string.format("%s: blacklist id=%s NOT FOUND in X4", context, tostring(blacklist_id)), "WARNING")
+        return
+    end
+    local name = verify_buf.name and ffi.string(verify_buf.name) or "?"
+    local relation = verify_buf.relation and ffi.string(verify_buf.relation) or ""
+    logTrace(string.format(
+        "%s: X4 confirms id=%s name='%s' nummacros=%d relation='%s'",
+        context, tostring(blacklist_id), name, tonumber(verify_buf.nummacros) or 0, relation
+    ))
 end
 
 local function convertStringToID(idcode)
@@ -171,7 +228,14 @@ end
 --- @param threatened_macro_list table List of sector macros with direct threats
 --- @param relation_value string "enemy" to block enemy factions, "" to disable
 local function updateFleetBlacklist(threatened_macro_list, relation_value)
-    local relation_display = (relation_value == "enemy") and '"enemy"' or 'disabled'
+    local relation_display = (relation_value == "enemy") and "enemy" or "disabled"
+    logTrace(string.format(
+        "updateFleetBlacklist: %d sector macro(s), faction blocking=%s, fleet_id=%s, initialized=%s",
+        #(threatened_macro_list or {}),
+        relation_display,
+        tostring(GT_Blacklist.fleet_blacklist_id),
+        tostring(GT_Blacklist.initialized)
+    ))
     debugLog(string.format("Updating fleet blacklist with %d threatened sector macros, faction blocking: %s", 
              #threatened_macro_list, relation_display))
     
@@ -244,8 +308,22 @@ local function updateFleetBlacklist(threatened_macro_list, relation_value)
     -- Create or update blacklist
     if not GT_Blacklist.fleet_blacklist_id then
         debugLog(string.format("Creating new fleet blacklist: %s", blacklist_name))
-        GT_Blacklist.fleet_blacklist_id = C.CreateBlacklist2(info)
+        local ok, new_id = pcall(function() return C.CreateBlacklist2(info) end)
+        if not ok then
+            logTrace("CreateBlacklist2 pcall failed: " .. tostring(new_id), "ERROR")
+            return false
+        end
+        GT_Blacklist.fleet_blacklist_id = new_id
+        if not new_id or new_id == 0 then
+            logTrace("CreateBlacklist2 returned invalid id=0", "ERROR")
+            return false
+        end
+        logTrace(string.format(
+            "CreateBlacklist2 OK: id=%d macros=[%s] relation='%s'",
+            new_id, summarizeMacroList(threatened_macro_list), relation_value
+        ))
         debugLog(string.format("Fleet blacklist created with ID: %d", GT_Blacklist.fleet_blacklist_id))
+        logBlacklistVerify(GT_Blacklist.fleet_blacklist_id, "after create")
     else
         -- Try to verify blacklist still exists before updating (player might have deleted it manually)
         local blacklist_still_exists = false
@@ -274,8 +352,22 @@ local function updateFleetBlacklist(threatened_macro_list, relation_value)
         if not blacklist_still_exists then
             -- Blacklist was deleted - recreate it
             debugLog("Recreating deleted blacklist...")
-            GT_Blacklist.fleet_blacklist_id = C.CreateBlacklist2(info)
+            local ok, new_id = pcall(function() return C.CreateBlacklist2(info) end)
+            if not ok then
+                logTrace("Recreate CreateBlacklist2 pcall failed: " .. tostring(new_id), "ERROR")
+                return false
+            end
+            GT_Blacklist.fleet_blacklist_id = new_id
+            if not new_id or new_id == 0 then
+                logTrace("Recreate CreateBlacklist2 returned invalid id=0", "ERROR")
+                return false
+            end
+            logTrace(string.format(
+                "Recreate OK: id=%d macros=[%s] relation='%s'",
+                new_id, summarizeMacroList(threatened_macro_list), relation_value
+            ))
             debugLog(string.format("Fleet blacklist recreated with new ID: %d", GT_Blacklist.fleet_blacklist_id))
+            logBlacklistVerify(GT_Blacklist.fleet_blacklist_id, "after recreate")
             
             -- Notify MD to update the stored ID
             AddUITriggeredEvent("gt_blacklist_manager", "BlacklistCreated", GT_Blacklist.fleet_blacklist_id)
@@ -283,8 +375,20 @@ local function updateFleetBlacklist(threatened_macro_list, relation_value)
             -- Blacklist exists (or we can't verify) - update it
             debugLog(string.format("Updating existing fleet blacklist ID: %d", GT_Blacklist.fleet_blacklist_id))
             info.id = GT_Blacklist.fleet_blacklist_id
-            C.UpdateBlacklist2(info)
+            local ok, err = pcall(function() C.UpdateBlacklist2(info) end)
+            if not ok then
+                logTrace(string.format(
+                    "UpdateBlacklist2 pcall failed for id=%s: %s",
+                    tostring(GT_Blacklist.fleet_blacklist_id), tostring(err)
+                ), "ERROR")
+                return false
+            end
+            logTrace(string.format(
+                "UpdateBlacklist2 OK: id=%d macros=[%s] relation='%s'",
+                GT_Blacklist.fleet_blacklist_id, summarizeMacroList(threatened_macro_list), relation_value
+            ))
             debugLog("Fleet blacklist updated")
+            logBlacklistVerify(GT_Blacklist.fleet_blacklist_id, "after update")
         end
     end
     
@@ -336,6 +440,7 @@ end
 --- Apply fleet blacklist to non-subordinate GT ships (subordinates inherit from commanders)
 local function applyFleetBlacklistToAllShips(ship_list)
     if not GT_Blacklist.fleet_blacklist_id then
+        logTrace("applyFleetBlacklistToAllShips: no fleet blacklist id to apply", "WARNING")
         debugLog("No fleet blacklist to apply", "WARN")
         return false
     end
@@ -386,12 +491,17 @@ end
 --- @param threat_data_string string Format: "sector_macro1:level1:timestamp1|sector_macro2:level2:timestamp2|..."
 --- @return table threatened_macros List of sector macros to blacklist
 local function parseThreatData(threat_data_string)
-    debugLog(string.format("Parsing threat data: %s", threat_data_string))
+    local payload_len = threat_data_string and #threat_data_string or 0
+    debugLog(string.format("Parsing threat data (%d chars): %s", payload_len, threat_data_string))
     
     -- Simple format: "sector_macro1:level1:timestamp1|sector_macro2:level2:timestamp2|..."
     local threatened_macros = {}
+    local entry_count = 0
+    local below_threshold = 0
+    local invalid_entries = 0
     
-    for sector_entry in string.gmatch(threat_data_string, "([^|]+)") do
+    for sector_entry in string.gmatch(threat_data_string or "", "([^|]+)") do
+        entry_count = entry_count + 1
         local parts = {}
         for part in string.gmatch(sector_entry, "([^:]+)") do
             table.insert(parts, part)
@@ -409,10 +519,22 @@ local function parseThreatData(threat_data_string)
                     threat_level = threat_level,
                     timestamp = timestamp
                 }
+            elseif threat_level < GT_Blacklist.CONFIG.THREAT_LEVEL_THRESHOLD then
+                below_threshold = below_threshold + 1
+            else
+                invalid_entries = invalid_entries + 1
             end
+        else
+            invalid_entries = invalid_entries + 1
         end
     end
     
+    logTrace(string.format(
+        "parseThreatData: entries=%d blacklisted=%d below_threshold=%d invalid=%d threshold=%d sample=[%s]",
+        entry_count, #threatened_macros, below_threshold, invalid_entries,
+        GT_Blacklist.CONFIG.THREAT_LEVEL_THRESHOLD,
+        summarizeMacroList(threatened_macros)
+    ))
     debugLog(string.format("Found %d sector macros above threat threshold", #threatened_macros))
     return threatened_macros
 end
@@ -440,17 +562,26 @@ end
 -- EVENT HANDLERS - MD SCRIPT INTERFACE
 -- =============================================================================
 
+-- Track dropped updates when not initialized (always log first; then every 25th)
+local dropped_update_count = 0
+
 --- Initialize the blacklist system
 local function onInitialize(_, event_data)
+    local already_initialized = GT_Blacklist.initialized
+    logTrace(string.format(
+        "EVENT Initialize received (initialized=%s, payload_len=%d)",
+        tostring(GT_Blacklist.initialized), event_data and #event_data or 0
+    ))
     debugLog("Initializing GalaxyTrader Dynamic Blacklist System...")
     
-    if GT_Blacklist.initialized then
-        debugLog("System already initialized", "WARN")
-        return true
+    if already_initialized then
+        logTrace("Initialize re-sync: refreshing settings and fleet blacklist shell")
+        debugLog("System already initialized - re-syncing", "WARN")
     end
     
     -- Verify FFI functions are available
     if type(C.CreateBlacklist2) ~= "cdata" then
+        logTrace("Initialize failed: CreateBlacklist2 FFI not available", "ERROR")
         debugLog("ERROR: CreateBlacklist2 FFI function not available!", "ERROR")
         return false
     end
@@ -468,11 +599,17 @@ local function onInitialize(_, event_data)
         for part in string.gmatch(event_data, "[^|]+") do
             table.insert(parts, part)
         end
+        logTrace(string.format(
+            "Initialize payload parsed: relation='%s' existing_id=%s threshold=%s",
+            tostring(parts[1] or ""), tostring(parts[2] or "0"), tostring(parts[3] or "3")
+        ))
         debugLog(string.format("Parsed parts: [1]='%s', [2]='%s', [3]='%s'",
                  tostring(parts[1] or "nil"), tostring(parts[2] or "nil"), tostring(parts[3] or "nil")))
         relation_value = parts[1] or ""
         existing_id = tonumber(parts[2]) or 0
         threshold = tonumber(parts[3]) or 3
+    else
+        logTrace("Initialize payload empty - using defaults (relation='', id=0, threshold=3)", "WARNING")
     end
     
     -- Apply threshold from MD settings
@@ -497,12 +634,14 @@ local function onInitialize(_, event_data)
     local success = updateFleetBlacklist(empty_sectors, GT_Blacklist.relation_value)
     
     if not success then
+        logTrace("Initialize failed: updateFleetBlacklist returned false", "ERROR")
         debugLog(" Failed to create/update blacklist", "WARN")
         return false
     end
     
     -- If we created a NEW blacklist, notify MD to store the ID
-    if existing_id == 0 and GT_Blacklist.fleet_blacklist_id then
+    if not already_initialized and existing_id == 0 and GT_Blacklist.fleet_blacklist_id then
+        logTrace(string.format("Notifying MD BlacklistCreated id=%d", GT_Blacklist.fleet_blacklist_id))
         debugLog(string.format("Notifying MD of new blacklist ID: %d", GT_Blacklist.fleet_blacklist_id))
         AddUITriggeredEvent("gt_blacklist_manager", "BlacklistCreated", GT_Blacklist.fleet_blacklist_id)
     end
@@ -510,6 +649,12 @@ local function onInitialize(_, event_data)
     debugLog("Fleet blacklist initialized with faction-based blocking enabled")
     
     GT_Blacklist.initialized = true
+    dropped_update_count = 0
+    logTrace(string.format(
+        "%s: id=%s threshold=%d relation='%s' (awaiting Update/ApplyToFleet)",
+        already_initialized and "RE-SYNC OK" or "INIT OK",
+        tostring(GT_Blacklist.fleet_blacklist_id), threshold, relation_value
+    ))
     debugLog("Dynamic Blacklist System initialized successfully")
     
     return true
@@ -517,11 +662,20 @@ end
 
 --- Update blacklists based on current threat data
 local function onUpdateBlacklist(_, event_data)
+    local payload_len = event_data and #event_data or 0
     if not GT_Blacklist.initialized then
+        dropped_update_count = dropped_update_count + 1
+        if dropped_update_count == 1 or (dropped_update_count % 25) == 0 then
+            logTrace(string.format(
+                "EVENT Update DROPPED (#%d): initialized=false payload_len=%d (MD sent update before Initialize?)",
+                dropped_update_count, payload_len
+            ), "WARNING")
+        end
         debugLog("System not initialized - ignoring update request", "WARN")
         return false
     end
     
+    logTrace(string.format("EVENT Update received payload_len=%d", payload_len))
     debugLog("Received blacklist update request")
     
     -- Parse threat data from MD (empty string = no threats)
@@ -533,19 +687,32 @@ local function onUpdateBlacklist(_, event_data)
     end
     
     -- Update fleet blacklist with threatened sectors AND relation value (must pass it every time!)
-    return updateFleetBlacklist(threatened_sectors, GT_Blacklist.relation_value)
+    local ok = updateFleetBlacklist(threatened_sectors, GT_Blacklist.relation_value)
+    if ok then
+        logTrace(string.format(
+            "EVENT Update applied: %d sector macro(s) id=%s",
+            #threatened_sectors, tostring(GT_Blacklist.fleet_blacklist_id)
+        ))
+    else
+        logTrace("EVENT Update failed: updateFleetBlacklist returned false", "ERROR")
+    end
+    return ok
 end
 
 --- Apply blacklist to GT fleet ships
 local function onApplyToFleet(_, event_data)
     if not GT_Blacklist.initialized then
+        logTrace("EVENT ApplyToFleet DROPPED: initialized=false", "WARNING")
         debugLog("System not initialized - ignoring apply request", "WARN")
         return false
     end
     
+    local payload_len = event_data and #event_data or 0
+    logTrace(string.format("EVENT ApplyToFleet received payload_len=%d fleet_id=%s", payload_len, tostring(GT_Blacklist.fleet_blacklist_id)))
     debugLog("Received fleet application request")
     
     if not event_data or event_data == "" then
+        logTrace("EVENT ApplyToFleet failed: empty ship list", "ERROR")
         debugLog("No ship list provided", "ERROR")
         return false
     end
@@ -556,14 +723,22 @@ local function onApplyToFleet(_, event_data)
         table.insert(ship_list, ship_id)
     end
     
-    return applyFleetBlacklistToAllShips(ship_list)
+    local ok = applyFleetBlacklistToAllShips(ship_list)
+    logTrace(string.format(
+        "EVENT ApplyToFleet finished: ships=%d ok=%s fleet_id=%s",
+        #ship_list, tostring(ok), tostring(GT_Blacklist.fleet_blacklist_id)
+    ))
+    return ok
 end
 
 --- Clean up expired threats and update blacklist
 local function onCleanupExpired(_, event_data)
     if not GT_Blacklist.initialized then
+        logTrace("EVENT CleanupExpired DROPPED: initialized=false", "WARNING")
         return false
     end
+    
+    logTrace(string.format("EVENT CleanupExpired received payload_len=%d", event_data and #event_data or 0))
     
     -- Check for nil/empty event_data before parsing (prevents crash)
     if not event_data or event_data == "" then
@@ -613,6 +788,7 @@ end
 
 --- Force recreate the blacklist (bypasses initialized check)
 local function onRecreateBlacklist(_, event_data)
+    logTrace("EVENT Recreate received - resetting initialized flag")
     debugLog("FORCE RECREATE: Resetting blacklist system...")
     
     -- Reset initialized flag to allow recreation
@@ -659,6 +835,7 @@ local function init()
     logLoad("================================================================================")
     logLoad("Dynamic Blacklist Manager loaded successfully!")
     logLoad("Signalled MD: gt_blacklist_manager Ready")
+    logLoad("Runtime state: initialized=false (waiting for GT_Blacklist.Initialize from MD)")
     logLoad("================================================================================")
 
     AddUITriggeredEvent("gt_blacklist_manager", "Ready", {})

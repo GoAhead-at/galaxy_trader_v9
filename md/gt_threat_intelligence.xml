@@ -1061,6 +1061,12 @@
           <set_value name="global.$GT_ThreatIntelligence.{$sector}" exact="table[]"/>
         </do_if>
         
+        <!-- Only log "Sector Blacklisted" once per sector threat episode (not on every repeat warning) -->
+        <set_value name="$wasAlreadyBlacklisted" exact="false"/>
+        <do_if value="@global.$GT_ThreatIntelligence.{$sector}.$ShouldBlacklist">
+          <set_value name="$wasAlreadyBlacklisted" exact="true"/>
+        </do_if>
+        
         <!-- Calculate threat level (1-5) -->
         <set_value name="$threatLevel" exact="2"/> <!-- Base: hostiles present -->
         <do_if value="$capitalShips gt 0">
@@ -1128,6 +1134,8 @@
               <param name="DebugChance" value="100"/>
             </run_actions>
             
+            <!-- Logbook only when sector is newly added to the blacklist (skip repeat warnings) -->
+            <do_if value="not $wasAlreadyBlacklisted">
             <!-- Create logbook message with enemy ship IDs sorted by size -->
             <!-- Get tracked enemy ships -->
             <set_value name="$trackedShips" exact="@global.$GT_ThreatIntelligence.{$sector}.$TrackedEnemyShips"/>
@@ -1253,6 +1261,12 @@
                 <debug_text text="'[GT-Threat] Logbook message created for blacklisted sector ' + $sector.knownname + ' with ' + $totalShipCount + ' enemy ships (detected by ' + $detectingShipID + '):\n' + $shipIDString" chance="100"/>
               </do_if>
             </do_if>
+            </do_if>
+            <do_else>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Threat] Skipped duplicate Sector Blacklisted logbook for ' + $sector.knownname + ' (already blacklisted)'" chance="100"/>
+              </do_if>
+            </do_else>
           </do_if>
           <do_else>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -1315,75 +1329,85 @@
     <!-- DYNAMIC BLACKLIST INTEGRATION                                            -->
     <!-- ========================================================================= -->
     
-    <!-- Initialize blacklist integration after ui.xml loads the Lua module -->
-    <cue name="InitializeBlacklistIntegration" instantiate="true">
-      <conditions>
-        <event_ui_triggered screen="'gt_blacklist_manager'" control="'Ready'" />
-      </conditions>
+    <!-- Shared bootstrap: raise Lua Initialize, push threat payload, optional fleet assign.
+         Called on session start (game_loaded / new game) AND on Lua Ready (UI loads before MD on menu). -->
+    <library name="BootstrapBlacklistLuaIntegration" purpose="run_actions">
+      <params>
+        <param name="Reason" default="'unknown'"/>
+        <param name="ApplyToFleet" default="true"/>
+      </params>
       <actions>
-        <!-- Initialize Lua blacklist manager -->
-        <!-- Pass relation threshold AND existing blacklist ID (if any) to Lua -->
-        <!-- Only pass relation threshold if BlockEnemyFactions is enabled (default: true) -->
-        <set_value name="$blockEnemyFactions" exact="@global.$GT_GlobalSettings.$ThreatAvoidance.$BlockEnemyFactions"/>
-        <do_if value="not $blockEnemyFactions?">
-          <set_value name="$blockEnemyFactions" exact="true"/> <!-- Default: enabled -->
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Blacklist] BootstrapBlacklistLuaIntegration reason=' + $Reason + ' applyToFleet=' + $ApplyToFleet" chance="100"/>
         </do_if>
         
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-Blacklist] BlockEnemyFactions setting: ' + $blockEnemyFactions" chance="100"/>
+        <!-- Pass relation threshold AND existing blacklist ID (if any) to Lua -->
+        <set_value name="$blockEnemyFactions" exact="@global.$GT_GlobalSettings.$ThreatAvoidance.$BlockEnemyFactions"/>
+        <do_if value="not $blockEnemyFactions?">
+          <set_value name="$blockEnemyFactions" exact="true"/>
         </do_if>
         
         <set_value name="$relationValue" exact="''"/>
         <do_if value="$blockEnemyFactions">
           <set_value name="$relationValue" exact="'enemy'"/>
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Blacklist] Enemy faction blocking ENABLED (X4 relation field = &quot;enemy&quot;)'" chance="100"/>
-          </do_if>
         </do_if>
-        <do_else>
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Blacklist] Enemy faction blocking DISABLED (X4 relation field = &quot;&quot;)'" chance="100"/>
-          </do_if>
-        </do_else>
         
-        <!-- Check if we have a saved blacklist ID from previous session -->
         <set_value name="$existingBlacklistID" exact="@global.$GT_BlacklistID"/>
         <do_if value="not $existingBlacklistID?">
-          <set_value name="$existingBlacklistID" exact="0"/> <!-- 0 = create new -->
+          <set_value name="$existingBlacklistID" exact="0"/>
         </do_if>
         
-        <!-- Get blacklist threshold from settings -->
         <set_value name="$blacklistThreshold" exact="@global.$GT_GlobalSettings.$ThreatAvoidance.$BlacklistThreshold"/>
         <do_if value="not $blacklistThreshold?">
-          <set_value name="$blacklistThreshold" exact="3"/> <!-- Default -->
+          <set_value name="$blacklistThreshold" exact="3"/>
         </do_if>
         
-        <!-- Pass relation value, existing ID, and threshold (format: "relation|id|threshold") -->
         <set_value name="$initData" exact="$relationValue + '|' + $existingBlacklistID + '|' + $blacklistThreshold"/>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-Blacklist] Passing to Lua: &quot;' + $initData + '&quot; (relation=' + $relationValue + ', id=' + $existingBlacklistID + ', threshold=' + $blacklistThreshold + ')'" chance="100"/>
+          <debug_text text="'[GT-Blacklist] Passing to Lua: &quot;' + $initData + '&quot; (reason=' + $Reason + ')'" chance="100"/>
         </do_if>
         <raise_lua_event name="'GT_Blacklist.Initialize'" param="$initData"/>
-        
-        <do_if value="$existingBlacklistID == 0">
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Blacklist] Creating NEW blacklist...'" chance="100"/>
-          </do_if>
-        </do_if>
-        <do_else>
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Blacklist] Reusing EXISTING blacklist ID: ' + $existingBlacklistID" chance="100"/>
-          </do_if>
-        </do_else>
         
         <!-- Load existing threats into blacklist immediately after creation -->
         <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
         
-        <!-- Do NOT auto-assign blacklist to fleet on startup.
-             Assignment is now manual via global settings button. -->
+        <do_if value="$ApplyToFleet and @global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist">
+          <set_value name="global.$GT_ManualBlacklistAssignRequested" exact="true"/>
+          <signal_cue_instantly cue="ApplyBlacklistToFleet"/>
+        </do_if>
         
-        <!-- Start cleanup cycle -->
         <signal_cue_instantly cue="CleanupExpiredThreats_Blacklist"/>
+      </actions>
+    </library>
+    
+    <!-- Primary init path: MD is active after save load / new game (Lua Ready often fires earlier on menu). -->
+    <cue name="InitializeBlacklistOnSessionStart" instantiate="true">
+      <conditions>
+        <check_any>
+          <event_game_loaded/>
+          <event_player_created/>
+          <event_game_started/>
+        </check_any>
+      </conditions>
+      <delay exact="1ms"/>
+      <actions>
+        <run_actions ref="BootstrapBlacklistLuaIntegration">
+          <param name="Reason" value="event.name"/>
+          <param name="ApplyToFleet" value="true"/>
+        </run_actions>
+      </actions>
+    </cue>
+    
+    <!-- Secondary init path: Lua module loaded (may fire before MD on start menu - session start cue is the reliable fix). -->
+    <cue name="InitializeBlacklistIntegration" instantiate="true">
+      <conditions>
+        <event_ui_triggered screen="'gt_blacklist_manager'" control="'Ready'" />
+      </conditions>
+      <actions>
+        <run_actions ref="BootstrapBlacklistLuaIntegration">
+          <param name="Reason" value="'lua_ready'"/>
+          <param name="ApplyToFleet" value="false"/>
+        </run_actions>
       </actions>
     </cue>
     

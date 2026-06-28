@@ -11,6 +11,135 @@
     <!-- ========================================= -->
     <!-- TRADE UTILITIES -->
     <!-- ========================================= -->
+
+    <!-- Ensure global fallback-instrumentation table exists (must be table, not list). -->
+    <library name="GT_EnsureFallbackActivationsTable" purpose="run_actions">
+      <actions>
+        <do_if value="not global.$GT_FallbackActivations? or typeof global.$GT_FallbackActivations != datatype.table">
+          <set_value name="global.$GT_FallbackActivations" exact="table[]"/>
+        </do_if>
+      </actions>
+    </library>
+
+    <!-- Increment a keyed fallback counter; returns new count. Mutate a local copy then assign global (in-place global subscript writes abort). -->
+    <library name="GT_IncrementFallbackActivation" purpose="run_actions">
+      <params>
+        <param name="key" comment="String key in global.$GT_FallbackActivations"/>
+      </params>
+      <actions>
+        <run_actions ref="md.GT_Libraries_General.GT_EnsureFallbackActivationsTable"/>
+        <set_value name="$fa" exact="table[]"/>
+        <do_if value="global.$GT_FallbackActivations? and typeof global.$GT_FallbackActivations == datatype.table">
+          <set_value name="$fa" exact="global.$GT_FallbackActivations"/>
+        </do_if>
+        <set_value name="$prev" exact="0"/>
+        <do_if value="$fa.{$key}?">
+          <set_value name="$prev" exact="$fa.{$key}"/>
+        </do_if>
+        <set_value name="$next" exact="$prev + 1"/>
+        <set_value name="$fa.{$key}" exact="$next"/>
+        <set_value name="global.$GT_FallbackActivations" exact="$fa"/>
+        <return value="$next"/>
+      </actions>
+    </library>
+
+    <!-- Normalize per-sector failed-pair storage to nested table {buySector}->{sellSector}->record.
+         Accepts legacy list entries (gt_trading_ai) or nested table (cache prefilter). -->
+    <library name="GT_NormalizeFailedSectorPairsSectorEntry" purpose="run_actions">
+      <params>
+        <param name="rawEntry" default="null"/>
+        <param name="expirationTime" default="1800s"/>
+      </params>
+      <actions>
+        <set_value name="$normalized" exact="table[]"/>
+        <do_if value="not $rawEntry?">
+          <return value="$normalized"/>
+        </do_if>
+        <do_if value="typeof $rawEntry == datatype.table">
+          <set_value name="$buyKeys" exact="$rawEntry.keys"/>
+          <do_all exact="$buyKeys.count" counter="$bki">
+            <set_value name="$buyKey" exact="$buyKeys.{$bki}"/>
+            <do_if value="$rawEntry.{$buyKey}? and typeof $rawEntry.{$buyKey} == datatype.table">
+              <set_value name="$innerTable" exact="$rawEntry.{$buyKey}"/>
+              <set_value name="$sellKeys" exact="$innerTable.keys"/>
+              <do_all exact="$sellKeys.count" counter="$ski">
+                <set_value name="$sellKey" exact="$sellKeys.{$ski}"/>
+                <set_value name="$record" exact="@$innerTable.{$sellKey}"/>
+                <set_value name="$keep" exact="true"/>
+                <do_if value="$expirationTime gt 0s and $record? and $record.$Timestamp?">
+                  <do_if value="(player.age - $record.$Timestamp) gt $expirationTime">
+                    <set_value name="$keep" exact="false"/>
+                  </do_if>
+                </do_if>
+                <do_if value="$keep and $record?">
+                  <set_value name="$buyMap" exact="if $normalized.{$buyKey}? then $normalized.{$buyKey} else table[]"/>
+                  <set_value name="$buyMap.{$sellKey}" exact="$record"/>
+                  <set_value name="$normalized.{$buyKey}" exact="$buyMap"/>
+                </do_if>
+              </do_all>
+            </do_if>
+          </do_all>
+        </do_if>
+        <do_elseif value="typeof $rawEntry == datatype.list">
+          <do_all exact="$rawEntry.count" counter="$li">
+            <set_value name="$legacyRec" exact="$rawEntry.{$li}"/>
+            <do_if value="$legacyRec? and $legacyRec.$BuySector? and $legacyRec.$BuySector.exists and $legacyRec.$SellSector? and $legacyRec.$SellSector.exists">
+              <set_value name="$keepLegacy" exact="true"/>
+              <do_if value="$expirationTime gt 0s and $legacyRec.$Timestamp?">
+                <do_if value="(player.age - $legacyRec.$Timestamp) gt $expirationTime">
+                  <set_value name="$keepLegacy" exact="false"/>
+                </do_if>
+              </do_if>
+              <do_if value="$keepLegacy">
+                <set_value name="$legacyBuy" exact="$legacyRec.$BuySector"/>
+                <set_value name="$legacySell" exact="$legacyRec.$SellSector"/>
+                <set_value name="$legacyBuyMap" exact="if $normalized.{$legacyBuy}? then $normalized.{$legacyBuy} else table[]"/>
+                <set_value name="$legacyBuyMap.{$legacySell}" exact="table[
+                  $Reason = if $legacyRec.$Reason? then $legacyRec.$Reason else '',
+                  $Timestamp = if $legacyRec.$Timestamp? then $legacyRec.$Timestamp else player.age
+                ]"/>
+                <set_value name="$normalized.{$legacyBuy}" exact="$legacyBuyMap"/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_elseif>
+        <return value="$normalized"/>
+      </actions>
+    </library>
+
+    <!-- Record a failed buy/sell sector pair for ships sharing $currentSector. Returns buy-sector key count. -->
+    <library name="GT_RecordFailedSectorPair" purpose="run_actions">
+      <params>
+        <param name="currentSector" default="null"/>
+        <param name="buySector" default="null"/>
+        <param name="sellSector" default="null"/>
+        <param name="reason" default="''"/>
+        <param name="expirationTime" default="1800s"/>
+      </params>
+      <actions>
+        <do_if value="not $currentSector? or not $currentSector.exists or not $buySector? or not $buySector.exists or not $sellSector? or not $sellSector.exists">
+          <return value="0"/>
+        </do_if>
+        <set_value name="$root" exact="table[]"/>
+        <do_if value="global.$GT_FailedSectorPairs? and typeof global.$GT_FailedSectorPairs == datatype.table">
+          <set_value name="$root" exact="global.$GT_FailedSectorPairs"/>
+        </do_if>
+        <set_value name="$rawSector" exact="if $root.{$currentSector}? then $root.{$currentSector} else null"/>
+        <run_actions ref="md.GT_Libraries_General.GT_NormalizeFailedSectorPairsSectorEntry" result="$sectorMap">
+          <param name="rawEntry" value="$rawSector"/>
+          <param name="expirationTime" value="$expirationTime"/>
+        </run_actions>
+        <set_value name="$buyMap" exact="if $sectorMap.{$buySector}? then $sectorMap.{$buySector} else table[]"/>
+        <set_value name="$buyMap.{$sellSector}" exact="table[$Reason = $reason, $Timestamp = player.age]"/>
+        <set_value name="$sectorMap.{$buySector}" exact="$buyMap"/>
+        <set_value name="$root.{$currentSector}" exact="$sectorMap"/>
+        <do_if value="$root.keys.count gt 100">
+          <set_value name="$root" exact="table[$currentSector = $sectorMap]"/>
+        </do_if>
+        <set_value name="global.$GT_FailedSectorPairs" exact="$root"/>
+        <return value="$sectorMap.keys.count"/>
+      </actions>
+    </library>
     
     <!-- Is Intra-Sector Trade -->
     <library name="GT_IsIntraSectorTrade" purpose="run_actions">

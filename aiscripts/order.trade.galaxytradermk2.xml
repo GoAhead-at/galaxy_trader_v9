@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<aiscript name="order.trade.galaxytraderMK2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="6">
+<aiscript name="order.trade.galaxytraderMK2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="7">
   <order id="GalaxyTraderMK2" name="{77000, 20002}" description="{77000, 20102}" category="trade" infinite="true" allowinloop="false" canplayercancel="true">
     <params>
       <param name="homeStation" type="object" default="null" text="{77000, 20017}" comment="{77000, 20117}">
@@ -188,15 +188,16 @@
       <set_command_action commandaction="commandaction.standingby"/>
     </do_if>
 
+    <!-- Range-clamp each threshold to its valid band only. The three thresholds are
+         INDEPENDENT controls (min = destination accept-until ceiling; static = source
+         drain floor; max = source rebalance trigger). We do NOT force a min<static<max
+         ladder here - forcing it silently rewrote configs like 98/0/0 into 98/99/100 and
+         froze the trader. The main_loop normalization re-applies the ordering ladder ONLY
+         in bidirectional mode (where it prevents ping-pong); unidirectional routes keep the
+         thresholds independent. -->
     <set_value name="$minStorage" exact="[0, [$minStorage, 98].min].max"/>
     <set_value name="$staticStorage" exact="[0, [$staticStorage, 99].min].max"/>
     <set_value name="$maxStorage" exact="[0, [$maxStorage, 100].min].max"/>
-    <do_if value="$staticStorage le $minStorage">
-      <set_value name="$staticStorage" exact="[99, $minStorage + 1].min"/>
-    </do_if>
-    <do_if value="$maxStorage le $staticStorage">
-      <set_value name="$maxStorage" exact="[100, $staticStorage + 1].min"/>
-    </do_if>
 
     <set_value name="this.$sourceStation" exact="$activeSources.{1}"/>
     <set_value name="this.$sourceList" exact="$activeSources"/>
@@ -293,7 +294,6 @@
     <do_if value="not $autoJumpDistanceByLevel?">
       <set_value name="$autoJumpDistanceByLevel" exact="false"/>
     </do_if>
-    <set_value name="this.$prevAutoJumpDistance" exact="$autoJumpDistanceByLevel"/>
     <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': v3->v4 patch applied (autoJumpDistanceByLevel=' + $autoJumpDistanceByLevel + ')'" filter="savegame"/>
   </patch>
   <patch sinceversion="5">
@@ -303,8 +303,38 @@
     <set_value name="this.$enforceRouteIllegalLegality" exact="$enforceRouteIllegalLegality"/>
     <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': v4->v5 patch applied (enforceRouteIllegalLegality=' + $enforceRouteIllegalLegality + ')'" filter="savegame"/>
   </patch>
-  <patch sinceversion="6">
-    <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': v5->v6 patch applied (post-tradematch fairness no longer double-subtracts destination reservations)'" filter="savegame"/>
+  <patch sinceversion="7">
+    <!-- v6 and earlier clamped staticStorage up to min+1 at init, persisting e.g.
+         98/99/100 for a configured 98/0/0 and freezing the trader. Recompute the live
+         thresholds from the raw params under the new rule: range-clamp only, with the
+         min<static<max ladder re-applied ONLY in bidirectional mode (where it prevents
+         ping-pong). main_loop re-normalizes every cycle thereafter; this just corrects
+         migrated saves immediately. Params are baseline (since v1) but guarded defensively
+         per the patch-ordering caveat. -->
+    <do_if value="not $minStorage?">
+      <set_value name="$minStorage" exact="20"/>
+    </do_if>
+    <do_if value="not $staticStorage?">
+      <set_value name="$staticStorage" exact="40"/>
+    </do_if>
+    <do_if value="not $maxStorage?">
+      <set_value name="$maxStorage" exact="70"/>
+    </do_if>
+    <do_if value="not $bidirectional?">
+      <set_value name="$bidirectional" exact="false"/>
+    </do_if>
+    <set_value name="this.$minStorage" exact="[0, [$minStorage, 98].min].max"/>
+    <set_value name="this.$staticStorage" exact="[0, [$staticStorage, 99].min].max"/>
+    <set_value name="this.$maxStorage" exact="[0, [$maxStorage, 100].min].max"/>
+    <do_if value="$bidirectional">
+      <do_if value="this.$staticStorage le this.$minStorage">
+        <set_value name="this.$staticStorage" exact="[99, this.$minStorage + 1].min"/>
+      </do_if>
+      <do_if value="this.$maxStorage le this.$staticStorage">
+        <set_value name="this.$maxStorage" exact="[100, this.$staticStorage + 1].min"/>
+      </do_if>
+    </do_if>
+    <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': v6->v7 patch applied (thresholds normalized to ' + this.$minStorage + '/' + this.$staticStorage + '/' + this.$maxStorage + ', bidir=' + $bidirectional + ')'" filter="savegame"/>
   </patch>
 
   <attention min="unknown">
@@ -493,6 +523,27 @@
           <set_value name="this.$idleParking" exact="if $mk2InheritedOrder.$idleParking? then $mk2InheritedOrder.$idleParking else false"/>
         </do_if>
       </do_elseif>
+      <!-- Threshold normalization (runs every cycle on the live this.$ values, after the
+           direct/inherited refresh above and the one-time init):
+           - Range-clamp each threshold to its valid band.
+           - Enforce the min<static<max ladder ONLY in bidirectional mode. When every
+             station can both supply and receive, a static floor below the destination min
+             ceiling can ping-pong stock (drain a low station into a fuller one and back),
+             so we keep the ordering guard there. Unidirectional routes have fixed
+             source/dest roles, so the three thresholds stay independent (e.g. 98/0/0 means
+             "fill destinations to 98%, drain sources fully"). -->
+      <set_value name="this.$minStorage" exact="[0, [this.$minStorage, 98].min].max"/>
+      <set_value name="this.$staticStorage" exact="[0, [this.$staticStorage, 99].min].max"/>
+      <set_value name="this.$maxStorage" exact="[0, [this.$maxStorage, 100].min].max"/>
+      <do_if value="this.$bidirectional">
+        <do_if value="this.$staticStorage le this.$minStorage">
+          <set_value name="this.$staticStorage" exact="[99, this.$minStorage + 1].min"/>
+        </do_if>
+        <do_if value="this.$maxStorage le this.$staticStorage">
+          <set_value name="this.$maxStorage" exact="[100, this.$staticStorage + 1].min"/>
+        </do_if>
+      </do_if>
+
       <!-- Re-apply pilot-level cap each cycle so level-up/down updates effective range immediately. -->
       <set_value name="$useVanillaXPOnly" exact="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$XP? and global.$GT_GlobalSettings.$XP.$UseVanillaXPOnly? and global.$GT_GlobalSettings.$XP.$UseVanillaXPOnly"/>
       <do_if value="not $useVanillaXPOnly">
@@ -1093,7 +1144,7 @@
             </do_if>
             <set_value name="$awTargetUnionDisplay" exact="$awTargetUnionDisplay + $targetResourceWares.{$awtui}"/>
           </do_all>
-          <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': AUTOWARES dst-union (resources + tradewares across ' + this.$activeDestinations.count + ' destinations) count=' + $targetResourceWares.count + ' [' + $awTargetUnionDisplay + ']'" chance="this.$debugchance"/>
+          <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': AUTOWARES receiver-union (resources + tradewares across ' + this.$activeDestinations.count + ' destinations' + (if this.$bidirectional then ' + ' + this.$activeSources.count + ' sources [bidirectional]' else '') + ') count=' + $targetResourceWares.count + ' [' + $awTargetUnionDisplay + ']'" chance="this.$debugchance"/>
           <do_all exact="this.$activeSources.count" counter="$awsi">
             <set_value name="$awSrc" exact="this.$activeSources.{$awsi}"/>
             <set_value name="$awSrcProducts" exact="$awSrc.products.list"/>

@@ -46,7 +46,11 @@
         <input_param name="max" value="10"/>
         <input_param name="step" value="1"/>
       </param>
-      <param name="prioritywares" default="[]" type="list" text="{77000,1064}" comment="{77000,1066}">
+      <param name="allowResources" default="true" type="bool" text="{77000,1076}" comment="Supply resource-class wares"/>
+      <param name="allowIntermediates" default="true" type="bool" text="{77000,1077}" comment="Supply intermediate/product wares"/>
+      <param name="allowTradewares" default="true" type="bool" text="{77000,1078}" comment="{77000,1090}"/>
+      <param name="autowares" default="true" type="bool" text="{77000,1015}" comment="{77000,1023}"/>
+      <param name="warebasket" default="[]" type="list" text="{77000,1069}" comment="{77000,1024}">
         <input_param name="type" value="'ware'"/>
         <input_param name="cancarry" value="this.ship"/>
       </param>
@@ -56,11 +60,7 @@
         <input_param name="max" value="10"/>
         <input_param name="step" value="1"/>
       </param>
-      <param name="allowResources" default="true" type="bool" text="{77000,1076}" comment="Supply resource-class wares"/>
-      <param name="allowIntermediates" default="true" type="bool" text="{77000,1077}" comment="Supply intermediate/product wares"/>
-      <param name="allowTradewares" default="true" type="bool" text="{77000,1078}" comment="{77000,1090}"/>
-      <param name="autowares" default="true" type="bool" text="{77000,1015}" comment="{77000,1023}"/>
-      <param name="warebasket" default="[]" type="list" text="{77000,1069}" comment="{77000,1024}">
+      <param name="prioritywares" default="[]" type="list" text="{77000,1064}" comment="{77000,1066}">
         <input_param name="type" value="'ware'"/>
         <input_param name="cancarry" value="this.ship"/>
       </param>
@@ -5106,6 +5106,19 @@
            target (customer station). Enforce strict BuildStorage-first by consuming all
            BuildStorage target buckets before non-BuildStorage buckets. -->
       <do_if value="$tradeList? and $tradeList.count gt 1">
+        <!-- Re-resolve priority wares here: the $pwForReorder local from the priority-first stage above
+             does not survive the cooperative <wait> yields in the intervening reorder loops. We need it
+             so priority-basket wares stay ahead of non-priority build-storage trades in the remaining-need
+             bias below; otherwise the round-robin re-sorts the build bucket purely by remaining need and
+             a non-priority ware (e.g. Claytronics) can outrank an explicit priority ware (e.g. Energy Cells)
+             when every trade targets a build storage. -->
+        <run_script name="'lib.gt.priority_wares.resolve'" result="$optaPwResult">
+          <param name="instanceWares" value="if this.$effectivePriorityWares? then this.$effectivePriorityWares else null"/>
+          <param name="localWares" value="if $effectivePriorityWares? then $effectivePriorityWares else null"/>
+          <param name="ship" value="this.ship"/>
+          <param name="validOrderIds" value="['GalaxyTraderMK3', 'GalaxyTraderMK4Supply2']"/>
+        </run_script>
+        <set_value name="$optaPw" exact="if $optaPwResult? and $optaPwResult != null then $optaPwResult else []"/>
         <create_list name="$optABuildTrades"/>
         <create_list name="$optANonBuildTrades"/>
         <do_all exact="$tradeList.count" counter="$optaSplitIdx">
@@ -5156,6 +5169,7 @@
           <do_all exact="$optABuildTrades.count" counter="$optaNeedPass">
             <set_value name="$optaBestNeedIdx" exact="0"/>
             <set_value name="$optaBestNeedValue" exact="999999999"/>
+            <set_value name="$optaBestIsPriority" exact="false"/>
             <do_all exact="$optABuildTrades.count" counter="$optaNeedIdx">
               <set_value name="$optaNeedAlreadyPicked" exact="false"/>
               <do_if value="$optaBuildNeedPicked.{$optaNeedIdx}?">
@@ -5170,9 +5184,32 @@
                 <do_elseif value="$optaNeedTrade.$SellOffer? and $optaNeedTrade.$SellOffer.amount? and $optaNeedTrade.$SellOffer.amount ge 0">
                   <set_value name="$optaNeedValue" exact="$optaNeedTrade.$SellOffer.amount"/>
                 </do_elseif>
-                <do_if value="$optaNeedValue lt $optaBestNeedValue">
+                <!-- Priority-ware membership is the PRIMARY ordering key: a basket priority ware ranks
+                     ahead of every non-priority build-storage trade, and remaining-need is only the
+                     tiebreaker within the same priority class. This honours the priority basket even
+                     when every candidate delivers to a build storage. -->
+                <set_value name="$optaNeedWare" exact="if $optaNeedTrade.$Ware? then $optaNeedTrade.$Ware else (if $optaNeedTrade.$BuyOffer? then @$optaNeedTrade.$BuyOffer.ware else null)"/>
+                <set_value name="$optaNeedIsPriority" exact="false"/>
+                <do_if value="$optaNeedWare? and $optaPw? and $optaPw.count gt 0">
+                  <do_all exact="$optaPw.count" counter="$optaPwi">
+                    <set_value name="$optaPwItem" exact="$optaPw.{$optaPwi}"/>
+                    <do_if value="$optaPwItem == $optaNeedWare or ($optaPwItem? and $optaNeedWare? and $optaPwItem.id? and $optaNeedWare.id? and $optaPwItem.id == $optaNeedWare.id)">
+                      <set_value name="$optaNeedIsPriority" exact="true"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                </do_if>
+                <set_value name="$optaNeedBetter" exact="false"/>
+                <do_if value="$optaNeedIsPriority and not $optaBestIsPriority">
+                  <set_value name="$optaNeedBetter" exact="true"/>
+                </do_if>
+                <do_elseif value="$optaNeedIsPriority == $optaBestIsPriority and $optaNeedValue lt $optaBestNeedValue">
+                  <set_value name="$optaNeedBetter" exact="true"/>
+                </do_elseif>
+                <do_if value="$optaNeedBetter">
                   <set_value name="$optaBestNeedValue" exact="$optaNeedValue"/>
                   <set_value name="$optaBestNeedIdx" exact="$optaNeedIdx"/>
+                  <set_value name="$optaBestIsPriority" exact="$optaNeedIsPriority"/>
                 </do_if>
               </do_if>
             </do_all>

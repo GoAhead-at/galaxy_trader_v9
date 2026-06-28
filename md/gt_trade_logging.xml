@@ -53,6 +53,12 @@
           <set_value name="$isMk2Distribution" exact="true"/>
         </do_if>
 
+        <!-- MK4-2 supply: queue-time undercut message (not trader profit). -->
+        <set_value name="$isMk4Supply" exact="false"/>
+        <do_if value="event.param2.$IsMk4Supply? and event.param2.$IsMk4Supply">
+          <set_value name="$isMk4Supply" exact="true"/>
+        </do_if>
+
         <!-- GT due override source of truth: mirror queued logbook semantics exactly. -->
         <!-- Use exact money snapshot from AI when available to avoid conversion drift. -->
         <set_value name="$moneyRawForDue" exact="if event.param2.$MoneyRaw? then event.param2.$MoneyRaw else -$amount * $buyPriceRaw"/>
@@ -97,6 +103,10 @@
         <set_value name="$isMultiTrade" exact="false"/>
         <do_if value="event.param2.$IsMultiTrade? and event.param2.$IsMultiTrade">
           <set_value name="$isMultiTrade" exact="true"/>
+        </do_if>
+        <set_value name="$multiTradeLegCount" exact="0"/>
+        <do_if value="event.param2.$MultiTradeLegs? and event.param2.$MultiTradeLegs.count gt 0">
+          <set_value name="$multiTradeLegCount" exact="event.param2.$MultiTradeLegs.count"/>
         </do_if>
         <set_value name="$multiTradeSummary" exact="''"/>
         <do_if value="event.param2.$MultiTradeSummary? and event.param2.$MultiTradeSummary != null">
@@ -225,16 +235,27 @@
                  3102 for MK2 distribution (supply only, no profit),
                  3107 for multi-trade summary,
                  3108 for MK3 'Ignore Player Pricing' player-supplier sale (buy leg hidden,
-                 profit = gross sell income because player production cost is treated as zero). -->
+                 profit = gross sell income because player production cost is treated as zero),
+                 3110 for MK4-2 supply (NPC supplier: price undercut vs customer cap),
+                 3111 for MK4-2 supply (player supplier: no money line),
+                 3112 for MK4-2 supply multitrade summary (total undercut). -->
             <set_value name="$logbookMessage" exact="null"/>
-            <do_if value="$isMultiTrade">
+            <do_if value="$isMultiTrade and $isMk4Supply">
+              <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$formattedUndercutTotal">
+                <param name="number" value="$profit/100"/>
+                <param name="suffix" value="' Cr'"/>
+              </run_actions>
+              <set_value name="$multiSummarySafe" exact="if $multiTradeSummary != '' then $multiTradeSummary else '-'"/>
+              <set_value name="$logbookMessage" exact="{77000,3112}.[$multiTradeLegCount,$multiSummarySafe,$formattedUndercutTotal]"/>
+            </do_if>
+            <do_elseif value="$isMultiTrade">
               <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$formattedProfit">
                 <param name="number" value="$profit/100"/>
                 <param name="suffix" value="' Cr'"/>
               </run_actions>
               <set_value name="$multiSummarySafe" exact="if $multiTradeSummary != '' then $multiTradeSummary else '-'"/>
               <set_value name="$logbookMessage" exact="{77000,3107}.[$multiSummarySafe,$formattedProfit]"/>
-            </do_if>
+            </do_elseif>
             <do_elseif value="not $buyOfferValid">
               <!-- Selling from cargo (no buy offer) - use translation ID 3100 -->
               <!-- Format profit with thousand separators and M suffix according to global settings -->
@@ -253,6 +274,31 @@
               <set_value name="$mk2SourceFillPercent" exact="if event.param2.$SourceFillPercent? then event.param2.$SourceFillPercent else 0"/>
               <set_value name="$mk2DestFillPercent" exact="if event.param2.$DestFillPercent? then event.param2.$DestFillPercent else 0"/>
               <set_value name="$logbookMessage" exact="{77000,3102}.[$amount,$wareInfo,$buyStationFormatted,$sellStationFormatted,$mk2SourceFillPercent,$mk2DestFillPercent]"/>
+            </do_elseif>
+            <do_elseif value="$isMk4Supply and $playerFreeSupplier">
+              <!-- MK4-2 supply from player-owned supplier: internal transfer — route only, no prices. -->
+              <set_value name="$logbookMessage" exact="{77000,3111}.[$amount,$wareInfo,$buyStationFormatted,$sellStationFormatted]"/>
+            </do_elseif>
+            <do_elseif value="$isMk4Supply">
+              <!-- MK4-2 supply from NPC supplier: customer cap minus sourcing price (undercut), not trader profit. -->
+              <set_value name="$supplyUnitUndercutCr" exact="$sellPrice - $buyPrice"/>
+              <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$formattedBuyPrice">
+                <param name="number" value="$buyPrice"/>
+                <param name="suffix" value="' Cr'"/>
+              </run_actions>
+              <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$formattedSellPrice">
+                <param name="number" value="$sellPrice"/>
+                <param name="suffix" value="' Cr'"/>
+              </run_actions>
+              <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$formattedUnitUndercut">
+                <param name="number" value="$supplyUnitUndercutCr"/>
+                <param name="suffix" value="' Cr'"/>
+              </run_actions>
+              <run_actions ref="md.GT_Libraries_General.GT_FormatNumber" result="$formattedUndercutTotal">
+                <param name="number" value="$profit/100"/>
+                <param name="suffix" value="' Cr'"/>
+              </run_actions>
+              <set_value name="$logbookMessage" exact="{77000,3110}.[$amount,$wareInfo,$formattedBuyPrice,$buyStationFormatted,$sellStationFormatted,$formattedSellPrice,$formattedUnitUndercut,$formattedUndercutTotal]"/>
             </do_elseif>
             <do_elseif value="$playerFreeSupplier">
               <!-- MK3 'Ignore Player Pricing' player-supplier trade: hide the buy leg.
@@ -286,14 +332,23 @@
             </do_else>
             
             <set_value name="$msgType" exact="'3101 (normal trade)'"/>
-            <do_if value="$isMultiTrade">
-              <set_value name="$msgType" exact="'3107 (multitrade queue summary)'"/>
+            <do_if value="$isMultiTrade and $isMk4Supply">
+              <set_value name="$msgType" exact="'3112 (mk4 supply multitrade)'"/>
             </do_if>
+            <do_elseif value="$isMultiTrade">
+              <set_value name="$msgType" exact="'3107 (multitrade queue summary)'"/>
+            </do_elseif>
             <do_elseif value="not $buyOfferValid">
               <set_value name="$msgType" exact="'3100 (cargo sale)'"/>
             </do_elseif>
             <do_elseif value="$isMk2Distribution">
               <set_value name="$msgType" exact="'3102 (mk2 distribution)'"/>
+            </do_elseif>
+            <do_elseif value="$isMk4Supply and $playerFreeSupplier">
+              <set_value name="$msgType" exact="'3111 (mk4 supply player supplier)'"/>
+            </do_elseif>
+            <do_elseif value="$isMk4Supply">
+              <set_value name="$msgType" exact="'3110 (mk4 supply undercut)'"/>
             </do_elseif>
             <do_elseif value="$playerFreeSupplier">
               <set_value name="$msgType" exact="'3108 (player-free-supplier sale)'"/>
@@ -344,6 +399,9 @@
             <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK4Supply'">
               <set_value name="$logbookOrderName" exact="'GalaxyTrader MK4 Supply'"/>
             </do_elseif>
+            <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK4Supply2'">
+              <set_value name="$logbookOrderName" exact="'GalaxyTrader MK4-2 Supply'"/>
+            </do_elseif>
             <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.defaultorder? and ((@$ship.commander.defaultorder.id == 'GalaxyTraderMK1') or (@$ship.commander.defaultorder.id == 'Assist' and $ship.commander.defaultorder.$baseorder? and @$ship.commander.defaultorder.$baseorder.id == 'GalaxyTraderMK1'))">
               <set_value name="$logbookOrderName" exact="'GalaxyTrader MK1'"/>
             </do_elseif>
@@ -356,6 +414,12 @@
             <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.defaultorder? and ((@$ship.commander.defaultorder.id == 'GalaxyTraderMK4Supply') or (@$ship.commander.defaultorder.id == 'Assist' and $ship.commander.defaultorder.$baseorder? and @$ship.commander.defaultorder.$baseorder.id == 'GalaxyTraderMK4Supply'))">
               <set_value name="$logbookOrderName" exact="'GalaxyTrader MK4 Supply'"/>
             </do_elseif>
+            <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.defaultorder? and ((@$ship.commander.defaultorder.id == 'GalaxyTraderMK4Supply2') or (@$ship.commander.defaultorder.id == 'Assist' and $ship.commander.defaultorder.$baseorder? and @$ship.commander.defaultorder.$baseorder.id == 'GalaxyTraderMK4Supply2'))">
+              <set_value name="$logbookOrderName" exact="'GalaxyTrader MK4-2 Supply'"/>
+            </do_elseif>
+            <do_if value="$isMk4Supply">
+              <set_value name="$logbookOrderName" exact="'GalaxyTrader MK4-2 Supply'"/>
+            </do_if>
             <set_value name="$logbookTitle" exact="$logbookOrderName + ': ' + $ship.knownname + ' (' + $ship.idcode + ')'"/>
             <do_if value="$searchPipeline == 'fallback'">
               <set_value name="$logbookTitle" exact="'[FALLBACK] ' + $logbookTitle"/>
@@ -379,6 +443,11 @@
               <set_value name="$logbookMoney" exact="null"/>
               <set_value name="$logbookBonus" exact="null"/>
             </do_if>
+            <do_elseif value="$isMk4Supply">
+              <!-- Supply run: show buy-leg reservation in Money; never show undercut as Bonus/profit. -->
+              <set_value name="$logbookMoney" exact="if $playerFreeSupplier then 0 else $moneyRawForDue"/>
+              <set_value name="$logbookBonus" exact="null"/>
+            </do_elseif>
             <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
               <param name="Message" value="$logbookMessage"/>
               <param name="Category" value="'tips'"/>
@@ -550,11 +619,26 @@
             <param name="suffix" value="' Cr'"/>
           </run_actions>
           <set_value name="$logbookMessage" exact="{77000,3105}.[$trade.$Amount,$trade.$BuyOffer.ware,$buyStationName,$sellStationName,$formattedProfit]"/>
+
+          <set_value name="$logbookOrderName" exact="'GalaxyTrader MK3'"/>
+          <do_if value="$ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK4Supply2'">
+            <set_value name="$logbookOrderName" exact="'GalaxyTrader MK4-2 Supply'"/>
+          </do_if>
+          <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK4Supply'">
+            <set_value name="$logbookOrderName" exact="'GalaxyTrader MK4 Supply'"/>
+          </do_elseif>
+          <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.defaultorder? and ((@$ship.commander.defaultorder.id == 'GalaxyTraderMK4Supply2') or (@$ship.commander.defaultorder.id == 'Assist' and $ship.commander.defaultorder.$baseorder? and @$ship.commander.defaultorder.$baseorder.id == 'GalaxyTraderMK4Supply2'))">
+            <set_value name="$logbookOrderName" exact="'GalaxyTrader MK4-2 Supply'"/>
+          </do_elseif>
+          <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.defaultorder? and ((@$ship.commander.defaultorder.id == 'GalaxyTraderMK4Supply') or (@$ship.commander.defaultorder.id == 'Assist' and $ship.commander.defaultorder.$baseorder? and @$ship.commander.defaultorder.$baseorder.id == 'GalaxyTraderMK4Supply'))">
+            <set_value name="$logbookOrderName" exact="'GalaxyTrader MK4 Supply'"/>
+          </do_elseif>
+          <set_value name="$logbookTitle" exact="$logbookOrderName + ': ' + $ship.knownname + ' (' + $ship.idcode + ')'"/>
           
           <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
             <param name="Message" value="$logbookMessage"/>
             <param name="Category" value="'tips'"/>
-            <param name="Title" value="(if ($ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK4Supply') or ($ship.defaultorder? and @$ship.defaultorder.id == 'Assist' and $ship.commander? and $ship.commander.defaultorder? and ((@$ship.commander.defaultorder.id == 'GalaxyTraderMK4Supply') or (@$ship.commander.defaultorder.id == 'Assist' and $ship.commander.defaultorder.$baseorder? and @$ship.commander.defaultorder.$baseorder.id == 'GalaxyTraderMK4Supply'))) then 'GalaxyTrader MK4 Supply' else 'GalaxyTrader MK3') + ': ' + $ship.knownname + ' (' + $ship.idcode + ')'"/>
+            <param name="Title" value="$logbookTitle"/>
             <param name="Object" value="$ship"/>
             <param name="Interaction" value="'showonmap'"/>
             <param name="Bonus" value="$trade.$Profit"/>

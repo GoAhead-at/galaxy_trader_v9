@@ -7650,6 +7650,12 @@
           <set_value name="$mk4UseMinCargoThresholdForRoute" exact="if $gt_useMinCargoThreshold? then $gt_useMinCargoThreshold else (if this.$effectiveUseMinCargoThresholdFilter? then this.$effectiveUseMinCargoThresholdFilter else false)"/>
           <set_value name="$mk4ThresholdPctForSingle" exact="[10,[(if $gt_cargotarget? then $gt_cargotarget else (if this.$effectiveCargoTarget? then this.$effectiveCargoTarget else 10)),100].min].max"/>
           <set_value name="$mk4CargoCapacityVolForSingle" exact="if this.ship.cargo.capacity.all? then this.ship.cargo.capacity.all else 0"/>
+          <set_value name="$mk4MinLegVolume" exact="0"/>
+          <do_if value="$mk4UseMinCargoThresholdForRoute and $mk4CargoCapacityVolForSingle gt 0">
+            <set_value name="$mk4TargetVolumeForLeg" exact="($mk4ThresholdPctForSingle * $mk4CargoCapacityVolForSingle) / 100"/>
+            <set_value name="$mk4MinLegVolume" exact="$mk4TargetVolumeForLeg / 3"/>
+          </do_if>
+          <set_value name="$mk4MinLegSkipped" exact="0"/>
 
           <!-- Normalize candidates once (amount clamps + pair dedupe). -->
           <do_if value="$validatedTradeCandidates? and $validatedTradeCandidates.count gt 0">
@@ -8052,6 +8058,7 @@
                   <set_value name="$scMaxByVolume" exact="($mk4RemainingVolume / $scVolumePerUnit)i"/>
                   <set_value name="$scPairAmount" exact="[$scPairAmount, $scMaxByVolume].min"/>
                 </do_if>
+                <set_value name="$scMaxFeasibleByVolume" exact="$scPairAmount"/>
                 <do_if value="$scPairAmount le 0">
                   <continue/>
                 </do_if>
@@ -8113,6 +8120,59 @@
                   <set_value name="$scPairAmount" exact="[$scPairAmount, $scSupBudgetRem].min"/>
                   <do_if value="$scPairAmount le 0">
                     <set_value name="$mk4SupBudgetSkipped" operation="add"/>
+                    <continue/>
+                  </do_if>
+                </do_if>
+
+                <!-- MIN_LEG_VOLUME: each extra leg must carry at least minCargoUsed/3 of hold
+                     volume (MK1 parity). Exception: admit when this leg fully covers remaining
+                     destination demand (e.g. final ware cell for construction/research). -->
+                <do_if value="$mk4MinLegVolume gt 0">
+                  <set_value name="$scMaxFeasibleVolume" exact="if $scVolumePerUnit gt 0 then ($scMaxFeasibleByVolume * $scVolumePerUnit) else 0"/>
+                  <do_if value="$scMaxFeasibleVolume le 0">
+                    <continue/>
+                  </do_if>
+                  <set_value name="$scFillsDestCompletely" exact="false"/>
+                  <set_value name="$scDestStation" exact="if $scTrade.$SellStation? and @$scTrade.$SellStation.exists then @$scTrade.$SellStation else (if $scTrade.$SellOffer? and $scTrade.$SellOffer.buyer? and @$scTrade.$SellOffer.buyer.exists then @$scTrade.$SellOffer.buyer else (if $scTrade.$SellOffer? and $scTrade.$SellOffer.owner? then @$scTrade.$SellOffer.owner else null))"/>
+                  <set_value name="$scDestWare" exact="if $scTrade.$Ware? then $scTrade.$Ware else null"/>
+                  <set_value name="$scDestNeedRemaining" exact="0"/>
+                  <do_if value="$scDestStation? and $scDestStation.exists and $scDestWare?">
+                    <set_value name="$scDestNeedRemaining" exact="[0, @$scDestStation.cargo.{$scDestWare}.target - @$scDestStation.cargo.{$scDestWare}.count].max"/>
+                    <get_ware_reservation object="$scDestStation" ware="$scDestWare" type="sell" virtual="false" result="$scDestIncomingRes"/>
+                    <set_value name="$scDestNeedRemaining" exact="[($scDestNeedRemaining - $scDestIncomingRes), 0].max"/>
+                  </do_if>
+                  <do_if value="$scTrade.$SellOffer? and global.$GT_Reservations? and global.$GT_Reservations.{$scTrade.$SellOffer}?">
+                    <set_value name="$scGtResData" exact="global.$GT_Reservations.{$scTrade.$SellOffer}"/>
+                    <do_if value="$scGtResData.$Until? and player.age lt @$scGtResData.$Until">
+                      <do_if value="not $scGtResData.$Ship? or @$scGtResData.$Ship != this.ship">
+                        <set_value name="$scGtResAmount" exact="0"/>
+                        <do_if value="$scGtResData.$Amount? and @$scGtResData.$Amount gt 0">
+                          <set_value name="$scGtResAmount" exact="$scGtResData.$Amount"/>
+                        </do_if>
+                        <do_else>
+                          <set_value name="$scGtResAmount" exact="1"/>
+                        </do_else>
+                        <set_value name="$scDestNeedRemaining" exact="[($scDestNeedRemaining - $scGtResAmount), 0].max"/>
+                      </do_if>
+                    </do_if>
+                  </do_if>
+                  <set_value name="$scAlreadyQueuedToDest" exact="0"/>
+                  <do_all exact="$mk4QueueableTrades.count" counter="$scqai">
+                    <set_value name="$scqTrade" exact="$mk4QueueableTrades.{$scqai}"/>
+                    <do_if value="$scTrade.$SellOffer? and $scqTrade.$SellOffer? and $scqTrade.$SellOffer == $scTrade.$SellOffer">
+                      <set_value name="$scqAmt" exact="if $scqTrade.$QueuedSellAmount? then $scqTrade.$QueuedSellAmount else (if $scqTrade.$Amount? then $scqTrade.$Amount else 0)"/>
+                      <set_value name="$scAlreadyQueuedToDest" exact="$scAlreadyQueuedToDest + $scqAmt"/>
+                    </do_if>
+                  </do_all>
+                  <set_value name="$scDestNeedRemaining" exact="[($scDestNeedRemaining - $scAlreadyQueuedToDest), 0].max"/>
+                  <do_if value="$scDestNeedRemaining gt 0 and $scPairAmount ge $scDestNeedRemaining">
+                    <set_value name="$scFillsDestCompletely" exact="true"/>
+                  </do_if>
+                  <do_if value="not $scFillsDestCompletely and $scMaxFeasibleVolume lt $mk4MinLegVolume">
+                    <set_value name="$mk4MinLegSkipped" operation="add"/>
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': MK4-2 secondary REJECTED (MIN_LEG_VOLUME: feasibleVol=' + $scMaxFeasibleVolume + ' minLeg=' + $mk4MinLegVolume + ' planned=' + $scPairAmount + ' destNeed=' + $scDestNeedRemaining + ')'" chance="100"/>
+                    </do_if>
                     <continue/>
                   </do_if>
                 </do_if>
@@ -8257,7 +8317,7 @@
             <set_value name="$finalSellAmount" exact="if $pendingTrade.$QueuedSellAmount? then $pendingTrade.$QueuedSellAmount else (if $pendingTrade.$FinalSellAmount? then $pendingTrade.$FinalSellAmount else $pendingTrade.$Amount)"/>
 
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': MK4 multitrade execution set: queued=' + $mk4QueueableTrades.count + '/' + $mk4QueueSourceCount + ' (maxTrades=' + $validatedCandidateLimit + ', secondaryBudgetSkipped=' + $mk4SecondaryBudgetSkipped + ', destBudgetSkipped=' + $mk4DestBudgetSkipped + ', supBudgetSkipped=' + $mk4SupBudgetSkipped + ', backtrackSkipped=' + $mk4BacktrackSkipped + ', singlePreferred=' + $mk4SinglePreferred + ')'" chance="100"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': MK4 multitrade execution set: queued=' + $mk4QueueableTrades.count + '/' + $mk4QueueSourceCount + ' (maxTrades=' + $validatedCandidateLimit + ', secondaryBudgetSkipped=' + $mk4SecondaryBudgetSkipped + ', destBudgetSkipped=' + $mk4DestBudgetSkipped + ', supBudgetSkipped=' + $mk4SupBudgetSkipped + ', backtrackSkipped=' + $mk4BacktrackSkipped + ', minLegSkipped=' + $mk4MinLegSkipped + ', minLegFloor=' + $mk4MinLegVolume + ', singlePreferred=' + $mk4SinglePreferred + ')'" chance="100"/>
             </do_if>
 
             <set_value name="$mk4CycleLegCount" exact="0"/>

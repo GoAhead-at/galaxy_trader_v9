@@ -29,6 +29,10 @@
     <param name="requireNonPlayerSupplierStation" default="false"/>
     <!-- MK3 'Ignore Player Pricing' companion filter: when true, drop cache entries whose delivery (customer) station is player-owned. -->
     <param name="requireNonPlayerDeliveryStation" default="false"/>
+    <!-- When false, enforce station-to-station trade rules (offer.cantradewith) at read time, mirroring
+         the order's trade_found validation: a customer (e.g. player build storage restricted to own
+         faction) that disallows a foreign source is rejected here instead of after the ship hauls out. -->
+    <param name="ignoreTradeRules" default="false"/>
     <param name="debugchance" default="0"/>
     <param name="mk42Priorities" default="table[]" comment="Class sliders table"/>
   </params>
@@ -50,6 +54,9 @@
       </do_if>
 
       <set_value name="this.$gt_mk42Only" exact="true"/>
+      <!-- Per-search memo for build-storage re-discovery (find_buy_offer by sector+ware). Instance var
+           so it survives the loop's cooperative waits; reset every search since live offers change. -->
+      <set_value name="this.$reBuyMemo" exact="table[]"/>
       <set_value name="$cacheHomeKey" exact="$homeSector"/>
       <set_value name="$homeCache" exact="null"/>
       <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK42.{$homeSector}"/>
@@ -126,14 +133,19 @@
         <do_if value="not $purgeRemove and @$purgeEntry.$BuyOffer != null and not @$purgeEntry.$BuyOffer.exists">
           <set_value name="$purgeRemove" exact="true"/>
         </do_if>
-        <do_if value="not $purgeRemove and @$purgeEntry.$SellOffer != null and not @$purgeEntry.$SellOffer.exists">
+        <!-- Build-storage delivery rows have their offer/build-storage/base recreated continuously, so a
+             dead $SellOffer / $SellStation is NORMAL and must NOT trigger eviction: cache.search re-discovers
+             the live offer from the permanent keys (sell sector + ware + delivery idcode). Only TTL and a
+             dead supplier (buy side) evict these. Rows without permanent keys keep the strict ref check. -->
+        <set_value name="$purgeReResolvable" exact="@$purgeEntry.$SellSector != null and @$purgeEntry.$SellSector.exists and @$purgeEntry.$Ware != null and @$purgeEntry.$DeliveryStationId != null"/>
+        <do_if value="not $purgeRemove and not $purgeReResolvable and @$purgeEntry.$SellOffer != null and not @$purgeEntry.$SellOffer.exists">
           <set_value name="$purgeRemove" exact="true"/>
         </do_if>
-        <do_if value="not $purgeRemove and @$purgeEntry.$SellStation != null and not @$purgeEntry.$SellStation.exists">
+        <do_if value="not $purgeRemove and not $purgeReResolvable and @$purgeEntry.$SellStation != null and not @$purgeEntry.$SellStation.exists">
           <set_value name="$purgeRemove" exact="true"/>
         </do_if>
         <!-- Universal station resolution: drop rows no ship can use (dead delivery/supplier refs). -->
-        <do_if value="not $purgeRemove">
+        <do_if value="not $purgeRemove and not $purgeReResolvable">
           <set_value name="$purgeSellStation" exact="null"/>
           <do_if value="$purgeEntry.$SellOffer? and @$purgeEntry.$SellOffer.exists and $purgeEntry.$SellOffer.buyer? and @$purgeEntry.$SellOffer.buyer.exists">
             <set_value name="$purgeSellStation" exact="@$purgeEntry.$SellOffer.buyer"/>
@@ -147,22 +159,24 @@
           <do_if value="not $purgeSellStation? or not @$purgeSellStation.exists">
             <set_value name="$purgeRemove" exact="true"/>
           </do_if>
-          <do_if value="not $purgeRemove and not ($purgeEntry.$IsSellOnly? and $purgeEntry.$IsSellOnly)">
-            <set_value name="$purgeBuyStation" exact="null"/>
-            <do_if value="$purgeEntry.$BuyStation? and @$purgeEntry.$BuyStation.exists">
-              <set_value name="$purgeBuyStation" exact="$purgeEntry.$BuyStation"/>
+        </do_if>
+        <!-- Supplier (buy side) is a normal station whose refs persist, so a dead supplier means the row
+             is genuinely gone - check this for ALL rows, including re-resolvable build-storage rows. -->
+        <do_if value="not $purgeRemove and not ($purgeEntry.$IsSellOnly? and $purgeEntry.$IsSellOnly)">
+          <set_value name="$purgeBuyStation" exact="null"/>
+          <do_if value="$purgeEntry.$BuyStation? and @$purgeEntry.$BuyStation.exists">
+            <set_value name="$purgeBuyStation" exact="$purgeEntry.$BuyStation"/>
+          </do_if>
+          <do_if value="not $purgeBuyStation? and $purgeEntry.$BuyOffer? and @$purgeEntry.$BuyOffer.exists">
+            <do_if value="$purgeEntry.$BuyOffer.seller? and @$purgeEntry.$BuyOffer.seller.exists">
+              <set_value name="$purgeBuyStation" exact="@$purgeEntry.$BuyOffer.seller"/>
             </do_if>
-            <do_if value="not $purgeBuyStation? and $purgeEntry.$BuyOffer? and @$purgeEntry.$BuyOffer.exists">
-              <do_if value="$purgeEntry.$BuyOffer.seller? and @$purgeEntry.$BuyOffer.seller.exists">
-                <set_value name="$purgeBuyStation" exact="@$purgeEntry.$BuyOffer.seller"/>
-              </do_if>
-              <do_elseif value="$purgeEntry.$BuyOffer.owner? and @$purgeEntry.$BuyOffer.owner.exists">
-                <set_value name="$purgeBuyStation" exact="@$purgeEntry.$BuyOffer.owner"/>
-              </do_elseif>
-            </do_if>
-            <do_if value="not $purgeBuyStation? or not @$purgeBuyStation.exists">
-              <set_value name="$purgeRemove" exact="true"/>
-            </do_if>
+            <do_elseif value="$purgeEntry.$BuyOffer.owner? and @$purgeEntry.$BuyOffer.owner.exists">
+              <set_value name="$purgeBuyStation" exact="@$purgeEntry.$BuyOffer.owner"/>
+            </do_elseif>
+          </do_if>
+          <do_if value="not $purgeBuyStation? or not @$purgeBuyStation.exists">
+            <set_value name="$purgeRemove" exact="true"/>
           </do_if>
         </do_if>
         <do_if value="$purgeRemove">
@@ -212,6 +226,10 @@
       <!-- If cache was populated with a smaller search radius than this ship needs, treat as miss
            so live search (with completion pass) can find trades outside the cached radius. -->
       <set_value name="$foundCount" exact="0"/>
+      <!-- DIAGNOSTIC: per-reason rejection tally (cheap; emitted only when debug logging is on).
+           Lets the MISS log explain WHY every cached entry was discarded for this specific ship. -->
+      <set_value name="$rejReasons" exact="table[]"/>
+      <set_value name="$rejTotal" exact="0"/>
       <set_value name="$isSellOnlySearch" exact="$searchMode == 'sell_only'"/>
       <set_value name="$wareBasketCount" exact="if $wareBasket? and typeof $wareBasket == datatype.list then $wareBasket.count else 0"/>
       <set_value name="$isIsolatedMode" exact="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?"/>
@@ -283,9 +301,72 @@
         <do_if value="not $entrySellStation? and $entry.$SellOffer? and @$entry.$SellOffer.exists and $entry.$SellOffer.owner? and @$entry.$SellOffer.owner.exists">
           <set_value name="$entrySellStation" exact="@$entry.$SellOffer.owner"/>
         </do_if>
+        <!-- Build-storage / player-construction deliveries recreate their trade offer, their build
+             storage AND its base station every construction tick, so EVERY captured component handle
+             (SellOffer, SellStation, SellStationBase) dies within tens of seconds -> sellstation_gone.
+             Caching a component reference can therefore never work for these rows. Instead we
+             re-DISCOVER the current live buy offer from PERMANENT keys: the cached sell SECTOR + WARE,
+             restricted to player-owned buyers, disambiguated by the delivery station's stable idcode.
+             This mirrors vanilla trade.station.xml, which always re-runs find_buy_offer against
+             station.buildstorage rather than caching the offer. The shared cache entry is repaired in
+             place so the rest of the fleet (and the order's own execution re-resolution) reuse it. -->
+        <do_if value="not $entrySellStation? or not @$entrySellStation.exists">
+          <!-- Fast path: base anchor still alive -> re-derive its current build storage cheaply. -->
+          <do_if value="$entry.$SellStationBase? and @$entry.$SellStationBase.exists">
+            <set_value name="$entryBaseBuildStorage" exact="@$entry.$SellStationBase.buildstorage"/>
+            <do_if value="$entryBaseBuildStorage? and @$entryBaseBuildStorage.exists">
+              <set_value name="$entrySellStation" exact="$entryBaseBuildStorage"/>
+              <set_value name="$entry.$SellStation" exact="$entryBaseBuildStorage"/>
+            </do_if>
+          </do_if>
+          <!-- Robust path: rediscover the live buy offer with the PROVEN MK4-2 player buy-offer query
+               (lib.gt.mk42.live.search.xml ~1368): scan player-owned buy offers for the ware in the sell
+               sector with a BARE <offeramount min="1"/> (NO tradepartner). The bare offeramount lets the
+               engine read the build storage's desiredamount (construction demand carries no funds);
+               specifying tradepartner forces the money-trade path that reads the 0 funds-amount -> nothing
+               found -> false sellstation_gone (XSD common.xsd offeramount: "uses the desired amount if money
+               would NOT change hands"). Disambiguate by the cached stable delivery idcode; repair the entry
+               in place so the rest of the fleet reuses it. -->
+          <do_if value="(not $entrySellStation? or not @$entrySellStation.exists) and $entry.$SellSector? and @$entry.$SellSector.exists and $entry.$Ware? and $entry.$DeliveryStationId?">
+            <find_buy_offer wares="$entry.$Ware" space="$entry.$SellSector" result="$reBsOffers" multiple="true">
+              <match_buyer tradesknownto="$ship.owner" owner="faction.player">
+                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
+              </match_buyer>
+              <offeramount min="1"/>
+            </find_buy_offer>
+            <do_if value="$reBsOffers? and $reBsOffers.count gt 0">
+              <do_for_each name="$reBsO" in="$reBsOffers">
+                <do_if value="(not $entrySellStation? or not @$entrySellStation.exists) and $reBsO? and @$reBsO.exists">
+                  <set_value name="$reBsCand" exact="null"/>
+                  <do_if value="$reBsO.buyer? and @$reBsO.buyer.exists">
+                    <set_value name="$reBsCand" exact="@$reBsO.buyer"/>
+                  </do_if>
+                  <do_elseif value="$reBsO.owner? and @$reBsO.owner.exists">
+                    <set_value name="$reBsCand" exact="@$reBsO.owner"/>
+                  </do_elseif>
+                  <do_if value="$reBsCand? and @$reBsCand.exists">
+                    <set_value name="$reBsCandId" exact="if @$reBsCand.isclass.buildstorage and $reBsCand.base? and @$reBsCand.base.exists then @$reBsCand.base.idcode else @$reBsCand.idcode"/>
+                    <do_if value="$reBsCandId == $entry.$DeliveryStationId">
+                      <set_value name="$entrySellStation" exact="$reBsCand"/>
+                      <set_value name="$entry.$SellStation" exact="$reBsCand"/>
+                      <set_value name="$entry.$SellOffer" exact="$reBsO"/>
+                      <do_if value="@$reBsCand.isclass.buildstorage and $reBsCand.base? and @$reBsCand.base.exists">
+                        <set_value name="$entry.$SellStationBase" exact="@$reBsCand.base"/>
+                        <set_value name="$entry.$DeliveryStationId" exact="@$reBsCand.base.idcode"/>
+                      </do_if>
+                    </do_if>
+                  </do_if>
+                </do_if>
+              </do_for_each>
+            </do_if>
+          </do_if>
+        </do_if>
 
         <!-- Basic validity -->
         <do_if value="not $entry? or not $entry.$Score? or $entry.$Score le 0">
+          <set_value name="$rejReasons.$bad_score" exact="if $rejReasons.$bad_score? then $rejReasons.$bad_score+1 else 1"/>
+          <set_value name="$rejTotal" operation="add"/>
           <continue/>
         </do_if>
 
@@ -299,6 +380,8 @@
             </do_if>
           </do_all>
           <do_if value="$shipFailedOnEntry">
+            <set_value name="$rejReasons.$ship_failed_before" exact="if $rejReasons.$ship_failed_before? then $rejReasons.$ship_failed_before+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_if>
@@ -308,14 +391,20 @@
              - buy_and_sell: never pick sell-only disposal entries -->
         <do_if value="$isSellOnlySearch">
           <do_if value="not $entry.$IsSellOnly? or not $entry.$IsSellOnly">
+            <set_value name="$rejReasons.$mode_not_sellonly" exact="if $rejReasons.$mode_not_sellonly? then $rejReasons.$mode_not_sellonly+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
           <do_if value="not $entry.$Ware? or $ship.cargo.{$entry.$Ware}.count le 0">
+            <set_value name="$rejReasons.$sellonly_no_cargo" exact="if $rejReasons.$sellonly_no_cargo? then $rejReasons.$sellonly_no_cargo+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_if>
         <do_else>
           <do_if value="$entry.$IsSellOnly? and $entry.$IsSellOnly">
+            <set_value name="$rejReasons.$mode_is_sellonly" exact="if $rejReasons.$mode_is_sellonly? then $rejReasons.$mode_is_sellonly+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_else>
@@ -346,6 +435,8 @@
             <set_value name="$cargoHoldOk" exact="true"/>
           </do_elseif>
           <do_if value="not $cargoHoldOk">
+            <set_value name="$rejReasons.$cargo_incompatible" exact="if $rejReasons.$cargo_incompatible? then $rejReasons.$cargo_incompatible+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_if>
@@ -367,22 +458,51 @@
             </do_if>
           </do_all>
           <do_if value="not $wareAllowed">
+            <set_value name="$rejReasons.$ware_basket" exact="if $rejReasons.$ware_basket? then $rejReasons.$ware_basket+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_if>
 
         <!-- TTL / age check -->
         <do_if value="$entry.$CachedAt? and ($now - $entry.$CachedAt) gt $cacheMaxAge">
+          <set_value name="$rejReasons.$ttl_expired" exact="if $rejReasons.$ttl_expired? then $rejReasons.$ttl_expired+1 else 1"/>
+          <set_value name="$rejTotal" operation="add"/>
           <continue/>
         </do_if>
 
         <!-- Station existence (before distance / MK4 ware-type property access on station). -->
         <do_if value="not $entry.$IsSellOnly?">
           <do_if value="not $entryBuyStation? or not @$entryBuyStation.exists">
+            <set_value name="$rejReasons.$buystation_gone" exact="if $rejReasons.$buystation_gone? then $rejReasons.$buystation_gone+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_if>
         <do_if value="not $entrySellStation? or not @$entrySellStation.exists">
+          <set_value name="$rejReasons.$sellstation_gone" exact="if $rejReasons.$sellstation_gone? then $rejReasons.$sellstation_gone+1 else 1"/>
+          <!-- Sub-diagnose [ANCHORv4]: record each raw fact INDEPENDENTLY (no elseif chain) so the
+               breakdown cannot hide a state we did not anticipate. -->
+          <do_if value="$entrySellStation?">
+            <!-- $entrySellStation was set but dead: an earlier resolution branch (281/289/292/303)
+                 produced a ref that did not survive to this check. -->
+            <set_value name="$rejReasons.$ssg_es_set_dead" exact="if $rejReasons.$ssg_es_set_dead? then $rejReasons.$ssg_es_set_dead+1 else 1"/>
+          </do_if>
+          <do_if value="not $entry.$SellStationBase?">
+            <set_value name="$rejReasons.$ssg_no_base_field" exact="if $rejReasons.$ssg_no_base_field? then $rejReasons.$ssg_no_base_field+1 else 1"/>
+          </do_if>
+          <do_if value="$entry.$SellStationBase? and not @$entry.$SellStationBase.exists">
+            <set_value name="$rejReasons.$ssg_base_dead" exact="if $rejReasons.$ssg_base_dead? then $rejReasons.$ssg_base_dead+1 else 1"/>
+          </do_if>
+          <do_if value="$entry.$SellStationBase? and @$entry.$SellStationBase.exists and not (@$entry.$SellStationBase.buildstorage and @$entry.$SellStationBase.buildstorage.exists)">
+            <set_value name="$rejReasons.$ssg_base_bs_dead" exact="if $rejReasons.$ssg_base_bs_dead? then $rejReasons.$ssg_base_bs_dead+1 else 1"/>
+          </do_if>
+          <do_if value="$entry.$SellStationBase? and @$entry.$SellStationBase.exists and @$entry.$SellStationBase.buildstorage and @$entry.$SellStationBase.buildstorage.exists">
+            <!-- Anchor IS resolvable here yet the row is gone: means $entrySellStation was set-dead and
+                 line-300 re-resolution was skipped because it was already non-null. -->
+            <set_value name="$rejReasons.$ssg_anchor_ok_but_gone" exact="if $rejReasons.$ssg_anchor_ok_but_gone? then $rejReasons.$ssg_anchor_ok_but_gone+1 else 1"/>
+          </do_if>
+          <set_value name="$rejTotal" operation="add"/>
           <continue/>
         </do_if>
 
@@ -397,20 +517,44 @@
               <set_value name="$mk4DeliveryPlayerOk" exact="true"/>
             </do_elseif>
             <do_if value="not $mk4DeliveryPlayerOk">
+              <set_value name="$rejReasons.$delivery_not_player" exact="if $rejReasons.$delivery_not_player? then $rejReasons.$delivery_not_player+1 else 1"/>
+              <set_value name="$rejTotal" operation="add"/>
               <continue/>
             </do_if>
           </do_if>
           <do_if value="$requirePlayerSupplierStation and (not $entryBuyStation? or not @$entryBuyStation.isplayerowned)">
+            <set_value name="$rejReasons.$supplier_not_player" exact="if $rejReasons.$supplier_not_player? then $rejReasons.$supplier_not_player+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
           <do_if value="$requireNonPlayerSupplierStation and (not $entryBuyStation? or @$entryBuyStation.isplayerowned)">
+            <set_value name="$rejReasons.$supplier_is_player" exact="if $rejReasons.$supplier_is_player? then $rejReasons.$supplier_is_player+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_if>
         <!-- 'Ignore Player Pricing' companion filter: drop any entry (including sell-only disposal)
              whose delivery destination is a player-owned station. -->
         <do_if value="$requireNonPlayerDeliveryStation and $entrySellStation? and @$entrySellStation.isplayerowned">
+          <set_value name="$rejReasons.$delivery_is_player" exact="if $rejReasons.$delivery_is_player? then $rejReasons.$delivery_is_player+1 else 1"/>
+          <set_value name="$rejTotal" operation="add"/>
           <continue/>
+        </do_if>
+        <!-- Station-to-station trade rules (mirror of trade_found validation in order.trade.galaxytradermk42).
+             A player build storage restricted to its own faction reports cantradewith=false for a foreign
+             source, so the trade can never execute. Reject it here (when trade rules are enforced) instead
+             of caching a dead entry that every ship re-discovers and discards after hauling out. -->
+        <do_if value="not $ignoreTradeRules and not $entry.$IsSellOnly?">
+          <do_if value="$entry.$SellOffer? and @$entry.$SellOffer.exists and $entryBuyStation? and @$entryBuyStation.exists and not $entry.$SellOffer.cantradewith.{$entryBuyStation}">
+            <set_value name="$rejReasons.$traderules" exact="if $rejReasons.$traderules? then $rejReasons.$traderules+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
+            <continue/>
+          </do_if>
+          <do_if value="$entry.$BuyOffer? and @$entry.$BuyOffer.exists and $entrySellStation? and @$entrySellStation.exists and not $entry.$BuyOffer.cantradewith.{$entrySellStation}">
+            <set_value name="$rejReasons.$traderules" exact="if $rejReasons.$traderules? then $rejReasons.$traderules+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
+            <continue/>
+          </do_if>
         </do_if>
         <!-- MK4 serveHomeOnly: delivery must match home anchor (station + build storage, or sector). -->
         <do_if value="$mk4DedicatedServe and not $mk4BuildStorageOnlyMode">
@@ -436,11 +580,15 @@
               </do_elseif>
             </do_if>
             <do_if value="not $serveHomeMatch">
+              <set_value name="$rejReasons.$servehome_station" exact="if $rejReasons.$servehome_station? then $rejReasons.$servehome_station+1 else 1"/>
+              <set_value name="$rejTotal" operation="add"/>
               <continue/>
             </do_if>
           </do_if>
           <do_elseif value="$serveHomeSector? and $serveHomeSector.exists">
             <do_if value="not $entrySellStation? or not $entrySellStation.sector? or @$entrySellStation.sector != $serveHomeSector">
+              <set_value name="$rejReasons.$servehome_sector" exact="if $rejReasons.$servehome_sector? then $rejReasons.$servehome_sector+1 else 1"/>
+              <set_value name="$rejTotal" operation="add"/>
               <continue/>
             </do_if>
           </do_elseif>
@@ -448,19 +596,28 @@
         <!-- MK4 build-storage-only mode: BS buyers within jumpDistanceCoverage; no BS supplier legs. -->
         <do_if value="$mk4BuildStorageOnlyMode and not $entry.$IsSellOnly?">
           <do_if value="$entryBuyStation? and @$entryBuyStation.isclass.buildstorage">
+            <set_value name="$rejReasons.$bso_buy_is_bs" exact="if $rejReasons.$bso_buy_is_bs? then $rejReasons.$bso_buy_is_bs+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
           <do_if value="not $entrySellStation? or not @$entrySellStation.isclass.buildstorage">
+            <set_value name="$rejReasons.$bso_sell_not_bs" exact="if $rejReasons.$bso_sell_not_bs? then $rejReasons.$bso_sell_not_bs+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
-          <!-- BS-only delivery scope: player build storage within jumpDistanceCoverage from home. -->
+          <!-- BS-only delivery scope: player build storage within jumpDistanceCoverage from home.
+               Pass the build-storage COMPONENT to gatedistance (mirror of the main distance fix);
+               a build storage often has no .sector accessor, so the old '.sector?'-guarded form
+               yielded dist = -1 and rejected EVERY entry in BS-only mode. -->
           <set_value name="$mk4BsoCoverageMax" exact="if $maxDistanceSell? and $maxDistanceSell gt 0 then $maxDistanceSell else $maxDistance"/>
           <set_value name="$mk4BsoInScope" exact="false"/>
-          <set_value name="$mk4BsoDist" exact="if $homeSector? and $entrySellStation? and $entrySellStation.sector? then $homeSector.gatedistance.{$entrySellStation.sector} else -1"/>
+          <set_value name="$mk4BsoDist" exact="if $homeSector? and $entrySellStation? then $homeSector.gatedistance.{$entrySellStation} else -1"/>
           <do_if value="$mk4BsoDist ge 0 and ($mk4BsoCoverageMax le 0 or $mk4BsoDist le $mk4BsoCoverageMax)">
             <set_value name="$mk4BsoInScope" exact="true"/>
           </do_if>
           <do_if value="not $mk4BsoInScope">
+            <set_value name="$rejReasons.$bso_out_of_scope" exact="if $rejReasons.$bso_out_of_scope? then $rejReasons.$bso_out_of_scope+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_if>
@@ -498,33 +655,33 @@
               <set_value name="$mk4AllowedByType" exact="true"/>
             </do_if>
             <do_if value="$mk4HasKnownType and not $mk4AllowedByType">
+              <set_value name="$rejReasons.$waretype" exact="if $rejReasons.$waretype? then $rejReasons.$waretype+1 else 1"/>
+              <set_value name="$rejTotal" operation="add"/>
               <continue/>
             </do_if>
           </do_if>
         </do_if>
 
-        <!-- Distance check with per-leg limits (sector-to-sector; station refs break gatedistance). -->
+        <!-- Distance check with per-leg limits.
+             Pass the station COMPONENT directly to gatedistance (mirrors lib.gt.tradematch
+             lines 1023/1029, which work). Resolving via $station.sector breaks for build-storage
+             deliveries: a build storage often has no .sector accessor (see gt_context_diagnose
+             "Stations carry no .sector by themselves in some hierarchies"), leaving distance = -1
+             and silently rejecting EVERY cached build-storage entry. gatedistance returns -1 (not
+             null) when unreachable and 0 when same-sector, so a single component call is correct. -->
         <do_if value="$maxDistanceBuyLeg gt 0 and $entryBuyStation?">
-          <set_value name="$distBuy" exact="-1"/>
-          <do_if value="$entryBuyStation.sector? and $entryBuyStation.sector == $homeSector">
-            <set_value name="$distBuy" exact="0"/>
-          </do_if>
-          <do_elseif value="$entryBuyStation.sector?">
-            <set_value name="$distBuy" exact="$homeSector.gatedistance.{$entryBuyStation.sector}"/>
-          </do_elseif>
+          <set_value name="$distBuy" exact="$homeSector.gatedistance.{$entryBuyStation}"/>
           <do_if value="$distBuy lt 0 or $distBuy gt $maxDistanceBuyLeg">
+            <set_value name="$rejReasons.$dist_buy" exact="if $rejReasons.$dist_buy? then $rejReasons.$dist_buy+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_if>
         <do_if value="$maxDistanceSellLeg gt 0 and $entrySellStation?">
-          <set_value name="$distSell" exact="-1"/>
-          <do_if value="$entrySellStation.sector? and $entrySellStation.sector == $homeSector">
-            <set_value name="$distSell" exact="0"/>
-          </do_if>
-          <do_elseif value="$entrySellStation.sector?">
-            <set_value name="$distSell" exact="$homeSector.gatedistance.{$entrySellStation.sector}"/>
-          </do_elseif>
+          <set_value name="$distSell" exact="$homeSector.gatedistance.{$entrySellStation}"/>
           <do_if value="$distSell lt 0 or $distSell gt $maxDistanceSellLeg">
+            <set_value name="$rejReasons.$dist_sell" exact="if $rejReasons.$dist_sell? then $rejReasons.$dist_sell+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_if>
@@ -532,18 +689,26 @@
         <!-- ROI / absolute profit check (sell-mode trades only) -->
         <do_if value="not $entry.$IsSellOnly?">
           <do_if value="$minAbsoluteProfit gt 0 and $entry.$Profit? and $entry.$Profit lt $minAbsoluteProfit">
+            <set_value name="$rejReasons.$min_abs_profit" exact="if $rejReasons.$min_abs_profit? then $rejReasons.$min_abs_profit+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
           <do_if value="$minROI gt 0 and $entry.$BuyPrice? and $entry.$BuyPrice gt 0">
             <set_value name="$entryROI" exact="($entry.$UnitProfit * 100) / $entry.$BuyPrice"/>
             <do_if value="$entryROI lt $minROI">
+              <set_value name="$rejReasons.$min_roi" exact="if $rejReasons.$min_roi? then $rejReasons.$min_roi+1 else 1"/>
+              <set_value name="$rejTotal" operation="add"/>
               <continue/>
             </do_if>
           </do_if>
         </do_if>
 
-        <!-- Cache Dropoff Tolerance: reject if profit dropped too much since caching -->
-        <do_if value="$cacheDropoffTolerance gt 0 and not $entry.$IsSellOnly? and $entry.$UnitProfit? and $entry.$UnitProfit gt 0 and $entry.$BuyOffer? and $entry.$SellOffer?">
+        <!-- Cache Dropoff Tolerance: reject if profit dropped too much since caching.
+             SKIPPED for MK4-2 supply: MK4-2 is a need-driven supply order, not a profit trader.
+             A supply route is valid whenever the price thresholds match (buy<=cap, sell>=floor);
+             there is no margin/ROI requirement, so a profit-drop re-check here would reject
+             thin/zero-margin supply rows on every re-read and make the cache permanently miss. -->
+        <do_if value="not $mk42Priorities? and $cacheDropoffTolerance gt 0 and not $entry.$IsSellOnly? and $entry.$UnitProfit? and $entry.$UnitProfit gt 0 and $entry.$BuyOffer? and $entry.$SellOffer?">
           <!-- Only check if both offers still exist (otherwise station-existence check will catch it) -->
           <do_if value="@$entry.$BuyOffer.exists and @$entry.$SellOffer.exists">
             <set_value name="$currentBuyPrice" exact="@$entry.$BuyOffer.unitprice"/>
@@ -553,10 +718,14 @@
               <!-- Calculate how much profit has dropped as % of original -->
               <do_if value="$currentUnitProfit le 0">
                 <!-- Profit went negative — always reject -->
+                <set_value name="$rejReasons.$dropoff_negative" exact="if $rejReasons.$dropoff_negative? then $rejReasons.$dropoff_negative+1 else 1"/>
+                <set_value name="$rejTotal" operation="add"/>
                 <continue/>
               </do_if>
               <set_value name="$profitDropPct" exact="(($entry.$UnitProfit - $currentUnitProfit) * 100) / $entry.$UnitProfit"/>
               <do_if value="$profitDropPct gt $cacheDropoffTolerance">
+                <set_value name="$rejReasons.$dropoff_pct" exact="if $rejReasons.$dropoff_pct? then $rejReasons.$dropoff_pct+1 else 1"/>
+                <set_value name="$rejTotal" operation="add"/>
                 <continue/>
               </do_if>
             </do_if>
@@ -566,17 +735,51 @@
         <!-- Build storage exclusion (legacy — skipped when MK4-2 priorities active). -->
         <do_if value="not $mk42Priorities? and $ignoreBuildStorage">
           <do_if value="($entryBuyStation? and @$entryBuyStation.isclass.buildstorage) or ($entrySellStation? and @$entrySellStation.isclass.buildstorage)">
+            <set_value name="$rejReasons.$ignore_buildstorage" exact="if $rejReasons.$ignore_buildstorage? then $rejReasons.$ignore_buildstorage+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_if>
 
-        <!-- MK4-2 class-at-0 filter on cached delivery customer. -->
+        <!-- MK4-2 class-at-0 filter on cached delivery customer (§4.4 O(1) prefilter).
+             Use the stored $CustomerClass tag (ship-/policy-agnostic, written at tradematch);
+             only classify inline when the tag is missing (legacy entries). prioSig invalidation
+             clears the home cache on any slider change, so stored class + current multiplier stay consistent. -->
         <do_if value="$mk42Priorities? and $entrySellStation? and @$entrySellStation.exists">
-          <run_script name="'lib.gt.mk42.classify'" result="$mk42CacheCls">
-            <param name="customer" value="$entrySellStation"/>
-            <param name="priorities" value="$mk42Priorities"/>
-          </run_script>
-          <do_if value="not $mk42CacheCls.$Eligible? or not @$mk42CacheCls.$Eligible">
+          <set_value name="$mk42CacheClass" exact="if $entry.$CustomerClass? then @$entry.$CustomerClass else 'None'"/>
+          <do_if value="$mk42CacheClass == 'None'">
+            <do_if value="@$entrySellStation.isclass.buildstorage and @$entrySellStation.isplayerowned">
+              <set_value name="$mk42CacheClass" exact="'Buildstorage'"/>
+            </do_if>
+            <do_elseif value="@$entrySellStation.isclass.station and @$entrySellStation.isplayerowned">
+              <set_value name="$mk42CacheClass" exact="'Stations'"/>
+            </do_elseif>
+            <do_elseif value="@$entrySellStation.isclass.ship and @$entrySellStation.type == shiptype.carrier and @$entrySellStation.isplayerowned">
+              <set_value name="$mk42CacheClass" exact="'Carrier'"/>
+            </do_elseif>
+            <do_elseif value="@$entrySellStation.isclass.ship and @$entrySellStation.primarypurpose == purpose.auxiliary and @$entrySellStation.isplayerowned">
+              <set_value name="$mk42CacheClass" exact="'Aux'"/>
+            </do_elseif>
+            <do_elseif value="@$entrySellStation.isclass.buildstorage and $entrySellStation.base? and @$entrySellStation.base.isplayerowned">
+              <set_value name="$mk42CacheClass" exact="'Buildstorage'"/>
+            </do_elseif>
+          </do_if>
+          <set_value name="$mk42CacheMult" exact="0"/>
+          <do_if value="$mk42CacheClass == 'Buildstorage'">
+            <set_value name="$mk42CacheMult" exact="if $mk42Priorities.$Buildstorage? then $mk42Priorities.$Buildstorage else 0"/>
+          </do_if>
+          <do_elseif value="$mk42CacheClass == 'Stations'">
+            <set_value name="$mk42CacheMult" exact="if $mk42Priorities.$Stations? then $mk42Priorities.$Stations else 0"/>
+          </do_elseif>
+          <do_elseif value="$mk42CacheClass == 'Aux'">
+            <set_value name="$mk42CacheMult" exact="if $mk42Priorities.$Aux? then $mk42Priorities.$Aux else 0"/>
+          </do_elseif>
+          <do_elseif value="$mk42CacheClass == 'Carrier'">
+            <set_value name="$mk42CacheMult" exact="if $mk42Priorities.$Carrier? then $mk42Priorities.$Carrier else 0"/>
+          </do_elseif>
+          <do_if value="$mk42CacheMult le 0">
+            <set_value name="$rejReasons.$class_mult_zero" exact="if $rejReasons.$class_mult_zero? then $rejReasons.$class_mult_zero+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_if>
@@ -584,6 +787,8 @@
         <!-- Carrier / auxiliary exclusion (legacy — skipped when MK4-2 priorities active). -->
         <do_if value="not $mk42Priorities? and $ignoreCarrierAux">
           <do_if value="($entryBuyStation? and @$entryBuyStation.isclass.ship and (@$entryBuyStation.type == shiptype.carrier or @$entryBuyStation.type == shiptype.resupplier)) or ($entrySellStation? and @$entrySellStation.isclass.ship and (@$entrySellStation.type == shiptype.carrier or @$entrySellStation.type == shiptype.resupplier))">
+            <set_value name="$rejReasons.$carrier_aux" exact="if $rejReasons.$carrier_aux? then $rejReasons.$carrier_aux+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_if>
@@ -607,6 +812,8 @@
               </do_if>
             </do_if>
             <do_if value="not $preBuyAmtQuick? or $preBuyAmtQuick le 0">
+              <set_value name="$rejReasons.$buy_amount_zero" exact="if $rejReasons.$buy_amount_zero? then $rejReasons.$buy_amount_zero+1 else 1"/>
+              <set_value name="$rejTotal" operation="add"/>
               <continue/>
             </do_if>
           </do_if>
@@ -624,6 +831,8 @@
               </do_if>
             </do_if>
             <do_if value="$sellOfferDemandFallback le 0">
+              <set_value name="$rejReasons.$sell_amount_zero" exact="if $rejReasons.$sell_amount_zero? then $rejReasons.$sell_amount_zero+1 else 1"/>
+              <set_value name="$rejTotal" operation="add"/>
               <continue/>
             </do_if>
           </do_if>
@@ -651,6 +860,8 @@
               </do_if>
             </do_if>
             <do_if value="not $preCheckBuyAmt? or $preCheckBuyAmt le 0">
+              <set_value name="$rejReasons.$buy_offeramount_zero" exact="if $rejReasons.$buy_offeramount_zero? then $rejReasons.$buy_offeramount_zero+1 else 1"/>
+              <set_value name="$rejTotal" operation="add"/>
               <continue/>
             </do_if>
           </do_if>
@@ -671,6 +882,8 @@
             </do_if>
           </do_if>
           <do_if value="not $preCheckSellAmt? or $preCheckSellAmt le 0">
+            <set_value name="$rejReasons.$sell_offeramount_zero" exact="if $rejReasons.$sell_offeramount_zero? then $rejReasons.$sell_offeramount_zero+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_if>
@@ -679,9 +892,12 @@
              Uses available reserved-aware offer amounts to estimate max feasible load. -->
         <do_if value="$enableMinCargoUtil and not $isIsolatedMode and not $entry.$IsSellOnly?">
           <set_value name="$minUtilVolumePerUnit" exact="1"/>
-          <do_if value="$entry.$Ware? and $entry.$Ware.volume?">
-            <set_value name="$minUtilVolumePerUnit" exact="$entry.$Ware.volume"/>
+          <do_if value="$entry.$VolumePerUnit? and $entry.$VolumePerUnit gt 0">
+            <set_value name="$minUtilVolumePerUnit" exact="$entry.$VolumePerUnit"/>
           </do_if>
+          <do_elseif value="$entry.$Ware? and $entry.$Ware.volume?">
+            <set_value name="$minUtilVolumePerUnit" exact="$entry.$Ware.volume"/>
+          </do_elseif>
           <set_value name="$minUtilAmountLimit" exact="$preCheckSellAmt"/>
           <do_if value="$preCheckBuyAmt? and $preCheckBuyAmt lt $minUtilAmountLimit">
             <set_value name="$minUtilAmountLimit" exact="$preCheckBuyAmt"/>
@@ -689,6 +905,8 @@
           <set_value name="$minUtilTradeVolume" exact="$minUtilAmountLimit * $minUtilVolumePerUnit"/>
           <set_value name="$minUtilRequiredVolume" exact="($ship.cargo.capacity.all * $cargoUtilThresholdPct) / 100.0"/>
           <do_if value="$minUtilTradeVolume lt $minUtilRequiredVolume">
+            <set_value name="$rejReasons.$min_cargo_util" exact="if $rejReasons.$min_cargo_util? then $rejReasons.$min_cargo_util+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_if>
@@ -701,6 +919,8 @@
             <set_value name="$resData" exact="global.$GT_Reservations.{$resKey}"/>
             <!-- Only skip if reservation is unexpired AND belongs to a different ship -->
             <do_if value="$resData.$Until? and player.age lt @$resData.$Until and $resData.$Ship? and @$resData.$Ship != $ship">
+              <set_value name="$rejReasons.$reserved_by_other" exact="if $rejReasons.$reserved_by_other? then $rejReasons.$reserved_by_other+1 else 1"/>
+              <set_value name="$rejTotal" operation="add"/>
               <continue/>
             </do_if>
           </do_if>
@@ -717,6 +937,8 @@
         <do_if value="$quotaWare?">
           <set_value name="$quotaWareFoundCount" exact="if $foundPerWare.{$quotaWare}? then $foundPerWare.{$quotaWare} else 0"/>
           <do_if value="$quotaWareFoundCount ge $perWareCap">
+            <set_value name="$rejReasons.$per_ware_quota" exact="if $rejReasons.$per_ware_quota? then $rejReasons.$per_ware_quota+1 else 1"/>
+            <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_if>
@@ -740,13 +962,63 @@
         </do_if>
       </do_all>
 
+      <!-- DIAGNOSTIC: when the cache search yields nothing, log a per-reason rejection breakdown so the
+           cause is visible instead of an opaque "MISS". Gated on debug logging; cheap string build. -->
+      <do_if value="$foundCount le 0 and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <set_value name="$rejBreakdownStr" exact="''"/>
+        <do_if value="$rejReasons.$bad_score?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' bad_score=' + $rejReasons.$bad_score"/></do_if>
+        <do_if value="$rejReasons.$ship_failed_before?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' ship_failed_before=' + $rejReasons.$ship_failed_before"/></do_if>
+        <do_if value="$rejReasons.$mode_not_sellonly?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' mode_not_sellonly=' + $rejReasons.$mode_not_sellonly"/></do_if>
+        <do_if value="$rejReasons.$sellonly_no_cargo?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' sellonly_no_cargo=' + $rejReasons.$sellonly_no_cargo"/></do_if>
+        <do_if value="$rejReasons.$mode_is_sellonly?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' mode_is_sellonly=' + $rejReasons.$mode_is_sellonly"/></do_if>
+        <do_if value="$rejReasons.$cargo_incompatible?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' cargo_incompatible=' + $rejReasons.$cargo_incompatible"/></do_if>
+        <do_if value="$rejReasons.$ware_basket?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' ware_basket=' + $rejReasons.$ware_basket"/></do_if>
+        <do_if value="$rejReasons.$ttl_expired?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' ttl_expired=' + $rejReasons.$ttl_expired"/></do_if>
+        <do_if value="$rejReasons.$buystation_gone?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' buystation_gone=' + $rejReasons.$buystation_gone"/></do_if>
+        <do_if value="$rejReasons.$sellstation_gone?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' sellstation_gone=' + $rejReasons.$sellstation_gone"/></do_if>
+        <do_if value="$rejReasons.$ssg_no_base_field?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' (ssg_no_base_field=' + $rejReasons.$ssg_no_base_field + ')'"/></do_if>
+        <do_if value="$rejReasons.$ssg_base_dead?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' (ssg_base_dead=' + $rejReasons.$ssg_base_dead + ')'"/></do_if>
+        <do_if value="$rejReasons.$ssg_base_bs_dead?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' (ssg_base_bs_dead=' + $rejReasons.$ssg_base_bs_dead + ')'"/></do_if>
+        <do_if value="$rejReasons.$ssg_es_set_dead?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' (ssg_es_set_dead=' + $rejReasons.$ssg_es_set_dead + ')'"/></do_if>
+        <do_if value="$rejReasons.$ssg_anchor_ok_but_gone?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' (ssg_anchor_ok_but_gone=' + $rejReasons.$ssg_anchor_ok_but_gone + ')'"/></do_if>
+        <do_if value="$rejReasons.$delivery_not_player?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' delivery_not_player=' + $rejReasons.$delivery_not_player"/></do_if>
+        <do_if value="$rejReasons.$supplier_not_player?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' supplier_not_player=' + $rejReasons.$supplier_not_player"/></do_if>
+        <do_if value="$rejReasons.$supplier_is_player?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' supplier_is_player=' + $rejReasons.$supplier_is_player"/></do_if>
+        <do_if value="$rejReasons.$delivery_is_player?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' delivery_is_player=' + $rejReasons.$delivery_is_player"/></do_if>
+        <do_if value="$rejReasons.$traderules?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' traderules=' + $rejReasons.$traderules"/></do_if>
+        <do_if value="$rejReasons.$servehome_station?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' servehome_station=' + $rejReasons.$servehome_station"/></do_if>
+        <do_if value="$rejReasons.$servehome_sector?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' servehome_sector=' + $rejReasons.$servehome_sector"/></do_if>
+        <do_if value="$rejReasons.$bso_buy_is_bs?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' bso_buy_is_bs=' + $rejReasons.$bso_buy_is_bs"/></do_if>
+        <do_if value="$rejReasons.$bso_sell_not_bs?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' bso_sell_not_bs=' + $rejReasons.$bso_sell_not_bs"/></do_if>
+        <do_if value="$rejReasons.$bso_out_of_scope?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' bso_out_of_scope=' + $rejReasons.$bso_out_of_scope"/></do_if>
+        <do_if value="$rejReasons.$waretype?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' waretype=' + $rejReasons.$waretype"/></do_if>
+        <do_if value="$rejReasons.$dist_buy?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' dist_buy=' + $rejReasons.$dist_buy"/></do_if>
+        <do_if value="$rejReasons.$dist_sell?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' dist_sell=' + $rejReasons.$dist_sell"/></do_if>
+        <do_if value="$rejReasons.$min_abs_profit?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' min_abs_profit=' + $rejReasons.$min_abs_profit"/></do_if>
+        <do_if value="$rejReasons.$min_roi?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' min_roi=' + $rejReasons.$min_roi"/></do_if>
+        <do_if value="$rejReasons.$dropoff_negative?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' dropoff_negative=' + $rejReasons.$dropoff_negative"/></do_if>
+        <do_if value="$rejReasons.$dropoff_pct?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' dropoff_pct=' + $rejReasons.$dropoff_pct"/></do_if>
+        <do_if value="$rejReasons.$ignore_buildstorage?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' ignore_buildstorage=' + $rejReasons.$ignore_buildstorage"/></do_if>
+        <do_if value="$rejReasons.$class_mult_zero?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' class_mult_zero=' + $rejReasons.$class_mult_zero"/></do_if>
+        <do_if value="$rejReasons.$carrier_aux?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' carrier_aux=' + $rejReasons.$carrier_aux"/></do_if>
+        <do_if value="$rejReasons.$buy_amount_zero?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' buy_amount_zero=' + $rejReasons.$buy_amount_zero"/></do_if>
+        <do_if value="$rejReasons.$sell_amount_zero?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' sell_amount_zero=' + $rejReasons.$sell_amount_zero"/></do_if>
+        <do_if value="$rejReasons.$buy_offeramount_zero?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' buy_offeramount_zero=' + $rejReasons.$buy_offeramount_zero"/></do_if>
+        <do_if value="$rejReasons.$sell_offeramount_zero?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' sell_offeramount_zero=' + $rejReasons.$sell_offeramount_zero"/></do_if>
+        <do_if value="$rejReasons.$min_cargo_util?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' min_cargo_util=' + $rejReasons.$min_cargo_util"/></do_if>
+        <do_if value="$rejReasons.$reserved_by_other?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' reserved_by_other=' + $rejReasons.$reserved_by_other"/></do_if>
+        <do_if value="$rejReasons.$per_ware_quota?"><set_value name="$rejBreakdownStr" exact="$rejBreakdownStr + ' per_ware_quota=' + $rejReasons.$per_ware_quota"/></do_if>
+        <debug_text text="'[GT-AI] ' + $ship.idcode + ': Cache search REJECT breakdown [ANCHORv4] (pool=' + $homeCacheCount + ', rejected=' + $rejTotal + ', home=' + (if $homeSector? then $homeSector.name else '?') + '):' + (if $rejBreakdownStr != '' then $rejBreakdownStr else ' (none - empty/stale pool)')" chance="100"/>
+      </do_if>
+
       <return value="table[
         $Found = ($bestTrade != null),
         $BestTrade = $bestTrade,
         $BestScore = $bestScore,
         $TradeList = $tradeList,
         $PurgedStale = $purgedStaleCount,
-        $PoolSizeAfter = $homeCacheCount
+        $PoolSizeAfter = $homeCacheCount,
+        $RejBreakdown = $rejReasons
       ]"/>
     </actions>
   </attention>

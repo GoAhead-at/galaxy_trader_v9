@@ -55,13 +55,27 @@
             <set_value name="$isStale" exact="true"/>
           </do_if>
         </do_if>
-        <do_if value="not $isStale and @$oldEntry.$BuyOffer != null and not @$oldEntry.$BuyOffer.exists">
+        <!-- Positive resolvability (same dead-ref-returns-null reasoning as the sell side below):
+             keep only if the supplier is still resolvable live. -->
+        <set_value name="$buyResolvable" exact="(@$oldEntry.$BuyStation != null and @$oldEntry.$BuyStation.exists) or (@$oldEntry.$BuyOffer != null and @$oldEntry.$BuyOffer.exists)"/>
+        <do_if value="not $isStale and not $buyResolvable">
           <set_value name="$isStale" exact="true"/>
         </do_if>
-        <do_if value="not $isStale and @$oldEntry.$SellOffer != null and not @$oldEntry.$SellOffer.exists">
-          <set_value name="$isStale" exact="true"/>
-        </do_if>
-        <do_if value="not $isStale and @$oldEntry.$SellStation != null and not @$oldEntry.$SellStation.exists">
+        <!-- Positive resolvability check: a dead component ref returns null under @, so the old
+             "!= null and not .exists" guard silently MISSED dead build-storage refs and broken rows
+             accumulated forever. Instead, keep a row only if its delivery is still resolvable live -
+             directly (SellStation/SellOffer) or, for build storages, via the stable base anchor
+             (base.buildstorage). Mirrors lib.gt.mk42.cache.search resolution; anything else is broken
+             and gets evicted. -->
+        <set_value name="$oldHasLiveBase" exact="@$oldEntry.$SellStationBase != null and @$oldEntry.$SellStationBase.exists and @$oldEntry.$SellStationBase.buildstorage != null and @$oldEntry.$SellStationBase.buildstorage.exists"/>
+        <!-- Build-storage rows legitimately have ALL component handles dead at any instant (offer, build
+             storage and base are recreated each construction tick) yet remain valid: cache.search
+             re-discovers the live offer from the permanent keys (sell sector + ware + delivery idcode).
+             So a row with live permanent keys is resolvable here too; TTL still evicts genuinely-gone
+             stations, keeping the cache bounded without an expensive per-entry find_buy_offer in purge. -->
+        <set_value name="$oldHasPermanentKeys" exact="@$oldEntry.$SellSector != null and @$oldEntry.$SellSector.exists and @$oldEntry.$Ware != null and @$oldEntry.$DeliveryStationId != null"/>
+        <set_value name="$sellResolvable" exact="$oldHasLiveBase or $oldHasPermanentKeys or (@$oldEntry.$SellStation != null and @$oldEntry.$SellStation.exists) or (@$oldEntry.$SellOffer != null and @$oldEntry.$SellOffer.exists)"/>
+        <do_if value="not $isStale and not $sellResolvable">
           <set_value name="$isStale" exact="true"/>
         </do_if>
         <do_if value="$isStale">
@@ -78,8 +92,35 @@
         <set_value name="$newTrade" exact="$tradeList.{$ti}"/>
         <set_value name="$newTrade.$CachedAt" exact="$cacheNow"/>
         <set_value name="$newTrade.$Timestamp" exact="$cacheNow"/>
+        <!-- Stamp the stable build-storage base anchor at write time, when the sell refs are still
+             fresh. Done here (the single chokepoint every cached trade passes through) so it is
+             independent of which matcher built the trade. The base station survives while the
+             transient build storage component/offer die; cache.search re-resolves base.buildstorage. -->
+        <do_if value="not $newTrade.$SellStationBase?">
+          <set_value name="$wAnchorSell" exact="null"/>
+          <do_if value="$newTrade.$SellStation? and @$newTrade.$SellStation.exists">
+            <set_value name="$wAnchorSell" exact="@$newTrade.$SellStation"/>
+          </do_if>
+          <do_elseif value="$newTrade.$SellOffer? and @$newTrade.$SellOffer.exists and $newTrade.$SellOffer.buyer? and @$newTrade.$SellOffer.buyer.exists">
+            <set_value name="$wAnchorSell" exact="@$newTrade.$SellOffer.buyer"/>
+          </do_elseif>
+          <do_if value="$wAnchorSell? and @$wAnchorSell.isclass.buildstorage and $wAnchorSell.base? and @$wAnchorSell.base.exists">
+            <set_value name="$newTrade.$SellStationBase" exact="@$wAnchorSell.base"/>
+          </do_if>
+        </do_if>
         <do_if value="not $newTrade.$DeliveryStationName? and $newTrade.$SellStation? and @$newTrade.$SellStation.exists and @$newTrade.$SellStation.knownname">
           <set_value name="$newTrade.$DeliveryStationName" exact="@$newTrade.$SellStation.knownname"/>
+        </do_if>
+        <!-- Stamp the delivery station's STABLE idcode (a string that outlives the recreated build-storage
+             and base entities). cache.search uses it to disambiguate which re-discovered player buy offer
+             corresponds to this cached row. For build storage we store the parent base station's idcode. -->
+        <do_if value="not $newTrade.$DeliveryStationId? and $newTrade.$SellStation? and @$newTrade.$SellStation.exists">
+          <do_if value="@$newTrade.$SellStation.isclass.buildstorage and $newTrade.$SellStation.base? and @$newTrade.$SellStation.base.exists">
+            <set_value name="$newTrade.$DeliveryStationId" exact="@$newTrade.$SellStation.base.idcode"/>
+          </do_if>
+          <do_else>
+            <set_value name="$newTrade.$DeliveryStationId" exact="@$newTrade.$SellStation.idcode"/>
+          </do_else>
         </do_if>
         <do_if value="not $newTrade.$CargoWareTransport?">
           <set_value name="$cacheTagWare" exact="if $newTrade.$Ware? then $newTrade.$Ware else null"/>

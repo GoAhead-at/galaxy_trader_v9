@@ -152,8 +152,16 @@
             <set_value name="$dispatchParams.$Phase" exact="'mk42live'"/>
             <set_value name="$dispatchParams.$HomeSector" exact="$homeSector"/>
             <set_value name="$dispatchParams.$SearchPool" exact="'mk4_supply_v2'"/>
+            <!-- Honor an explicit ship request for a live search. A ship raises ForceLiveSearch=true only
+                 after its cache attempt already failed (every cached candidate rejected for THIS ship). If we
+                 silently downgrade to a cache re-read whenever the shared pool is non-empty, the ship is handed
+                 the very same already-failing entries again and loops forever, never discovering the live demand
+                 that other ships have not claimed (observed: FIK/FOB stuck re-reading CUP's pool of 30, never
+                 running a live search). Only apply the cache-first heuristic when the ship did NOT explicitly
+                 force live. -->
+            <set_value name="$shipForcedLive" exact="$params? and $params.$ForceLiveSearch? and @$params.$ForceLiveSearch"/>
             <set_value name="$dispatchForceLive" exact="true"/>
-            <do_if value="$homeSector? and $homeSector.exists and global.$GT_TradeCacheMK42? and global.$GT_TradeCacheMK42.{$homeSector}? and global.$GT_TradeCacheMK42.{$homeSector}.count gt 0">
+            <do_if value="not $shipForcedLive and $homeSector? and $homeSector.exists and global.$GT_TradeCacheMK42? and global.$GT_TradeCacheMK42.{$homeSector}? and global.$GT_TradeCacheMK42.{$homeSector}.count gt 0">
               <set_value name="$dispatchForceLive" exact="false"/>
             </do_if>
             <set_value name="$dispatchParams.$ForceLiveSearch" exact="$dispatchForceLive"/>
@@ -366,6 +374,47 @@
             <do_if value="$mk42WakeShips.count gt 0 and global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-Scheduler] HandleMK42CacheUpdated: Woke ' + $mk42WakeShips.count + ' waiting ships to retry cache home=' + (if $homeSector.knownname? then @$homeSector.knownname else '?') + ' pool=' + $mk42CacheEntryCount + ' maxDist=' + $updatedMaxDistance" chance="100"/>
             </do_if>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- Save/load recovery: an AI <wait> does not re-issue its trade-search request after a
+         game load (the pre-save GT_Search_Request was discarded when the scheduler queues were
+         reset on load), so MK4-2 ships sit in 'wait for MD response' forever until the order is
+         manually re-applied. Re-kick every in-service MK4-2 ship once on load with
+         GT_TradeSearch_Reset: the order's wait interrupt sees it is no longer scheduled (queues
+         were just reset) and resumes its main loop, sending a fresh GT_Search_Request.
+         One-shot and event-driven (no polling). The delay lets InitMK42Semaphore and the main
+         scheduler's load-time reservation clear (2s) settle first. Ships that are actively
+         executing a trade are unaffected (GT_TradeSearch_Reset is only caught in the response wait). -->
+    <cue name="MK42ReinitShipsOnLoad" instantiate="true" version="1">
+      <conditions>
+        <event_game_loaded/>
+      </conditions>
+      <delay exact="5s"/>
+      <actions>
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
+          <set_value name="$mk42LoadShipKeys" exact="global.$GT_Ships.keys.list"/>
+          <set_value name="$mk42LoadKicked" exact="0"/>
+          <do_all exact="$mk42LoadShipKeys.count" counter="$mk42lki">
+            <set_value name="$mk42LoadShip" exact="$mk42LoadShipKeys.{$mk42lki}"/>
+            <do_if value="$mk42LoadShip? and $mk42LoadShip.exists and $mk42LoadShip.isplayerowned and $mk42LoadShip.defaultorder?">
+              <set_value name="$mk42LoadIsMk42" exact="false"/>
+              <do_if value="@$mk42LoadShip.defaultorder.id == 'GalaxyTraderMK4Supply2'">
+                <set_value name="$mk42LoadIsMk42" exact="true"/>
+              </do_if>
+              <do_elseif value="@$mk42LoadShip.defaultorder.id == 'Assist' and $mk42LoadShip.defaultorder.$baseorder? and @$mk42LoadShip.defaultorder.$baseorder.id == 'GalaxyTraderMK4Supply2'">
+                <set_value name="$mk42LoadIsMk42" exact="true"/>
+              </do_elseif>
+              <do_if value="$mk42LoadIsMk42">
+                <signal_objects object="$mk42LoadShip" param="'GT_TradeSearch_Reset'" delay="1ms"/>
+                <set_value name="$mk42LoadKicked" operation="add"/>
+              </do_if>
+            </do_if>
+          </do_all>
+          <do_if value="$mk42LoadKicked gt 0 and global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Scheduler] MK42ReinitShipsOnLoad: re-kicked ' + $mk42LoadKicked + ' MK4-2 ship(s) to resume trade search after game load'" chance="100"/>
           </do_if>
         </do_if>
       </actions>

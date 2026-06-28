@@ -440,6 +440,15 @@
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Commander order changed - restarting to resync settings'" chance="100"/>
         </do_if>
+        <!-- Release any scheduler registration BEFORE restarting. abort_called_scripts resume="init"
+             jumps straight back to the main loop without passing through the normal abort/cleanup path,
+             so a ship that was queued/active (e.g. $MK42LiveQueued after escalating to live) keeps that
+             stale membership. The restarted loop then re-sends GT_Search_Request, which HandleSearchRequest
+             REJECTS as a duplicate (reason=MK42LiveQueued), parks the ship in the InProgress wait, and the
+             stale queue entry is never dispatched -> the ship is stuck until the 120s timeout while the
+             cache it could read sits ready. The abort signal is queued and processed by the MD handler
+             independently of the immediate script restart. -->
+        <signal_objects object="player.galaxy" param="'GT_Search_Abort'" param2="table[$Ship = this.ship]"/>
         <!-- Use abort_called_scripts like vanilla - forcefully restart at init label -->
         <abort_called_scripts resume="init"/>
       </actions>
@@ -1251,6 +1260,15 @@
       <set_value name="this.$tradeFoundSignalWaitTime" exact="5ms"/>
       <!-- Purpose B: No-trade retry cooldown (seconds) -->
       <set_value name="this.$retryCooldown" exact="10s"/>
+
+      <!-- Clear leaked active-trade tracking on (re)start. global.$GT_ActiveTrade.{ship} is written
+           when a trade is selected (pre-execution) and normally cleared at trade_completed. A
+           commander-settings restart (abort_called_scripts resume="init") bypasses that cleanup,
+           leaving a phantom entry that the diagnostic reports as an active trade. Only clear it when
+           the hold is empty (no haul in progress) — a ship carrying cargo keeps its entry. -->
+      <do_if value="global.$GT_ActiveTrade? and global.$GT_ActiveTrade.{this.ship}? and this.ship.cargo.free.all ge this.ship.cargo.capacity.all">
+        <remove_value name="global.$GT_ActiveTrade.{this.ship}"/>
+      </do_if>
       
       <!-- ======================================= -->
       <!-- PILOT CHANGE DETECTION (Script Restart) -->
@@ -3013,6 +3031,30 @@
           <set_value name="this.$trackedCommanderSettingsSig" exact="$_commanderSettingsSig"/>
         </do_if>
       </do_if>
+      <do_else>
+        <!-- ORDER-HOLDER SELF-REFRESH (commander / standalone):
+             Subordinates resync from the commander above, but the order-holder reads its params only in <init>.
+             Re-read the live trade-rule toggle from its own default order each request so a runtime
+             ignoretraderules edit takes effect without restarting the order. -->
+        <do_if value="this.ship.defaultorder? and @this.ship.defaultorder.id == 'GalaxyTraderMK4Supply2' and this.ship.defaultorder.$ignoretraderules?">
+          <set_value name="$_ownIgnoreTradeRules" exact="this.ship.defaultorder.$ignoretraderules"/>
+          <do_if value="not this.$effectiveIgnoreTradeRules? or this.$effectiveIgnoreTradeRules != $_ownIgnoreTradeRules">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Own order ignoretraderules changed -> ' + $_ownIgnoreTradeRules + ' (refreshing)'" chance="100"/>
+            </do_if>
+            <set_value name="$effectiveIgnoreTradeRules" exact="$_ownIgnoreTradeRules"/>
+            <set_value name="this.$effectiveIgnoreTradeRules" exact="$_ownIgnoreTradeRules"/>
+            <!-- Drop stale trades validated under the previous trade-rule setting -->
+            <do_if value="global.$GT_TradesAwaitingValidation? and global.$GT_TradesAwaitingValidation.{this.ship}?">
+              <remove_value name="global.$GT_TradesAwaitingValidation.{this.ship}"/>
+            </do_if>
+            <set_value name="this.$tradeFoundViaInterrupt" exact="false"/>
+            <do_if value="this.$searchFailed?">
+              <set_value name="this.$searchFailed" exact="0"/>
+            </do_if>
+          </do_if>
+        </do_if>
+      </do_else>
       
       <!-- Initialize retry counter if not exists -->
       <do_if value="not this.$searchFailed?">
@@ -3530,9 +3572,14 @@
                 <do_if value="not $resetStillScheduled and global.$GT_SearchSemaphore.$MK4LiveActiveShips? and global.$GT_SearchSemaphore.$MK4LiveActiveShips.{this.ship}?">
                   <set_value name="$resetStillScheduled" exact="true"/>
                 </do_if>
-                <do_if value="not $resetStillScheduled and global.$GT_SearchSemaphore.$LiveWaiterWakePending? and global.$GT_SearchSemaphore.$LiveWaiterWakePending.{this.ship}?">
-                  <set_value name="$resetStillScheduled" exact="true"/>
-                </do_if>
+                <!-- IMPORTANT: $LiveWaiterWakePending must NOT keep the ship in the wait. It is the
+                     scheduler's "you were just woken — act now" marker (set by HandleMK42CacheUpdated /
+                     HandleSearchAbort / starved-waiter promotion, which also DEQUEUE the ship and expect
+                     it to re-issue a fresh request — "retry cache first"). The flag is cleared only inside
+                     HandleSearchRequest, i.e. on the re-request. Treating it as "still scheduled" here
+                     stranded woken ships in wait_for_response_continue with no pending GT_Search_Go until
+                     the 120s timeout (e.g. a fleet ship never reading a freshly-written cache). Fall
+                     through to main_loop so the wake deterministically produces a new search request. -->
                 <do_if value="not $resetStillScheduled and global.$GT_SearchSemaphore.$MK4LiveWaitersByHome? and global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.keys.count gt 0">
                   <set_value name="$resetWaiterHomeKeys" exact="global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.keys.list"/>
                   <do_all exact="$resetWaiterHomeKeys.count" counter="$rwhi">
@@ -3798,22 +3845,13 @@
         </do_if>
         <set_value name="$priorityWaresChanged" exact="this.$lastPriorityWaresSig? and this.$lastPriorityWaresSig != $pwSig"/>
         <set_value name="$mk42PrioChanged" exact="this.$lastMk42PrioSig? and this.$lastMk42PrioSig != $mk42PrioSig"/>
-        <set_value name="$invalidateSearchCache" exact="$priorityWaresChanged"/>
-        <do_if value="$priorityWaresChanged and $searchHomeSector? and $searchHomeSector.exists">
-          <!-- Priority-ware signature changed: home cache may no longer match basket — clear MK4 pool only. -->
-          <do_if value="global.$GT_TradeCacheMK42? and global.$GT_TradeCacheMK42.{$searchHomeSector}?">
-            <remove_value name="global.$GT_TradeCacheMK42.{$searchHomeSector}"/>
-            <do_if value="global.$GT_TradeCacheMK42ByWare? and global.$GT_TradeCacheMK42ByWare.{$searchHomeSector}?">
-              <remove_value name="global.$GT_TradeCacheMK42ByWare.{$searchHomeSector}"/>
-            </do_if>
-            <do_if value="global.$GT_TradeCacheMK42MaxDistance? and global.$GT_TradeCacheMK42MaxDistance.{$searchHomeSector}?">
-              <remove_value name="global.$GT_TradeCacheMK42MaxDistance.{$searchHomeSector}"/>
-            </do_if>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': priority wares changed - cleared cache for home sector ' + (if $searchHomeSector.knownname? then @$searchHomeSector.knownname else '?') + ' (next search will run live)'" chance="100"/>
-            </do_if>
-          </do_if>
-        </do_if>
+        <!-- A priority-signature change is a PER-SHIP scoring concern, not a fleet-wide invalidation: the
+             shared MK4-2 pool holds valid supply trades regardless of any one ship's priority sliders, and
+             the cache reader re-filters/re-scores per ship. Wiping the global pool here let a single
+             subordinate (whose sliders shift on staggered commander re-inheritance) erase the whole fleet's
+             freshly-filled cache, starving every other ship (observed: DMB-935 wiped pool=30 0.5s after
+             CUP-541 filled it). The non-destructive $mk42PrioChanged handler below already forces a live
+             re-score for the affected ship when needed, so no global wipe is required. -->
         <do_if value="$mk42PrioChanged and $searchHomeSector? and $searchHomeSector.exists">
           <set_value name="$mk4PolicyCacheEmpty" exact="true"/>
           <do_if value="global.$GT_TradeCacheMK42? and global.$GT_TradeCacheMK42.{$searchHomeSector}? and global.$GT_TradeCacheMK42.{$searchHomeSector}.count gt 0">
@@ -3874,6 +3912,7 @@
               <param name="mk4AllowResources" value="if this.$mk4AllowResources? then this.$mk4AllowResources else true"/>
               <param name="mk4AllowIntermediates" value="if this.$mk4AllowIntermediates? then this.$mk4AllowIntermediates else true"/>
               <param name="mk4AllowTradewares" value="if this.$mk4AllowTradewares? then this.$mk4AllowTradewares else true"/>
+              <param name="ignoreTradeRules" value="if this.$effectiveIgnoreTradeRules? then this.$effectiveIgnoreTradeRules else false"/>
               
             </run_script>
             <do_if value="$cacheFoundOnlyResult? and $cacheFoundOnlyResult.$Found?">
@@ -3950,6 +3989,7 @@
             <param name="mk4AllowResources" value="if this.$mk4AllowResources? then this.$mk4AllowResources else true"/>
             <param name="mk4AllowIntermediates" value="if this.$mk4AllowIntermediates? then this.$mk4AllowIntermediates else true"/>
             <param name="mk4AllowTradewares" value="if this.$mk4AllowTradewares? then this.$mk4AllowTradewares else true"/>
+            <param name="ignoreTradeRules" value="if this.$effectiveIgnoreTradeRules? then this.$effectiveIgnoreTradeRules else false"/>
             
           </run_script>
         </do_if>
@@ -4598,6 +4638,12 @@
               <do_elseif value="$freshTrade.$SellOffer.owner? and @$freshTrade.$SellOffer.owner.exists">
                 <set_value name="$freshSellStation" exact="@$freshTrade.$SellOffer.owner"/>
               </do_elseif>
+              <!-- Build-storage delivery refs go stale fast; recover the live build storage from the
+                   stable base station captured at match time (mirrors lib.gt.mk42.cache.search). -->
+              <do_elseif value="$freshTrade.$SellStationBase? and @$freshTrade.$SellStationBase.exists and @$freshTrade.$SellStationBase.buildstorage and @$freshTrade.$SellStationBase.buildstorage.exists">
+                <set_value name="$freshSellStation" exact="@$freshTrade.$SellStationBase.buildstorage"/>
+                <set_value name="$freshTrade.$SellStation" exact="$freshSellStation"/>
+              </do_elseif>
               <do_if value="$freshBuyStation? and $freshBuyStation.exists and $freshBuyWare != null">
                 <find_sell_offer seller="$freshBuyStation" wares="$freshBuyWare" tradepartner="this.ship" result="$freshResolvedBuyOffer"/>
                 <do_if value="$freshResolvedBuyOffer?">
@@ -4605,7 +4651,13 @@
                 </do_if>
               </do_if>
               <do_if value="$freshSellStation? and $freshSellStation.exists and $freshSellWare != null">
-                <find_buy_offer buyer="$freshSellStation" wares="$freshSellWare" tradepartner="this.ship" result="$freshResolvedSellOffer"/>
+                <!-- Build storages expose "empty" buy offers; fetch with excludeempty/usereservations=false. -->
+                <do_if value="@$freshSellStation.isclass.buildstorage">
+                  <find_buy_offer buyer="$freshSellStation" wares="$freshSellWare" tradepartner="this.ship" result="$freshResolvedSellOffer" excludeempty="false" usereservations="false"/>
+                </do_if>
+                <do_else>
+                  <find_buy_offer buyer="$freshSellStation" wares="$freshSellWare" tradepartner="this.ship" result="$freshResolvedSellOffer"/>
+                </do_else>
                 <do_if value="$freshResolvedSellOffer?">
                   <set_value name="$freshTrade.$SellOffer" exact="$freshResolvedSellOffer"/>
                 </do_if>
@@ -5018,9 +5070,10 @@
             </do_elseif>
           </do_elseif>
 
-          <do_if value="$bsBuyStation? and $bsBuyStation.isclass.buildstorage">
-            <set_value name="$isBuildStorageTrade" exact="true"/>
-          </do_if>
+          <!-- "Supplying a build storage" = the DELIVERY (sell) station is the build storage. A trade that
+               merely BUYS from a build storage but delivers to a normal station is ordinary supply and must
+               NOT be force-promoted into the build-storage priority bucket - doing so dragged drain-a-build-
+               storage trades ahead of actual supply trades and defeated the delivery-class 10x score. -->
           <do_if value="$bsSellStation? and $bsSellStation.isclass.buildstorage">
             <set_value name="$isBuildStorageTrade" exact="true"/>
           </do_if>
@@ -5080,9 +5133,8 @@
             </do_elseif>
           </do_elseif>
 
-          <do_if value="$optaBuyStation? and $optaBuyStation.isclass.buildstorage">
-            <set_value name="$optaIsBuildStorageTrade" exact="true"/>
-          </do_if>
+          <!-- Only delivery-to-build-storage counts as a build-storage supply trade (see reorder above);
+               buying from a build storage to feed a normal station is ordinary supply. -->
           <do_if value="$optaSellStation? and $optaSellStation.isclass.buildstorage">
             <set_value name="$optaIsBuildStorageTrade" exact="true"/>
           </do_if>
@@ -6277,11 +6329,77 @@
                     <do_elseif value="$currentTrade.$SellOffer.owner? and @$currentTrade.$SellOffer.owner.exists">
                       <set_value name="$preValSellStation" exact="@$currentTrade.$SellOffer.owner"/>
                     </do_elseif>
-                    <do_if value="$preValSellStation? and $preValSellStation.exists and $preValSellWare != null">
+                    <!-- Build-storage deliveries recreate their offer, build storage AND base every
+                         construction tick, so all cached refs are dead by execution time (-> buyer_missing
+                         at clamp). Re-discover the LIVE delivery the same way lib.gt.mk42.cache.search does:
+                         first the cheap base anchor, then find the current player buy offer by the cached
+                         sell sector + ware, disambiguated by the stored stable delivery idcode. -->
+                    <do_if value="(not $preValSellStation? or not @$preValSellStation.exists) and $currentTrade.$SellStationBase? and @$currentTrade.$SellStationBase.exists and @$currentTrade.$SellStationBase.buildstorage and @$currentTrade.$SellStationBase.buildstorage.exists">
+                      <set_value name="$preValSellStation" exact="@$currentTrade.$SellStationBase.buildstorage"/>
+                    </do_if>
+                    <!-- A build-storage component handle churns every construction tick but can still
+                         report .exists=true while its offers have already moved to a fresh component.
+                         So for ANY build-storage delivery (cached component dead OR still "existing", OR a
+                         stored build-storage base/DeliveryStationId), always re-discover the LIVE offer by
+                         sector + stable idcode instead of trusting the cached component (-> buyer_missing). -->
+                    <set_value name="$preValForceBsRescan" exact="(not $preValSellStation? or not @$preValSellStation.exists) or (@$preValSellStation.exists and @$preValSellStation.isclass.buildstorage) or ($currentTrade.$SellStationBase? and @$currentTrade.$SellStationBase.exists and $currentTrade.$SellStationBase.buildstorage?)"/>
+                    <set_value name="$preValBsBuyer" exact="null"/>
+                    <set_value name="$preValRePick" exact="null"/>
+                    <do_if value="$preValForceBsRescan and $currentTrade.$SellSector? and @$currentTrade.$SellSector.exists and $preValSellWare != null and $currentTrade.$DeliveryStationId?">
+                      <!-- Re-resolve the live build-storage buy offer with the PROVEN MK4-2 player buy-offer
+                           query (lib.gt.mk42.live.search.xml ~1368): scan player-owned buy offers for the ware
+                           in the sell sector with a BARE <offeramount min="1"/> (NO tradepartner). The bare
+                           offeramount lets the engine read the build storage's desiredamount (construction
+                           demand carries no funds); specifying tradepartner=ship forces the money-trade path
+                           that reads the 0 funds-amount -> nothing found -> false buyer_missing (XSD common.xsd
+                           offeramount: "uses the desired amount if money would NOT change hands"). Disambiguate
+                           the correct delivery by the cached stable base idcode. -->
+                      <find_buy_offer wares="$preValSellWare" space="$currentTrade.$SellSector" result="$preValBsOffers" multiple="true">
+                        <match_buyer tradesknownto="this.ship.owner" owner="faction.player">
+                          <match_relation_to object="this.ship" relation="dock" comparison="ge"/>
+                          <match_relation_to faction="this.ship.owner" relation="enemy" comparison="not"/>
+                        </match_buyer>
+                        <offeramount min="1"/>
+                      </find_buy_offer>
+                      <do_if value="$preValBsOffers? and $preValBsOffers.count gt 0">
+                        <do_for_each name="$preValBsO" in="$preValBsOffers">
+                          <do_if value="not ($preValRePick? and @$preValRePick.exists) and $preValBsO? and @$preValBsO.exists">
+                            <set_value name="$preValBsCand" exact="null"/>
+                            <do_if value="$preValBsO.buyer? and @$preValBsO.buyer.exists">
+                              <set_value name="$preValBsCand" exact="@$preValBsO.buyer"/>
+                            </do_if>
+                            <do_elseif value="$preValBsO.owner? and @$preValBsO.owner.exists">
+                              <set_value name="$preValBsCand" exact="@$preValBsO.owner"/>
+                            </do_elseif>
+                            <do_if value="$preValBsCand? and @$preValBsCand.exists">
+                              <set_value name="$preValBsCandId" exact="if @$preValBsCand.isclass.buildstorage and $preValBsCand.base? and @$preValBsCand.base.exists then @$preValBsCand.base.idcode else @$preValBsCand.idcode"/>
+                              <do_if value="$preValBsCandId == $currentTrade.$DeliveryStationId">
+                                <set_value name="$preValRePick" exact="$preValBsO"/>
+                                <set_value name="$preValBsBuyer" exact="$preValBsCand"/>
+                                <set_value name="$preValSellStation" exact="$preValBsCand"/>
+                                <set_value name="$currentTrade.$SellStation" exact="$preValBsCand"/>
+                                <set_value name="$currentTrade.$SellOffer" exact="$preValBsO"/>
+                              </do_if>
+                            </do_if>
+                          </do_if>
+                        </do_for_each>
+                      </do_if>
+                    </do_if>
+                    <!-- Non-build-storage normal-station refresh (build storage already handled above). -->
+                    <do_if value="not $preValForceBsRescan and $preValSellStation? and $preValSellStation.exists and $preValSellWare != null and not @$preValSellStation.isclass.buildstorage">
                       <find_buy_offer buyer="$preValSellStation" wares="$preValSellWare" tradepartner="this.ship" result="$preValFreshSellOffer"/>
                       <do_if value="$preValFreshSellOffer?">
                         <set_value name="$currentTrade.$SellOffer" exact="$preValFreshSellOffer"/>
                       </do_if>
+                    </do_if>
+                    <do_if value="$preValForceBsRescan and @global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-Reserve] ' + this.ship.idcode + ': BS re-resolve' +
+                        '\n  ware=' + (if $preValSellWare? then $preValSellWare.name else 'null') +
+                        '\n  deliveryId=' + (if $currentTrade.$DeliveryStationId? then $currentTrade.$DeliveryStationId else 'null') +
+                        '\n  bsBuyer found=' + (if $preValBsBuyer? and @$preValBsBuyer.exists then 1 else 0) +
+                        '\n  sellOffer.buyer alive=' + (if $currentTrade.$SellOffer.buyer? and @$currentTrade.$SellOffer.buyer.exists then 1 else 0) +
+                        '\n  sellOffer.owner alive=' + (if $currentTrade.$SellOffer.owner? and @$currentTrade.$SellOffer.owner.exists then 1 else 0)"
+                        chance="100"/>
                     </do_if>
 
                     <!-- Check buy offer: available AND has SOME amount (clamping will handle exact amount reduction) -->
@@ -7234,11 +7352,67 @@
           </do_if>
           
           <do_if value="$pendingTrade.$SellOffer?">
-            <set_value name="$finalSellStation" exact="if $pendingTrade.$SellStation? then $pendingTrade.$SellStation else (if $pendingTrade.$SellOffer.buyer? and @$pendingTrade.$SellOffer.buyer.exists then @$pendingTrade.$SellOffer.buyer else (if $pendingTrade.$SellOffer.owner? then @$pendingTrade.$SellOffer.owner else null))"/>
-            <set_value name="$finalSellWare" exact="if $pendingTrade.$SellOffer.ware? then @$pendingTrade.$SellOffer.ware else null"/>
+            <set_value name="$finalSellStation" exact="if $pendingTrade.$SellStation? and @$pendingTrade.$SellStation.exists then $pendingTrade.$SellStation else (if $pendingTrade.$SellOffer.buyer? and @$pendingTrade.$SellOffer.buyer.exists then @$pendingTrade.$SellOffer.buyer else (if $pendingTrade.$SellOffer.owner? and @$pendingTrade.$SellOffer.owner.exists then @$pendingTrade.$SellOffer.owner else null))"/>
+            <set_value name="$finalSellWare" exact="if $pendingTrade.$SellOffer.ware? then @$pendingTrade.$SellOffer.ware else (if $pendingTrade.$Ware? then $pendingTrade.$Ware else null)"/>
+            <!-- Build-storage delivery refs die between clamp and order creation too; re-discover the live
+                 delivery (base anchor, then player buy offer by sell sector + ware matching the stable
+                 delivery idcode) so create_order gets a live offer. Mirrors lib.gt.mk42.cache.search. -->
+            <do_if value="(not $finalSellStation? or not @$finalSellStation.exists) and $pendingTrade.$SellStationBase? and @$pendingTrade.$SellStationBase.exists and @$pendingTrade.$SellStationBase.buildstorage and @$pendingTrade.$SellStationBase.buildstorage.exists">
+              <set_value name="$finalSellStation" exact="@$pendingTrade.$SellStationBase.buildstorage"/>
+            </do_if>
+            <!-- A build-storage component handle churns each construction tick but can still report
+                 .exists=true with stale offers; always re-discover the live offer by sector + idcode. -->
+            <set_value name="$finalForceBsRescan" exact="(not $finalSellStation? or not @$finalSellStation.exists) or (@$finalSellStation.exists and @$finalSellStation.isclass.buildstorage) or ($pendingTrade.$SellStationBase? and @$pendingTrade.$SellStationBase.exists and $pendingTrade.$SellStationBase.buildstorage?)"/>
+            <set_value name="$finalBsBuyer" exact="null"/>
+            <set_value name="$finalRePick" exact="null"/>
+            <do_if value="$finalForceBsRescan and $pendingTrade.$SellSector? and @$pendingTrade.$SellSector.exists and $finalSellWare != null and $pendingTrade.$DeliveryStationId?">
+              <!-- Re-resolve the live build-storage buy offer with the PROVEN MK4-2 player buy-offer query
+                   (lib.gt.mk42.live.search.xml ~1368): bare <offeramount min="1"/> (NO tradepartner) so the
+                   engine reads the build storage's desiredamount; tradepartner=ship would force the money path
+                   that reads 0 funds-amount -> false buyer_missing. Disambiguate by stable base idcode. -->
+              <find_buy_offer wares="$finalSellWare" space="$pendingTrade.$SellSector" result="$finalBsOffers" multiple="true">
+                <match_buyer tradesknownto="this.ship.owner" owner="faction.player">
+                  <match_relation_to object="this.ship" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="this.ship.owner" relation="enemy" comparison="not"/>
+                </match_buyer>
+                <offeramount min="1"/>
+              </find_buy_offer>
+              <do_if value="$finalBsOffers? and $finalBsOffers.count gt 0">
+                <do_for_each name="$finalBsO" in="$finalBsOffers">
+                  <do_if value="not ($finalRePick? and @$finalRePick.exists) and $finalBsO? and @$finalBsO.exists">
+                    <set_value name="$finalBsCand" exact="null"/>
+                    <do_if value="$finalBsO.buyer? and @$finalBsO.buyer.exists">
+                      <set_value name="$finalBsCand" exact="@$finalBsO.buyer"/>
+                    </do_if>
+                    <do_elseif value="$finalBsO.owner? and @$finalBsO.owner.exists">
+                      <set_value name="$finalBsCand" exact="@$finalBsO.owner"/>
+                    </do_elseif>
+                    <do_if value="$finalBsCand? and @$finalBsCand.exists">
+                      <set_value name="$finalBsCandId" exact="if @$finalBsCand.isclass.buildstorage and $finalBsCand.base? and @$finalBsCand.base.exists then @$finalBsCand.base.idcode else @$finalBsCand.idcode"/>
+                      <do_if value="$finalBsCandId == $pendingTrade.$DeliveryStationId">
+                        <set_value name="$finalRePick" exact="$finalBsO"/>
+                        <set_value name="$finalBsBuyer" exact="$finalBsCand"/>
+                        <set_value name="$finalSellStation" exact="$finalBsCand"/>
+                        <set_value name="$pendingTrade.$SellStation" exact="$finalBsCand"/>
+                        <set_value name="$pendingTrade.$SellOffer" exact="$finalBsO"/>
+                      </do_if>
+                    </do_if>
+                  </do_if>
+                </do_for_each>
+              </do_if>
+            </do_if>
             
             <do_if value="$finalSellStation? and $finalSellStation.exists and $finalSellWare != null">
-              <find_buy_offer buyer="$finalSellStation" wares="$finalSellWare" tradepartner="this.ship" result="$finalValidatedSellOffer"/>
+              <set_value name="$finalValidatedSellOffer" exact="null"/>
+              <do_if value="@$finalSellStation.isclass.buildstorage">
+                <!-- Build storage already re-resolved above; reuse that live offer. -->
+                <do_if value="$pendingTrade.$SellOffer? and @$pendingTrade.$SellOffer.exists">
+                  <set_value name="$finalValidatedSellOffer" exact="@$pendingTrade.$SellOffer"/>
+                </do_if>
+              </do_if>
+              <do_else>
+                <find_buy_offer buyer="$finalSellStation" wares="$finalSellWare" tradepartner="this.ship" result="$finalValidatedSellOffer"/>
+              </do_else>
               <set_value name="$finalSellEffectiveAmount" exact="0"/>
               <do_if value="$finalValidatedSellOffer?">
                 <set_value name="$pendingTrade.$SellOffer" exact="$finalValidatedSellOffer"/>
@@ -7422,11 +7596,28 @@
 
               <set_value name="$qtSellOfferAmount" exact="0"/>
               <do_if value="$qt.$SellOffer? and $qt.$SellOffer.exists">
-                <set_value name="$qtSellOfferAmount" exact="$qt.$SellOffer.offeramount.{this.ship}"/>
-                <do_if value="$qtSellOfferAmount == null">
-                  <set_value name="$qtSellOfferAmount" exact="0"/>
+                <!-- Build-storage construction offers report offeramount.{ship}=0 (no money
+                     changes hands), so clamping the already-validated sell amount to offeramount
+                     would zero it, drop the trade here, and leave only normal-station trades in
+                     the queue. The validated $FinalSellAmount already reflects construction
+                     demand, so skip the offeramount clamp for build-storage deliveries. -->
+                <set_value name="$qtSellIsBuildStorage" exact="false"/>
+                <do_if value="$qt.$SellStation? and @$qt.$SellStation.exists and @$qt.$SellStation.isclass.buildstorage">
+                  <set_value name="$qtSellIsBuildStorage" exact="true"/>
                 </do_if>
-                <set_value name="$qtSellAmount" exact="[$qtSellAmount, $qtSellOfferAmount].min"/>
+                <do_elseif value="$qt.$SellOffer.buyer? and @$qt.$SellOffer.buyer.exists and @$qt.$SellOffer.buyer.isclass.buildstorage">
+                  <set_value name="$qtSellIsBuildStorage" exact="true"/>
+                </do_elseif>
+                <do_elseif value="$qt.$SellOffer.owner? and @$qt.$SellOffer.owner.exists and @$qt.$SellOffer.owner.isclass.buildstorage">
+                  <set_value name="$qtSellIsBuildStorage" exact="true"/>
+                </do_elseif>
+                <do_if value="not $qtSellIsBuildStorage">
+                  <set_value name="$qtSellOfferAmount" exact="$qt.$SellOffer.offeramount.{this.ship}"/>
+                  <do_if value="$qtSellOfferAmount == null">
+                    <set_value name="$qtSellOfferAmount" exact="0"/>
+                  </do_if>
+                  <set_value name="$qtSellAmount" exact="[$qtSellAmount, $qtSellOfferAmount].min"/>
+                </do_if>
               </do_if>
               <do_else>
                 <continue/>
@@ -10915,11 +11106,23 @@
                 </do_if>
                 
                 <do_if value="$isValid and $sellStation? and $sellStation.exists and $sellWare != null">
-                  <find_buy_offer buyer="$sellStation" wares="$sellWare" tradepartner="this.ship" result="$validatedSellOffer"/>
-                  <do_if value="not $validatedSellOffer.available">
-                    <set_value name="$isValid" exact="false"/>
-                    <set_value name="$rejectReason" exact="'trade_rules_sell_violation'"/>
+                  <!-- Build-storage buy offers are "empty" (.available stays false while a cargo deficit
+                       exists), so fetch with excludeempty/usereservations=false and accept a resolvable
+                       offer rather than requiring .available (which would reject every build storage). -->
+                  <do_if value="@$sellStation.isclass.buildstorage">
+                    <find_buy_offer buyer="$sellStation" wares="$sellWare" tradepartner="this.ship" result="$validatedSellOffer" excludeempty="false" usereservations="false"/>
+                    <do_if value="not $validatedSellOffer? or not @$validatedSellOffer.exists">
+                      <set_value name="$isValid" exact="false"/>
+                      <set_value name="$rejectReason" exact="'trade_rules_sell_violation'"/>
+                    </do_if>
                   </do_if>
+                  <do_else>
+                    <find_buy_offer buyer="$sellStation" wares="$sellWare" tradepartner="this.ship" result="$validatedSellOffer"/>
+                    <do_if value="not $validatedSellOffer.available">
+                      <set_value name="$isValid" exact="false"/>
+                      <set_value name="$rejectReason" exact="'trade_rules_sell_violation'"/>
+                    </do_if>
+                  </do_else>
                 </do_if>
               </do_if>
               

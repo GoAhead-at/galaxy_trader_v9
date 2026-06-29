@@ -198,6 +198,22 @@ local function logBlacklistVerify(blacklist_id, context)
     ))
 end
 
+--- Parse ship list from MD raise_lua_event param ("id1,id2,..." or single numeric component id)
+local function parseShipListPayload(event_data)
+    local ship_list = {}
+    if not event_data then
+        return ship_list
+    end
+    if type(event_data) == "number" then
+        table.insert(ship_list, tostring(event_data))
+    elseif type(event_data) == "string" and event_data ~= "" then
+        for ship_id in string.gmatch(event_data, "([^,]+)") do
+            table.insert(ship_list, ship_id)
+        end
+    end
+    return ship_list
+end
+
 local function convertStringToID(idcode)
     if not idcode or idcode == "" then
         return 0
@@ -678,7 +694,10 @@ local function onUpdateBlacklist(_, event_data)
     logTrace(string.format("EVENT Update received payload_len=%d", payload_len))
     debugLog("Received blacklist update request")
     
-    -- Parse threat data from MD (empty string = no threats)
+    -- MD sends a full snapshot each time (not incremental). Replace local tracking so
+    -- a clear/wipe cannot leave stale sectors that CleanupExpired would resurrect.
+    GT_Blacklist.blacklisted_sectors = {}
+    
     local threatened_sectors = {}
     if event_data and event_data ~= "" then
         threatened_sectors = parseThreatData(event_data)
@@ -707,20 +726,17 @@ local function onApplyToFleet(_, event_data)
         return false
     end
     
-    local payload_len = event_data and #event_data or 0
-    logTrace(string.format("EVENT ApplyToFleet received payload_len=%d fleet_id=%s", payload_len, tostring(GT_Blacklist.fleet_blacklist_id)))
+    local ship_list = parseShipListPayload(event_data)
+    logTrace(string.format(
+        "EVENT ApplyToFleet received ships=%d fleet_id=%s",
+        #ship_list, tostring(GT_Blacklist.fleet_blacklist_id)
+    ))
     debugLog("Received fleet application request")
     
-    if not event_data or event_data == "" then
+    if #ship_list == 0 then
         logTrace("EVENT ApplyToFleet failed: empty ship list", "ERROR")
         debugLog("No ship list provided", "ERROR")
         return false
-    end
-    
-    -- Parse ship list: "ship1,ship2,ship3,..."
-    local ship_list = {}
-    for ship_id in string.gmatch(event_data, "([^,]+)") do
-        table.insert(ship_list, ship_id)
     end
     
     local ok = applyFleetBlacklistToAllShips(ship_list)

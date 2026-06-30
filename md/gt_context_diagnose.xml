@@ -866,6 +866,9 @@
             <do_if value="$minerDiag.$Timestamp?">
               <set_value name="$lastUpdateText" exact="'' + ((player.age - $minerDiag.$Timestamp) / 1s)i + 's ago'"/>
             </do_if>
+            <do_if value="$minerDiag.$StallReason?">
+              <set_value name="$intentPhaseText" exact="'' + $intentPhaseText + ' | stall: ' + $minerDiag.$StallReason"/>
+            </do_if>
           </do_if>
 
           <!-- Detect live/stale coordination entries for this ship -->
@@ -1806,11 +1809,11 @@
           </do_if>
           <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Home Anchor', $Status = if $minerHome == 'Not set' then 'FAIL' else 'PASS', $Detail = $minerHome]"/>
           
-          <set_value name="$minerTargetStations" exact="0"/>
+          <set_value name="$diagMinerConfiguredTargetCount" exact="0"/>
           <do_if value="$gtOrder? and $gtOrder.$stationList? and $gtOrder.$stationList.count?">
-            <set_value name="$minerTargetStations" exact="$gtOrder.$stationList.count"/>
+            <set_value name="$diagMinerConfiguredTargetCount" exact="$gtOrder.$stationList.count"/>
           </do_if>
-          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Target Stations', $Status = 'INFO', $Detail = '' + $minerTargetStations + ' stations']"/>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Configured Target Stations', $Status = if $diagMinerConfiguredTargetCount gt 0 then 'PASS' else 'INFO', $Detail = '' + $diagMinerConfiguredTargetCount + ' in stationList (empty = miner auto-discovers demand stations at runtime)']"/>
           
           <set_value name="$minerOverflow" exact="false"/>
           <do_if value="$gtOrder? and $gtOrder.$allowOverflowSellToOthers?">
@@ -1822,11 +1825,14 @@
             <set_value name="$minerPlayerOnly" exact="$gtOrder.$playerStationsOnly"/>
           </do_if>
           <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Player Stations Only', $Status = 'INFO', $Detail = if $minerPlayerOnly then 'true' else 'false']"/>
-          <set_value name="$minerCheckDemandFirst" exact="true"/>
+          <set_value name="$diagMinerCheckDemandFirst" exact="true"/>
           <do_if value="$gtOrder? and $gtOrder.$checkDemandFirst?">
-            <set_value name="$minerCheckDemandFirst" exact="$gtOrder.$checkDemandFirst"/>
+            <set_value name="$diagMinerCheckDemandFirst" exact="$gtOrder.$checkDemandFirst"/>
           </do_if>
-          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Check Demand First', $Status = 'INFO', $Detail = if $minerCheckDemandFirst then 'true (demand-first)' else 'false (demand-off / stockpile)']"/>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Check Demand First', $Status = if $diagMinerCheckDemandFirst then 'INFO' else 'WARN', $Detail = if $diagMinerCheckDemandFirst then 'true (demand-first) - checks station demand before starting to mine' else 'false (demand-off / stockpile) - mines proactively; selling still uses primary stations below overflow threshold or Overflow sell']"/>
+          <do_if value="not $diagMinerCheckDemandFirst">
+            <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Demand-off Note', $Status = 'INFO', $Detail = 'Toggle OFF bypasses the mining demand gate only. Full bay with no willing buyer enters standby until capacity opens or overflow sell is enabled.']"/>
+          </do_if>
           <set_value name="$minerOverflowThreshold" exact="90"/>
           <do_if value="$gtOrder? and $gtOrder.$overflowThreshold?">
             <set_value name="$minerOverflowThreshold" exact="[70, [100, $gtOrder.$overflowThreshold].min].max"/>
@@ -1860,7 +1866,16 @@
         <set_value name="$diagMinerUnsellableCargoDetail" exact="''"/>
         <set_value name="$diagMinerOnSellRun" exact="false"/>
         <set_value name="$diagMinerSellRunDetail" exact="''"/>
+        <set_value name="$diagMinerConfiguredTargetCount" exact="0"/>
+        <set_value name="$diagMinerRuntimeDemandAdded" exact="0"/>
+        <set_value name="$diagMinerCargoHasWillingBuyer" exact="false"/>
+        <set_value name="$diagMinerDemandOffFullBayStall" exact="false"/>
+        <set_value name="$diagMinerSnapshotStallReason" exact="''"/>
         <do_if value="$orderId == 'GalaxyMiner'">
+          <set_value name="$diagMinerCheckDemandFirst" exact="true"/>
+          <do_if value="$gtOrder? and $gtOrder.$checkDemandFirst?">
+            <set_value name="$diagMinerCheckDemandFirst" exact="$gtOrder.$checkDemandFirst"/>
+          </do_if>
           <set_value name="$diagMinerOfferWaresDetail" exact="'none (no mineable cargo and no active mining ware snapshot)'"/>
           <do_if value="$gtOrder? and $gtOrder.$playerStationsOnly?">
             <set_value name="$diagMinerPlayerStationsOnly" exact="$gtOrder.$playerStationsOnly"/>
@@ -1894,6 +1909,64 @@
           </do_if>
           <do_if value="$gtOrder? and $gtOrder.$homeStation? and $gtOrder.$homeStation.exists and $gtOrder.$homeStation.isoperational and ((not $diagMinerPlayerStationsOnly) or ($gtOrder.$homeStation.owner == $ship.owner)) and ((not $gtOrder.$homeSector?) or (not $gtOrder.$homeSector.exists) or ($gtOrder.$homeStation.sector == $gtOrder.$homeSector)) and not $diagMinerPrimaryStations.indexof.{$gtOrder.$homeStation}">
             <append_to_list name="$diagMinerPrimaryStations" exact="$gtOrder.$homeStation"/>
+          </do_if>
+          <!-- Mirror order.trade.galaxyminer.xml demand-station auto-discovery when stationList is empty
+               and no home station is set (home sector anchor -> all operational stations in sell range). -->
+          <do_if value="not ($gtOrder? and $gtOrder.$stationList? and $gtOrder.$stationList.count gt 0)">
+            <do_if value="not ($gtOrder? and $gtOrder.$homeStation? and $gtOrder.$homeStation.exists and $gtOrder.$homeStation.isoperational)">
+              <set_value name="$diagMinerDemandRefSector" exact="null"/>
+              <do_if value="$gtOrder? and $gtOrder.$homeSector? and $gtOrder.$homeSector.exists">
+                <set_value name="$diagMinerDemandRefSector" exact="$gtOrder.$homeSector"/>
+              </do_if>
+              <do_elseif value="$homeSector? and $homeSector.exists">
+                <set_value name="$diagMinerDemandRefSector" exact="$homeSector"/>
+              </do_elseif>
+              <do_else>
+                <set_value name="$diagMinerDemandRefSector" exact="$ship.sector"/>
+              </do_else>
+              <do_if value="$diagMinerDemandRefSector? and $diagMinerDemandRefSector.exists">
+                <set_value name="$diagMinerDemandSectors" exact="[]"/>
+                <append_to_list name="$diagMinerDemandSectors" exact="$diagMinerDemandRefSector"/>
+                <do_if value="$maxSell gt 0">
+                  <find_sector name="$diagMinerDemandNearby" space="player.galaxy" multiple="true">
+                    <match_gate_distance object="$diagMinerDemandRefSector" min="0" max="$maxSell"/>
+                  </find_sector>
+                  <do_if value="$diagMinerDemandNearby? and $diagMinerDemandNearby.count gt 0">
+                    <do_all exact="$diagMinerDemandNearby.count" counter="$ddsi">
+                      <set_value name="$diagMinerDemandSector" exact="$diagMinerDemandNearby.{$ddsi}"/>
+                      <do_if value="$diagMinerDemandSector? and $diagMinerDemandSector.exists and not $diagMinerDemandSectors.indexof.{$diagMinerDemandSector}">
+                        <append_to_list name="$diagMinerDemandSectors" exact="$diagMinerDemandSector"/>
+                      </do_if>
+                    </do_all>
+                  </do_if>
+                </do_if>
+                <do_all exact="$diagMinerDemandSectors.count" counter="$ddsi2">
+                  <set_value name="$diagMinerDemandSector" exact="$diagMinerDemandSectors.{$ddsi2}"/>
+                  <find_station name="$diagMinerSectorStations" space="$diagMinerDemandSector" checkoperational="true" multiple="true"/>
+                  <do_if value="$diagMinerSectorStations? and $diagMinerSectorStations.count gt 0">
+                    <do_all exact="$diagMinerSectorStations.count" counter="$dssi">
+                      <set_value name="$diagMinerSectorStation" exact="$diagMinerSectorStations.{$dssi}"/>
+                      <do_if value="$diagMinerSectorStation? and $diagMinerSectorStation.exists and $diagMinerSectorStation.isclass.station and $diagMinerSectorStation.isoperational and ((not $diagMinerPlayerStationsOnly) or ($diagMinerSectorStation.owner == $ship.owner)) and not $diagMinerPrimaryStations.indexof.{$diagMinerSectorStation}">
+                        <append_to_list name="$diagMinerPrimaryStations" exact="$diagMinerSectorStation"/>
+                        <set_value name="$diagMinerRuntimeDemandAdded" operation="add"/>
+                      </do_if>
+                    </do_all>
+                  </do_if>
+                </do_all>
+              </do_if>
+              <do_elseif value="$ship.sector? and $ship.sector.exists">
+                <find_station name="$diagMinerSectorStations" space="$ship.sector" checkoperational="true" multiple="true"/>
+                <do_if value="$diagMinerSectorStations? and $diagMinerSectorStations.count gt 0">
+                  <do_all exact="$diagMinerSectorStations.count" counter="$dssi">
+                    <set_value name="$diagMinerSectorStation" exact="$diagMinerSectorStations.{$dssi}"/>
+                    <do_if value="$diagMinerSectorStation? and $diagMinerSectorStation.exists and $diagMinerSectorStation.isclass.station and $diagMinerSectorStation.isoperational and ((not $diagMinerPlayerStationsOnly) or ($diagMinerSectorStation.owner == $ship.owner)) and not $diagMinerPrimaryStations.indexof.{$diagMinerSectorStation}">
+                      <append_to_list name="$diagMinerPrimaryStations" exact="$diagMinerSectorStation"/>
+                      <set_value name="$diagMinerRuntimeDemandAdded" operation="add"/>
+                    </do_if>
+                  </do_all>
+                </do_if>
+              </do_elseif>
+            </do_if>
           </do_if>
           <set_value name="$diagMinerPolicySummary" exact="'Per-ware: deliver to primary stations below ' + $diagMinerOverflowThreshold + '% fill; wares at/above threshold use overflow sell rules when enabled'"/>
           <set_value name="$diagMinerPhysicalStorageAbortPct" exact="20"/>
@@ -2011,10 +2084,60 @@
               <set_value name="$diagMinerWareHasPrimaryCapacity.{$dwWare}" exact="$dwHasCap"/>
             </do_all>
           </do_if>
+          <do_if value="$ship.cargo.list? and $ship.cargo.list.count gt 0 and $diagMinerPrimaryStations.count gt 0">
+            <do_all exact="$ship.cargo.list.count" counter="$dcfwi">
+              <set_value name="$dcfwWare" exact="$ship.cargo.list.{$dcfwi}"/>
+              <do_if value="not $diagMinerCargoHasWillingBuyer and $dcfwWare? and $dcfwWare.hastag.minable and $ship.cargo.{$dcfwWare}.count gt 0 and $ship.cargo.{$dcfwWare}.max gt 0">
+                <do_all exact="$diagMinerPrimaryStations.count" counter="$dcfws">
+                  <do_if value="$diagMinerCargoHasWillingBuyer">
+                    <break/>
+                  </do_if>
+                  <set_value name="$dcfwStation" exact="$diagMinerPrimaryStations.{$dcfws}"/>
+                  <do_if value="$dcfwStation? and $dcfwStation.exists">
+                    <set_value name="$dcfwTarget" exact="@$dcfwStation.cargo.{$dcfwWare}.target"/>
+                    <do_if value="$dcfwTarget? and $dcfwTarget gt 0">
+                      <set_value name="$dcfwPhysical" exact="@$dcfwStation.cargo.{$dcfwWare}.count"/>
+                      <do_if value="not $dcfwPhysical?">
+                        <set_value name="$dcfwPhysical" exact="0"/>
+                      </do_if>
+                      <set_value name="$dcfwFillPct" exact="($dcfwPhysical * 100) / [$dcfwTarget, 1].max"/>
+                      <do_if value="$dcfwFillPct lt $diagMinerOverflowThreshold">
+                        <set_value name="$diagMinerCargoHasWillingBuyer" exact="true"/>
+                      </do_if>
+                    </do_if>
+                  </do_if>
+                </do_all>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="$cargoCap gt 0 and $cargoFree le 0 and not $diagMinerAllowOverflowSellToOthers and not $diagMinerCargoHasWillingBuyer and not $diagMinerCheckDemandFirst">
+            <set_value name="$diagMinerDemandOffFullBayStall" exact="true"/>
+          </do_if>
+          <do_if value="global.$GT_MinerDiag? and global.$GT_MinerDiag.{$ship}? and global.$GT_MinerDiag.{$ship}.$StallReason?">
+            <set_value name="$diagMinerSnapshotStallReason" exact="'' + global.$GT_MinerDiag.{$ship}.$StallReason"/>
+          </do_if>
           <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Diagnose Sell Wares', $Status = if $diagMinerOfferWares.count gt 0 then 'PASS' else 'WARN', $Detail = $diagMinerOfferWaresDetail]"/>
           <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Diagnose Miner Policy', $Status = 'INFO', $Detail = $diagMinerPolicySummary]"/>
           <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Physical Storage Gate', $Status = if $diagMinerPhysicalGateActive then 'PASS' else 'INFO', $Detail = $diagMinerPhysicalGateDetail]"/>
-          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Diagnose Primary Stations', $Status = if $diagMinerPrimaryStations.count gt 0 then 'PASS' else 'WARN', $Detail = '' + $diagMinerPrimaryStations.count + ' stations']"/>
+          <set_value name="$diagMinerRuntimeDemandDetail" exact="'' + $diagMinerPrimaryStations.count + ' stations'"/>
+          <do_if value="$diagMinerRuntimeDemandAdded gt 0">
+            <set_value name="$diagMinerRuntimeDemandDetail" exact="$diagMinerRuntimeDemandDetail + ' (' + $diagMinerRuntimeDemandAdded + ' auto-discovered within ' + $maxSell + ' sell jumps of home anchor - mirrors live miner)'"/>
+          </do_if>
+          <do_elseif value="$diagMinerConfiguredTargetCount gt 0">
+            <set_value name="$diagMinerRuntimeDemandDetail" exact="$diagMinerRuntimeDemandDetail + ' (from configured stationList)'"/>
+          </do_elseif>
+          <do_elseif value="$gtOrder? and $gtOrder.$homeStation? and $gtOrder.$homeStation.exists">
+            <set_value name="$diagMinerRuntimeDemandDetail" exact="$diagMinerRuntimeDemandDetail + ' (home station only)'"/>
+          </do_elseif>
+          <do_if value="$diagMinerPrimaryStations.count == 0">
+            <set_value name="$diagMinerRuntimeDemandDetail" exact="'0 stations - no stationList, home station, or sell-range scan found any demand targets'"/>
+          </do_if>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Runtime Demand Stations', $Status = if $diagMinerPrimaryStations.count gt 0 then 'PASS' else 'WARN', $Detail = $diagMinerRuntimeDemandDetail]"/>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Cargo-first Willing Buyer', $Status = if $diagMinerCargoHasWillingBuyer then 'PASS' else (if $cargoUsed gt 0 then 'WARN' else 'INFO'), $Detail = if $diagMinerCargoHasWillingBuyer then 'At least one carried minable ware has a primary station below the overflow threshold - miner should deliver' else (if $cargoUsed gt 0 then 'No primary station below overflow threshold for cargo on board - full bay cannot clear via primary delivery' else 'no cargo on board')"/>
+          <do_if value="$diagMinerSnapshotStallReason != ''">
+            <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Live Stall Reason (snapshot)', $Status = 'WARN', $Detail = $diagMinerSnapshotStallReason]"/>
+          </do_if>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Diagnose Primary Stations', $Status = if $diagMinerPrimaryStations.count gt 0 then 'PASS' else 'WARN', $Detail = '' + $diagMinerPrimaryStations.count + ' stations used for policy/clearance scans']"/>
           <do_if value="$diagMinerPrimaryStations.count gt 0">
             <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Primary Station Cargo', $Status = 'INFO', $Detail = 'Physical stock / storage target per ware (miner rejects primary delivery at or above ' + $diagMinerOverflowThreshold + '% of target)']"/>
             <do_all exact="$diagMinerPrimaryStations.count" counter="$pssi">
@@ -3106,9 +3229,9 @@
                NOTE on null checks: in X4 MD, `$var?` returns true whenever the variable was
                set, even if it was set to `null` - so `$selWBest?` is true after the initial
                `set_value name="$selWBest" exact="null"`. Use explicit `!= null` here. -->
-          <set_value name="$selWStalled" exact="$selWBest == null and $selWStallCandidate != null and (not $diagMinerAllowOverflowSellToOthers)"/>
+          <set_value name="$selWStalled" exact="$diagMinerCheckDemandFirst and $selWBest == null and $selWStallCandidate != null and (not $diagMinerAllowOverflowSellToOthers)"/>
           <do_if value="$selWHasStations and $rscWareRows.count gt 0">
-            <append_to_list name="$sec3b.$Rows" exact="table[$Check = '--- Selectability (what the miner would pick now) ---', $Status = 'INFO', $Detail = '']"/>
+            <append_to_list name="$sec3b.$Rows" exact="table[$Check = '--- Selectability (what the miner would pick now) ---', $Status = 'INFO', $Detail = if $diagMinerCheckDemandFirst then 'Demand-first mode: urgency scoring over primary stations' else 'Demand-off mode: fixed Resource Basket / slice-committed pick (urgency scoring skipped for mining gate)']"/>
             <do_if value="$selWBest != null">
               <append_to_list name="$sec3b.$Rows" exact="table[
                 $Check = 'Would Select',
@@ -7100,6 +7223,9 @@
             <append_to_list name="$suggestions" exact="'See Primary Station Cargo (section 3) for each primary station ware fill: physical units, target, and % vs overflow threshold ' + $diagMinerOverflowThreshold + '%.'"/>
             <append_to_list name="$suggestions" exact="'See Miner Sell Offer Details for sample rejected offers with explicit policy reasons.'"/>
             <append_to_list name="$suggestions" exact="'For overflow wares (e.g. Ice full at home): enable Overflow → Sell To Other Stations or wait for primary demand to drain.'"/>
+            <do_if value="not $diagMinerCheckDemandFirst">
+              <append_to_list name="$suggestions" exact="'Check Demand First is OFF: POLICY BLOCKING here affects selling carried cargo, not permission to mine. See Runtime Demand Stations for the station set the live miner actually uses.'"/>
+            </do_if>
           </do_if>
           <do_else>
             <set_value name="$verdict" exact="'NO OFFERS: ' + (if $orderId == 'GalaxyMiner' then 'No buy offers' else (if $allSellOffers.count == 0 then 'No sell offers' else 'No buy offers')) + ' found in ' + $searchSectors.count + ' sectors'"/>
@@ -7107,12 +7233,28 @@
             <append_to_list name="$suggestions" exact="'Check if sectors have operational stations'"/>
           </do_else>
         </do_elseif>
+        <!-- Priority 4a-min: Demand-off full bay with no willing primary buyer (stockpile standby). -->
+        <do_elseif value="$orderId == 'GalaxyMiner' and $diagMinerDemandOffFullBayStall and not $diagMinerOnSellRun">
+          <set_value name="$verdict" exact="'MINER STALLED (demand-off full-bay): cargo bay full (' + $cargoUsed + '/' + $cargoCap + '). Check Demand First is OFF (stockpile mode) but no primary station is below the ' + $diagMinerOverflowThreshold + '% overflow threshold for cargo on board, and Overflow → Sell To Other Stations is disabled. The miner is in full-bay standby until a buyer opens or you intervene.'"/>
+          <do_if value="$diagMinerSnapshotStallReason != ''">
+            <set_value name="$verdict" exact="$verdict + ' Live snapshot stall reason: ' + $diagMinerSnapshotStallReason + '.'"/>
+          </do_if>
+          <append_to_list name="$suggestions" exact="'Enable Overflow → Sell To Other Stations so full cargo can sell to non-primary buyers.'"/>
+          <append_to_list name="$suggestions" exact="'Add stations to Target Stations (stationList) or wait for primary demand to drain below ' + $diagMinerOverflowThreshold + '%.'"/>
+          <append_to_list name="$suggestions" exact="'Demand-off only bypasses the mining demand gate - it does not remove sell policy. See Runtime Demand Stations vs Configured Target Stations in section 3.'"/>
+        </do_elseif>
         <!-- Priority 4a0: Miner is actively executing a sell/delivery leg (not stuck). -->
         <do_elseif value="$orderId == 'GalaxyMiner' and $diagMinerOnSellRun? and $diagMinerOnSellRun">
           <set_value name="$verdict" exact="'MINER DELIVERING: cargo on board (' + $cargoUsed + '/' + $cargoCap + '). Ship is actively executing a sell leg (' + $diagMinerSellRunDetail + ') — not stuck. Clearance/policy rows in this report are a static re-scan and may show 0 matches even while the runtime sell pipeline already selected a buyer.'"/>
           <do_if value="$selWBest != null">
             <set_value name="$verdict" exact="$verdict + ' After delivery, would mine ' + $selWBest + ' (urgency ' + $selWBestUrgency + ').'"/>
           </do_if>
+        </do_elseif>
+        <!-- Priority 4a-deliver: Demand-off full bay but a willing primary buyer exists - should deliver, not mine. -->
+        <do_elseif value="$orderId == 'GalaxyMiner' and not $diagMinerCheckDemandFirst and $diagMinerFullBayNeedsClearance and $diagMinerCargoHasWillingBuyer and not $diagMinerOnSellRun">
+          <set_value name="$verdict" exact="'MINER BLOCKED (demand-off deliver): cargo bay full (' + $cargoUsed + '/' + $cargoCap + ') but a primary buyer has capacity below the overflow threshold. The miner should run a delivery slice before mining more. If it is still standing by, reload the order or check for a stuck immediate order.'"/>
+          <append_to_list name="$suggestions" exact="'See Cargo-first Willing Buyer in section 3 - if PASS, the runtime should deliver on the next mining slice.'"/>
+          <append_to_list name="$suggestions" exact="'Compare Live Stall Reason (snapshot) in section 3 - demand_off_full_bay here means the previous cycle blocked delivery (fixed in current build).'"/>
         </do_elseif>
         <!-- Priority 4a: Miner has selectable demand but is stuck (overflow wait). -->
         <do_elseif value="$orderId == 'GalaxyMiner' and $selWStalled? and $selWStalled">
@@ -7446,6 +7588,12 @@
         </do_elseif>
         <do_elseif value="not $isClearanceMode and $orderId == 'GalaxyMiner' and $diagMinerOnSellRun? and $diagMinerOnSellRun">
           <set_value name="$verdictStatus" exact="'PASS'"/>
+        </do_elseif>
+        <do_elseif value="not $isClearanceMode and $orderId == 'GalaxyMiner' and $diagMinerDemandOffFullBayStall and not $diagMinerOnSellRun">
+          <set_value name="$verdictStatus" exact="'FAIL'"/>
+        </do_elseif>
+        <do_elseif value="not $isClearanceMode and $orderId == 'GalaxyMiner' and not $diagMinerCheckDemandFirst and $diagMinerFullBayNeedsClearance and $diagMinerCargoHasWillingBuyer and not $diagMinerOnSellRun">
+          <set_value name="$verdictStatus" exact="'WARN'"/>
         </do_elseif>
         <do_elseif value="not $isClearanceMode and $orderId == 'GalaxyMiner' and $diagMinerCargoBlocksMining">
           <set_value name="$verdictStatus" exact="'FAIL'"/>

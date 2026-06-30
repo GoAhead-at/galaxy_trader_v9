@@ -4122,10 +4122,209 @@
           <do_if value="$clear_blocked_level">
             <remove_value name="global.$GT_Pilots.{$pilot}.$BlockedLevel"/>
           </do_if>
+          <!-- Paused placeholders survive commander-pause cleanup; drop them whenever
+               the live block is cleared so reactivation cannot re-apply [BL]. -->
+          <remove_value name="global.$GT_Pilots.{$pilot}.$PausedWithTrainingNeeded"/>
+          <remove_value name="global.$GT_Pilots.{$pilot}.$PausedBlockedLevel"/>
           <set_value name="global.$GT_Pilots.{$pilot}.$TrainingState" exact="'active'"/>
           <return value="true"/>
         </do_if>
         <return value="false"/>
+      </actions>
+    </library>
+    
+    <!-- Apply training gate when XP crosses a new skill threshold (any XP source). -->
+    <library name="GT_ProcessLevelUpTrainingGate" purpose="run_actions">
+      <params>
+        <param name="pilot" comment="Pilot who gained XP"/>
+        <param name="ship" comment="Ship to rename and signal for auto-training"/>
+        <param name="currentSkillLevel" comment="Management skill level before XP award"/>
+        <param name="newSkillLevel" comment="Management skill level implied by new XP total"/>
+        <param name="newXP" comment="Pilot XP total after award"/>
+        <param name="ware" default="null" comment="Ware name for level-up notification (optional)"/>
+        <param name="logTag" default="'XP'" comment="Debug log prefix"/>
+      </params>
+      <actions>
+        <set_value name="$result" exact="table[$TrainingBlocked = false, $RequiredTrainingLevel = 0]"/>
+        <set_value name="$starRating" exact="($newSkillLevel / 3)i"/>
+        <do_if value="$starRating gt 5">
+          <set_value name="$starRating" exact="5"/>
+        </do_if>
+        
+        <set_value name="$trainingRequired" exact="false"/>
+        <set_value name="$requiredTrainingLevel" exact="0"/>
+        
+        <do_all exact="($newSkillLevel - $currentSkillLevel)" counter="$levelCheck">
+          <set_value name="$checkLevel" exact="$currentSkillLevel + $levelCheck"/>
+          
+          <set_value name="$levelRequiresTraining" exact="false"/>
+          <do_if value="global.$GT_Config.$Training.$RequiredLevels?">
+            <do_all exact="global.$GT_Config.$Training.$RequiredLevels.count" counter="$i">
+              <do_if value="global.$GT_Config.$Training.$RequiredLevels.{$i} == $checkLevel">
+                <set_value name="$levelRequiresTraining" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+          
+          <do_if value="$levelRequiresTraining">
+            <set_value name="$hasCompletedTraining" exact="false"/>
+            <do_if value="global.$GT_Pilots.{$pilot}.$TrainingCompleted?">
+              <do_all exact="global.$GT_Pilots.{$pilot}.$TrainingCompleted.count" counter="$j">
+                <do_if value="global.$GT_Pilots.{$pilot}.$TrainingCompleted.{$j} == $checkLevel">
+                  <set_value name="$hasCompletedTraining" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+            </do_if>
+            
+            <do_if value="not $hasCompletedTraining">
+              <set_value name="$trainingRequired" exact="true"/>
+              <set_value name="$requiredTrainingLevel" exact="$checkLevel"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GalaxyTrader MK3] (' + $ship.idcode + ')   TRAINING BLOCK: Pilot would advance from ' + $currentSkillLevel + ' to ' + $newSkillLevel + ' but needs training at level ' + $checkLevel + ' [' + $logTag + ']'" chance="100"/>
+              </do_if>
+              <break/>
+            </do_if>
+          </do_if>
+        </do_all>
+        
+        <do_if value="$trainingRequired">
+          <set_value name="$result.$TrainingBlocked" exact="true"/>
+          <set_value name="$result.$RequiredTrainingLevel" exact="$requiredTrainingLevel"/>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GalaxyTrader MK3] (' + $ship.idcode + ')  ' + $logTag + ': Skill level ' + $requiredTrainingLevel + ' requires training - blocking advancement (would have reached level ' + $newSkillLevel + ')'" chance="100"/>
+          </do_if>
+          
+          <set_value name="$vanillaMgmtLevel" exact="if $pilot.skill.management? then $pilot.skill.management else 0"/>
+          <do_if value="$currentSkillLevel gt $vanillaMgmtLevel">
+            <set_skill entity="$pilot" type="skilltype.management" exact="$currentSkillLevel"/>
+          </do_if>
+          <set_value name="global.$GT_Pilots.{$pilot}.$Level" exact="$currentSkillLevel"/>
+          
+          <set_value name="$currentPilotSkill" exact="0"/>
+          <do_if value="$pilot.skill.piloting?">
+            <set_value name="$currentPilotSkill" exact="@$pilot.skill.piloting"/>
+          </do_if>
+          <set_value name="$targetPilotLevel" exact="($currentSkillLevel * 9) / 15"/>
+          <do_if value="$targetPilotLevel lt 1">
+            <set_value name="$targetPilotLevel" exact="1"/>
+          </do_if>
+          <do_if value="$targetPilotLevel gt 9">
+            <set_value name="$targetPilotLevel" exact="9"/>
+          </do_if>
+          <do_if value="$targetPilotLevel gt $currentPilotSkill">
+            <set_skill entity="$pilot" type="skilltype.piloting" exact="$targetPilotLevel"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GalaxyTrader MK3] (' + $ship.idcode + ') Pilot skill increased from ' + $currentPilotSkill + ' to ' + $targetPilotLevel + ' (management blocked at: ' + $currentSkillLevel + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+          
+          <set_value name="global.$GT_Pilots.{$pilot}.$PendingSkillLevel" exact="$newSkillLevel"/>
+          
+          <run_actions ref="md.GT_Libraries_General.GT_SetTrainingBlocked">
+            <param name="pilot" value="$pilot"/>
+            <param name="level" value="$requiredTrainingLevel"/>
+            <param name="set_xpblocked" value="true"/>
+          </run_actions>
+          
+          <run_actions ref="md.GT_Ship_Management.Update_Ship_Name">
+            <param name="ship" value="$ship"/>
+            <param name="pilot" value="$pilot"/>
+            <param name="xp" value="$newXP"/>
+            <param name="level" value="$requiredTrainingLevel"/>
+            <param name="nameType" value="'blocked'"/>
+          </run_actions>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GalaxyTrader MK3] (' + $ship.idcode + ') Ship renamed to show blocked state (advancement required for level ' + $requiredTrainingLevel + ')'" chance="100"/>
+          </do_if>
+          
+          <do_if value="global.$GT_Config.$Notifications.$TrainingRequired">
+            <set_value name="$message" exact="'Pilot ' + $pilot.name + ' needs training to advance to skill level ' + $requiredTrainingLevel + '! Dock at a training station to unlock further progression.'"/>
+            <show_notification text="$message" timeout="8s" priority="7"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <write_to_logbook category="upkeep" title="'Training Required: ' + $pilot.name + ' (' + $ship.knownname + ')'" text="$message" interaction="showonmap" object="$ship" highlighted="true"/>
+            </do_if>
+          </do_if>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GalaxyTrader MK3] (' + $ship.idcode + ') Management skill kept at level ' + $currentSkillLevel + ' until level ' + $requiredTrainingLevel + ' training completed'" chance="100"/>
+          </do_if>
+          
+          <signal_objects object="player.galaxy" param="'GT_Training_Needed'" param2="table[
+            $Ship = $ship,
+            $Pilot = $pilot,
+            $RequiredLevel = $requiredTrainingLevel,
+            $CurrentLevel = $currentSkillLevel,
+            $TargetLevel = $newSkillLevel,
+            $BlockedXP = $newXP
+          ]"/>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GalaxyTrader MK3] (' + $ship.idcode + ') AUTO-TRAINING: Sent training needed signal for pilot ' + $pilot.name + ' (requires level ' + $requiredTrainingLevel + ' training) [' + $logTag + ']'" chance="100"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GalaxyTrader MK3] (' + $ship.idcode + ') ' + $logTag + ': Pilot ' + $pilot.name + ' advanced from skill level ' + $currentSkillLevel + ' to ' + $newSkillLevel + ' (no training required)!'" chance="100"/>
+          </do_if>
+          
+          <set_value name="$vanillaMgmtLevel" exact="if $pilot.skill.management? then $pilot.skill.management else 0"/>
+          <do_if value="$newSkillLevel gt $vanillaMgmtLevel">
+            <set_skill entity="$pilot" type="skilltype.management" exact="$newSkillLevel"/>
+          </do_if>
+          <set_value name="global.$GT_Pilots.{$pilot}.$Level" exact="$newSkillLevel"/>
+          
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GalaxyTrader MK3] (' + $ship.idcode + ') Management skill set to level ' + $newSkillLevel + ' (' + $starRating + ' stars)'" chance="100"/>
+          </do_if>
+          
+          <set_value name="$currentPilotSkill" exact="0"/>
+          <do_if value="$pilot.skill.piloting?">
+            <set_value name="$currentPilotSkill" exact="@$pilot.skill.piloting"/>
+          </do_if>
+          <set_value name="$targetPilotLevel" exact="($newSkillLevel * 9) / 15"/>
+          <do_if value="$targetPilotLevel lt 1">
+            <set_value name="$targetPilotLevel" exact="1"/>
+          </do_if>
+          <do_if value="$targetPilotLevel gt 9">
+            <set_value name="$targetPilotLevel" exact="9"/>
+          </do_if>
+          <do_if value="$targetPilotLevel gt $currentPilotSkill">
+            <set_skill entity="$pilot" type="skilltype.piloting" exact="$targetPilotLevel"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GalaxyTrader MK3] (' + $ship.idcode + ') Pilot skill increased from ' + $currentPilotSkill + ' to ' + $targetPilotLevel + ' (management: ' + $newSkillLevel + ')'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GalaxyTrader MK3] (' + $ship.idcode + ') Pilot skill unchanged at ' + $currentPilotSkill + ' (already higher than target ' + $targetPilotLevel + ')'" chance="100"/>
+            </do_if>
+          </do_else>
+          
+          <do_if value="global.$GT_Config.$Notifications.$LevelUp">
+            <set_value name="$wareLabel" exact="if $ware? and $ware != null then $ware else 'trade'"/>
+            <set_value name="$message" exact="{77000,2006}.[$pilot.name, $newSkillLevel, $wareLabel]"/>
+            <set_value name="$greenColor" exact="'\033#FF00CC00#'"/>
+            <set_value name="$colorReset" exact="'\033X'"/>
+            <set_value name="$coloredMessage" exact="$greenColor + $message + $colorReset"/>
+            <show_notification text="$coloredMessage" timeout="6s"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <write_to_logbook category="news" title="'Level Up: ' + $pilot.name + ' (' + $ship.knownname + ')'" text="$message" interaction="showonmap" object="$ship"/>
+            </do_if>
+          </do_if>
+          
+          <run_actions ref="md.GT_Ship_Management.Update_Ship_Name">
+            <param name="ship" value="$ship"/>
+            <param name="pilot" value="$pilot"/>
+            <param name="xp" value="$newXP"/>
+            <param name="level" value="$newSkillLevel"/>
+            <param name="nameType" value="'trader'"/>
+          </run_actions>
+        </do_else>
+        
+        <return value="$result"/>
       </actions>
     </library>
     

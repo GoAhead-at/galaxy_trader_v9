@@ -148,7 +148,9 @@
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <set_value name="$dockDebugChance" exact="$debugchance"/>
         </do_if>
-        <create_order id="'DockAndWait'" object="this.ship" immediate="true">
+        <!-- Parent DockAndTrain pauses while DockAndWait runs; flag handoff so on_abort does not treat this as failure. -->
+        <set_value name="this.$trainingDockHandoff" exact="true"/>
+        <create_order name="$trainingDockOrder" id="'DockAndWait'" object="this.ship" immediate="true">
           <param name="destination" value="$destination"/>
           <param name="building" value="false"/>
           <param name="trading" value="false"/>
@@ -161,10 +163,13 @@
         <wait>
           <interrupt>
             <conditions>
-              <event_object_order_ready object="this.ship"/>
+              <event_object_order_ready object="this.ship" order="$trainingDockOrder"/>
             </conditions>
           </interrupt>
         </wait>
+        
+        <remove_value name="this.$trainingDockHandoff"/>
+        <remove_value name="this.$trainingDockOrder"/>
         
         <!-- Validate docking success (VALIDATED AGAINST WORKING REFERENCE) -->
         <do_if value="not ((this.ship.dock and (this.ship.dock.container == $destination)) or (this.ship.parkedat and ((this.ship.parkedat == $destination) or this.ship.parkedat.hascontext.{$destination})))">
@@ -201,6 +206,10 @@
         $TrainingLevel = $requiredLevel,
         $TrainingStation = $destination
       ]"/>
+      <!-- Yield so HandleStartTraining commits payment + $TrainingDuration
+           before this script reads registry timer fields (signal_objects is
+           queued across AI/MD boundaries). -->
+      <wait exact="1ms"/>
       
       <!-- Send immersive training message to logbook - only if enabled -->
       <do_if value="@this.ship.commander.defaultorder.$logbookentries or @this.ship.defaultorder.$logbookentries">
@@ -229,44 +238,54 @@
        <!-- CRITICAL FIX: Ensure duration is a time value, not an integer -->
        <!-- Match against datatype.time (vanilla pattern) so values arriving
             as long-fixed / float (e.g. via the Lua-written academy
-            blackboard) are promoted too, not only literal integers.
-            Without this, `<wait max=...>` rejects the attribute as
-            "not of type time" and the wait returns immediately. -->
+            blackboard) are promoted too, not only literal integers. -->
        <do_if value="$trainingDuration and typeof $trainingDuration != datatype.time">
          <set_value name="$trainingDuration" exact="$trainingDuration * 1s"/>
          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
            <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Converted integer duration to time: ' + ($trainingDuration / 1s) + 's'" chance="100"/>
          </do_if>
        </do_if>
+       <!-- Rebuild a fresh local time literal for <wait>. Registry reads can
+            keep datatype.time while still using the engine's 1/12-second raw
+            unit count; (x / 1s) * 1s normalizes to whole seconds (e.g. 600s
+            was completing in ~50s game time when passed straight to wait max). -->
+       <set_value name="$trainingWaitTime" exact="($trainingDuration / 1s) * 1s"/>
        
        <!-- Save/load: continue from remaining course time when the timer was
-            already started before the save (HandleStartTraining stamps both). -->
+            already started before the save (HandleStartTraining stamps both).
+            Ignore the stub stamp HandleStartTraining sets in the same frame as
+            a fresh dock commit (elapsed le 1s). -->
        <set_value name="$skipTrainingWait" exact="false"/>
        <do_if value="global.$GT_Pilots.{this.ship.pilot}.$TrainingStarted?">
          <set_value name="$elapsedTraining" exact="player.age - global.$GT_Pilots.{this.ship.pilot}.$TrainingStarted"/>
-         <set_value name="$remainingTraining" exact="$trainingDuration - $elapsedTraining"/>
-         <do_if value="$remainingTraining le 0s">
-           <set_value name="$skipTrainingWait" exact="true"/>
-           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-             <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Training timer expired during save/load - completing immediately'" chance="100"/>
+         <do_if value="$elapsedTraining gt 1s">
+           <set_value name="$remainingTraining" exact="$trainingWaitTime - $elapsedTraining"/>
+           <do_if value="$remainingTraining le 0s">
+             <set_value name="$skipTrainingWait" exact="true"/>
+             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+               <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Training timer expired during save/load - completing immediately'" chance="100"/>
+             </do_if>
            </do_if>
+           <do_else>
+             <set_value name="$trainingWaitTime" exact="($remainingTraining / 1s) * 1s"/>
+             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+               <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Resuming training with ' + ($trainingWaitTime / 1s) + 's remaining'" chance="100"/>
+             </do_if>
+           </do_else>
          </do_if>
-         <do_else>
-           <set_value name="$trainingDuration" exact="$remainingTraining"/>
-           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-             <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Resuming training with ' + ($trainingDuration / 1s) + 's remaining'" chance="100"/>
-           </do_if>
-         </do_else>
        </do_if>
        
+       <set_value name="this.$trainingEndsAt" exact="player.age + $trainingWaitTime"/>
+       
        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-         <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Level ' + $requiredLevel + ' training duration: ' + ($trainingDuration / 1s) + 's'" chance="$debugchance"/>
+         <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Level ' + $requiredLevel + ' training duration: ' + ($trainingWaitTime / 1s) + 's (ends at ' + this.$trainingEndsAt + ')'" chance="$debugchance"/>
        </do_if>
       
        <!-- Event-driven training wait (no polling) -->
-       <!-- FIXED: Changed from exact= to max= to allow interrupt to fire immediately -->
+       <!-- min=max keeps the full course length while still allowing the
+            GT_Abort_Training interrupt to fire immediately (vanilla/GT pattern). -->
        <do_if value="not $skipTrainingWait">
-       <wait max="$trainingDuration">
+       <wait min="$trainingWaitTime" max="$trainingWaitTime">
          <interrupt>
            <conditions>
              <event_object_signalled object="this.ship" param="'GT_Abort_Training'"/>
@@ -343,15 +362,40 @@
       <signal_objects object="this.ship" param="'GT_Training_Complete'" param2="table[
         $Level = $requiredLevel,
         $Station = $destination,
-        $Duration = $trainingDuration
+        $Duration = $trainingWaitTime
       ]"/>
       
     </actions>
   </attention>
   
   <on_abort>
+    <!-- DockAndWait child pauses this script while the ship flies to the station.
+         That engine pause fires on_abort; it is NOT a player cancel or failure. -->
+    <set_value name="$isDockTransitHandoff" exact="false"/>
+    <do_if value="this.$trainingDockOrder? and this.$trainingDockOrder.exists">
+      <set_value name="$isDockTransitHandoff" exact="true"/>
+    </do_if>
+    <do_if value="not $isDockTransitHandoff and this.ship.order? and @this.ship.order.id == 'DockAndWait' and this.ship.order.$callerid? and @this.ship.order.$callerid.id == 'DockAndTrain'">
+      <set_value name="$isDockTransitHandoff" exact="true"/>
+    </do_if>
+    <do_if value="not $isDockTransitHandoff and this.ship.orders? and this.ship.orders.count gt 0">
+      <do_all exact="this.ship.orders.count" counter="$toai">
+        <set_value name="$toOrder" exact="this.ship.orders.{$toai}"/>
+        <do_if value="@$toOrder.id == 'DockAndWait' and $toOrder.$callerid? and @$toOrder.$callerid.id == 'DockAndTrain'">
+          <set_value name="$isDockTransitHandoff" exact="true"/>
+          <break/>
+        </do_if>
+      </do_all>
+    </do_if>
+    <do_if value="$isDockTransitHandoff">
+      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[GT-Training] ' + this.ship.idcode + ': on_abort skipped (DockAndWait transit handoff - training still in progress)'" chance="$debugchance"/>
+      </do_if>
+      <return/>
+    </do_if>
+    
     <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-      <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Training order was aborted'" chance="$debugchance"/>
+      <debug_text text="'[GT-Training] ' + this.ship.idcode + ': Training order cancelled'" chance="$debugchance"/>
     </do_if>
     
     <!-- CRITICAL: Check if GT order is still active before sending signals -->
@@ -381,11 +425,11 @@
       <signal_objects object="player.galaxy" param="'GT_Abort_Training'" param2="table[
         $Pilot = this.ship.pilot,
         $Ship = this.ship,
-        $Reason = 'Training order aborted'
+        $Reason = 'Training order cancelled'
       ]"/>
       
       <!-- Signal abortion to main trading script -->
-      <signal_objects object="this.ship" param="'training_aborted'" param2="'Training order was aborted'"/>
+      <signal_objects object="this.ship" param="'training_aborted'" param2="'Training order cancelled'"/>
     </do_if>
     <do_else>
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">

@@ -5751,18 +5751,14 @@
                   <!-- Update trade object profit (for logbook display) -->
                   <set_value name="$currentTrade.$Profit" exact="$recalculatedProfitRAW"/>
                   
-                  <!-- Also update prices in trade object if they were missing (for future use) -->
-                  <do_if value="not $currentTrade.$BuyPrice?">
-                    <set_value name="$currentTrade.$BuyPrice" exact="$buyPriceForRecalc"/>
-                  </do_if>
-                  <do_if value="not $currentTrade.$SellPrice?">
-                    <set_value name="$currentTrade.$SellPrice" exact="$sellPriceForRecalc"/>
-                  </do_if>
+                  <!-- Always refresh price snapshots to match live offers used for profit validation. -->
+                  <set_value name="$currentTrade.$BuyPrice" exact="$buyPriceForRecalc"/>
+                  <set_value name="$currentTrade.$SellPrice" exact="$sellPriceForRecalc"/>
                   
                   <!-- PROFIT DEBUG: Log profit recalculation -->
                   <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                     <set_value name="$wareName" exact="if $currentTrade.$BuyOffer? and $currentTrade.$BuyOffer.ware? then @$currentTrade.$BuyOffer.ware.name else (if $currentTrade.$SellOffer? and $currentTrade.$SellOffer.ware? then @$currentTrade.$SellOffer.ware.name else 'NULL')"/>
-                    <set_value name="$priceSource" exact="if $currentTrade.$BuyPrice? then 'trade_object' else 'extracted_from_offers'"/>
+                    <set_value name="$priceSource" exact="'live_offer_at_validation'"/>
                     <set_value name="$amountStatus" exact="if $amountChanged then 'YES (was ' + $originalAmount + ', now ' + $finalAmountForProfit + ')' else 'NO (unchanged: ' + $finalAmountForProfit + ')'"/>
                     <debug_text text="'[GT-AI-PROFIT] (' + this.ship.idcode + ') PROFIT RECALCULATION (ALWAYS):' + 
                       '\n  Ware: ' + $wareName +
@@ -5992,6 +5988,9 @@
                 <!-- Store clamped amounts in pendingTrade for use after loop -->
                 <set_value name="$pendingTrade.$FinalBuyAmount" exact="$finalBuyAmount"/>
                 <set_value name="$pendingTrade.$FinalSellAmount" exact="$finalSellAmount"/>
+                <!-- Logbook price snapshot at validation (before create_trade_order mutates offer.unitprice). -->
+                <set_value name="$pendingTrade.$LogbookBuyPriceRaw" exact="if $buyPriceForRecalc? then $buyPriceForRecalc else 0"/>
+                <set_value name="$pendingTrade.$LogbookSellPriceRaw" exact="if $sellPriceForRecalc? then $sellPriceForRecalc else 0"/>
                 
                 <!-- Create fleet reservation (restored from pre-migration gt_trading_search.xml).
                      Prevents other ships from selecting this trade during the search-to-execution gap.
@@ -6329,6 +6328,26 @@
           </do_if>
           </do_if>
 
+          <!-- Queued logbook / UI P/L snapshot: validation-time prices BEFORE create_trade_order.
+               create_trade_order mutates offer.unitprice; logbook must match economics at acceptance. -->
+          <set_value name="$uiLogAmount" exact="if $isSellOnlyTradeForPending then $finalSellAmount else $finalBuyAmount"/>
+          <set_value name="$buyPriceRawCanonical" exact="if $pendingTrade.$LogbookBuyPriceRaw? then $pendingTrade.$LogbookBuyPriceRaw else (if $pendingTrade.$BuyPrice? then $pendingTrade.$BuyPrice else 0)"/>
+          <set_value name="$sellPriceRawCanonical" exact="if $pendingTrade.$LogbookSellPriceRaw? then $pendingTrade.$LogbookSellPriceRaw else (if $pendingTrade.$SellPrice? then $pendingTrade.$SellPrice else 0)"/>
+          <set_value name="$profitRawForSignal" exact="0"/>
+          <do_if value="$ippPlayerSupplier">
+            <set_value name="$profitRawForSignal" exact="$sellPriceRawCanonical * $uiLogAmount"/>
+          </do_if>
+          <do_elseif value="$isSellOnlyTradeForPending">
+            <set_value name="$profitRawForSignal" exact="$sellPriceRawCanonical * $uiLogAmount"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$profitRawForSignal" exact="($sellPriceRawCanonical - $buyPriceRawCanonical) * $uiLogAmount"/>
+          </do_else>
+          <set_value name="$uiMoneyRawForSignal" exact="if $ippPlayerSupplier then 0 else (-$uiLogAmount * $buyPriceRawCanonical)"/>
+          <set_value name="$pendingTrade.$BuyPrice" exact="$buyPriceRawCanonical"/>
+          <set_value name="$pendingTrade.$SellPrice" exact="$sellPriceRawCanonical"/>
+          <set_value name="$pendingTrade.$Profit" exact="$profitRawForSignal"/>
+
           <!-- Vanilla pattern (order.trade.routine): queue SELL first as immediate,
                then queue BUY as immediate so BUY displaces SELL and runs first. -->
           <do_if value="$pendingTrade.$SellOffer?">
@@ -6361,7 +6380,7 @@
               <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Created BUY trade order (internal=' + $tradeOrderInternal + ', isSubordinate=' + $isSubordinate + ', hasCommander=' + (if this.ship.commander? and this.ship.commander.exists then 'true' else 'false') + ')'" chance="100"/>
             </do_if>
           </do_if>
-          
+
           <!-- Phase C: runtime illegal-route policy snapshot (cleared on completion/abort). -->
           <do_if value="$effectiveAllowIllegal and $effectiveEnforceRouteIllegalLegality">
             <do_if value="not global.$GT_Ships?">
@@ -6535,10 +6554,8 @@
             <!-- Extract amount -->
             <set_value name="$escapeAmount" exact="if $isSellOnlyTradeForPending then $finalSellAmount else $finalBuyAmount"/>
             
-            <!-- Extract profit -->
-            <do_if value="$pendingTrade.$Profit?">
-              <set_value name="$escapeProfit" exact="$pendingTrade.$Profit"/>
-            </do_if>
+            <!-- Extract profit (creation-time snapshot; set after create_trade_order) -->
+            <set_value name="$escapeProfit" exact="if $profitRawForSignal? then $profitRawForSignal else (if $pendingTrade.$Profit? then $pendingTrade.$Profit else 0)"/>
             
             <!-- Safe defaults for missing values -->
             <set_value name="$currentSectorName" exact="'Unknown Sector'"/>
@@ -6642,20 +6659,16 @@
             <set_value name="$logbookEnabled" exact="true"/>
           </do_elseif>
 
-          <!-- Canonical queued trade prices in RAW: use pendingTrade snapshot first (real created-trade values). -->
-          <set_value name="$buyPriceRawCanonical" exact="if $pendingTrade.$BuyPrice? then $pendingTrade.$BuyPrice else (if $pendingTrade.$BuyOffer? and $pendingTrade.$BuyOffer.unitprice? then $pendingTrade.$BuyOffer.unitprice else 0)"/>
-          <set_value name="$sellPriceRawCanonical" exact="if $pendingTrade.$SellPrice? then $pendingTrade.$SellPrice else (if $pendingTrade.$SellOffer? and $pendingTrade.$SellOffer.unitprice? then $pendingTrade.$SellOffer.unitprice else 0)"/>
-
-          <!-- UI bridge: always publish queued-trade values (independent of per-ship logbook setting). -->
-          <set_value name="$uiLogAmount" exact="if $isSellOnlyTradeForPending then $finalSellAmount else $finalBuyAmount"/>
+          <!-- UI bridge: always publish queued-trade values (independent of per-ship logbook setting).
+               $buyPriceRawCanonical / $sellPriceRawCanonical / $profitRawForSignal / $uiMoneyRawForSignal
+               were snapshotted from live offers immediately after create_trade_order. -->
           <set_value name="$uiBuyPriceRawForSignal" exact="$buyPriceRawCanonical"/>
-          <set_value name="$uiMoneyRawForSignal" exact="-$uiLogAmount * $uiBuyPriceRawForSignal"/>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <set_value name="$rawBuyOfferUnitPrice" exact="if $pendingTrade.$BuyOffer? and $pendingTrade.$BuyOffer.unitprice? then $pendingTrade.$BuyOffer.unitprice else -1"/>
             <set_value name="$rawSellOfferUnitPrice" exact="if $pendingTrade.$SellOffer? and $pendingTrade.$SellOffer.unitprice? then $pendingTrade.$SellOffer.unitprice else -1"/>
-            <set_value name="$rawPendingTradeBuyPrice" exact="if $pendingTrade.$BuyPrice? then $pendingTrade.$BuyPrice else -1"/>
-            <set_value name="$rawPendingTradeSellPrice" exact="if $pendingTrade.$SellPrice? then $pendingTrade.$SellPrice else -1"/>
-            <set_value name="$rawPendingTradeProfit" exact="if $pendingTrade.$Profit? then $pendingTrade.$Profit else 0"/>
+            <set_value name="$rawPendingTradeBuyPrice" exact="$buyPriceRawCanonical"/>
+            <set_value name="$rawPendingTradeSellPrice" exact="$sellPriceRawCanonical"/>
+            <set_value name="$rawPendingTradeProfit" exact="$profitRawForSignal"/>
             <set_value name="$rawSignalSum" exact="abs($uiMoneyRawForSignal) + $rawPendingTradeProfit"/>
             <debug_text text="'[GT-AI-UI-DUE] ' + this.ship.idcode +
               '\n  Amount: ' + $uiLogAmount +
@@ -6670,7 +6683,7 @@
               '\n  Expected due sum RAW: ' + $rawSignalSum + ' (' + ($rawSignalSum / 100) + ' Cr)'" chance="100"/>
           </do_if>
           <do_if value="$logbookEnabled">
-            <set_value name="$logAmount" exact="if $isSellOnlyTradeForPending then $finalSellAmount else $finalBuyAmount"/>
+            <set_value name="$logAmount" exact="$uiLogAmount"/>
             
             <!-- PROFIT DEBUG: Log trade data before sending to logbook -->
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -6678,7 +6691,6 @@
               <set_value name="$buyStationName" exact="if $pendingTrade.$BuyStation? then @$pendingTrade.$BuyStation.knownname else (if $pendingTrade.$BuyOffer? and $pendingTrade.$BuyOffer.owner? then @$pendingTrade.$BuyOffer.owner.knownname else 'NULL')"/>
               <set_value name="$sellStationName" exact="if $pendingTrade.$SellStation? then @$pendingTrade.$SellStation.knownname else (if $pendingTrade.$SellOffer? and $pendingTrade.$SellOffer.owner? then @$pendingTrade.$SellOffer.owner.knownname else 'NULL')"/>
               <set_value name="$originalAmount" exact="if $pendingTrade.$Amount? then $pendingTrade.$Amount else 'NULL'"/>
-              <!-- Use canonical raw snapshot prices to keep buy/sell/profit consistent. -->
               <set_value name="$buyPrice" exact="$buyPriceRawCanonical"/>
               <set_value name="$sellPrice" exact="$sellPriceRawCanonical"/>
               <debug_text text="'[GT-AI-PROFIT] (' + this.ship.idcode + ') LOGBOOK ENTRY PREPARATION:' + 
@@ -6689,12 +6701,10 @@
                 '\n  Final Buy Amount (clamped): ' + $finalBuyAmount + ' units' +
                 '\n  Final Sell Amount (clamped): ' + $finalSellAmount + ' units' +
                 '\n  Log Amount (used for display): ' + $logAmount + ' units' +
-                '\n  Profit (RAW): ' + (if $pendingTrade.$Profit? then $pendingTrade.$Profit else 'NULL') + ' = ' + (if $pendingTrade.$Profit? then ($pendingTrade.$Profit/100) + ' Cr' else 'NULL') +
-                '\n  Verification with original amount: (' + ($sellPrice/100) + ' - ' + ($buyPrice/100) + ') * ' + $originalAmount + ' = ' + (if $originalAmount != 'NULL' then (($sellPrice - $buyPrice) * $originalAmount / 100) + ' Cr' else 'N/A') +
+                '\n  Profit (RAW): ' + $profitRawForSignal + ' = ' + ($profitRawForSignal/100) + ' Cr' +
                 '\n  Verification with log amount: (' + ($sellPrice/100) + ' - ' + ($buyPrice/100) + ') * ' + $logAmount + ' = ' + (($sellPrice - $buyPrice) * $logAmount / 100) + ' Cr'" chance="100"/>
             </do_if>
             
-            <!-- Use canonical raw snapshot prices for queued trade message. -->
             <set_value name="$buyPriceForSignal" exact="$buyPriceRawCanonical / 100"/>
             <set_value name="$sellPriceForSignal" exact="$sellPriceRawCanonical / 100"/>
             
@@ -6711,15 +6721,15 @@
               $BuyOffer = if $pendingTrade.$BuyOffer? then $pendingTrade.$BuyOffer else null,
               $SellOffer = if $pendingTrade.$SellOffer? then $pendingTrade.$SellOffer else null,
               $Amount = $logAmount,
-              $Profit = if $pendingTrade.$Profit? then $pendingTrade.$Profit else 0,
+              $Profit = $profitRawForSignal,
               $BuyPrice = $buyPriceForSignal,
               $SellPrice = $sellPriceForSignal,
               $BuyPriceRaw = $buyPriceRawCanonical,
               $SellPriceRaw = $sellPriceRawCanonical,
-              $MoneyRaw = -$logAmount * $buyPriceRawCanonical,
+              $MoneyRaw = $uiMoneyRawForSignal,
               $IsSellOnly = $isSellOnlyTradeForPending,
               $SearchPipeline = $logSearchPipeline,
-              $PlayerFreeSupplier = if $pendingTrade.$PlayerFreeSupplier? then @$pendingTrade.$PlayerFreeSupplier else false
+              $PlayerFreeSupplier = if $ippPlayerSupplier then true else (if $pendingTrade.$PlayerFreeSupplier? then @$pendingTrade.$PlayerFreeSupplier else false)
             ]"/>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-AI-LOG-SIGNAL] ' + this.ship.idcode +
@@ -6729,8 +6739,8 @@
                 '\n  SellPrice sent (Cr): ' + $sellPriceForSignal +
                 '\n  BuyPrice sent (RAW): ' + $buyPriceRawCanonical +
                 '\n  SellPrice sent (RAW): ' + $sellPriceRawCanonical +
-                '\n  Profit sent (RAW): ' + (if $pendingTrade.$Profit? then $pendingTrade.$Profit else 0) +
-                '\n  MoneyRaw sent: ' + (-$logAmount * $buyPriceRawCanonical) + ' (' + ((-$logAmount * $buyPriceRawCanonical) / 100) + ' Cr)'" chance="100"/>
+                '\n  Profit sent (RAW): ' + $profitRawForSignal +
+                '\n  MoneyRaw sent: ' + $uiMoneyRawForSignal + ' (' + ($uiMoneyRawForSignal / 100) + ' Cr)'" chance="100"/>
             </do_if>
           </do_if>
         </do_if>

@@ -3074,6 +3074,7 @@
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': SENDING GT_Search_Request signal to MD at game time ' + player.age" chance="100"/>
           </do_if>
+          <remove_value name="this.$cacheValidationRetried"/>
           <set_value name="$requestForceLiveSearch" exact="false"/>
           <do_if value="this.$forceLiveAfterLiveReject? and this.$forceLiveAfterLiveReject">
             <set_value name="$requestForceLiveSearch" exact="true"/>
@@ -3347,10 +3348,24 @@
         <set_value name="$searchMode" exact="if $searchParams.$SearchMode? then @$searchParams.$SearchMode else 'buy_and_sell'"/>
         <set_value name="$forceLiveSearch" exact="if $searchParams.$ForceLiveSearch? then @$searchParams.$ForceLiveSearch else false"/>
         <set_value name="$searchPhase" exact="if $searchParams.$Phase? then @$searchParams.$Phase else 'live'"/>
-        <set_value name="$skipCacheRead" exact="if $searchParams.$CachePhaseMiss? and $searchParams.$CachePhaseMiss then true else false"/>
-        <!-- Explicit live phase from scheduler must never re-enter cache path. -->
+        <set_value name="$searchCacheReadOffset" exact="if $searchParams.$CacheReadOffset? then @$searchParams.$CacheReadOffset else 0"/>
+        <set_value name="$skipCacheRead" exact="false"/>
+        <set_value name="$mk3HomeCacheCount" exact="0"/>
+        <do_if value="$searchHomeSector? and $searchHomeSector.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$searchHomeSector}?">
+          <set_value name="$mk3HomeCacheCount" exact="@global.$GT_TradeCache.{$searchHomeSector}.count"/>
+        </do_if>
+        <!-- Only skip cache re-read when prior cache phase missed AND pool is still empty. -->
+        <do_if value="$searchParams.$CachePhaseMiss? and $searchParams.$CachePhaseMiss and $mk3HomeCacheCount == 0">
+          <set_value name="$skipCacheRead" exact="true"/>
+        </do_if>
+        <!-- live slot: force expensive live refresh only when pool is empty or explicitly requested. -->
         <do_if value="$searchPhase == 'live'">
-          <set_value name="$forceLiveSearch" exact="true"/>
+          <do_if value="($searchParams.$ForceLiveSearch? and $searchParams.$ForceLiveSearch) or $mk3HomeCacheCount == 0">
+            <set_value name="$forceLiveSearch" exact="true"/>
+          </do_if>
+          <do_else>
+            <set_value name="$forceLiveSearch" exact="false"/>
+          </do_else>
         </do_if>
 
         <!-- Derive minROI/minAbsoluteProfit from pilot skill level -->
@@ -3403,6 +3418,29 @@
         <set_value name="this.$lastPriorityWaresSig" exact="$pwSig"/>
         <set_value name="this.$lastPriorityWaresHome" exact="$searchHomeSector"/>
 
+        <!-- Resolve price range once for cache read purge + live search (mode/isolated/fallback/sell_only). -->
+        <set_value name="$searchSellPriceMax" exact="1.0"/>
+        <set_value name="$searchBuyPriceMin" exact="-1.0"/>
+        <do_if value="global.$GT_Config? and global.$GT_Config.$Trading?">
+          <do_if value="$searchMode? and $searchMode == 'sell_only'">
+            <set_value name="$searchSellPriceMax" exact="if global.$GT_Config.$Trading.$FallbackSellPriceMax? then @global.$GT_Config.$Trading.$FallbackSellPriceMax else 1.0"/>
+            <set_value name="$searchBuyPriceMin" exact="if global.$GT_Config.$Trading.$FallbackBuyPriceMin? then @global.$GT_Config.$Trading.$FallbackBuyPriceMin else -1.0"/>
+          </do_if>
+          <do_elseif value="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{this.ship}?">
+            <set_value name="$searchSellPriceMax" exact="if global.$GT_Config.$Trading.$IsolatedSellPriceMax? then @global.$GT_Config.$Trading.$IsolatedSellPriceMax else 1.0"/>
+            <set_value name="$searchBuyPriceMin" exact="if global.$GT_Config.$Trading.$IsolatedBuyPriceMin? then @global.$GT_Config.$Trading.$IsolatedBuyPriceMin else -1.0"/>
+          </do_elseif>
+          <do_elseif value="global.$GT_FallbackTradeActive? and global.$GT_FallbackTradeActive.{this.ship}?">
+            <set_value name="$searchSellPriceMax" exact="if global.$GT_Config.$Trading.$FallbackSellPriceMax? then @global.$GT_Config.$Trading.$FallbackSellPriceMax else 1.0"/>
+            <set_value name="$searchBuyPriceMin" exact="if global.$GT_Config.$Trading.$FallbackBuyPriceMin? then @global.$GT_Config.$Trading.$FallbackBuyPriceMin else -1.0"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$searchSellPriceMax" exact="if global.$GT_Config.$Trading.$SellPriceMax? then @global.$GT_Config.$Trading.$SellPriceMax else 1.0"/>
+            <set_value name="$searchBuyPriceMin" exact="if global.$GT_Config.$Trading.$BuyPriceMin? then @global.$GT_Config.$Trading.$BuyPriceMin else -1.0"/>
+          </do_else>
+        </do_if>
+        <set_value name="$searchBypassPlayerSellerPricing" exact="if $searchIgnorePlayerPricing? then $searchIgnorePlayerPricing else (if this.$effectiveIgnorePlayerPricing? then this.$effectiveIgnorePlayerPricing else false)"/>
+
         <!-- Phase 1 (cache-only): run lightweight cache lookup and return control to scheduler. -->
         <do_if value="$searchPhase == 'cache'">
           <set_value name="$cacheFoundOnlyResult" exact="null"/>
@@ -3425,12 +3463,34 @@
               <param name="maxEntries" value="if global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries? then @global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries else 50"/>
               <param name="cacheMaxAge" value="if global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$CacheTTL? then @global.$GT_GlobalSettings.$Fleet.$CacheTTL else 300s"/>
               <param name="cacheDropoffTolerance" value="if global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$CacheDropoffTolerance? then @global.$GT_GlobalSettings.$Fleet.$CacheDropoffTolerance else 15"/>
+              <param name="sellPriceMax" value="$searchSellPriceMax"/>
+              <param name="buyPriceMin" value="$searchBuyPriceMin"/>
+              <param name="bypassPlayerSellerPricing" value="$searchBypassPlayerSellerPricing"/>
+              <param name="ignoreTradeRules" value="$searchIgnoreTradeRules"/>
+              <param name="cacheReadOffset" value="$searchCacheReadOffset"/>
             </run_script>
+            <set_value name="this.$lastCacheReadOffset" exact="$searchCacheReadOffset"/>
             <do_if value="$cacheFoundOnlyResult? and $cacheFoundOnlyResult.$Found?">
               <set_value name="$cacheFoundOnly" exact="@$cacheFoundOnlyResult.$Found"/>
             </do_if>
             <do_if value="$cacheFoundOnly and $cacheFoundOnlyResult? and $cacheFoundOnlyResult.$TradeList?">
               <set_value name="$cacheFoundOnlyTradeList" exact="@$cacheFoundOnlyResult.$TradeList"/>
+            </do_if>
+            <!-- Pool has entries but this ship got zero: clear stale per-ship failure flags. -->
+            <set_value name="$cacheMissPoolCount" exact="if $cacheFoundOnlyResult? and $cacheFoundOnlyResult.$PoolSizeAfter? then @$cacheFoundOnlyResult.$PoolSizeAfter else $mk3HomeCacheCount"/>
+            <do_if value="not $cacheFoundOnly and $cacheMissPoolCount gt 0 and $searchHomeSector? and $searchHomeSector.exists and global.$GT_TradeCache? and global.$GT_TradeCache.{$searchHomeSector}?">
+              <do_all exact="global.$GT_TradeCache.{$searchHomeSector}.count" counter="$cacheMissFsi">
+                <set_value name="$cacheMissEntry" exact="global.$GT_TradeCache.{$searchHomeSector}.{$cacheMissFsi}"/>
+                <do_if value="$cacheMissEntry? and $cacheMissEntry.$FailedShips? and $cacheMissEntry.$FailedShips.count gt 0">
+                  <set_value name="$cacheMissNewFailed" exact="[]"/>
+                  <do_all exact="$cacheMissEntry.$FailedShips.count" counter="$cacheMissFsi2">
+                    <do_if value="$cacheMissEntry.$FailedShips.{$cacheMissFsi2} != this.ship">
+                      <append_to_list name="$cacheMissNewFailed" exact="$cacheMissEntry.$FailedShips.{$cacheMissFsi2}"/>
+                    </do_if>
+                  </do_all>
+                  <set_value name="$cacheMissEntry.$FailedShips" exact="$cacheMissNewFailed"/>
+                </do_if>
+              </do_all>
             </do_if>
           </do_if>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -3444,7 +3504,8 @@
             $TradeList = $cacheFoundOnlyTradeList,
             $SearchMethod = 'cache',
             $SearchType = 'cache',
-            $HomeSector = $searchHomeSector
+            $HomeSector = $searchHomeSector,
+            $PoolSizeAfter = if $cacheFoundOnlyResult? and $cacheFoundOnlyResult.$PoolSizeAfter? then @$cacheFoundOnlyResult.$PoolSizeAfter else (if $searchHomeSector? and global.$GT_TradeCache? and global.$GT_TradeCache.{$searchHomeSector}? then @global.$GT_TradeCache.{$searchHomeSector}.count else 0)
           ]"/>
           <resume label="wait_for_response"/>
         </do_if>
@@ -3471,7 +3532,13 @@
             <param name="maxEntries" value="if global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries? then @global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries else 50"/>
             <param name="cacheMaxAge" value="if global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$CacheTTL? then @global.$GT_GlobalSettings.$Fleet.$CacheTTL else 300s"/>
             <param name="cacheDropoffTolerance" value="if global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$CacheDropoffTolerance? then @global.$GT_GlobalSettings.$Fleet.$CacheDropoffTolerance else 15"/>
+            <param name="sellPriceMax" value="$searchSellPriceMax"/>
+            <param name="buyPriceMin" value="$searchBuyPriceMin"/>
+            <param name="bypassPlayerSellerPricing" value="$searchBypassPlayerSellerPricing"/>
+            <param name="ignoreTradeRules" value="$searchIgnoreTradeRules"/>
+            <param name="cacheReadOffset" value="$searchCacheReadOffset"/>
           </run_script>
+          <set_value name="this.$lastCacheReadOffset" exact="$searchCacheReadOffset"/>
         </do_if>
         <!-- SAVEGAME GUARD: If save/load interrupted the run_script above, all locals are lost.
              Detect and bail to retry instead of cascading property lookup errors. -->
@@ -3504,28 +3571,6 @@
           </do_if>
 
           <!-- 3) Live offers -->
-          <!-- Resolve price range based on search mode + ship state.
-               Clearance (sell_only) always uses fallback thresholds to prioritize cargo liquidation. -->
-          <set_value name="$searchSellPriceMax" exact="1.0"/>
-          <set_value name="$searchBuyPriceMin" exact="-1.0"/>
-          <do_if value="global.$GT_Config? and global.$GT_Config.$Trading?">
-            <do_if value="$searchMode? and $searchMode == 'sell_only'">
-              <set_value name="$searchSellPriceMax" exact="if global.$GT_Config.$Trading.$FallbackSellPriceMax? then @global.$GT_Config.$Trading.$FallbackSellPriceMax else 1.0"/>
-              <set_value name="$searchBuyPriceMin" exact="if global.$GT_Config.$Trading.$FallbackBuyPriceMin? then @global.$GT_Config.$Trading.$FallbackBuyPriceMin else -1.0"/>
-            </do_if>
-            <do_elseif value="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{this.ship}?">
-              <set_value name="$searchSellPriceMax" exact="if global.$GT_Config.$Trading.$IsolatedSellPriceMax? then @global.$GT_Config.$Trading.$IsolatedSellPriceMax else 1.0"/>
-              <set_value name="$searchBuyPriceMin" exact="if global.$GT_Config.$Trading.$IsolatedBuyPriceMin? then @global.$GT_Config.$Trading.$IsolatedBuyPriceMin else -1.0"/>
-            </do_elseif>
-            <do_elseif value="global.$GT_FallbackTradeActive? and global.$GT_FallbackTradeActive.{this.ship}?">
-              <set_value name="$searchSellPriceMax" exact="if global.$GT_Config.$Trading.$FallbackSellPriceMax? then @global.$GT_Config.$Trading.$FallbackSellPriceMax else 1.0"/>
-              <set_value name="$searchBuyPriceMin" exact="if global.$GT_Config.$Trading.$FallbackBuyPriceMin? then @global.$GT_Config.$Trading.$FallbackBuyPriceMin else -1.0"/>
-            </do_elseif>
-            <do_else>
-              <set_value name="$searchSellPriceMax" exact="if global.$GT_Config.$Trading.$SellPriceMax? then @global.$GT_Config.$Trading.$SellPriceMax else 1.0"/>
-              <set_value name="$searchBuyPriceMin" exact="if global.$GT_Config.$Trading.$BuyPriceMin? then @global.$GT_Config.$Trading.$BuyPriceMin else -1.0"/>
-            </do_else>
-          </do_if>
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': PriceRange: SellPriceMax=' + $searchSellPriceMax + ' BuyPriceMin=' + $searchBuyPriceMin" chance="@this.$debugchance"/>
           <run_script name="'lib.gt.live.search'" result="$liveResult">
             <param name="ship" value="this.ship"/>
@@ -3543,8 +3588,8 @@
             <param name="sellPriceMax" value="$searchSellPriceMax"/>
             <param name="buyPriceMin" value="$searchBuyPriceMin"/>
             <param name="priorityWares" value="if $effectivePriorityWares? then $effectivePriorityWares else []"/>
-            <param name="bypassPlayerSellerPricing" value="if $searchIgnorePlayerPricing? then $searchIgnorePlayerPricing else (if this.$effectiveIgnorePlayerPricing? then this.$effectiveIgnorePlayerPricing else false)"/>
-            <param name="excludePlayerBuyers" value="if $searchIgnorePlayerPricing? then $searchIgnorePlayerPricing else (if this.$effectiveIgnorePlayerPricing? then this.$effectiveIgnorePlayerPricing else false)"/>
+            <param name="bypassPlayerSellerPricing" value="$searchBypassPlayerSellerPricing"/>
+            <param name="excludePlayerBuyers" value="$searchBypassPlayerSellerPricing"/>
             <param name="debugchance" value="@this.$debugchance"/>
           </run_script>
           <!-- SAVEGAME GUARD -->
@@ -3787,6 +3832,25 @@
           <set_value name="$pipelineSearchMethod" exact="'live'"/>
         </do_if>
 
+        <!-- Cap pipeline list to MaxTradesToReturn before cache write + validation (already score-sorted). -->
+        <set_value name="$maxTradesReturn" exact="20"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn?">
+          <set_value name="$maxTradesReturn" exact="@global.$GT_GlobalSettings.$Performance.$MaxTradesToReturn"/>
+        </do_if>
+        <do_if value="$maxTradesReturn lt 1">
+          <set_value name="$maxTradesReturn" exact="1"/>
+        </do_if>
+        <do_if value="$pipelineTradeList.count gt $maxTradesReturn">
+          <create_list name="$pipelineTradeListCapped"/>
+          <do_all exact="$maxTradesReturn" counter="$mtrCap">
+            <append_to_list name="$pipelineTradeListCapped" exact="$pipelineTradeList.{$mtrCap}"/>
+          </do_all>
+          <set_value name="$pipelineTradeList" exact="$pipelineTradeListCapped"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Capped trade list to MaxTradesToReturn=' + $maxTradesReturn" chance="100"/>
+          </do_if>
+        </do_if>
+
         <!-- Write live search results to cache (sorted insertion with AI-script yields).
              Includes sell-only live results so cargo disposal can reuse cache entries. -->
         <do_if value="$pipelineFound and $pipelineTradeList.count gt 0 and ($pipelineSearchMethod == 'live' or $pipelineSearchMethod == 'live_sell_only') and $searchMode?">
@@ -3795,6 +3859,9 @@
             <param name="homeSector" value="$searchHomeSector"/>
             <param name="cacheTTL" value="if global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$CacheTTL? then @global.$GT_GlobalSettings.$Fleet.$CacheTTL else 300s"/>
             <param name="maxSearchDistance" value="$searchMaxDistance"/>
+            <param name="sellPriceMax" value="$searchSellPriceMax"/>
+            <param name="buyPriceMin" value="$searchBuyPriceMin"/>
+            <param name="cacheDropoffTolerance" value="if global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$CacheDropoffTolerance? then @global.$GT_GlobalSettings.$Fleet.$CacheDropoffTolerance else 15"/>
           </run_script>
         </do_if>
         <!-- SAVEGAME GUARD -->
@@ -4310,7 +4377,32 @@
           </do_if>
         </do_if>
       </do_if>
-      
+
+      <!-- Fleet spread (cache only): co-located subordinates receive an identical cache
+           list AND the per-ship selection sort produces an identical order, so every ship
+           validates trade #1 first. The fleet reservation is committed only after full
+           validation, too late to deflect same-window ships, so all but one fail the final
+           offer-availability check and re-search. Rotate the sorted list by this ship's
+           scheduler-assigned cache offset so concurrent ships lead with different trades
+           and consume all available offers in one wave instead of colliding on the top one.
+           This makes the existing per-home $CacheReadOffset cursor effective (it is otherwise
+           discarded by the selection sort above). Live results are per-ship, so no rotation. -->
+      <do_if value="$searchMethod == 'cache' and $tradeList? and $tradeList.count gt 1 and this.$lastCacheReadOffset?">
+        <set_value name="$fleetSpreadStart" exact="this.$lastCacheReadOffset % $tradeList.count"/>
+        <do_if value="$fleetSpreadStart gt 0">
+          <set_value name="$fleetSpreadCount" exact="$tradeList.count"/>
+          <create_list name="$fleetSpreadList"/>
+          <do_all exact="$fleetSpreadCount" counter="$fleetSpreadIdx">
+            <set_value name="$fleetSpreadPick" exact="((($fleetSpreadStart + $fleetSpreadIdx - 1) % $fleetSpreadCount) + 1)"/>
+            <append_to_list name="$fleetSpreadList" exact="$tradeList.{$fleetSpreadPick}"/>
+          </do_all>
+          <set_value name="$tradeList" exact="$fleetSpreadList"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Fleet-spread rotated cache trade list by ' + $fleetSpreadStart + ' of ' + $fleetSpreadCount + ' (reduces herd collision on top trade)'" chance="100"/>
+          </do_if>
+        </do_if>
+      </do_if>
+
       <!-- Iterate through trade list -->
       <!-- Check if tradeList exists and has items before looping -->
       <do_if value="(if $tradeList != null then $tradeList.count else 0) gt 0">
@@ -5952,30 +6044,46 @@
                   </do_if>
                 </do_if>
 
-                <!-- Trade-rule sourcing enforcement INSIDE the validation loop (not only the final gate).
-                     When ignoretraderules=false, the customer station's buy offer must permit the NPC
-                     source faction, and the source sell offer must permit the customer station.
-                     Ship-scoped cache failure on reject (S1/S1b) — no fleet-wide purge. -->
+                <!-- Trade-rule enforcement: player-owned stations only (NPC×NPC ignores cantradewith). -->
                 <do_if value="not (if this.$effectiveIgnoreTradeRules? then this.$effectiveIgnoreTradeRules else false) and not $isSellOnlyTrade">
-                  <set_value name="$_tradeRuleBlocked" exact="false"/>
-                  <set_value name="$_tradeRuleReason" exact="''"/>
-                  <do_if value="$currentTrade.$SellOffer? and $buyStation? and $buyStation.exists and not $currentTrade.$SellOffer.cantradewith.{$buyStation}">
-                    <set_value name="$_tradeRuleBlocked" exact="true"/>
-                    <set_value name="$_tradeRuleReason" exact="'customer ' + @$sellStation.knownname + ' disallows source ' + @$buyStation.knownname"/>
-                  </do_if>
-                  <do_if value="not $_tradeRuleBlocked and $currentTrade.$BuyOffer? and $sellStation? and $sellStation.exists and not $currentTrade.$BuyOffer.cantradewith.{$sellStation}">
-                    <set_value name="$_tradeRuleBlocked" exact="true"/>
-                    <set_value name="$_tradeRuleReason" exact="'source ' + @$buyStation.knownname + ' disallows delivery to ' + @$sellStation.knownname"/>
-                  </do_if>
-                  <do_if value="$_tradeRuleBlocked">
-                    <set_value name="$tradesRejectedRestriction" operation="add"/>
-                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' rejected by trade rules (' + $_tradeRuleReason + ') → Trying next trade...'" chance="100"/>
+                  <set_value name="$_applyTradeRules" exact="false"/>
+                  <do_if value="$buyStation? and @$buyStation.exists">
+                    <do_if value="@$buyStation.isplayerowned">
+                      <set_value name="$_applyTradeRules" exact="true"/>
                     </do_if>
-                    <do_if value="$searchMethod == 'cache'">
-                      <signal_objects object="player.galaxy" param="'GT_Cache_Flag_Ship'" param2="table[$Ship = this.ship, $BuyOffer = @$currentTrade.$BuyOffer, $SellOffer = @$currentTrade.$SellOffer, $HomeSector = $searchHomeSector, $Reason = 'trade_rules_failed']"/>
+                    <do_elseif value="@$buyStation.isclass.buildstorage and $buyStation.base? and @$buyStation.base.exists and @$buyStation.base.isplayerowned">
+                      <set_value name="$_applyTradeRules" exact="true"/>
+                    </do_elseif>
+                  </do_if>
+                  <do_if value="not $_applyTradeRules and $sellStation? and @$sellStation.exists">
+                    <do_if value="@$sellStation.isplayerowned">
+                      <set_value name="$_applyTradeRules" exact="true"/>
                     </do_if>
-                    <continue/>
+                    <do_elseif value="@$sellStation.isclass.buildstorage and $sellStation.base? and @$sellStation.base.exists and @$sellStation.base.isplayerowned">
+                      <set_value name="$_applyTradeRules" exact="true"/>
+                    </do_elseif>
+                  </do_if>
+                  <do_if value="$_applyTradeRules">
+                    <set_value name="$_tradeRuleBlocked" exact="false"/>
+                    <set_value name="$_tradeRuleReason" exact="''"/>
+                    <do_if value="$currentTrade.$SellOffer? and $buyStation? and $buyStation.exists and not $currentTrade.$SellOffer.cantradewith.{$buyStation}">
+                      <set_value name="$_tradeRuleBlocked" exact="true"/>
+                      <set_value name="$_tradeRuleReason" exact="'customer ' + @$sellStation.knownname + ' disallows source ' + @$buyStation.knownname"/>
+                    </do_if>
+                    <do_if value="not $_tradeRuleBlocked and $currentTrade.$BuyOffer? and $sellStation? and $sellStation.exists and not $currentTrade.$BuyOffer.cantradewith.{$sellStation}">
+                      <set_value name="$_tradeRuleBlocked" exact="true"/>
+                      <set_value name="$_tradeRuleReason" exact="'source ' + @$buyStation.knownname + ' disallows delivery to ' + @$sellStation.knownname"/>
+                    </do_if>
+                    <do_if value="$_tradeRuleBlocked">
+                      <set_value name="$tradesRejectedRestriction" operation="add"/>
+                      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' rejected by trade rules (' + $_tradeRuleReason + ') → Trying next trade...'" chance="100"/>
+                      </do_if>
+                      <do_if value="$searchMethod == 'cache'">
+                        <signal_objects object="player.galaxy" param="'GT_Cache_Flag_Ship'" param2="table[$Ship = this.ship, $BuyOffer = @$currentTrade.$BuyOffer, $SellOffer = @$currentTrade.$SellOffer, $HomeSector = $searchHomeSector, $Reason = 'trade_rules_failed']"/>
+                      </do_if>
+                      <continue/>
+                    </do_if>
                   </do_if>
                 </do_if>
                 
@@ -6938,8 +7046,46 @@
             <resume label="escape_from_blacklisted"/>
           </do_if>
           
-          <!-- Check if trades came from cache - if so, trigger live search instead of retrying cache -->
+          <!-- Check if trades came from cache - retry cache once after per-ship FailedShips flags, then live. -->
           <do_if value="$searchMethod == 'cache'">
+            <do_if value="not this.$cacheValidationRetried? or not this.$cacheValidationRetried">
+              <set_value name="this.$cacheValidationRetried" exact="true"/>
+              <set_value name="$retryHomeBase" exact="if this.$effectiveHome? then this.$effectiveHome else (if this.ship.defaultorder and this.ship.defaultorder.$home? then @this.ship.defaultorder.$home else this.ship.sector)"/>
+              <set_value name="$retryHomeSector" exact="if $retryHomeBase? and $retryHomeBase.isclass.sector then $retryHomeBase else (if $retryHomeBase? and $retryHomeBase.sector? then @$retryHomeBase.sector else this.ship.sector)"/>
+              <set_value name="$retryMaxDistance" exact="if this.$effectiveMaxSell? then this.$effectiveMaxSell else (if $maxsell? then $maxsell else 1)"/>
+              <set_value name="$retryBypassPlayerSellerPricing" exact="if this.$effectiveIgnorePlayerPricing? then this.$effectiveIgnorePlayerPricing else false"/>
+              <set_value name="$retryCacheResult" exact="null"/>
+              <set_value name="$retryCacheReadOffset" exact="if this.$lastCacheReadOffset? then (this.$lastCacheReadOffset + 1) else ($searchCacheReadOffset + 1)"/>
+              <run_script name="'lib.gt.cache.search'" result="$retryCacheResult">
+                <param name="ship" value="this.ship"/>
+                <param name="searchMode" value="'buy_and_sell'"/>
+                <param name="homeSector" value="$retryHomeSector"/>
+                <param name="maxDistance" value="$retryMaxDistance"/>
+                <param name="wareBasket" value="$warebasket"/>
+                <param name="minROI" value="0"/>
+                <param name="minAbsoluteProfit" value="0"/>
+                <param name="minCargoUtilPercent" value="if $gt_cargotarget? then $gt_cargotarget else (if this.$effectiveCargoTarget? then this.$effectiveCargoTarget else 10)"/>
+                <param name="ignoreBuildStorage" value="@this.$effectiveIgnoreBuildStorage"/>
+                <param name="ignoreCarrierAux" value="@this.$effectiveIgnoreCarrierAux"/>
+                <param name="requireNonPlayerDeliveryStation" value="$retryBypassPlayerSellerPricing"/>
+                <param name="maxEntries" value="if global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries? then @global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries else 50"/>
+                <param name="cacheMaxAge" value="if global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$CacheTTL? then @global.$GT_GlobalSettings.$Fleet.$CacheTTL else 300s"/>
+                <param name="cacheDropoffTolerance" value="if global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$CacheDropoffTolerance? then @global.$GT_GlobalSettings.$Fleet.$CacheDropoffTolerance else 15"/>
+                <param name="sellPriceMax" value="if this.$effectiveSellPriceMax? then this.$effectiveSellPriceMax else (if $gt_sellpricemax? then $gt_sellpricemax else 1.0)"/>
+                <param name="buyPriceMin" value="if this.$effectiveBuyPriceMin? then this.$effectiveBuyPriceMin else (if $gt_buypricemin? then $gt_buypricemin else -1.0)"/>
+                <param name="bypassPlayerSellerPricing" value="$retryBypassPlayerSellerPricing"/>
+                <param name="ignoreTradeRules" value="@this.$effectiveIgnoreTradeRules"/>
+                <param name="cacheReadOffset" value="$retryCacheReadOffset"/>
+              </run_script>
+              <do_if value="$retryCacheResult? and $retryCacheResult.$Found? and @$retryCacheResult.$Found and $retryCacheResult.$TradeList? and @$retryCacheResult.$TradeList.count gt 0">
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache retry after validation reject found ' + $retryCacheResult.$TradeList.count + ' trades - re-validating'" chance="100"/>
+                </do_if>
+                <set_value name="this.$tradeListFromSignal" exact="@$retryCacheResult.$TradeList"/>
+                <set_value name="this.$searchMethodFromSignal" exact="'cache'"/>
+                <resume label="trade_found"/>
+              </do_if>
+            </do_if>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache exhausted — all ' + $tradeListCountSafe + ' cache candidates failed validation, triggering LIVE market search' +
                 '\n  Rejection breakdown: Path=' + $tradesRejectedPathSafe + ', Docking=' + $tradesRejectedDockingSafe + ', OfferInvalid=' + $tradesRejectedOfferInvalidSafe + ', Distance=' + $tradesRejectedDistanceSafe + ', Cargo=' + $tradesRejectedCargoSafe + ', Restriction=' + $tradesRejectedRestrictionSafe + ', Blacklist=' + $tradesBlacklistedSafe" chance="100"/>

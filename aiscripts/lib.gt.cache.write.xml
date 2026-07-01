@@ -17,6 +17,9 @@
     <param name="homeSector"/>
     <param name="cacheTTL" default="300s"/>
     <param name="maxSearchDistance" default="0"/> <!-- For per-pool max-distance metadata tracking -->
+    <param name="cacheDropoffTolerance" default="15"/> <!-- Accepted at call site for API compat; band filter is read-time only (lib.gt.cache.search). -->
+    <param name="sellPriceMax" default="1.0" comment="Unused at write; per-ship band filter runs at cache read."/>
+    <param name="buyPriceMin" default="-1.0" comment="Unused at write; per-ship band filter runs at cache read."/>
     <param name="debugchance" default="0"/>
   </params>
   <patch sinceversion="2">
@@ -118,13 +121,15 @@
         <do_if value="$oldTs != null and ($cacheNow - $oldTs) gt $cacheTTL">
           <set_value name="$isStale" exact="true"/>
         </do_if>
+        <set_value name="$oldReResolvable" exact="@$oldEntry.$SellSector != null and @$oldEntry.$SellSector.exists and (@$oldEntry.$Ware != null or @$oldEntry.$DeliveryStationName != null) and (@$oldEntry.$DeliveryStationId != null or @$oldEntry.$DeliveryStationName != null)"/>
         <do_if value="not $isStale and @$oldEntry.$BuyOffer != null and not @$oldEntry.$BuyOffer.exists">
           <set_value name="$isStale" exact="true"/>
         </do_if>
-        <do_if value="not $isStale and @$oldEntry.$SellOffer != null and not @$oldEntry.$SellOffer.exists">
+        <!-- Dead delivery offer/station refs are normal when buy offers refresh; permanent keys allow re-discovery at read. -->
+        <do_if value="not $isStale and not $oldReResolvable and @$oldEntry.$SellOffer != null and not @$oldEntry.$SellOffer.exists">
           <set_value name="$isStale" exact="true"/>
         </do_if>
-        <do_if value="not $isStale and @$oldEntry.$SellStation != null and not @$oldEntry.$SellStation.exists">
+        <do_if value="not $isStale and not $oldReResolvable and @$oldEntry.$SellStation != null and not @$oldEntry.$SellStation.exists">
           <set_value name="$isStale" exact="true"/>
         </do_if>
 
@@ -181,6 +186,89 @@
           <do_elseif value="$newTrade.$SellOffer.owner? and @$newTrade.$SellOffer.owner.exists and @$newTrade.$SellOffer.owner.knownname">
             <set_value name="$newTrade.$DeliveryStationName" exact="@$newTrade.$SellOffer.owner.knownname"/>
           </do_elseif>
+        </do_if>
+        <!-- Stable delivery keys: customer buy-offer refs die on refresh; idcode + sector + ware re-discover the live offer. -->
+        <do_if value="not $newTrade.$SellStationBase?">
+          <set_value name="$wAnchorSell" exact="null"/>
+          <do_if value="$newTrade.$SellStation? and @$newTrade.$SellStation.exists">
+            <set_value name="$wAnchorSell" exact="@$newTrade.$SellStation"/>
+          </do_if>
+          <do_elseif value="$newTrade.$SellOffer? and @$newTrade.$SellOffer.exists and $newTrade.$SellOffer.buyer? and @$newTrade.$SellOffer.buyer.exists">
+            <set_value name="$wAnchorSell" exact="@$newTrade.$SellOffer.buyer"/>
+          </do_elseif>
+          <do_if value="$wAnchorSell? and @$wAnchorSell.isclass.buildstorage and $wAnchorSell.base? and @$wAnchorSell.base.exists">
+            <set_value name="$newTrade.$SellStationBase" exact="@$wAnchorSell.base"/>
+          </do_if>
+        </do_if>
+        <do_if value="not $newTrade.$DeliveryStationId?">
+          <set_value name="$wIdSell" exact="null"/>
+          <do_if value="$newTrade.$SellStation? and @$newTrade.$SellStation.exists">
+            <set_value name="$wIdSell" exact="@$newTrade.$SellStation"/>
+          </do_if>
+          <do_elseif value="$newTrade.$SellOffer? and @$newTrade.$SellOffer.exists and $newTrade.$SellOffer.buyer? and @$newTrade.$SellOffer.buyer.exists">
+            <set_value name="$wIdSell" exact="@$newTrade.$SellOffer.buyer"/>
+          </do_elseif>
+          <do_if value="$wIdSell? and @$wIdSell.exists">
+            <do_if value="@$wIdSell.isclass.buildstorage and $wIdSell.base? and @$wIdSell.base.exists">
+              <set_value name="$newTrade.$DeliveryStationId" exact="@$wIdSell.base.idcode"/>
+            </do_if>
+            <do_else>
+              <set_value name="$newTrade.$DeliveryStationId" exact="@$wIdSell.idcode"/>
+            </do_else>
+          </do_if>
+        </do_if>
+        <!-- Stamp trade-rule verdict for player-owned legs only (fresh offer refs).
+             NPC×NPC cantradewith is not a player trade rule — do not stamp or skip those rows. -->
+        <do_if value="not $newTrade.$IsSellOnly?">
+          <set_value name="$trbBuyStation" exact="null"/>
+          <do_if value="$newTrade.$BuyStation? and @$newTrade.$BuyStation.exists">
+            <set_value name="$trbBuyStation" exact="@$newTrade.$BuyStation"/>
+          </do_if>
+          <do_elseif value="$newTrade.$BuyOffer? and @$newTrade.$BuyOffer.exists and $newTrade.$BuyOffer.seller? and @$newTrade.$BuyOffer.seller.exists">
+            <set_value name="$trbBuyStation" exact="@$newTrade.$BuyOffer.seller"/>
+          </do_elseif>
+          <do_elseif value="$newTrade.$BuyOffer? and @$newTrade.$BuyOffer.exists and $newTrade.$BuyOffer.owner? and @$newTrade.$BuyOffer.owner.exists">
+            <set_value name="$trbBuyStation" exact="@$newTrade.$BuyOffer.owner"/>
+          </do_elseif>
+          <set_value name="$trbSellStation" exact="null"/>
+          <do_if value="$newTrade.$SellOffer? and @$newTrade.$SellOffer.exists and $newTrade.$SellOffer.buyer? and @$newTrade.$SellOffer.buyer.exists">
+            <set_value name="$trbSellStation" exact="@$newTrade.$SellOffer.buyer"/>
+          </do_if>
+          <do_elseif value="$newTrade.$SellStation? and @$newTrade.$SellStation.exists">
+            <set_value name="$trbSellStation" exact="@$newTrade.$SellStation"/>
+          </do_elseif>
+          <do_elseif value="$newTrade.$SellOffer? and @$newTrade.$SellOffer.exists and $newTrade.$SellOffer.owner? and @$newTrade.$SellOffer.owner.exists">
+            <set_value name="$trbSellStation" exact="@$newTrade.$SellOffer.owner"/>
+          </do_elseif>
+          <set_value name="$trbPlayerStationInvolved" exact="false"/>
+          <do_if value="$trbBuyStation? and @$trbBuyStation.exists">
+            <do_if value="@$trbBuyStation.isplayerowned">
+              <set_value name="$trbPlayerStationInvolved" exact="true"/>
+            </do_if>
+            <do_elseif value="@$trbBuyStation.isclass.buildstorage and $trbBuyStation.base? and @$trbBuyStation.base.exists and @$trbBuyStation.base.isplayerowned">
+              <set_value name="$trbPlayerStationInvolved" exact="true"/>
+            </do_elseif>
+          </do_if>
+          <do_if value="not $trbPlayerStationInvolved and $trbSellStation? and @$trbSellStation.exists">
+            <do_if value="@$trbSellStation.isplayerowned">
+              <set_value name="$trbPlayerStationInvolved" exact="true"/>
+            </do_if>
+            <do_elseif value="@$trbSellStation.isclass.buildstorage and $trbSellStation.base? and @$trbSellStation.base.exists and @$trbSellStation.base.isplayerowned">
+              <set_value name="$trbPlayerStationInvolved" exact="true"/>
+            </do_elseif>
+          </do_if>
+          <set_value name="$newTrade.$TradeRuleBlocked" exact="false"/>
+          <do_if value="$trbPlayerStationInvolved">
+            <do_if value="$newTrade.$SellOffer? and @$newTrade.$SellOffer.exists and $trbBuyStation? and @$trbBuyStation.exists and not $newTrade.$SellOffer.cantradewith.{$trbBuyStation}">
+              <set_value name="$newTrade.$TradeRuleBlocked" exact="true"/>
+            </do_if>
+            <do_elseif value="$newTrade.$BuyOffer? and @$newTrade.$BuyOffer.exists and $trbSellStation? and @$trbSellStation.exists and not $newTrade.$BuyOffer.cantradewith.{$trbSellStation}">
+              <set_value name="$newTrade.$TradeRuleBlocked" exact="true"/>
+            </do_elseif>
+            <do_if value="$newTrade.$TradeRuleBlocked? and $newTrade.$TradeRuleBlocked">
+              <continue/>
+            </do_if>
+          </do_if>
         </do_if>
         <!-- MK4 shared pool: persist ware transport (container/solid/liquid) so readers skip incompatible holds without validation poisoning. -->
         <do_if value="this.$gt_cachePoolIsMk4 and not $newTrade.$CargoWareTransport?">
@@ -270,6 +358,17 @@
       <do_else>
         <set_value name="$finalCacheSize" exact="if @global.$GT_TradeCache.{$homeSector}.count != null then @global.$GT_TradeCache.{$homeSector}.count else 0"/>
       </do_else>
+      <!-- MK3 pool: trim lowest-score tail (list is score-sorted descending). Band filter no longer limits inserts. -->
+      <do_if value="not this.$gt_cachePoolIsMk4 and $finalCacheSize gt 0">
+        <set_value name="$cacheMaxEntries" exact="50"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries?">
+          <set_value name="$cacheMaxEntries" exact="@global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries"/>
+        </do_if>
+        <do_while value="$finalCacheSize gt $cacheMaxEntries">
+          <remove_value name="global.$GT_TradeCache.{$homeSector}.{$finalCacheSize}"/>
+          <set_value name="$finalCacheSize" operation="subtract"/>
+        </do_while>
+      </do_if>
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
         <debug_text text="'[GT-CacheWrite] ' + this.ship.idcode + ': (' + $poolLabel + ') Wrote ' + $tradeList.count + ' trades (sorted) into ' + $homeSector.knownname + ' cache (total: ' + $finalCacheSize + ', cleaned: ' + $expiredCount + ')'" chance="100"/>
       </do_if>
@@ -296,13 +395,15 @@
           </do_if>
         </do_else>
       </do_if>
-      <set_value name="$mk4CacheWakeNeeded" exact="this.$gt_cachePoolIsMk4 and $homeSector? and $homeSector.exists and ($tradeList.count gt 0 or $metadataUpdated)"/>
-      <do_if value="$mk4CacheWakeNeeded">
+      <!-- Wake same-home waiters on any pool write (MK3 traders + MK4 supply). -->
+      <set_value name="$cacheWakeNeeded" exact="$homeSector? and $homeSector.exists and ($tradeList.count gt 0 or $metadataUpdated)"/>
+      <do_if value="$cacheWakeNeeded">
         <signal_objects object="player.galaxy" param="'GT_MK4_Cache_Updated'" param2="table[
           $HomeSector = $homeSector,
           $MaxDistance = $maxSearchDistance,
           $Written = $tradeList.count,
-          $CacheSize = $finalCacheSize
+          $CacheSize = $finalCacheSize,
+          $CachePool = if this.$gt_cachePoolIsMk4 then 'mk4' else 'mk3'
         ]"/>
       </do_if>
 

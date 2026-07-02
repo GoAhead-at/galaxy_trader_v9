@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Per-ship cache read scoring: shipScore = profitCr / (1 + (ship→buy + buy→sell) × distancePenalty).
+     Does not mutate global cache rows — sets $ShipScore / $SelectionScore on list entries only. -->
+<aiscript name="lib.gt.cache.score_for_ship" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <params>
+    <param name="tradeList" default="[]"/>
+    <param name="ship"/>
+    <param name="distancePenalty" default="0.1"/>
+    <param name="blacklistGroup" default="blacklistgroup.civilian"/>
+    <param name="maxEntries" default="50"/>
+    <param name="debugchance" default="0"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <do_if value="not $tradeList? or $tradeList.count == 0">
+        <wait exact="1ms" comment="Cooperative yield before immediate return (wake-loop guard)"/>
+        <return value="table[
+          $SortedTrades = if $tradeList? then $tradeList else [],
+          $BestTrade = null,
+          $BestScore = 0
+        ]"/>
+      </do_if>
+
+      <set_value name="$penalty" exact="if $distancePenalty? and $distancePenalty ge 0 then $distancePenalty else 0.1"/>
+      <set_value name="$shipSector" exact="null"/>
+      <do_if value="$ship? and $ship.sector? and $ship.sector.exists">
+        <set_value name="$shipSector" exact="$ship.sector"/>
+      </do_if>
+      <set_value name="$gdShipToBuy" exact="table[]"/>
+      <set_value name="$gdBuyToSell" exact="table[]"/>
+
+      <do_all exact="$tradeList.count" counter="$si">
+        <set_value name="$trade" exact="$tradeList.{$si}"/>
+        <set_value name="$shipScore" exact="if $trade.$Score? then $trade.$Score else 0"/>
+        <set_value name="$shipToBuyDist" exact="-1"/>
+        <set_value name="$routeLegDist" exact="0"/>
+        <set_value name="$shipRouteDist" exact="0"/>
+
+        <do_if value="$trade.$IsSellOnly? and $trade.$IsSellOnly">
+          <set_value name="$trade.$ShipToBuyDistance" exact="0"/>
+          <set_value name="$trade.$ShipRouteDistance" exact="0"/>
+          <set_value name="$trade.$ShipScore" exact="$shipScore"/>
+          <set_value name="$trade.$SelectionScore" exact="$shipScore"/>
+          <set_value name="$trade.$ShipRouteScored" exact="true"/>
+        </do_if>
+        <do_else>
+          <set_value name="$buySector" exact="null"/>
+          <do_if value="$trade.$BuySector? and $trade.$BuySector.exists">
+            <set_value name="$buySector" exact="$trade.$BuySector"/>
+          </do_if>
+          <do_elseif value="$trade.$BuyStation? and $trade.$BuyStation.sector? and $trade.$BuyStation.sector.exists">
+            <set_value name="$buySector" exact="$trade.$BuyStation.sector"/>
+          </do_elseif>
+          <do_elseif value="$trade.$BuyOffer? and $trade.$BuyOffer.owner? and $trade.$BuyOffer.owner.sector? and $trade.$BuyOffer.owner.sector.exists">
+            <set_value name="$buySector" exact="$trade.$BuyOffer.owner.sector"/>
+          </do_elseif>
+
+          <set_value name="$sellSector" exact="null"/>
+          <do_if value="$trade.$SellSector? and $trade.$SellSector.exists">
+            <set_value name="$sellSector" exact="$trade.$SellSector"/>
+          </do_if>
+          <do_elseif value="$trade.$SellStation? and $trade.$SellStation.sector? and $trade.$SellStation.sector.exists">
+            <set_value name="$sellSector" exact="$trade.$SellStation.sector"/>
+          </do_elseif>
+          <do_elseif value="$trade.$SellOffer? and $trade.$SellOffer.owner? and $trade.$SellOffer.owner.sector? and $trade.$SellOffer.owner.sector.exists">
+            <set_value name="$sellSector" exact="$trade.$SellOffer.owner.sector"/>
+          </do_elseif>
+
+          <do_if value="$buySector? and $shipSector?">
+            <do_if value="$buySector == $shipSector">
+              <set_value name="$shipToBuyDist" exact="0"/>
+            </do_if>
+            <do_elseif value="$blacklistGroup? and $blacklistGroup != null and $ship?">
+              <do_if value="$gdShipToBuy.{$shipSector}? and $gdShipToBuy.{$shipSector}.{$buySector}?">
+                <set_value name="$shipToBuyDist" exact="$gdShipToBuy.{$shipSector}.{$buySector}"/>
+              </do_if>
+              <do_else>
+                <set_value name="$shipToBuyDist" exact="$ship.gatedistance.{$buySector}.{$blacklistGroup}.{$ship}"/>
+                <do_if value="not $gdShipToBuy.{$shipSector}?">
+                  <set_value name="$gdShipToBuy.{$shipSector}" exact="table[]"/>
+                </do_if>
+                <set_value name="$gdShipToBuy.{$shipSector}.{$buySector}" exact="$shipToBuyDist"/>
+              </do_else>
+            </do_elseif>
+            <do_else>
+              <set_value name="$shipToBuyDist" exact="$ship.gatedistance.{$buySector}"/>
+            </do_else>
+          </do_if>
+
+          <do_if value="$shipToBuyDist lt 0">
+            <set_value name="$shipScore" exact="0"/>
+          </do_if>
+          <do_else>
+            <set_value name="$reuseRouteLeg" exact="false"/>
+            <do_if value="$trade.$RouteDistance? and $buySector? and $sellSector? and $trade.$BuySector? and $trade.$BuySector.exists and $trade.$SellSector? and $trade.$SellSector.exists and $trade.$BuySector == $buySector and $trade.$SellSector == $sellSector">
+              <set_value name="$routeLegDist" exact="$trade.$RouteDistance"/>
+              <set_value name="$reuseRouteLeg" exact="true"/>
+            </do_if>
+            <do_if value="not $reuseRouteLeg and $buySector? and $sellSector?">
+              <do_if value="$buySector == $sellSector">
+                <set_value name="$routeLegDist" exact="0"/>
+              </do_if>
+              <do_elseif value="$blacklistGroup? and $blacklistGroup != null and $ship?">
+                <do_if value="$gdBuyToSell.{$buySector}? and $gdBuyToSell.{$buySector}.{$sellSector}?">
+                  <set_value name="$routeLegDist" exact="$gdBuyToSell.{$buySector}.{$sellSector}"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$routeLegDist" exact="$buySector.gatedistance.{$sellSector}.{$blacklistGroup}.{$ship}"/>
+                  <do_if value="not $gdBuyToSell.{$buySector}?">
+                    <set_value name="$gdBuyToSell.{$buySector}" exact="table[]"/>
+                  </do_if>
+                  <set_value name="$gdBuyToSell.{$buySector}.{$sellSector}" exact="$routeLegDist"/>
+                </do_else>
+              </do_elseif>
+              <do_else>
+                <set_value name="$routeLegDist" exact="$buySector.gatedistance.{$sellSector}"/>
+              </do_else>
+            </do_if>
+
+            <do_if value="$routeLegDist lt 0">
+              <set_value name="$shipScore" exact="0"/>
+            </do_if>
+            <do_else>
+              <set_value name="$shipRouteDist" exact="$shipToBuyDist + $routeLegDist"/>
+              <set_value name="$profitCr" exact="0"/>
+              <do_if value="$trade.$Profit?">
+                <set_value name="$profitCr" exact="($trade.$Profit / 1Cr)i"/>
+              </do_if>
+              <do_elseif value="$trade.$UnitProfit? and $trade.$Amount?">
+                <set_value name="$profitCr" exact="(($trade.$UnitProfit * $trade.$Amount) / 1Cr)i"/>
+              </do_elseif>
+              <do_if value="$profitCr le 0 and $trade.$Score?">
+                <set_value name="$shipScore" exact="$trade.$Score"/>
+              </do_if>
+              <do_else>
+                <set_value name="$distanceFactor" exact="1.0 + ($shipRouteDist * $penalty)"/>
+                <do_if value="$distanceFactor gt 0">
+                  <set_value name="$shipScore" exact="$profitCr / $distanceFactor"/>
+                </do_if>
+              </do_else>
+            </do_else>
+          </do_else>
+
+          <set_value name="$trade.$ShipToBuyDistance" exact="[$shipToBuyDist, 0].max"/>
+          <set_value name="$trade.$ShipRouteDistance" exact="$shipRouteDist"/>
+          <set_value name="$trade.$ShipScore" exact="$shipScore"/>
+          <set_value name="$trade.$SelectionScore" exact="$shipScore"/>
+          <set_value name="$trade.$ShipRouteScored" exact="true"/>
+        </do_else>
+
+        <do_if value="($si % 20) == 0">
+          <wait exact="1ms" comment="Yield ship-route score loop"/>
+        </do_if>
+      </do_all>
+
+      <sort_list list="$tradeList" sortbyvalue="loop.element.$ShipScore" sortdescending="true"/>
+
+      <set_value name="$truncatedList" exact="[]"/>
+      <set_value name="$outCount" exact="[$maxEntries, $tradeList.count].min"/>
+      <do_all exact="$outCount" counter="$ti">
+        <append_to_list name="$truncatedList" exact="$tradeList.{$ti}"/>
+      </do_all>
+
+      <set_value name="$bestTrade" exact="null"/>
+      <set_value name="$bestScoreOut" exact="0"/>
+      <do_if value="$truncatedList.count gt 0">
+        <set_value name="$bestTrade" exact="$truncatedList.{1}"/>
+        <do_if value="$bestTrade.$ShipScore?">
+          <set_value name="$bestScoreOut" exact="$bestTrade.$ShipScore"/>
+        </do_if>
+      </do_if>
+
+      <wait exact="1ms" comment="Cooperative yield before return (wake-loop guard)"/>
+      <return value="table[
+        $SortedTrades = $truncatedList,
+        $BestTrade = $bestTrade,
+        $BestScore = $bestScoreOut
+      ]"/>
+    </actions>
+  </attention>
+</aiscript>

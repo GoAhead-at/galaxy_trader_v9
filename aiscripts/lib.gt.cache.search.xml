@@ -35,6 +35,8 @@
     <!-- MK3 'Ignore Player Pricing' companion filter: when true, drop cache entries whose delivery (customer) station is player-owned. -->
     <param name="requireNonPlayerDeliveryStation" default="false"/>
     <param name="ignoreTradeRules" default="false" comment="When false, drop entries where a player-owned station's trade rules block the pair (NPC×NPC ignores cantradewith)."/>
+    <param name="distancePenalty" default="0.1" comment="MK3 ship-route score divisor (matches lib.gt.tradematch / order distancepenalty)."/>
+    <param name="blacklistGroup" default="blacklistgroup.civilian" comment="Blacklist-aware ship→buy and buy→sell for lib.gt.cache.score_for_ship."/>
     <param name="debugchance" default="0"/>
   </params>
   <patch sinceversion="3">
@@ -295,18 +297,22 @@
       <do_else>
         <set_value name="$perWareCap" exact="[2, [$maxTradesPerWareSetting, 5].min].max"/>
       </do_else>
-      <!-- Iterate cache with per-ship rotation (cache is sorted by Score descending via lib.gt.cache.write).
-           Without rotation, a fleet burst reads the same top entries and collides on fleet reservations.
-           Collect up to $perWareCap valid trades per ware until $maxEntries total OR cache exhausted. -->
+      <!-- MK3: scan full pool (filter all), then lib.gt.cache.score_for_ship ranks by ship→buy + buy→sell.
+           MK4: legacy rotated scan with early cap at $maxEntries (unchanged). -->
       <!-- NOTE: $homeCacheCount is a snapshot; the list can shrink mid-loop (MD purge/cleanup
            runs while this AI script yields). Guard with bounds check before access. -->
       <set_value name="$loopSpan" exact="[$homeCacheCount, 1].max"/>
       <set_value name="$startOffset" exact="0"/>
-      <do_if value="$cacheReadOffset? and $loopSpan gt 0">
+      <do_if value="this.$gt_cachePoolIsMk4 and $cacheReadOffset? and $loopSpan gt 0">
         <set_value name="$startOffset" exact="(($cacheReadOffset) % $loopSpan)"/>
       </do_if>
       <do_all exact="$loopSpan" counter="$visitIdx">
-        <set_value name="$i" exact="(($startOffset + $visitIdx - 1) % $loopSpan) + 1"/>
+        <do_if value="this.$gt_cachePoolIsMk4">
+          <set_value name="$i" exact="(($startOffset + $visitIdx - 1) % $loopSpan) + 1"/>
+        </do_if>
+        <do_else>
+          <set_value name="$i" exact="$visitIdx"/>
+        </do_else>
         <!-- Bounds guard: list may have shrunk since $homeCacheCount was captured -->
         <do_if value="$i gt $homeCache.count">
           <continue/>
@@ -1125,13 +1131,15 @@
         <do_if value="$quotaWare?">
           <set_value name="$foundPerWare.{$quotaWare}" exact="if $foundPerWare.{$quotaWare}? then ($foundPerWare.{$quotaWare} + 1) else 1"/>
         </do_if>
-        <do_if value="$entry.$Score gt $bestScore">
-          <set_value name="$bestScore" exact="$entry.$Score"/>
-          <set_value name="$bestTrade" exact="$entry"/>
-        </do_if>
-        <!-- Stop once we have enough valid trades -->
-        <do_if value="$foundCount ge $maxEntries">
-          <break/>
+        <do_if value="this.$gt_cachePoolIsMk4">
+          <do_if value="$entry.$Score gt $bestScore">
+            <set_value name="$bestScore" exact="$entry.$Score"/>
+            <set_value name="$bestTrade" exact="$entry"/>
+          </do_if>
+          <!-- MK4: stop once enough valid trades collected (home-sorted scan order). -->
+          <do_if value="$foundCount ge $maxEntries">
+            <break/>
+          </do_if>
         </do_if>
         <do_if value="($visitIdx % 10) == 0">
           <wait exact="this.$gt_yieldMs * 1ms" comment="Yield cache scan loop"/>
@@ -1304,6 +1312,34 @@
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-CacheSearch] ' + $ship.idcode + ': Read-time purge removed ' + $purgedDeadCount + ' unreadable entries from ' + $cacheHomeKey.knownname + ' (remaining: ' + $homeCacheCount + ')'" chance="100"/>
           </do_if>
+        </do_if>
+      </do_if>
+
+      <!-- MK3: per-ship route score, sort, truncate (fleet spread rotation happens in order validation). -->
+      <do_if value="not this.$gt_cachePoolIsMk4 and $tradeList.count gt 0">
+        <run_script name="'lib.gt.cache.score_for_ship'" result="$shipRouteScoreResult">
+          <param name="tradeList" value="$tradeList"/>
+          <param name="ship" value="$ship"/>
+          <param name="distancePenalty" value="if $distancePenalty? then $distancePenalty else 0.1"/>
+          <param name="blacklistGroup" value="if $blacklistGroup? then $blacklistGroup else blacklistgroup.civilian"/>
+          <param name="maxEntries" value="$maxEntries"/>
+          <param name="debugchance" value="$debugchance"/>
+        </run_script>
+        <do_if value="$shipRouteScoreResult? and $shipRouteScoreResult.$SortedTrades?">
+          <set_value name="$tradeList" exact="$shipRouteScoreResult.$SortedTrades"/>
+        </do_if>
+        <do_if value="$shipRouteScoreResult? and $shipRouteScoreResult.$BestTrade?">
+          <set_value name="$bestTrade" exact="$shipRouteScoreResult.$BestTrade"/>
+        </do_if>
+        <do_if value="$shipRouteScoreResult? and $shipRouteScoreResult.$BestScore?">
+          <set_value name="$bestScore" exact="$shipRouteScoreResult.$BestScore"/>
+        </do_if>
+        <do_if value="$tradeList.count == 0">
+          <set_value name="$bestTrade" exact="null"/>
+          <set_value name="$bestScore" exact="0"/>
+        </do_if>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $tradeList.count gt 0">
+          <debug_text text="'[GT-CacheSearch] ' + $ship.idcode + ': Ship-route scored ' + $tradeList.count + ' cache trades (top ShipScore=' + $bestScore + ')'" chance="100"/>
         </do_if>
       </do_if>
 

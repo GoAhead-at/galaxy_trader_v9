@@ -90,6 +90,97 @@
                                 (if $trackedCost? then ($trackedCost / 100) else 0) + ' Cr)'" 
                           chance="100"/>
             </do_if>
+
+            <!-- Buy-completion sell-leg gate: inspect the queued sell WITHOUT cancelling first.
+                 Cancel and route to disposal only when the buyer offer is universally dead (.available false
+                 or partner gone). Never cancel for offeramount.{ship}==0 while .available is true - that is
+                 transient fleet saturation and our pending TradePerform still holds the reservation. -->
+            <set_value name="$gateHasPendingSell" exact="false"/>
+            <do_if value="$ship.tradeorders? and $ship.tradeorders.count gt 0">
+              <do_all exact="$ship.tradeorders.count" counter="$gpi">
+                <set_value name="$gateOrder" exact="$ship.tradeorders.{$gpi}"/>
+                <do_if value="$gateOrder? and $gateOrder != $ship.order and $gateOrder.$tradedeal?">
+                  <do_if value="not @$gateOrder.$tradedeal.seller.exists and $gateOrder.$tradedeal.ware == $ware">
+                    <set_value name="$gateHasPendingSell" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_if>
+              </do_all>
+            </do_if>
+
+            <do_if value="$gateHasPendingSell">
+              <set_value name="$gateSellStation" exact="null"/>
+              <do_if value="global.$GT_ActiveTrade? and global.$GT_ActiveTrade.{$ship}? and global.$GT_ActiveTrade.{$ship}.$SellStation?">
+                <set_value name="$gateSellStation" exact="global.$GT_ActiveTrade.{$ship}.$SellStation"/>
+              </do_if>
+              <do_if value="not $gateSellStation? or not $gateSellStation.exists">
+                <do_if value="$ship.tradeorders? and $ship.tradeorders.count gt 0">
+                  <do_all exact="$ship.tradeorders.count" counter="$gpsi">
+                    <set_value name="$gatePendingOrder" exact="$ship.tradeorders.{$gpsi}"/>
+                    <do_if value="$gatePendingOrder? and $gatePendingOrder.$tradedeal? and not @$gatePendingOrder.$tradedeal.seller.exists and $gatePendingOrder.$tradedeal.ware == $ware">
+                      <do_if value="$gatePendingOrder.$tradedeal.owner? and $gatePendingOrder.$tradedeal.owner.exists">
+                        <set_value name="$gateSellStation" exact="$gatePendingOrder.$tradedeal.owner"/>
+                      </do_if>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                </do_if>
+              </do_if>
+
+              <set_value name="$gateSellDead" exact="false"/>
+              <set_value name="$gateSellStationName" exact="if $gateSellStation? then @$gateSellStation.knownname else 'Unknown'"/>
+              <do_if value="not $gateSellStation? or not $gateSellStation.exists or not $gateSellStation.isoperational">
+                <set_value name="$gateSellDead" exact="true"/>
+              </do_if>
+              <do_else>
+                <find_buy_offer buyer="$gateSellStation" wares="$ware" tradepartner="$ship" result="$gateSellOffer"/>
+                <do_if value="not $gateSellOffer.available">
+                  <set_value name="$gateSellDead" exact="true"/>
+                </do_if>
+                <do_elseif value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <set_value name="$gateOfferAmt" exact="@$gateSellOffer.offeramount.{$ship}"/>
+                  <debug_text text="'[GT-SellGate] ' + $ship.idcode + ': queued sell leg still valid after buy (' + $ware.name + ' to ' + $gateSellStationName + ', offeramount.ship=' + (if $gateOfferAmt? then $gateOfferAmt else 'null') + ')'" chance="100"/>
+                </do_elseif>
+              </do_else>
+
+              <do_if value="$gateSellDead">
+                <set_value name="$gateCancelled" exact="0"/>
+                <do_if value="$ship.tradeorders? and $ship.tradeorders.count gt 0">
+                  <do_all exact="$ship.tradeorders.count" counter="$gci">
+                    <set_value name="$gateCancelOrder" exact="$ship.tradeorders.{$gci}"/>
+                    <do_if value="$gateCancelOrder? and $gateCancelOrder != $ship.order and $gateCancelOrder.$tradedeal?">
+                      <do_if value="not @$gateCancelOrder.$tradedeal.seller.exists and $gateCancelOrder.$tradedeal.ware == $ware">
+                        <cancel_order order="$gateCancelOrder"/>
+                        <set_value name="$gateCancelled" operation="add"/>
+                      </do_if>
+                    </do_if>
+                  </do_all>
+                </do_if>
+
+                <run_actions ref="md.GT_Libraries_General.GT_ClearPendingTradeData">
+                  <param name="ship" value="$ship"/>
+                </run_actions>
+                <run_actions ref="md.GT_Libraries_General.GT_ClearUICreditsDueForShip">
+                  <param name="ship" value="$ship"/>
+                </run_actions>
+
+                <signal_objects object="$ship" param="'GT_Trade_Failed'" param2="table[
+                  $Ship = $ship,
+                  $Reason = 'ERR_TRADEOFFER_INVALID',
+                  $FailureText = null,
+                  $Partner = $gateSellStation,
+                  $IsBuying = false,
+                  $ReasonType = 'MARKET',
+                  $PathBlocked = false,
+                  $ShouldTryNext = false,
+                  $Timestamp = player.age
+                ]" delay="1ms"/>
+
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-SellGate] ' + $ship.idcode + ': sell leg dead after buy - cancelled ' + $gateCancelled + ' queued sell order(s) for ' + $ware.name + ' (partner: ' + $gateSellStationName + ') - routing to cargo disposal'" chance="100"/>
+                </do_if>
+              </do_if>
+            </do_if>
           </do_while>
         </do_if>
       </actions>

@@ -2,14 +2,15 @@
 <mdscript name="GT_TradeSearch_Scheduler" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/md.xsd">
   <cues>
     <!-- Two-phase scheduler:
-         GT_Search_Request -> GT_Search_Go(phase=cache/live) -> GT_Search_Done
+         GT_Search_Request -> GT_Search_Go(phase=cache/live/clearance) -> GT_Search_Done
 
          Key guarantees:
          1) Home-sector live-refresh coalescing:
             If a live refresh is already active for home sector H, cache-miss ships for H wait
             (keepalive + reset wakeup) instead of queueing duplicate live refreshes.
          2) Fairness across homes:
-            Live dispatch is round-robin by home sector, so one fleet/home cannot starve others. -->
+            Live dispatch is round-robin by home sector, so one fleet/home cannot starve others.
+         3) sell_only (cargo clearance) skips cache and uses the dedicated clearance live pool. -->
 
     <cue name="Init" instantiate="true" version="1">
       <conditions>
@@ -242,10 +243,13 @@
         </do_if>
 
         <!-- Force-live requests skip cache and go directly to normal live pool.
-             sell_only (clearance) is cache-first and uses dedicated clearance slot on cache miss. -->
-        <do_if value="$forceLiveSearch">
-          <set_value name="$targetPhase" exact="'live'"/>
+             sell_only (clearance) is live-only: one ware, cheap scan, stale cache not used. -->
+        <do_if value="$searchMode == 'sell_only'">
+          <set_value name="$targetPhase" exact="'clearance'"/>
         </do_if>
+        <do_elseif value="$forceLiveSearch">
+          <set_value name="$targetPhase" exact="'live'"/>
+        </do_elseif>
 
         <!-- Cross-pool dedup + validation -->
         <set_value name="$rejectReason" exact="''"/>
@@ -467,7 +471,23 @@
         </do_if>
 
         <do_if value="$enqueueAllowed">
-          <do_if value="$targetPhase == 'live'">
+          <do_if value="$searchMode == 'sell_only'">
+            <set_value name="$clearanceParams" exact="if $params? then $params else table[$Ship = $ship]"/>
+            <set_value name="$clearanceParams.$Phase" exact="'live'"/>
+            <set_value name="$clearanceParams.$HomeSector" exact="$homeSector"/>
+            <set_value name="$clearanceParams.$SearchMode" exact="'sell_only'"/>
+            <set_value name="$clearanceParams.$ForceLiveSearch" exact="true"/>
+            <append_to_list name="global.$GT_SearchSemaphore.$ClearanceQueue" exact="table[
+              $Ship = $ship,
+              $Params = $clearanceParams,
+              $HomeSector = $homeSector,
+              $EnqueuedAt = player.age
+            ]"/>
+            <set_value name="global.$GT_SearchSemaphore.$ClearanceQueued.{$ship}" exact="true"/>
+            <set_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}" exact="'clearance_queued'"/>
+            <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.DispatchClearanceSearchGo"/>
+          </do_if>
+          <do_elseif value="$targetPhase == 'live'">
             <do_if value="$useMK42LivePool">
               <do_if value="not global.$GT_SearchSemaphore.$MK42LiveQueueByHome.{$homeSector}?">
                 <set_value name="global.$GT_SearchSemaphore.$MK42LiveQueueByHome.{$homeSector}" exact="[]"/>
@@ -555,7 +575,7 @@
               </do_if>
               <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.DispatchLiveSearchGo"/>
             </do_else>
-          </do_if>
+          </do_elseif>
           <do_else>
             <append_to_list name="global.$GT_SearchSemaphore.$CacheQueue" exact="table[
               $Ship = $ship,

@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- MK4-2 supply scoring: MK4-Spec urgency × ship-agnostic amount ÷ route distance; class slider + ware bonus (§3–4). -->
+<!-- MK4-2 supply scoring: MK4-Spec urgency x ship-agnostic amount / route distance; per-class base
+     normalisation within the candidate batch, then class slider multiply (BS=10 ST=1 wins unless a
+     station trade is much more urgent within its own class). -->
 <aiscript name="lib.gt.mk42.score.trades" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
   <params>
     <param name="tradeList" default="[]"/>
-    <param name="priorities" default="table[]" comment="table[$Buildstorage, $Stations, $Aux, $Carrier]"/>
+    <param name="priorities" default="table[]" comment="table[$Buildstorage, $Stations, $Aux, $Carrier] - when set, class mult is resolved from $CustomerClass for per-ship cache re-score"/>
     <param name="priorityWares" default="[]"/>
-    <param name="priorityScoreMultiplier" default="1" comment="1=no ware bonus; 2-10 additive on baseSupplyScore"/>
+    <param name="priorityScoreMultiplier" default="1" comment="1=no ware bonus; 2-10 additive on normalised base"/>
     <param name="playerSupplierPriority" default="5" comment="buyFromPlayer slider (0-10); self-normalised supplier-side score weight"/>
     <param name="aiSupplierPriority" default="5" comment="buyFromFaction slider (0-10); self-normalised supplier-side score weight"/>
     <param name="distancePenalty" default="0.5" comment="Runtime multiplier (UI 0-100% converted by caller)"/>
@@ -23,11 +25,6 @@
       <do_if value="$wareMult lt 1"><set_value name="$wareMult" exact="1"/></do_if>
       <do_if value="$wareMult gt 10"><set_value name="$wareMult" exact="10"/></do_if>
 
-      <!-- Supplier-side priority: buyFromPlayer / buyFromFaction sliders (0-10) double as priorities.
-           0-valued classes are already filtered upstream (truthy gate); here we bias the *score* between
-           the two supplier classes. Self-normalising against the larger of the two so equal sliders
-           (the neutral default 5/5) leave every score unchanged, and only the lower-priority supplier
-           class gets scaled down - it never inflates a score above its un-weighted value. -->
       <set_value name="$supPlayerPrio" exact="if $playerSupplierPriority? then $playerSupplierPriority else 5"/>
       <set_value name="$supAiPrio" exact="if $aiSupplierPriority? then $aiSupplierPriority else 5"/>
       <set_value name="$supPrioMax" exact="[$supPlayerPrio, $supAiPrio].max"/>
@@ -37,32 +34,135 @@
         <return value="table[$Found = false, $BestTrade = null, $BestScore = 0, $SortedTrades = $sortedTrades]"/>
       </do_if>
 
+      <set_value name="$maxRawByClass" exact="table[$Buildstorage = 0, $Stations = 0, $Aux = 0, $Carrier = 0, $None = 0]"/>
+
+      <!-- Pass 1: per delivery-class max raw $baseSupplyScore (not global - one starving station must not crush BS norms). -->
+      <do_all exact="$tradeList.count" counter="$maxi">
+        <set_value name="$maxTrade" exact="$tradeList.{$maxi}"/>
+        <set_value name="$maxClassTag" exact="if $maxTrade.$CustomerClass? then @$maxTrade.$CustomerClass else 'None'"/>
+        <set_value name="$maxRaw" exact="0"/>
+        <do_if value="$maxClassTag != 'None'">
+          <do_if value="$maxTrade.$baseSupplyScore?">
+            <set_value name="$maxRaw" exact="$maxTrade.$baseSupplyScore"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <set_value name="$maxRaw" exact="if $maxTrade.$baseSupplyScore? then $maxTrade.$baseSupplyScore else (if $maxTrade.$Score? then $maxTrade.$Score else 0)"/>
+        </do_else>
+        <set_value name="$maxClassMult" exact="if $maxTrade.$ClassMultiplier? then $maxTrade.$ClassMultiplier else 1"/>
+        <do_if value="$priorities? and $maxClassTag != 'None'">
+          <do_if value="$maxClassTag == 'Buildstorage'">
+            <set_value name="$maxClassMult" exact="if $priorities.$Buildstorage? then $priorities.$Buildstorage else 0"/>
+          </do_if>
+          <do_elseif value="$maxClassTag == 'Stations'">
+            <set_value name="$maxClassMult" exact="if $priorities.$Stations? then $priorities.$Stations else 0"/>
+          </do_elseif>
+          <do_elseif value="$maxClassTag == 'Aux'">
+            <set_value name="$maxClassMult" exact="if $priorities.$Aux? then $priorities.$Aux else 0"/>
+          </do_elseif>
+          <do_elseif value="$maxClassTag == 'Carrier'">
+            <set_value name="$maxClassMult" exact="if $priorities.$Carrier? then $priorities.$Carrier else 0"/>
+          </do_elseif>
+        </do_if>
+        <do_if value="$maxClassMult gt 0 and $maxRaw gt 0">
+          <do_if value="$maxClassTag == 'Buildstorage'">
+            <do_if value="not $maxRawByClass.$Buildstorage? or $maxRaw gt $maxRawByClass.$Buildstorage">
+              <set_value name="$maxRawByClass.$Buildstorage" exact="$maxRaw"/>
+            </do_if>
+          </do_if>
+          <do_elseif value="$maxClassTag == 'Stations'">
+            <do_if value="not $maxRawByClass.$Stations? or $maxRaw gt $maxRawByClass.$Stations">
+              <set_value name="$maxRawByClass.$Stations" exact="$maxRaw"/>
+            </do_if>
+          </do_elseif>
+          <do_elseif value="$maxClassTag == 'Aux'">
+            <do_if value="not $maxRawByClass.$Aux? or $maxRaw gt $maxRawByClass.$Aux">
+              <set_value name="$maxRawByClass.$Aux" exact="$maxRaw"/>
+            </do_if>
+          </do_elseif>
+          <do_elseif value="$maxClassTag == 'Carrier'">
+            <do_if value="not $maxRawByClass.$Carrier? or $maxRaw gt $maxRawByClass.$Carrier">
+              <set_value name="$maxRawByClass.$Carrier" exact="$maxRaw"/>
+            </do_if>
+          </do_elseif>
+          <do_elseif value="$maxClassTag == 'None'">
+            <do_if value="not $maxRawByClass.$None? or $maxRaw gt $maxRawByClass.$None">
+              <set_value name="$maxRawByClass.$None" exact="$maxRaw"/>
+            </do_if>
+          </do_elseif>
+        </do_if>
+      </do_all>
+
+      <!-- Pass 2: normBase = rawBase / maxRaw[class]; final = normBase x classMult (+ ware bonus on normBase). -->
       <do_all exact="$tradeList.count" counter="$i">
         <set_value name="$trade" exact="$tradeList.{$i}"/>
-        <set_value name="$baseSupplyScore" exact="if $trade.$baseSupplyScore? then $trade.$baseSupplyScore else (if $trade.$Score? then $trade.$Score else 0)"/>
+        <set_value name="$classTag" exact="if $trade.$CustomerClass? then @$trade.$CustomerClass else 'None'"/>
+        <set_value name="$rawBase" exact="0"/>
+        <do_if value="$classTag != 'None'">
+          <do_if value="$trade.$baseSupplyScore?">
+            <set_value name="$rawBase" exact="$trade.$baseSupplyScore"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <set_value name="$rawBase" exact="if $trade.$baseSupplyScore? then $trade.$baseSupplyScore else (if $trade.$Score? then $trade.$Score else 0)"/>
+        </do_else>
         <set_value name="$classMult" exact="if $trade.$ClassMultiplier? then $trade.$ClassMultiplier else 1"/>
-        <do_if value="$classMult le 0">
+        <do_if value="$priorities? and $classTag != 'None'">
+          <do_if value="$classTag == 'Buildstorage'">
+            <set_value name="$classMult" exact="if $priorities.$Buildstorage? then $priorities.$Buildstorage else 0"/>
+          </do_if>
+          <do_elseif value="$classTag == 'Stations'">
+            <set_value name="$classMult" exact="if $priorities.$Stations? then $priorities.$Stations else 0"/>
+          </do_elseif>
+          <do_elseif value="$classTag == 'Aux'">
+            <set_value name="$classMult" exact="if $priorities.$Aux? then $priorities.$Aux else 0"/>
+          </do_elseif>
+          <do_elseif value="$classTag == 'Carrier'">
+            <set_value name="$classMult" exact="if $priorities.$Carrier? then $priorities.$Carrier else 0"/>
+          </do_elseif>
+        </do_if>
+        <do_if value="$classMult le 0 or $rawBase le 0">
           <continue/>
         </do_if>
-        <set_value name="$typeScore" exact="$baseSupplyScore * $classMult"/>
+        <set_value name="$classMaxRaw" exact="0"/>
+        <do_if value="$classTag == 'Buildstorage'">
+          <set_value name="$classMaxRaw" exact="if $maxRawByClass.$Buildstorage? then $maxRawByClass.$Buildstorage else 0"/>
+        </do_if>
+        <do_elseif value="$classTag == 'Stations'">
+          <set_value name="$classMaxRaw" exact="if $maxRawByClass.$Stations? then $maxRawByClass.$Stations else 0"/>
+        </do_elseif>
+        <do_elseif value="$classTag == 'Aux'">
+          <set_value name="$classMaxRaw" exact="if $maxRawByClass.$Aux? then $maxRawByClass.$Aux else 0"/>
+        </do_elseif>
+        <do_elseif value="$classTag == 'Carrier'">
+          <set_value name="$classMaxRaw" exact="if $maxRawByClass.$Carrier? then $maxRawByClass.$Carrier else 0"/>
+        </do_elseif>
+        <do_elseif value="$classTag == 'None'">
+          <set_value name="$classMaxRaw" exact="if $maxRawByClass.$None? then $maxRawByClass.$None else 0"/>
+        </do_elseif>
+        <set_value name="$normBase" exact="if $classMaxRaw gt 0 then ($rawBase / ($classMaxRaw * 1.0)) else 0"/>
+        <do_if value="$normBase le 0">
+          <continue/>
+        </do_if>
+        <set_value name="$typeScore" exact="$normBase * $classMult"/>
         <set_value name="$wareBonus" exact="0"/>
         <do_if value="$wareMult gt 1 and $trade.$Ware? and $safePriorityWares.count gt 0">
           <do_all exact="$safePriorityWares.count" counter="$pw">
             <do_if value="$safePriorityWares.{$pw} == $trade.$Ware">
-              <set_value name="$wareBonus" exact="$baseSupplyScore * ($wareMult - 1)"/>
+              <set_value name="$wareBonus" exact="$normBase * ($wareMult - 1)"/>
               <break/>
             </do_if>
           </do_all>
         </do_if>
         <set_value name="$finalScore" exact="$typeScore + $wareBonus"/>
-        <!-- Apply supplier-side weighting (player vs faction). Factor 1.0 when both sliders equal or when
-             the supplier side is unknown (e.g. sell-only player deliveries with no $BuyStation). -->
         <do_if value="$supPrioMax gt 0">
           <set_value name="$supThisPrio" exact="if $trade.$BuyStation? and @$trade.$BuyStation.exists and @$trade.$BuyStation.isplayerowned then $supPlayerPrio else $supAiPrio"/>
           <set_value name="$supFactor" exact="$supThisPrio / ($supPrioMax * 1.0)"/>
           <set_value name="$finalScore" exact="$finalScore * $supFactor"/>
         </do_if>
-        <set_value name="$trade.$baseSupplyScore" exact="$baseSupplyScore"/>
+        <set_value name="$trade.$baseSupplyScore" exact="$rawBase"/>
+        <set_value name="$trade.$normBase" exact="$normBase"/>
+        <set_value name="$trade.$ClassMultiplier" exact="$classMult"/>
         <set_value name="$trade.$finalScore" exact="$finalScore"/>
         <set_value name="$trade.$Score" exact="$finalScore"/>
         <append_to_list name="$sortedTrades" exact="$trade"/>

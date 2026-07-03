@@ -254,8 +254,7 @@
       <do_else>
         <set_value name="$perWareCap" exact="[2, [$maxTradesPerWareSetting, 5].min].max"/>
       </do_else>
-      <!-- Iterate start-to-end (cache is sorted by Score descending via lib.gt.cache.write).
-           Collect up to $perWareCap valid trades per ware until $maxEntries total OR cache exhausted. -->
+      <!-- Iterate start-to-end; collect up to $perWareCap valid trades per (ware, delivery-class) bucket. -->
       <!-- NOTE: $homeCacheCount is a snapshot; the list can shrink mid-loop (MD purge/cleanup
            runs while this AI script yields). Guard with bounds check before access. -->
       <do_all exact="$homeCacheCount" counter="$i">
@@ -999,16 +998,25 @@
           <set_value name="$resKey" exact="$entry.$SellOffer"/>
           <do_if value="global.$GT_Reservations.{$resKey}?">
             <set_value name="$resData" exact="global.$GT_Reservations.{$resKey}"/>
-            <!-- Only skip if reservation is unexpired AND belongs to a different ship -->
+            <!-- Only skip if reservation is unexpired AND belongs to a different ship.
+                 Build-storage deliveries are multi-ship by design (construction feed); do not
+                 let one ship's selection lock starve fleet mates of the same BS row. -->
             <do_if value="$resData.$Until? and player.age lt @$resData.$Until and $resData.$Ship? and @$resData.$Ship != $ship">
-              <set_value name="$rejReasons.$reserved_by_other" exact="if $rejReasons.$reserved_by_other? then $rejReasons.$reserved_by_other+1 else 1"/>
-              <set_value name="$rejTotal" operation="add"/>
-              <continue/>
+              <set_value name="$skipForOtherReservation" exact="true"/>
+              <do_if value="$entrySellStation? and @$entrySellStation.exists and @$entrySellStation.isclass.buildstorage">
+                <set_value name="$skipForOtherReservation" exact="false"/>
+              </do_if>
+              <do_if value="$skipForOtherReservation">
+                <set_value name="$rejReasons.$reserved_by_other" exact="if $rejReasons.$reserved_by_other? then $rejReasons.$reserved_by_other+1 else 1"/>
+                <set_value name="$rejTotal" operation="add"/>
+                <continue/>
+              </do_if>
             </do_if>
           </do_if>
         </do_if>
 
-        <!-- Per-ware quota gate (after all filters — only count shippable candidates). -->
+        <!-- Per-ware + delivery-class quota: same ware to BS and to a station are separate buckets
+             (otherwise two station claytronics fills block the BS claytronics row before re-score). -->
         <set_value name="$quotaWare" exact="if $entry.$Ware? then $entry.$Ware else null"/>
         <do_if value="not $quotaWare? and $entry.$BuyOffer? and @$entry.$BuyOffer.exists and @$entry.$BuyOffer.ware != null">
           <set_value name="$quotaWare" exact="@$entry.$BuyOffer.ware"/>
@@ -1016,8 +1024,41 @@
         <do_if value="not $quotaWare? and $entry.$SellOffer? and @$entry.$SellOffer.exists and @$entry.$SellOffer.ware != null">
           <set_value name="$quotaWare" exact="@$entry.$SellOffer.ware"/>
         </do_if>
-        <do_if value="$quotaWare?">
-          <set_value name="$quotaWareFoundCount" exact="if $foundPerWare.{$quotaWare}? then $foundPerWare.{$quotaWare} else 0"/>
+        <set_value name="$quotaDeliveryClass" exact="if $entry.$CustomerClass? then @$entry.$CustomerClass else 'None'"/>
+        <do_if value="$quotaDeliveryClass == 'None' and $entrySellStation? and @$entrySellStation.exists">
+          <do_if value="@$entrySellStation.isclass.buildstorage and @$entrySellStation.isplayerowned">
+            <set_value name="$quotaDeliveryClass" exact="'Buildstorage'"/>
+          </do_if>
+          <do_elseif value="@$entrySellStation.isclass.station and @$entrySellStation.isplayerowned">
+            <set_value name="$quotaDeliveryClass" exact="'Stations'"/>
+          </do_elseif>
+          <do_elseif value="@$entrySellStation.isclass.ship and @$entrySellStation.isplayerowned and @$entrySellStation.type == shiptype.carrier">
+            <set_value name="$quotaDeliveryClass" exact="'Carrier'"/>
+          </do_elseif>
+          <do_elseif value="@$entrySellStation.isclass.ship and @$entrySellStation.isplayerowned and @$entrySellStation.primarypurpose == purpose.auxiliary">
+            <set_value name="$quotaDeliveryClass" exact="'Aux'"/>
+          </do_elseif>
+          <do_elseif value="@$entrySellStation.isclass.buildstorage and $entrySellStation.base? and @$entrySellStation.base.isplayerowned">
+            <set_value name="$quotaDeliveryClass" exact="'Buildstorage'"/>
+          </do_elseif>
+        </do_if>
+        <do_if value="$quotaWare? and ($quotaDeliveryClass == 'Buildstorage' or $quotaDeliveryClass == 'Stations' or $quotaDeliveryClass == 'Aux' or $quotaDeliveryClass == 'Carrier')">
+          <do_if value="not $foundPerWare.{$quotaWare}?">
+            <set_value name="$foundPerWare.{$quotaWare}" exact="table[$Buildstorage = 0, $Stations = 0, $Aux = 0, $Carrier = 0]"/>
+          </do_if>
+          <set_value name="$quotaWareFoundCount" exact="0"/>
+          <do_if value="$quotaDeliveryClass == 'Buildstorage'">
+            <set_value name="$quotaWareFoundCount" exact="if $foundPerWare.{$quotaWare}.$Buildstorage? then $foundPerWare.{$quotaWare}.$Buildstorage else 0"/>
+          </do_if>
+          <do_elseif value="$quotaDeliveryClass == 'Stations'">
+            <set_value name="$quotaWareFoundCount" exact="if $foundPerWare.{$quotaWare}.$Stations? then $foundPerWare.{$quotaWare}.$Stations else 0"/>
+          </do_elseif>
+          <do_elseif value="$quotaDeliveryClass == 'Aux'">
+            <set_value name="$quotaWareFoundCount" exact="if $foundPerWare.{$quotaWare}.$Aux? then $foundPerWare.{$quotaWare}.$Aux else 0"/>
+          </do_elseif>
+          <do_elseif value="$quotaDeliveryClass == 'Carrier'">
+            <set_value name="$quotaWareFoundCount" exact="if $foundPerWare.{$quotaWare}.$Carrier? then $foundPerWare.{$quotaWare}.$Carrier else 0"/>
+          </do_elseif>
           <do_if value="$quotaWareFoundCount ge $perWareCap">
             <set_value name="$rejReasons.$per_ware_quota" exact="if $rejReasons.$per_ware_quota? then $rejReasons.$per_ware_quota+1 else 1"/>
             <set_value name="$rejTotal" operation="add"/>
@@ -1028,17 +1069,28 @@
         <!-- Entry passed all filters -->
         <append_to_list name="$tradeList" exact="$entry"/>
         <set_value name="$foundCount" operation="add"/>
-        <do_if value="$quotaWare?">
-          <set_value name="$foundPerWare.{$quotaWare}" exact="if $foundPerWare.{$quotaWare}? then ($foundPerWare.{$quotaWare} + 1) else 1"/>
+        <do_if value="$quotaWare? and ($quotaDeliveryClass == 'Buildstorage' or $quotaDeliveryClass == 'Stations' or $quotaDeliveryClass == 'Aux' or $quotaDeliveryClass == 'Carrier')">
+          <do_if value="not $foundPerWare.{$quotaWare}?">
+            <set_value name="$foundPerWare.{$quotaWare}" exact="table[$Buildstorage = 0, $Stations = 0, $Aux = 0, $Carrier = 0]"/>
+          </do_if>
+          <do_if value="$quotaDeliveryClass == 'Buildstorage'">
+            <set_value name="$foundPerWare.{$quotaWare}.$Buildstorage" exact="if $foundPerWare.{$quotaWare}.$Buildstorage? then ($foundPerWare.{$quotaWare}.$Buildstorage + 1) else 1"/>
+          </do_if>
+          <do_elseif value="$quotaDeliveryClass == 'Stations'">
+            <set_value name="$foundPerWare.{$quotaWare}.$Stations" exact="if $foundPerWare.{$quotaWare}.$Stations? then ($foundPerWare.{$quotaWare}.$Stations + 1) else 1"/>
+          </do_elseif>
+          <do_elseif value="$quotaDeliveryClass == 'Aux'">
+            <set_value name="$foundPerWare.{$quotaWare}.$Aux" exact="if $foundPerWare.{$quotaWare}.$Aux? then ($foundPerWare.{$quotaWare}.$Aux + 1) else 1"/>
+          </do_elseif>
+          <do_elseif value="$quotaDeliveryClass == 'Carrier'">
+            <set_value name="$foundPerWare.{$quotaWare}.$Carrier" exact="if $foundPerWare.{$quotaWare}.$Carrier? then ($foundPerWare.{$quotaWare}.$Carrier + 1) else 1"/>
+          </do_elseif>
         </do_if>
         <do_if value="$entry.$Score gt $bestScore">
           <set_value name="$bestScore" exact="$entry.$Score"/>
           <set_value name="$bestTrade" exact="$entry"/>
         </do_if>
-        <!-- Stop once we have enough valid trades -->
-        <do_if value="$foundCount ge $maxEntries">
-          <break/>
-        </do_if>
+        <!-- Scan the full MK4-2 pool; per-ship class re-score + searchDepth cap happen in the order script. -->
         <do_if value="($i % 10) == 0">
           <wait exact="this.$gt_yieldMs * 1ms" comment="Yield cache scan loop"/>
         </do_if>

@@ -708,131 +708,11 @@
         </do_if>
       </do_if>
 
-      <!-- Shared GT maintenance -->
-      <signal_objects object="player.galaxy" param="'GT_DoMaintenance'" param2="this.ship"/>
-      <wait exact="2s"/>
-
-      <!-- =========================================================================
-           RESUPPLY EXECUTOR: turn the shopping list gt_maintenance.xml prepared into
-           an actual wharf build. gt_maintenance.xml's DoMaintenance / ExecuteMaintenance
-           cues only build $ammotable + $unittable and stash them in
-           global.$GT_ResupplyOrders.{$ship} - they do NOT call add_build_to_modify_ship
-           themselves. The trader scripts (order.trade.galaxytrader.xml ~2052-2205,
-           order.trade.galaxytradermk4.xml ~2237-2310) host the executor for trader
-           ships; without an equivalent block here collector-drone restock from GT_Maintenance
-           sat in $GT_ResupplyOrders forever and the ship never undocked. Mirrors the
-           trader pattern: docking-bay verify -> add_build_to_modify_ship -> wait up
-           to 900s for GT_Maintenance_Complete (signaled by gt_maintenance.xml's
-           ProcessResupplyComplete after order.build.equip.xml's completion patch
-           queues GT_ResupplyComplete on wharf finish).
-
-           ALIGNED WITH v8 (proven baseline). Differences vs the prior v9 draft:
-           - No separate Repair branch: gt_maintenance.xml's RepairOrders flow is not
-             produced for miners in the current pipeline; if it is later, mirror the
-             trader pattern. Adding a stub create_order here was speculative and could
-             have raced with the resupply wait below.
-           - No this.$maintenance_transition flag: nothing in v9 actually consumes it,
-             and leaving stale state on aborts requires extra cleanup.
-           - The 900s wait is gated on $buildSuccessful: a failed wharf call never
-             fires GT_Maintenance_Complete, so the prior "wait whenever a tracking
-             entry exists" branch could hang for 900s on every dead station.
-           - On a failed build we apply a 5min cooldown via global.$GT_MaintenanceFailedResupply.
-           ========================================================================= -->
-      <do_if value="global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{this.ship}?">
-        <set_value name="$resupplyData" exact="global.$GT_ResupplyOrders.{this.ship}"/>
-        <set_value name="$ammoTableKeys" exact="@$resupplyData.$AmmoTable.keys"/>
-        <set_value name="$ammoTableCount" exact="@$ammoTableKeys.count"/>
-        <set_value name="$unitTableKeys" exact="@$resupplyData.$UnitTable.keys"/>
-        <set_value name="$unitTableCount" exact="@$unitTableKeys.count"/>
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Found pending resupply order at ' + @$resupplyData.$Station.knownname + ' (Ammo types=' + $ammoTableCount + ', Unit types=' + $unitTableCount + ') - executing add_build_to_modify_ship'" chance="100"/>
-        </do_if>
-
-        <do_if value="$ammoTableCount? or $unitTableCount?">
-          <set_value name="$resupplyStation" exact="$resupplyData.$Station"/>
-          <set_value name="$canDockResupply" exact="false"/>
-          <do_if value="@$resupplyStation.exists">
-            <run_script name="'lib.gt.dockcheck'" result="$minerResupplyDockResult">
-              <param name="ship" value="this.ship"/>
-              <param name="station" value="$resupplyStation"/>
-              <param name="purpose" value="'service_ai'"/>
-            </run_script>
-            <set_value name="$canDockResupply" exact="$minerResupplyDockResult.$CanDock"/>
-          </do_if>
-
-          <do_if value="$canDockResupply">
-            <set_value name="$buildSuccessful" exact="false"/>
-            <add_build_to_modify_ship
-                object="$resupplyStation"
-                buildobject="this.ship"
-                ammo="$resupplyData.$AmmoTable"
-                units="$resupplyData.$UnitTable"
-                immediate="false"
-                internal="true"
-                result="$buildSuccessful"/>
-
-            <do_if value="$buildSuccessful">
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': add_build_to_modify_ship OK at ' + $resupplyStation.knownname + ' - waiting up to 900s for GT_Maintenance_Complete'" chance="100"/>
-              </do_if>
-
-              <wait max="900s">
-                <interrupt>
-                  <conditions>
-                    <event_object_signalled object="this.ship" param="'GT_Maintenance_Complete'"/>
-                  </conditions>
-                  <actions>
-                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                      <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': GT_Maintenance_Complete received, resuming mining'" chance="100"/>
-                    </do_if>
-                  </actions>
-                </interrupt>
-              </wait>
-
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': resupply wait ended (completion or 900s timeout) - continuing main_loop'" chance="100"/>
-              </do_if>
-            </do_if>
-            <do_else>
-              <!-- Build call rejected (station cannot fulfill the order, e.g. no probe stock).
-                   Drop the tracking so DoMaintenance can retry on the next cycle, and apply a
-                   5-min cooldown on the AI side so we do not hammer the same dead station. The
-                   same blackboard variable is read by the mining routine's BUY block to
-                   throttle its own GT_DoMaintenance signal. -->
-              <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': add_build_to_modify_ship FAILED at ' + $resupplyStation.knownname + ' - clearing tracking + 5min cooldown'" chance="100"/>
-              <remove_value name="global.$GT_ResupplyOrders.{this.ship}"/>
-              <do_if value="global.$GT_MaintenanceOrders? and global.$GT_MaintenanceOrders.{this.ship}?">
-                <remove_value name="global.$GT_MaintenanceOrders.{this.ship}"/>
-              </do_if>
-              <do_if value="not global.$GT_MaintenanceFailedResupply?">
-                <set_value name="global.$GT_MaintenanceFailedResupply" exact="table[]"/>
-              </do_if>
-              <set_value name="global.$GT_MaintenanceFailedResupply.{this.ship}" exact="player.age + 300s"/>
-            </do_else>
-          </do_if>
-          <do_else>
-            <!-- Resupply station is no longer reachable for this ship's dock size. Drop the
-                 tracking so the next cycle picks a different station. -->
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': resupply station ' + @$resupplyStation.knownname + ' has no compatible dock (ship size=' + this.ship.docksize + ') - clearing tracking'" chance="100"/>
-            </do_if>
-            <remove_value name="global.$GT_ResupplyOrders.{this.ship}"/>
-            <do_if value="global.$GT_MaintenanceOrders? and global.$GT_MaintenanceOrders.{this.ship}?">
-              <remove_value name="global.$GT_MaintenanceOrders.{this.ship}"/>
-            </do_if>
-          </do_else>
-        </do_if>
-        <do_else>
-          <!-- Empty shopping list - nothing to buy, just clean up. -->
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': empty resupply shopping list - clearing tracking'" chance="100"/>
-          </do_if>
-          <remove_value name="global.$GT_ResupplyOrders.{this.ship}"/>
-          <do_if value="global.$GT_MaintenanceOrders? and global.$GT_MaintenanceOrders.{this.ship}?">
-            <remove_value name="global.$GT_MaintenanceOrders.{this.ship}"/>
-          </do_if>
-        </do_else>
-      </do_if>
+      <!-- Shared GT maintenance (repair + resupply - same pipeline as MK3/MK4) -->
+      <run_script name="'lib.gt.maintenance.execute'">
+        <param name="ship" value="this.ship"/>
+        <param name="logPrefix" value="'GT-Miner'"/>
+      </run_script>
 
       <!-- Resolve home anchor.
            Home Station defines the operating anchor when set; Home Sector is the fallback
@@ -2699,6 +2579,11 @@
       </do_if>
       <return/>
     </do_if>
+
+    <do_if value="not this.$maintenance_transition? and global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{this.ship}?">
+      <remove_value name="global.$GT_ResupplyOrders.{this.ship}"/>
+    </do_if>
+    <remove_value name="this.$maintenance_transition"/>
 
     <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': on_abort cleanup start. commander=' + (if this.ship.commander? and this.ship.commander.exists then this.ship.commander.idcode else 'NONE') + ', default=' + (if this.ship.defaultorder? then @this.ship.defaultorder.id else 'NONE') + ', overflowDetached=' + this.$minerDetachedForOverflow" chance="this.$debugchance"/>
     <!-- Safety reattach:

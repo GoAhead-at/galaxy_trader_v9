@@ -17,20 +17,42 @@
         <return/>
       </do_if>
 
-      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-        <debug_text text="'[' + $logPrefix + '] ' + $ship.idcode + ': Requesting maintenance check'" chance="100"/>
+      <run_script name="'lib.gt.reroute.clear'">
+        <param name="ship" value="$ship"/>
+        <param name="logPrefix" value="$logPrefix"/>
+      </run_script>
+
+      <!-- If MD already issued maintenance and is waiting for repair/equipment completion, do not
+           re-signal GT_DoMaintenance or recreate orders from stale global.$GT_RepairOrders tables
+           (repair leg may be done while equipment is still in flight). -->
+      <set_value name="$maintenanceInFlight" exact="false"/>
+      <do_if value="global.$GT_MaintenanceOrders? and global.$GT_MaintenanceOrders.{$ship}?">
+        <set_value name="$inFlightWaitingEquipment" exact="@global.$GT_MaintenanceOrders.{$ship}.$WaitingForEquipment"/>
+        <set_value name="$inFlightWaitingRepair" exact="@global.$GT_MaintenanceOrders.{$ship}.$WaitingForRepair"/>
+        <do_if value="$inFlightWaitingEquipment or $inFlightWaitingRepair">
+          <set_value name="$maintenanceInFlight" exact="true"/>
+        </do_if>
       </do_if>
 
-      <signal_objects object="player.galaxy" param="'GT_DoMaintenance'" param2="$ship"/>
-      <wait exact="$mdPrepareWait"/>
+      <do_if value="not $maintenanceInFlight">
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[' + $logPrefix + '] ' + $ship.idcode + ': Requesting maintenance check'" chance="100"/>
+        </do_if>
+
+        <signal_objects object="player.galaxy" param="'GT_DoMaintenance'" param2="$ship"/>
+        <wait exact="$mdPrepareWait"/>
+      </do_if>
+      <do_elseif value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[' + $logPrefix + '] ' + $ship.idcode + ': Maintenance already in flight (WaitingForEquipment=' + $inFlightWaitingEquipment + ', WaitingForRepair=' + $inFlightWaitingRepair + ') - skipping new DoMaintenance'" chance="100"/>
+      </do_elseif>
 
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
         <set_value name="$diagHasRepair" exact="global.$GT_RepairOrders? and global.$GT_RepairOrders.{$ship}?"/>
         <set_value name="$diagHasResupply" exact="global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{$ship}?"/>
-        <debug_text text="'[' + $logPrefix + '] ' + $ship.idcode + ': Maintenance check result: RepairOrder=' + $diagHasRepair + ', ResupplyOrder=' + $diagHasResupply + ', HullPct=' + $ship.hullpercentage + '%'" chance="100"/>
+        <debug_text text="'[' + $logPrefix + '] ' + $ship.idcode + ': Maintenance check result: RepairOrder=' + $diagHasRepair + ', ResupplyOrder=' + $diagHasResupply + ', HullPct=' + $ship.hullpercentage + '%, InFlight=' + $maintenanceInFlight" chance="100"/>
       </do_if>
 
-      <do_if value="global.$GT_RepairOrders? and global.$GT_RepairOrders.{$ship}?">
+      <do_if value="not $maintenanceInFlight and global.$GT_RepairOrders? and global.$GT_RepairOrders.{$ship}?">
         <set_value name="$repairData" exact="global.$GT_RepairOrders.{$ship}"/>
         <set_value name="$repairStation" exact="$repairData.$Station"/>
 
@@ -54,7 +76,21 @@
           </do_if>
         </do_if>
 
-        <do_if value="$canDockRepair">
+        <!-- Hull may already be healthy if repair finished but global.$GT_RepairOrders was not cleared yet. -->
+        <set_value name="$hullAlreadyHealthy" exact="false"/>
+        <do_if value="@global.$GT_GlobalSettings.$AutoRepair.$Enabled">
+          <set_value name="$repairThreshold" exact="@global.$GT_GlobalSettings.$AutoRepair.$HullThreshold"/>
+          <do_if value="$ship.hullpercentage ge $repairThreshold">
+            <set_value name="$hullAlreadyHealthy" exact="true"/>
+          </do_if>
+        </do_if>
+        <do_if value="$hullAlreadyHealthy">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[' + $logPrefix + '] ' + $ship.idcode + ': Hull already at ' + $ship.hullpercentage + '% (threshold ' + $repairThreshold + '%) - skipping stale repair order'" chance="100"/>
+          </do_if>
+          <remove_value name="global.$GT_RepairOrders.{$ship}"/>
+        </do_if>
+        <do_elseif value="$canDockRepair">
           <debug_text text="'[' + $logPrefix + '] ' + $ship.idcode + ': Creating Repair order at ' + $repairStation.knownname" chance="100"/>
           <set_value name="this.$maintenance_transition" exact="true"/>
           <create_order object="$ship" id="'Repair'" immediate="false" priority="true">
@@ -65,10 +101,15 @@
             <param name="urgent" value="false"/>
             <param name="internalorder" value="true"/>
           </create_order>
-        </do_if>
+          <remove_value name="global.$GT_RepairOrders.{$ship}"/>
+          <run_script name="'lib.gt.attention.refresh_ship_name'">
+            <param name="ship" value="$ship"/>
+            <param name="force" value="true"/>
+          </run_script>
+        </do_elseif>
       </do_if>
 
-      <do_if value="global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{$ship}?">
+      <do_if value="not $maintenanceInFlight and global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{$ship}?">
         <set_value name="$resupplyData" exact="global.$GT_ResupplyOrders.{$ship}"/>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[' + $logPrefix + '] ' + $ship.idcode + ': CREATING RESUPPLY BUILD ORDER at ' + $resupplyData.$Station.knownname" chance="100"/>
@@ -141,7 +182,7 @@
         </do_else>
       </do_if>
 
-      <do_if value="(global.$GT_RepairOrders? and global.$GT_RepairOrders.{$ship}?) or (global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{$ship}?)">
+      <do_if value="$maintenanceInFlight or (global.$GT_RepairOrders? and global.$GT_RepairOrders.{$ship}?) or (global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{$ship}?)">
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[' + $logPrefix + '] ' + $ship.idcode + ': Waiting for maintenance orders to complete (max 900s)...'" chance="100"/>
         </do_if>

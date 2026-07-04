@@ -169,6 +169,17 @@
         </do_else>
       </actions>
     </handler>
+
+    <!-- Proactive threat abort: sector blacklisted while ship is en route -->
+    <handler>
+      <conditions>
+        <event_object_signalled object="this.ship" param="'GT_Destination_Threatened'"/>
+      </conditions>
+      <actions>
+        <set_value name="this.$destinationThreatened" exact="true"/>
+        <set_value name="this.$destinationThreatData" exact="event.param2"/>
+      </actions>
+    </handler>
     
     <!-- High-Performance Training Event Handlers -->
     <handler>
@@ -1698,6 +1709,15 @@
       
       <label name="main_loop"/>
 
+      <do_if value="this.$destinationThreatened?">
+        <run_script name="'lib.gt.threat.abort'">
+          <param name="ship" value="this.ship"/>
+          <param name="threatData" value="if this.$destinationThreatData? then this.$destinationThreatData else null"/>
+        </run_script>
+        <remove_value name="this.$destinationThreatened"/>
+        <remove_value name="this.$destinationThreatData"/>
+      </do_if>
+
       <!-- Idle park timed release (trader keeps searching; hold expiry handled here). -->
       <run_script name="'lib.gt.idlepark'">
         <param name="handoffMode" value="'check_timed_release'"/>
@@ -2661,6 +2681,7 @@
               <check_any>
                 <event_object_signalled object="this.ship" param="'GT_Trade_Completed'"/>
                 <event_object_signalled object="this.ship" param="'GT_Trade_Failed'"/>
+                <event_object_signalled object="this.ship" param="'GT_Destination_Threatened'"/>
               </check_any>
             </conditions>
             <actions>
@@ -2993,23 +3014,6 @@
               <!-- CARGO DISPOSAL: Reset cargo disposal failure counter on successful trade -->
               <do_if value="this.$cargoDisposalFailed?">
                 <set_value name="this.$cargoDisposalFailed" exact="0"/>
-              </do_if>
-              
-              <!-- Clear reroute flag (new destination found) -->
-              <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}? and global.$GT_Ships.{this.ship}.$Rerouting?">
-                <remove_value name="global.$GT_Ships.{this.ship}.$Rerouting"/>
-                
-                <!-- Trigger ship rename to remove [REROUTE] state -->
-                <do_if value="@this.ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}?">
-                  <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
-                    $Ship=this.ship, 
-                    $pilot=this.ship.pilot, 
-                    $xp=global.$GT_Pilots.{this.ship.pilot}.$XP, 
-                    $level=global.$GT_Pilots.{this.ship.pilot}.$Level,
-                    $rank=@global.$GT_Pilots.{this.ship.pilot}.$CurrentRank,
-                    $nameType='trader'
-                  ]"/>
-                </do_if>
               </do_if>
               
               <resume label="trade_found"/>
@@ -3994,6 +3998,12 @@
       <!-- TRADE FOUND - VALIDATE BLACKLIST FIRST   -->
       <!-- ========================================= -->
       <label name="trade_found"/>
+
+      <run_script name="'lib.gt.reroute.clear'">
+        <param name="ship" value="this.ship"/>
+        <param name="logPrefix" value="'GT-AI'"/>
+      </run_script>
+
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': REACHED trade_found label - starting blacklist validation at game time ' + player.age" chance="100"/>
       </do_if>
@@ -6462,6 +6472,19 @@
               '\n  SELL: ' + $sellOrderText"
               chance="100"/>
           </do_if>
+
+          <!-- Register full trade route for proactive threat notification (sector index) -->
+          <set_value name="$routeRegDest" exact="if $isSellOnlyTradeForPending then $sellSector else $buySector"/>
+          <do_if value="$routeRegDest?">
+            <run_script name="'lib.gt.route.registry'">
+              <param name="mode" value="'register'"/>
+              <param name="ship" value="this.ship"/>
+              <param name="destinationSector" value="$routeRegDest"/>
+              <param name="sellSector" value="if $isSellOnlyTradeForPending then null else $sellSector"/>
+              <param name="leg" value="if $isSellOnlyTradeForPending then 'sell' else 'buy'"/>
+              <param name="blacklistGroup" value="if this.$blacklistgroup? then this.$blacklistgroup else blacklistgroup.civilian"/>
+            </run_script>
+          </do_if>
           
           <!-- Send logbook message when ship is escaping from blacklisted sector -->
           <set_value name="$isEscapeTrade" exact="false"/>
@@ -6995,6 +7018,7 @@
             <check_any>
               <event_object_signalled object="this.ship" param="'GT_Trade_Completed'"/>
               <event_object_signalled object="this.ship" param="'GT_Trade_Failed'"/>
+              <event_object_signalled object="this.ship" param="'GT_Destination_Threatened'"/>
             </check_any>
           </conditions>
           <actions>
@@ -7074,6 +7098,10 @@
                 </do_else>
               </do_else>
             </do_elseif>
+            <do_elseif value="event.param == 'GT_Destination_Threatened'">
+              <set_value name="this.$destinationThreatened" exact="true"/>
+              <set_value name="this.$destinationThreatData" exact="event.param2"/>
+            </do_elseif>
             <resume label="trade_completed"/>
           </actions>
         </interrupt>
@@ -7085,6 +7113,17 @@
       </do_if>
       
       <label name="trade_completed"/>
+
+      <do_if value="this.$destinationThreatened?">
+        <run_script name="'lib.gt.threat.abort'">
+          <param name="ship" value="this.ship"/>
+          <param name="threatData" value="if this.$destinationThreatData? then this.$destinationThreatData else null"/>
+        </run_script>
+        <remove_value name="this.$destinationThreatened"/>
+        <remove_value name="this.$destinationThreatData"/>
+        <set_value name="this.$failureReason" exact="'DESTINATION_THREATENED'"/>
+        <set_value name="this.$tryNextTrade" exact="true"/>
+      </do_if>
       
       <!-- Sell-leg gate / market failure with cargo: skip market refresh wait and enter disposal immediately. -->
       <set_value name="$hasCargoAfterTrade" exact="this.ship.cargo.free.all lt this.ship.cargo.capacity.all"/>

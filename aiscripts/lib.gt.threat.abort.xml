@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="utf-8"?>
+<aiscript name="lib.gt.threat.abort" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <!--
+    Proactive mid-trade threat abort (GT_Destination_Threatened response).
+    Cancels trade legs, logs {77000,3209}, feeds GT_TradeFailure pathing pipeline.
+  -->
+  <params>
+    <param name="ship" default="this.ship"/>
+    <param name="threatData" default="null"/>
+    <param name="logPrefix" default="'GT-Threat'"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <do_if value="not $ship? or not @$ship.exists">
+        <return/>
+      </do_if>
+
+      <!-- Idempotency: skip duplicate abort within 10s -->
+      <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$ThreatAbortHandled?">
+        <do_if value="(player.age - global.$GT_Ships.{$ship}.$ThreatAbortHandled) lt 10s">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[' + $logPrefix + '] ' + $ship.idcode + ': threat abort skipped (already handled ' + (player.age - global.$GT_Ships.{$ship}.$ThreatAbortHandled) + ' ago)'" chance="100"/>
+          </do_if>
+          <return/>
+        </do_if>
+      </do_if>
+
+      <do_if value="not global.$GT_Ships?">
+        <set_value name="global.$GT_Ships" exact="table[]"/>
+      </do_if>
+      <do_if value="not global.$GT_Ships.{$ship}?">
+        <set_value name="global.$GT_Ships.{$ship}" exact="table[]"/>
+      </do_if>
+
+      <set_value name="global.$GT_Ships.{$ship}.$ThreatAbortHandled" exact="player.age"/>
+      <set_value name="global.$GT_Ships.{$ship}.$Rerouting" exact="true"/>
+
+      <set_value name="$threatSector" exact="null"/>
+      <set_value name="$threatLevel" exact="0"/>
+      <do_if value="$threatData? and $threatData != null">
+        <set_value name="$threatSector" exact="@$threatData.$Sector"/>
+        <set_value name="$threatLevel" exact="if $threatData.$ThreatLevel? then $threatData.$ThreatLevel else 0"/>
+      </do_if>
+      <set_value name="$threatSectorName" exact="if $threatSector? then @$threatSector.knownname else 'Unknown'"/>
+
+      <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[' + $logPrefix + '] ' + $ship.idcode + ': DESTINATION THREATENED abort (sector=' + $threatSectorName + ', level=' + $threatLevel + ')'" chance="100"/>
+      </do_if>
+
+      <do_if value="$ship.pilot? and global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}?">
+        <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
+          $Ship = $ship,
+          $pilot = $ship.pilot,
+          $xp = global.$GT_Pilots.{$ship.pilot}.$XP,
+          $level = global.$GT_Pilots.{$ship.pilot}.$Level,
+          $rank = @global.$GT_Pilots.{$ship.pilot}.$CurrentRank,
+          $nameType = 'trader'
+        ]"/>
+      </do_if>
+
+      <set_value name="$logbookMessage" exact="{77000,3209}.[$threatSectorName, $threatLevel, $ship.knownname]"/>
+      <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
+        $Message = $logbookMessage,
+        $Category = 'alerts',
+        $Title = 'Urgent Route Alert: ' + $ship.knownname,
+        $Object = $ship,
+        $Ship = $ship,
+        $Interaction = 'showonmap',
+        $Highlighted = false,
+        $CheckGlobalSettings = false,
+        $RespectPerShipLogbook = true
+      ]"/>
+
+      <!-- Cancel active trade legs -->
+      <do_if value="$ship.tradeorders? and $ship.tradeorders.count gt 0">
+        <set_value name="$pendingTrades" exact="$ship.tradeorders"/>
+        <do_all exact="$pendingTrades.count" counter="$tci" reverse="true">
+          <set_value name="$pendingOrder" exact="$pendingTrades.{$tci}"/>
+          <do_if value="$pendingOrder?">
+            <cancel_order order="$pendingOrder"/>
+          </do_if>
+        </do_all>
+      </do_if>
+
+      <run_script name="'lib.gt.route.registry'">
+        <param name="mode" value="'clear'"/>
+        <param name="ship" value="$ship"/>
+      </run_script>
+
+      <!-- Feed unified trade-failure pipeline (pathing / try next trade) -->
+      <do_if value="$ship.pilot? and global.$GT_Pilots? and global.$GT_Pilots.{$ship.pilot}?">
+        <set_value name="$failurePartner" exact="null"/>
+        <do_if value="global.$GT_ActiveTrade? and global.$GT_ActiveTrade.{$ship}?">
+          <do_if value="global.$GT_ActiveTrade.{$ship}.$BuyStation?">
+            <set_value name="$failurePartner" exact="global.$GT_ActiveTrade.{$ship}.$BuyStation"/>
+          </do_if>
+        </do_if>
+        <set_value name="$failure_data" exact="table[
+          $Ship = $ship,
+          $pilot = $ship.pilot,
+          $reason = 'DESTINATION_THREATENED',
+          $failureText = 'Threat detected on planned trade route.',
+          $ware = if global.$GT_ActiveTrade? and global.$GT_ActiveTrade.{$ship}? and global.$GT_ActiveTrade.{$ship}.$Ware? then global.$GT_ActiveTrade.{$ship}.$Ware else null,
+          $partner = $failurePartner,
+          $isBuying = true,
+          $timestamp = player.age
+        ]"/>
+        <do_if value="not global.$GT_TradeFailureQueue?">
+          <set_value name="global.$GT_TradeFailureQueue" exact="[]"/>
+        </do_if>
+        <append_to_list name="global.$GT_TradeFailureQueue" exact="$failure_data"/>
+        <signal_objects object="player.galaxy" param="'GT_TradeFailure'"/>
+      </do_if>
+    </actions>
+  </attention>
+</aiscript>

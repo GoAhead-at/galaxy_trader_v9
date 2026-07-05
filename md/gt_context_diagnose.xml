@@ -3636,6 +3636,50 @@
             <set_value name="$diagCacheTTL" exact="@global.$GT_GlobalSettings.$Fleet.$CacheTTL"/>
           </do_if>
 
+          <!-- Cache Validation section: per-entry PASS/FAIL with first failing gate (mirrors lib.gt.cache.search gate order). -->
+          <set_value name="$sec7v" exact="table[]"/>
+          <set_value name="$sec7v.$Name" exact="'Cache Validation'"/>
+          <set_value name="$sec7v.$Rows" exact="[]"/>
+          <set_value name="$cvDataRows" exact="[]"/>
+          <set_value name="$cvPassCount" exact="0"/>
+          <set_value name="$cvMaxRows" exact="100"/>
+          <set_value name="$diagCacheDropoff" exact="15"/>
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$CacheDropoffTolerance?">
+            <set_value name="$diagCacheDropoff" exact="@global.$GT_GlobalSettings.$Fleet.$CacheDropoffTolerance"/>
+          </do_if>
+          <set_value name="$diagBandSellMax" exact="$activeSellPriceMax"/>
+          <set_value name="$diagBandBuyMin" exact="$activeBuyPriceMin"/>
+          <set_value name="$diagBandPriceCheckActive" exact="false"/>
+          <set_value name="$diagBandSellMaxRelaxed" exact="$diagBandSellMax"/>
+          <set_value name="$diagBandBuyMinRelaxed" exact="$diagBandBuyMin"/>
+          <set_value name="$diagBandSupplierQtyMax" exact="2.0"/>
+          <set_value name="$diagBandCustomerQtyMin" exact="0.0"/>
+          <set_value name="$diagBandMinQtySpread" exact="0.0"/>
+          <do_if value="not ($diagBandSellMax ge 1.0 and $diagBandBuyMin le -1.0)">
+            <set_value name="$diagBandPriceCheckActive" exact="true"/>
+            <set_value name="$diagBandDropoffPct" exact="if $diagCacheDropoff gt 0 then $diagCacheDropoff else 0"/>
+            <set_value name="$diagBandSellSlack" exact="[$diagBandSellMax, -$diagBandSellMax].max * ($diagBandDropoffPct / 100.0)"/>
+            <set_value name="$diagBandBuySlack" exact="[$diagBandBuyMin, -$diagBandBuyMin].max * ($diagBandDropoffPct / 100.0)"/>
+            <set_value name="$diagBandSellMaxRelaxed" exact="$diagBandSellMax + $diagBandSellSlack"/>
+            <set_value name="$diagBandBuyMinRelaxed" exact="$diagBandBuyMin - $diagBandBuySlack"/>
+            <set_value name="$diagBandSupplierQtyMax" exact="1.0 + $diagBandSellMaxRelaxed"/>
+            <set_value name="$diagBandCustomerQtyMin" exact="1.0 + $diagBandBuyMinRelaxed"/>
+            <set_value name="$diagBandMinQtySpread" exact="$diagBandBuyMinRelaxed - $diagBandSellMaxRelaxed"/>
+          </do_if>
+          <set_value name="$diagRequireNonPlayerDelivery" exact="false"/>
+          <do_if value="$ignorePlayerPricing and $orderId == 'GalaxyTraderMK3'">
+            <set_value name="$diagRequireNonPlayerDelivery" exact="true"/>
+          </do_if>
+          <set_value name="$diagIsolatedForCargoFilter" exact="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?"/>
+          <set_value name="$diagEnableMinCargoUtil" exact="$useMinCargoThreshold and not $diagIsolatedForCargoFilter"/>
+          <set_value name="$diagCacheMinProfit" exact="0"/>
+          <set_value name="$diagCacheMinROI" exact="0"/>
+          <do_if value="$orderId == 'GalaxyTraderMK3'">
+            <set_value name="$diagCacheMinProfit" exact="$finalProfitThreshold"/>
+            <set_value name="$diagCacheMinROI" exact="$effectiveROI"/>
+          </do_if>
+          <set_value name="$cvReasonCounts" exact="table[]"/>
+
           <!-- Count unique wares + cargo compatibility across ALL cache entries (mirrors lib.gt.cache.search). -->
           <!-- NOTE: Must NOT combine @ and ? operators (X4 rule: @$x? is invalid) -->
           <do_all exact="$cacheEntryCount" counter="$wi">
@@ -3841,34 +3885,66 @@
               </do_if>
 
               <set_value name="$tempRuntimeOk" exact="true"/>
-              <do_if value="not $wareEntry.$Score? or $wareEntry.$Score le 0">
-                <set_value name="$tempRuntimeOk" exact="false"/>
-              </do_if>
-              <do_if value="$wareEntry.$IsSellOnly? and $wareEntry.$IsSellOnly">
-                <set_value name="$tempRuntimeOk" exact="false"/>
-              </do_if>
-              <do_if value="not $tempCargoOk">
-                <set_value name="$tempRuntimeOk" exact="false"/>
-              </do_if>
+              <set_value name="$cvReason" exact="''"/>
+              <set_value name="$cvDetail" exact="''"/>
               <set_value name="$cacheEntryTs" exact="if $wareEntry.$CachedAt? then @$wareEntry.$CachedAt else (if $wareEntry.$Timestamp? then @$wareEntry.$Timestamp else null)"/>
-              <do_if value="$cacheEntryTs? and (player.age - $cacheEntryTs) gt $diagCacheTTL">
-                <set_value name="$tempRuntimeOk" exact="false"/>
+              <set_value name="$tempPreBuyAmt" exact="0"/>
+              <set_value name="$tempPreSellAmt" exact="0"/>
+
+              <!-- Gate walk (first fail wins; order mirrors lib.gt.cache.search). -->
+              <do_if value="$cvReason == ''">
+                <do_if value="not $wareEntry.$Score? or $wareEntry.$Score le 0">
+                  <set_value name="$cvReason" exact="'invalid_score'"/>
+                </do_if>
               </do_if>
-              <do_if value="$wareEntry.$FailedShips? and $wareEntry.$FailedShips.count gt 0">
-                <do_all exact="$wareEntry.$FailedShips.count" counter="$cacheFsIdx">
-                  <do_if value="$wareEntry.$FailedShips.{$cacheFsIdx} == $ship">
-                    <set_value name="$tempRuntimeOk" exact="false"/>
+              <do_if value="$cvReason == ''">
+                <do_if value="$wareEntry.$FailedShips? and $wareEntry.$FailedShips.count gt 0">
+                  <do_all exact="$wareEntry.$FailedShips.count" counter="$cacheFsIdx">
+                    <do_if value="$wareEntry.$FailedShips.{$cacheFsIdx} == $ship">
+                      <set_value name="$cvReason" exact="'failed_ships'"/>
+                      <break/>
+                    </do_if>
+                  </do_all>
+                </do_if>
+              </do_if>
+              <do_if value="$cvReason == ''">
+                <do_if value="$wareEntry.$IsSellOnly? and $wareEntry.$IsSellOnly">
+                  <set_value name="$cvReason" exact="'sell_only_entry'"/>
+                </do_if>
+              </do_if>
+              <do_if value="$cvReason == ''">
+                <do_if value="not $tempCargoOk">
+                  <set_value name="$cvReason" exact="'cargo_incompatible'"/>
+                </do_if>
+              </do_if>
+              <do_if value="$cvReason == '' and $wareBasket.count gt 0">
+                <set_value name="$cvWareAllowed" exact="false"/>
+                <do_all exact="$wareBasket.count" counter="$cvWbIdx">
+                  <do_if value="$wareBasket.{$cvWbIdx} == $tempWare">
+                    <set_value name="$cvWareAllowed" exact="true"/>
                     <break/>
                   </do_if>
                 </do_all>
+                <do_if value="not $cvWareAllowed">
+                  <set_value name="$cvReason" exact="'ware_basket'"/>
+                </do_if>
               </do_if>
-              <do_if value="not $wareEntry.$IsSellOnly? and not $tempBuyStationOk">
-                <set_value name="$tempRuntimeOk" exact="false"/>
+              <do_if value="$cvReason == ''">
+                <do_if value="$cacheEntryTs? and (player.age - $cacheEntryTs) gt $diagCacheTTL">
+                  <set_value name="$cvReason" exact="'ttl_expired'"/>
+                  <set_value name="$cvDetail" exact="'' + ((player.age - $cacheEntryTs) / 1s)i + 's gt ' + (($diagCacheTTL / 1s)i) + 's'"/>
+                </do_if>
               </do_if>
-              <do_if value="not $tempSellStationOk">
-                <set_value name="$tempRuntimeOk" exact="false"/>
+              <do_if value="$cvReason == '' and not $wareEntry.$IsSellOnly? and not $tempBuyStationOk">
+                <set_value name="$cvReason" exact="'no_buy_station'"/>
               </do_if>
-              <do_if value="$tempRuntimeOk and ($orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2') and $diagMk4CustomerMustBePlayer">
+              <do_if value="$cvReason == '' and not $tempSellStationOk">
+                <set_value name="$cvReason" exact="'no_sell_station'"/>
+              </do_if>
+              <do_if value="$cvReason == '' and not $wareEntry.$IsSellOnly? and $tempBuyStationOk and $tempSellStationOk and $tempBuyStation == $tempSellStation">
+                <set_value name="$cvReason" exact="'same_station'"/>
+              </do_if>
+              <do_if value="$cvReason == '' and ($orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2') and $diagMk4CustomerMustBePlayer">
                 <set_value name="$tempMk4DeliveryPlayerOk" exact="false"/>
                 <do_if value="$tempSellStationOk and @$tempSellStation.isplayerowned">
                   <set_value name="$tempMk4DeliveryPlayerOk" exact="true"/>
@@ -3877,54 +3953,260 @@
                   <set_value name="$tempMk4DeliveryPlayerOk" exact="true"/>
                 </do_elseif>
                 <do_if value="not $tempMk4DeliveryPlayerOk">
-                  <set_value name="$tempRuntimeOk" exact="false"/>
+                  <set_value name="$cvReason" exact="'mk4_customer_not_player'"/>
                 </do_if>
               </do_if>
-              <do_if value="$tempRuntimeOk and ($orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2') and not $wareEntry.$IsSellOnly?">
+              <do_if value="$cvReason == '' and ($orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2') and not $wareEntry.$IsSellOnly?">
                 <do_if value="not $diagMk4AllowAiSuppliers and (not $tempBuyStationOk or not @$tempBuyStation.isplayerowned)">
-                  <set_value name="$tempRuntimeOk" exact="false"/>
+                  <set_value name="$cvReason" exact="'mk4_supplier_npc_required'"/>
                 </do_if>
-                <do_if value="not $diagMk4AllowPlayerSuppliers and $tempBuyStationOk and @$tempBuyStation.isplayerowned">
-                  <set_value name="$tempRuntimeOk" exact="false"/>
+                <do_if value="$cvReason == '' and not $diagMk4AllowPlayerSuppliers and $tempBuyStationOk and @$tempBuyStation.isplayerowned">
+                  <set_value name="$cvReason" exact="'mk4_supplier_player_required'"/>
                 </do_if>
               </do_if>
-              <do_if value="$tempRuntimeOk and ($orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2') and $diagMk4BuildStorageOnlyMode and not $wareEntry.$IsSellOnly?">
+              <do_if value="$cvReason == '' and $diagRequireNonPlayerDelivery and $tempSellStationOk and @$tempSellStation.isplayerowned">
+                <set_value name="$cvReason" exact="'player_delivery_excluded'"/>
+              </do_if>
+              <do_if value="$cvReason == '' and ($orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2') and $diagMk4DedicatedServe and not $diagMk4BuildStorageOnlyMode and $diagMk4HomeAnchor? and not $wareEntry.$IsSellOnly?">
+                <set_value name="$cvServeHomeMatch" exact="false"/>
+                <do_if value="$diagMk4HomeAnchor.isclass.station and $tempSellStationOk">
+                  <do_if value="$tempSellStation == $diagMk4HomeAnchor">
+                    <set_value name="$cvServeHomeMatch" exact="true"/>
+                  </do_if>
+                  <do_elseif value="$diagMk4HomeAnchor.buildstorage? and $diagMk4HomeAnchor.buildstorage.exists and $tempSellStation == $diagMk4HomeAnchor.buildstorage">
+                    <set_value name="$cvServeHomeMatch" exact="true"/>
+                  </do_elseif>
+                  <do_elseif value="$tempSellStation.isclass.buildstorage and $tempSellStation.base? and $tempSellStation.base.exists and $tempSellStation.base == $diagMk4HomeAnchor">
+                    <set_value name="$cvServeHomeMatch" exact="true"/>
+                  </do_elseif>
+                  <do_elseif value="$tempSellStation.hascontext.{$diagMk4HomeAnchor}">
+                    <set_value name="$cvServeHomeMatch" exact="true"/>
+                  </do_elseif>
+                  <do_elseif value="$diagMk4HomeAnchor.hascontext.{$tempSellStation}">
+                    <set_value name="$cvServeHomeMatch" exact="true"/>
+                  </do_elseif>
+                </do_if>
+                <do_elseif value="$diagMk4HomeSector? and $diagMk4HomeSector.exists and $tempSellStationOk and $tempSellStation.sector? and @$tempSellStation.sector == $diagMk4HomeSector">
+                  <set_value name="$cvServeHomeMatch" exact="true"/>
+                </do_elseif>
+                <do_if value="not $cvServeHomeMatch">
+                  <set_value name="$cvReason" exact="'mk4_serve_home_only'"/>
+                </do_if>
+              </do_if>
+              <do_if value="$cvReason == '' and ($orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2') and $diagMk4BuildStorageOnlyMode and not $wareEntry.$IsSellOnly?">
                 <do_if value="$tempBuyStationOk and @$tempBuyStation.isclass.buildstorage">
-                  <set_value name="$tempRuntimeOk" exact="false"/>
+                  <set_value name="$cvReason" exact="'mk4_bs_only_supplier'"/>
                 </do_if>
-                <do_if value="not $tempSellStationOk or not @$tempSellStation.isclass.buildstorage">
-                  <set_value name="$tempRuntimeOk" exact="false"/>
+                <do_if value="$cvReason == '' and (not $tempSellStationOk or not @$tempSellStation.isclass.buildstorage)">
+                  <set_value name="$cvReason" exact="'mk4_bs_only_delivery'"/>
                 </do_if>
-                <set_value name="$tempMk4BsoInScope" exact="false"/>
-                <!-- Component-based gatedistance (build storage often has no .sector); mirror of fixed cache.search. -->
-                <set_value name="$tempMk4BsoDist" exact="if $homeSector? and $tempSellStationOk then $homeSector.gatedistance.{$tempSellStation} else -1"/>
-                <do_if value="$tempMk4BsoDist ge 0 and ($maxSell le 0 or $tempMk4BsoDist le $maxSell)">
-                  <set_value name="$tempMk4BsoInScope" exact="true"/>
-                </do_if>
-                <do_if value="not $tempMk4BsoInScope">
-                  <set_value name="$tempRuntimeOk" exact="false"/>
+                <do_if value="$cvReason == ''">
+                  <set_value name="$tempMk4BsoDist" exact="if $homeSector? and $tempSellStationOk then $homeSector.gatedistance.{$tempSellStation} else -1"/>
+                  <do_if value="$tempMk4BsoDist lt 0 or ($maxSell gt 0 and $tempMk4BsoDist gt $maxSell)">
+                    <set_value name="$cvReason" exact="'mk4_bs_out_of_coverage'"/>
+                    <set_value name="$cvDetail" exact="'dist=' + $tempMk4BsoDist + ' max=' + $maxSell"/>
+                  </do_if>
                 </do_if>
               </do_if>
-              <!-- Distance: pass the station COMPONENT to gatedistance (mirror of fixed
-                   lib.gt.mk42.cache.search). Build storages often have no .sector accessor, so the
-                   old '.sector?'-guarded form silently skipped the check and reported entries as
-                   readable while the real cache rejected them on distance = -1. -->
-              <do_if value="$tempRuntimeOk and $homeSector? and $homeSector.exists and not $wareEntry.$IsSellOnly?">
+              <do_if value="$cvReason == '' and ($orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2') and not $wareEntry.$IsSellOnly? and $tempSellStationOk and (not $tempSellStation.isclass.buildstorage or $ignoreBuildStorage)">
+                <set_value name="$cvTypeWare" exact="if $tempWare? then $tempWare else null"/>
+                <do_if value="$cvTypeWare?">
+                  <set_value name="$cvMk4IsTradeWare" exact="$tempSellStation.tradewares.{$cvTypeWare}.exists"/>
+                  <set_value name="$cvMk4IsResource" exact="$tempSellStation.resources.{$cvTypeWare}.exists"/>
+                  <set_value name="$cvMk4IsProduct" exact="$tempSellStation.products.{$cvTypeWare}.exists"/>
+                  <set_value name="$cvMk4IsIntermediate" exact="false"/>
+                  <do_if value="$tempSellStation.resources.{$cvTypeWare}.exists and @$tempSellStation.resources.{$cvTypeWare}.intermediate">
+                    <set_value name="$cvMk4IsIntermediate" exact="true"/>
+                  </do_if>
+                  <do_if value="$tempSellStation.products.{$cvTypeWare}.exists and @$tempSellStation.products.{$cvTypeWare}.intermediate">
+                    <set_value name="$cvMk4IsIntermediate" exact="true"/>
+                  </do_if>
+                  <set_value name="$cvMk4IsPureResource" exact="$cvMk4IsResource and not $cvMk4IsIntermediate"/>
+                  <set_value name="$cvMk4IsIntermediateOrProduct" exact="$cvMk4IsIntermediate or $cvMk4IsProduct"/>
+                  <set_value name="$cvMk4HasKnownType" exact="$cvMk4IsTradeWare or $cvMk4IsResource or $cvMk4IsProduct"/>
+                  <set_value name="$cvMk4AllowedByType" exact="false"/>
+                  <do_if value="$cvMk4IsTradeWare and $diagMk4AllowTradewares">
+                    <set_value name="$cvMk4AllowedByType" exact="true"/>
+                  </do_if>
+                  <do_if value="not $cvMk4AllowedByType and $cvMk4IsPureResource and $diagMk4AllowResources">
+                    <set_value name="$cvMk4AllowedByType" exact="true"/>
+                  </do_if>
+                  <do_if value="not $cvMk4AllowedByType and $cvMk4IsIntermediateOrProduct and $diagMk4AllowIntermediates">
+                    <set_value name="$cvMk4AllowedByType" exact="true"/>
+                  </do_if>
+                  <do_if value="$cvMk4HasKnownType and not $cvMk4AllowedByType">
+                    <set_value name="$cvReason" exact="'mk4_ware_type'"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+              <do_if value="$cvReason == '' and $homeSector? and $homeSector.exists and not $wareEntry.$IsSellOnly?">
                 <do_if value="$maxBuy gt 0 and $tempBuyStationOk">
                   <set_value name="$tempDistBuy" exact="$homeSector.gatedistance.{$tempBuyStation}"/>
                   <do_if value="$tempDistBuy lt 0 or $tempDistBuy gt $maxBuy">
-                    <set_value name="$tempRuntimeOk" exact="false"/>
+                    <set_value name="$cvReason" exact="'buy_distance'"/>
+                    <set_value name="$cvDetail" exact="'' + $tempDistBuy + 'j gt max ' + $maxBuy"/>
                   </do_if>
                 </do_if>
-                <do_if value="$maxSell gt 0 and $tempSellStationOk">
+                <do_if value="$cvReason == '' and $maxSell gt 0 and $tempSellStationOk">
                   <set_value name="$tempDistSell" exact="$homeSector.gatedistance.{$tempSellStation}"/>
                   <do_if value="$tempDistSell lt 0 or $tempDistSell gt $maxSell">
-                    <set_value name="$tempRuntimeOk" exact="false"/>
+                    <set_value name="$cvReason" exact="'sell_distance'"/>
+                    <set_value name="$cvDetail" exact="'' + $tempDistSell + 'j gt max ' + $maxSell"/>
                   </do_if>
                 </do_if>
               </do_if>
-              <!-- Trade rules: player-owned stations only (NPC×NPC ignores cantradewith). -->
-              <do_if value="$tempRuntimeOk and not $ignoreTradeRules and not $wareEntry.$IsSellOnly?">
+              <do_if value="$cvReason == '' and not $wareEntry.$IsSellOnly? and $orderId == 'GalaxyTraderMK3'">
+                <do_if value="$diagCacheMinProfit gt 0 and $wareEntry.$Profit? and $wareEntry.$Profit lt $diagCacheMinProfit">
+                  <set_value name="$cvReason" exact="'min_profit'"/>
+                  <set_value name="$cvDetail" exact="'' + ($wareEntry.$Profit / 100) + ' Cr lt ' + ($diagCacheMinProfit / 100) + ' Cr'"/>
+                </do_if>
+                <do_if value="$cvReason == '' and $diagCacheMinROI gt 0 and $wareEntry.$BuyPrice? and $wareEntry.$BuyPrice gt 0 and $wareEntry.$UnitProfit?">
+                  <set_value name="$cvEntryROI" exact="($wareEntry.$UnitProfit * 100) / $wareEntry.$BuyPrice"/>
+                  <do_if value="$cvEntryROI lt $diagCacheMinROI">
+                    <set_value name="$cvReason" exact="'min_roi'"/>
+                    <set_value name="$cvDetail" exact="'' + $cvEntryROI + '% lt ' + $diagCacheMinROI + '%'"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+              <do_if value="$cvReason == '' and $diagCacheDropoff gt 0 and not $wareEntry.$IsSellOnly? and $wareEntry.$UnitProfit? and $wareEntry.$UnitProfit gt 0 and $wareEntry.$BuyOffer? and $wareEntry.$SellOffer?">
+                <do_if value="@$wareEntry.$BuyOffer.exists and @$wareEntry.$SellOffer.exists">
+                  <set_value name="$cvCurBuy" exact="@$wareEntry.$BuyOffer.unitprice"/>
+                  <set_value name="$cvCurSell" exact="@$wareEntry.$SellOffer.unitprice"/>
+                  <do_if value="$cvCurBuy? and $cvCurSell? and $cvCurBuy gt 0">
+                    <set_value name="$cvCurUnitProfit" exact="$cvCurSell - $cvCurBuy"/>
+                    <do_if value="$cvCurUnitProfit le 0">
+                      <set_value name="$cvReason" exact="'profit_dropoff'"/>
+                    </do_if>
+                    <do_elseif value="$wareEntry.$UnitProfit gt 0">
+                      <set_value name="$cvProfitDropPct" exact="(($wareEntry.$UnitProfit - $cvCurUnitProfit) * 100) / $wareEntry.$UnitProfit"/>
+                      <do_if value="$cvProfitDropPct gt $diagCacheDropoff">
+                        <set_value name="$cvReason" exact="'profit_dropoff'"/>
+                        <set_value name="$cvDetail" exact="'drop ' + $cvProfitDropPct + '% gt tol ' + $diagCacheDropoff + '%'"/>
+                      </do_if>
+                    </do_elseif>
+                  </do_if>
+                </do_if>
+              </do_if>
+              <do_if value="$cvReason == '' and $diagBandPriceCheckActive">
+                <set_value name="$cvSkipSupplierBand" exact="false"/>
+                <do_if value="$wareEntry.$PlayerFreeSupplier? and $wareEntry.$PlayerFreeSupplier">
+                  <set_value name="$cvSkipSupplierBand" exact="true"/>
+                </do_if>
+                <do_if value="not $cvSkipSupplierBand and $ignorePlayerPricing and $orderId == 'GalaxyTraderMK3' and $wareEntry.$BuyOffer? and @$wareEntry.$BuyOffer.exists and @$wareEntry.$BuyOffer.owner.isplayerowned">
+                  <set_value name="$cvSkipSupplierBand" exact="true"/>
+                </do_if>
+                <set_value name="$cvCustQty" exact="null"/>
+                <set_value name="$cvSuppQty" exact="null"/>
+                <do_if value="$wareEntry.$SellOffer? and @$wareEntry.$SellOffer.exists">
+                  <do_if value="$wareEntry.$SellOffer.quantityfactor?">
+                    <set_value name="$cvCustQty" exact="@$wareEntry.$SellOffer.quantityfactor"/>
+                  </do_if>
+                  <do_elseif value="$wareEntry.$SellOffer.unitprice? and $wareEntry.$SellOffer.ware? and @$wareEntry.$SellOffer.ware.averageprice gt 0">
+                    <set_value name="$cvCustQty" exact="@$wareEntry.$SellOffer.unitprice / (@$wareEntry.$SellOffer.ware.averageprice * 100)"/>
+                  </do_elseif>
+                  <do_else>
+                    <set_value name="$cvReason" exact="'price_band'"/>
+                  </do_else>
+                  <do_if value="$cvReason == '' and $cvCustQty? and $cvCustQty lt $diagBandCustomerQtyMin">
+                    <set_value name="$cvReason" exact="'price_band'"/>
+                    <set_value name="$cvDetail" exact="'customer qty ' + $cvCustQty + ' lt ' + $diagBandCustomerQtyMin"/>
+                  </do_if>
+                </do_if>
+                <do_elseif value="$cvReason == ''">
+                  <set_value name="$cvReason" exact="'price_band'"/>
+                </do_elseif>
+                <do_if value="$cvReason == '' and not $wareEntry.$IsSellOnly? and not $cvSkipSupplierBand">
+                  <do_if value="$wareEntry.$BuyOffer? and @$wareEntry.$BuyOffer.exists">
+                    <do_if value="$wareEntry.$BuyOffer.quantityfactor?">
+                      <set_value name="$cvSuppQty" exact="@$wareEntry.$BuyOffer.quantityfactor"/>
+                    </do_if>
+                    <do_elseif value="$wareEntry.$BuyOffer.unitprice? and $wareEntry.$BuyOffer.ware? and @$wareEntry.$BuyOffer.ware.averageprice gt 0">
+                      <set_value name="$cvSuppQty" exact="@$wareEntry.$BuyOffer.unitprice / (@$wareEntry.$BuyOffer.ware.averageprice * 100)"/>
+                    </do_elseif>
+                    <do_else>
+                      <set_value name="$cvReason" exact="'price_band'"/>
+                    </do_else>
+                    <do_if value="$cvReason == '' and $cvSuppQty? and $cvSuppQty gt $diagBandSupplierQtyMax">
+                      <set_value name="$cvReason" exact="'price_band'"/>
+                      <set_value name="$cvDetail" exact="'supplier qty ' + $cvSuppQty + ' gt ' + $diagBandSupplierQtyMax"/>
+                    </do_if>
+                  </do_if>
+                  <do_else>
+                    <set_value name="$cvReason" exact="'price_band'"/>
+                  </do_else>
+                  <do_if value="$cvReason == '' and $cvCustQty? and $cvSuppQty? and ($cvCustQty - $cvSuppQty) lt $diagBandMinQtySpread">
+                    <set_value name="$cvReason" exact="'price_band'"/>
+                    <set_value name="$cvDetail" exact="'spread ' + ($cvCustQty - $cvSuppQty) + ' lt ' + $diagBandMinQtySpread"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+              <do_if value="$cvReason == '' and $ignoreBuildStorage">
+                <do_if value="($tempBuyStationOk and @$tempBuyStation.isclass.buildstorage) or ($tempSellStationOk and @$tempSellStation.isclass.buildstorage)">
+                  <set_value name="$cvReason" exact="'build_storage_excluded'"/>
+                </do_if>
+              </do_if>
+              <do_if value="$cvReason == '' and $ignoreCarrierAux">
+                <do_if value="($tempBuyStationOk and @$tempBuyStation.isclass.ship and (@$tempBuyStation.type == shiptype.carrier or @$tempBuyStation.type == shiptype.resupplier)) or ($tempSellStationOk and @$tempSellStation.isclass.ship and (@$tempSellStation.type == shiptype.carrier or @$tempSellStation.type == shiptype.resupplier))">
+                  <set_value name="$cvReason" exact="'carrier_aux_excluded'"/>
+                </do_if>
+              </do_if>
+              <do_if value="$cvReason == '' and not $wareEntry.$IsSellOnly? and $wareEntry.$BuyOffer? and @$wareEntry.$BuyOffer.exists">
+                <set_value name="$tempPreBuyAmt" exact="@$wareEntry.$BuyOffer.offeramount.{$ship}"/>
+                <do_if value="(not $tempPreBuyAmt? or $tempPreBuyAmt le 0) and @$wareEntry.$BuyOffer.amount gt 0">
+                  <set_value name="$tempPreBuyAmt" exact="@$wareEntry.$BuyOffer.amount"/>
+                </do_if>
+                <do_if value="(not $tempPreBuyAmt? or $tempPreBuyAmt le 0) and $tempSellStationOk and $tempWare?">
+                  <set_value name="$tempPreBuyAmt" exact="[0, $tempSellStation.cargo.{$tempWare}.target - $tempSellStation.cargo.{$tempWare}.count].max"/>
+                </do_if>
+                <do_if value="not $tempPreBuyAmt? or $tempPreBuyAmt le 0">
+                  <set_value name="$cvReason" exact="'offer_amount_buy'"/>
+                  <set_value name="$cacheRejectOfferAmount" operation="add"/>
+                </do_if>
+              </do_if>
+              <do_if value="$cvReason == '' and $wareEntry.$SellOffer? and @$wareEntry.$SellOffer.exists">
+                <set_value name="$tempPreSellAmt" exact="@$wareEntry.$SellOffer.offeramount.{$ship}"/>
+                <do_if value="(not $tempPreSellAmt? or $tempPreSellAmt le 0) and @$wareEntry.$SellOffer.amount gt 0">
+                  <set_value name="$tempPreSellAmt" exact="@$wareEntry.$SellOffer.amount"/>
+                </do_if>
+                <do_if value="(not $tempPreSellAmt? or $tempPreSellAmt le 0) and $tempSellStationOk and $tempWare?">
+                  <set_value name="$tempPreSellAmt" exact="[0, $tempSellStation.cargo.{$tempWare}.target - $tempSellStation.cargo.{$tempWare}.count].max"/>
+                </do_if>
+                <do_if value="not $tempPreSellAmt? or $tempPreSellAmt le 0">
+                  <set_value name="$cvReason" exact="'offer_amount_sell'"/>
+                  <set_value name="$cacheRejectOfferAmount" operation="add"/>
+                </do_if>
+              </do_if>
+              <do_if value="$cvReason == '' and $diagEnableMinCargoUtil and not $wareEntry.$IsSellOnly? and $orderId != 'GalaxyTraderMK4Supply' and $orderId != 'GalaxyTraderMK4Supply2'">
+                <set_value name="$cvVolPerUnit" exact="1"/>
+                <do_if value="$tempWare? and $tempWare.volume?">
+                  <set_value name="$cvVolPerUnit" exact="$tempWare.volume"/>
+                </do_if>
+                <set_value name="$cvAmtLimit" exact="$tempPreSellAmt"/>
+                <do_if value="$tempPreBuyAmt? and $tempPreBuyAmt lt $cvAmtLimit">
+                  <set_value name="$cvAmtLimit" exact="$tempPreBuyAmt"/>
+                </do_if>
+                <do_if value="$wareEntry.$Amount? and $wareEntry.$Amount gt 0 and $wareEntry.$Amount lt $cvAmtLimit">
+                  <set_value name="$cvAmtLimit" exact="$wareEntry.$Amount"/>
+                </do_if>
+                <set_value name="$cvTradeVol" exact="$cvAmtLimit * $cvVolPerUnit"/>
+                <set_value name="$cvReqVol" exact="($ship.cargo.capacity.all * $effectiveCargoTarget) / 100.0"/>
+                <do_if value="$cvTradeVol lt $cvReqVol">
+                  <set_value name="$cvUtilPct" exact="if $ship.cargo.capacity.all gt 0 then ($cvTradeVol * 100.0) / $ship.cargo.capacity.all else 0"/>
+                  <set_value name="$cvReason" exact="'cargo_util_below_min'"/>
+                  <set_value name="$cvDetail" exact="'' + $cvUtilPct + '% lt ' + $effectiveCargoTarget + '% (' + $cvTradeVol + ' m3 lt ' + $cvReqVol + ' m3)'"/>
+                </do_if>
+              </do_if>
+              <do_if value="$cvReason == '' and global.$GT_Reservations? and $wareEntry.$SellOffer?">
+                <set_value name="$cvResKey" exact="$wareEntry.$SellOffer"/>
+                <do_if value="global.$GT_Reservations.{$cvResKey}?">
+                  <set_value name="$cvResData" exact="global.$GT_Reservations.{$cvResKey}"/>
+                  <do_if value="$cvResData.$Until? and player.age lt @$cvResData.$Until and $cvResData.$Ship? and @$cvResData.$Ship != $ship">
+                    <set_value name="$cvReason" exact="'reserved_by_other_ship'"/>
+                    <set_value name="$cvDetail" exact="if $cvResData.$Ship.idcode? then $cvResData.$Ship.idcode else 'other'"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+              <do_if value="$cvReason == '' and not $ignoreTradeRules and not $wareEntry.$IsSellOnly?">
                 <set_value name="$tempTradeRulesApply" exact="false"/>
                 <do_if value="$tempBuyStationOk and $tempBuyStation? and @$tempBuyStation.exists">
                   <do_if value="@$tempBuyStation.isplayerowned">
@@ -3944,44 +4226,50 @@
                 </do_if>
                 <do_if value="$tempTradeRulesApply">
                   <do_if value="$wareEntry.$SellOffer? and @$wareEntry.$SellOffer.exists and $tempBuyStationOk and not $wareEntry.$SellOffer.cantradewith.{$tempBuyStation}">
-                    <set_value name="$tempRuntimeOk" exact="false"/>
+                    <set_value name="$cvReason" exact="'trade_rules'"/>
                     <set_value name="$cacheRejectTradeRules" operation="add"/>
                   </do_if>
                   <do_elseif value="$wareEntry.$BuyOffer? and @$wareEntry.$BuyOffer.exists and $tempSellStationOk and not $wareEntry.$BuyOffer.cantradewith.{$tempSellStation}">
-                    <set_value name="$tempRuntimeOk" exact="false"/>
+                    <set_value name="$cvReason" exact="'trade_rules'"/>
                     <set_value name="$cacheRejectTradeRules" operation="add"/>
                   </do_elseif>
                 </do_if>
               </do_if>
-              <do_if value="$tempRuntimeOk and not $wareEntry.$IsSellOnly? and $wareEntry.$BuyOffer? and @$wareEntry.$BuyOffer.exists">
-                <set_value name="$tempPreBuyAmt" exact="@$wareEntry.$BuyOffer.offeramount.{$ship}"/>
-                <do_if value="(not $tempPreBuyAmt? or $tempPreBuyAmt le 0) and @$wareEntry.$BuyOffer.amount gt 0">
-                  <set_value name="$tempPreBuyAmt" exact="@$wareEntry.$BuyOffer.amount"/>
-                </do_if>
-                <do_if value="(not $tempPreBuyAmt? or $tempPreBuyAmt le 0) and $tempSellStationOk and $tempWare?">
-                  <set_value name="$tempPreBuyAmt" exact="[0, $tempSellStation.cargo.{$tempWare}.target - $tempSellStation.cargo.{$tempWare}.count].max"/>
-                </do_if>
-                <do_if value="not $tempPreBuyAmt? or $tempPreBuyAmt le 0">
-                  <set_value name="$tempRuntimeOk" exact="false"/>
-                  <set_value name="$cacheRejectOfferAmount" operation="add"/>
+              <do_if value="$cvReason == '' and not $wareEntry.$IsSellOnly? and $wareEntry.$BuyOffer? and @$wareEntry.$BuyOffer.exists and $wareEntry.$SellOffer? and @$wareEntry.$SellOffer.exists">
+                <do_if value="$wareEntry.$BuyOffer.unitprice? and $wareEntry.$SellOffer.unitprice? and ($wareEntry.$SellOffer.unitprice - $wareEntry.$BuyOffer.unitprice) le 0">
+                  <set_value name="$cvReason" exact="'live_profit_nonpositive'"/>
                 </do_if>
               </do_if>
-              <do_if value="$tempRuntimeOk and $wareEntry.$SellOffer? and @$wareEntry.$SellOffer.exists">
-                <set_value name="$tempPreSellAmt" exact="@$wareEntry.$SellOffer.offeramount.{$ship}"/>
-                <do_if value="(not $tempPreSellAmt? or $tempPreSellAmt le 0) and @$wareEntry.$SellOffer.amount gt 0">
-                  <set_value name="$tempPreSellAmt" exact="@$wareEntry.$SellOffer.amount"/>
-                </do_if>
-                <do_if value="(not $tempPreSellAmt? or $tempPreSellAmt le 0) and $tempSellStationOk and $tempWare?">
-                  <set_value name="$tempPreSellAmt" exact="[0, $tempSellStation.cargo.{$tempWare}.target - $tempSellStation.cargo.{$tempWare}.count].max"/>
-                </do_if>
-                <do_if value="not $tempPreSellAmt? or $tempPreSellAmt le 0">
-                  <set_value name="$tempRuntimeOk" exact="false"/>
-                  <set_value name="$cacheRejectOfferAmount" operation="add"/>
-                </do_if>
-              </do_if>
+
+              <set_value name="$tempRuntimeOk" exact="$cvReason == ''"/>
               <do_if value="$tempRuntimeOk">
                 <set_value name="$cacheRuntimeReadableCount" operation="add"/>
+                <set_value name="$cvPassCount" operation="add"/>
               </do_if>
+              <do_elseif value="$cvReason != ''">
+                <do_if value="not $cvReasonCounts.{$cvReason}?">
+                  <set_value name="$cvReasonCounts.{$cvReason}" exact="0"/>
+                </do_if>
+                <set_value name="$cvReasonCounts.{$cvReason}" operation="add"/>
+              </do_elseif>
+
+              <!-- Per-entry validation row (capped for UI performance). -->
+              <do_if value="$wi le $cvMaxRows">
+                <set_value name="$cvWareLabel" exact="if $tempWare? then $tempWare.name else '???'"/>
+                <set_value name="$cvBuyLabel" exact="if $tempBuyStationOk and $tempBuyStation.knownname? then @$tempBuyStation.knownname else '(no buy)'"/>
+                <set_value name="$cvSellLabel" exact="if $tempSellStationOk and $tempSellStation.knownname? then @$tempSellStation.knownname else '(no sell)'"/>
+                <set_value name="$cvRoute" exact="$cvBuyLabel + ' -> ' + $cvSellLabel"/>
+                <set_value name="$cvVolPerUnit2" exact="if $tempWare? and $tempWare.volume? then $tempWare.volume else 1"/>
+                <set_value name="$cvAmtShow" exact="if $tempPreSellAmt? and $tempPreSellAmt gt 0 then $tempPreSellAmt else (if $wareEntry.$Amount? then $wareEntry.$Amount else 0)"/>
+                <set_value name="$cvVolShow" exact="$cvAmtShow * $cvVolPerUnit2"/>
+                <set_value name="$cvCapShow" exact="$ship.cargo.capacity.all"/>
+                <set_value name="$cvAmtVolCol" exact="'' + $cvAmtShow + ' / ' + $cvCapShow + ' m3'"/>
+                <set_value name="$cvScoreCol" exact="'' + (if $wareEntry.$Score? then ($wareEntry.$Score)i else 0)"/>
+                <set_value name="$cvStatus" exact="if $tempRuntimeOk then 'PASS' else 'FAIL'"/>
+                <set_value name="$cvReasonCol" exact="if $tempRuntimeOk then '' else ($cvReason + (if $cvDetail != '' then (' (' + $cvDetail + ')') else ''))"/>
+                <append_to_list name="$cvDataRows" exact="table[$Check = ('#' + $wi + ' ' + $cvWareLabel), $Status = $cvStatus, $Detail = $cvRoute, $Col4 = $cvAmtVolCol, $Col5 = $cvScoreCol, $Col6 = $cvReasonCol]"/>
+              </do_if>
+
               <do_if value="not $tempCargoOk and ($tempWare? or $tempTransport?)">
                 <set_value name="$cargoIncompatCount" operation="add"/>
               </do_if>
@@ -4304,6 +4592,30 @@
             </do_if>
           </do_all>
 
+          <!-- Assemble Cache Validation section (summary + per-entry rows). -->
+          <set_value name="$cvFailHistDetail" exact="'none'"/>
+          <set_value name="$cvHistKeys" exact="@$cvReasonCounts.keys"/>
+          <do_if value="$cvHistKeys? and $cvHistKeys.count gt 0">
+            <set_value name="$cvFailHistDetail" exact="''"/>
+            <do_all exact="$cvHistKeys.count" counter="$cvhki">
+              <set_value name="$cvhKey" exact="$cvHistKeys.{$cvhki}"/>
+              <set_value name="$cvhCnt" exact="if $cvReasonCounts.{$cvhKey}? then $cvReasonCounts.{$cvhKey} else 0"/>
+              <do_if value="$cvFailHistDetail != ''">
+                <set_value name="$cvFailHistDetail" exact="$cvFailHistDetail + ', '"/>
+              </do_if>
+              <set_value name="$cvFailHistDetail" exact="$cvFailHistDetail + $cvhKey + '=' + $cvhCnt"/>
+            </do_all>
+          </do_if>
+          <append_to_list name="$sec7v.$Rows" exact="table[$Check = 'Summary', $Status = if $cvPassCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $cvPassCount + ' / ' + $cacheEntryCount + ' PASS (mirrors lib.gt.cache.search per-ship gates)']"/>
+          <append_to_list name="$sec7v.$Rows" exact="table[$Check = 'Fail Histogram', $Status = if $cvPassCount lt $cacheEntryCount then 'WARN' else 'PASS', $Detail = $cvFailHistDetail]"/>
+          <do_if value="$cacheEntryCount gt $cvMaxRows">
+            <append_to_list name="$sec7v.$Rows" exact="table[$Check = 'Row Cap', $Status = 'INFO', $Detail = 'Showing first ' + $cvMaxRows + ' of ' + $cacheEntryCount + ' entries (cache sorted by score desc)']"/>
+          </do_if>
+          <append_to_list name="$sec7v.$Rows" exact="table[$Check = '--- Per-Entry Validation ---', $Status = 'INFO', $Detail = 'Status | Ware | Route | Amount/Vol | Score | Reason']"/>
+          <do_all exact="$cvDataRows.count" counter="$cvDri">
+            <append_to_list name="$sec7v.$Rows" exact="$cvDataRows.{$cvDri}"/>
+          </do_all>
+
           <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Unique Wares In Cache', $Status = 'INFO', $Detail = '' + $uniqueWares.keys.count + ' wares']"/>
           <do_if value="$orderId == 'GalaxyTraderMK4Supply2'">
             <set_value name="$diagCacheBucketDetail" exact="'BS_P=' + $diagCacheBsP + '/BS_N=' + $diagCacheBsN + '/ST_P=' + $diagCacheStP + '/ST_N=' + $diagCacheStN + '/AX_P=' + $diagCacheAxP + '/AX_N=' + $diagCacheAxN + '/CR_P=' + $diagCacheCrP + '/CR_N=' + $diagCacheCrN"/>
@@ -4313,7 +4625,7 @@
           <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Cargo-Incompatible Entries', $Status = if $cargoIncompatCount gt 0 then 'WARN' else 'PASS', $Detail = '' + $cargoIncompatCount + ' entries for other hold types']"/>
           <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Missing Sell Station (stale cache)', $Status = if $cacheRejectNoSellStation gt 0 then 'WARN' else 'PASS', $Detail = '' + $cacheRejectNoSellStation + ' / ' + $cacheEntryCount + ' entries have no resolvable $SellStation / $SellOffer.buyer (lib.gt.cache.search skips these)']"/>
           <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Missing Buy Station (stale cache)', $Status = if $cacheRejectNoBuyStation gt 0 then 'WARN' else 'PASS', $Detail = '' + $cacheRejectNoBuyStation + ' / ' + $cacheEntryCount + ' entries have no resolvable $BuyStation / $BuyOffer.seller']"/>
-          <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Cache Runtime Readable', $Status = if $cacheRuntimeReadableCount gt 0 then 'PASS' else (if $cacheEntryCount gt 0 then 'WARN' else 'INFO'), $Detail = '' + $cacheRuntimeReadableCount + ' / ' + $cacheEntryCount + ' would be returned by lib.gt.cache.search for this ship (cargo+stations+MK4 policy+distance+offeramount+TTL+FailedShips; TTL=' + (($diagCacheTTL / 1s)i) + 's)']"/>
+          <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Cache Runtime Readable', $Status = if $cacheRuntimeReadableCount gt 0 then 'PASS' else (if $cacheEntryCount gt 0 then 'WARN' else 'INFO'), $Detail = '' + $cacheRuntimeReadableCount + ' / ' + $cacheEntryCount + ' pass full lib.gt.cache.search gate walk for this ship (see Cache Validation tab for per-entry reasons; TTL=' + (($diagCacheTTL / 1s)i) + 's)']"/>
           <do_if value="$cacheRejectOfferAmount gt 0">
             <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Rejected: Zero Offer Amount', $Status = 'WARN', $Detail = '' + $cacheRejectOfferAmount + ' entries failed per-ship offeramount/demand fallback (saturation or stale offers)']"/>
           </do_if>
@@ -4325,6 +4637,9 @@
         </do_if>
 
         <append_to_list name="$report.$Sections" exact="$sec7"/>
+        <do_if value="$cacheExists and $cacheEntryCount gt 0 and $sec7v?">
+          <append_to_list name="$report.$Sections" exact="$sec7v"/>
+        </do_if>
         </do_if>
 
         <!-- ======================================================== -->

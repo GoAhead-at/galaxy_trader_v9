@@ -323,11 +323,12 @@ function gtDiagnose.populateFrame(frame)
     -- Determine section name for layout selection
     local sectionName = currentSection.name or ""
     local isPairDetails    = (sectionName == "Pair Details")
+    local isCacheValidation = (sectionName == "Cache Validation")
     local isClearance      = (sectionName == "Clearance")
     local isSearchSummary  = (sectionName == "Search Summary")
     local isReservations   = (sectionName == "Reservations and Fleet")
     local isMinerScan      = (sectionName == "Miner Resource Scan")
-    local isMultiCol       = (numCols >= 6) or isPairDetails or isClearance or isSearchSummary or isMinerScan
+    local isMultiCol       = (numCols >= 6) or isPairDetails or isCacheValidation or isClearance or isSearchSummary or isMinerScan
 
     if isMultiCol then
         -- ===== 6-COLUMN STRUCTURED LAYOUT =====
@@ -372,6 +373,17 @@ function gtDiagnose.populateFrame(frame)
                 "Route",
                 { text = "Profit (incl. ROI)", halign = "right" },
                 { text = "Score · Sel", halign = "right" },
+                "Reason",
+            })
+        elseif isCacheValidation then
+            -- Cache Validation: Status=6%, Ware=10%, Route=28%, Amount/Vol=12%, Score=10%, Reason=flexible
+            GT_UI.setColPercents(contentTable, { 6, 10, 28, 12, 10 })
+            GT_UI.addHeaderRow(contentTable, {
+                { text = "Status", halign = "center" },
+                "Ware",
+                "Route",
+                { text = "Amount/Vol", halign = "right" },
+                { text = "Score", halign = "right" },
                 "Reason",
             })
         elseif isClearance then
@@ -443,7 +455,7 @@ function gtDiagnose.populateFrame(frame)
                     if isSearchSummary then
                         detailAlign = "right"
                         col4Align   = "right"
-                    elseif isPairDetails then
+                    elseif isPairDetails or isCacheValidation then
                         col4Align = "right"
                     elseif isMinerScan then
                         -- Miner Resource Scan: Best Yield right, Reachable centered, Sectors right

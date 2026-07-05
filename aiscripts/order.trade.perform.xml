@@ -172,6 +172,15 @@
     </do_if>
     
   </add>
+
+  <!-- Capture pre-clamp trade amounts before vanilla zeroes $tradedeal.amount (updatedeal=true).
+       Vanilla $preamount is debug-only (chance=$debugchance) and is removed before finish. -->
+  <add sel="//aiscript[@name='order.trade.perform']/attention/actions/clamp_trade_amount[@reason='$clampreason']" pos="before">
+    <do_if value="this.ship.pilot and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}?">
+      <set_value name="this.$gtCargoPreClampAmount" exact="$amount"/>
+      <set_value name="this.$gtCargoPreClampDealAmount" exact="if $tradedeal.amount? then $tradedeal.amount else $amount"/>
+    </do_if>
+  </add>
   
   <!-- PHASE 1.1: Add Failure Signal Detection -->
   <!-- This runs when resume label="finish" is called (including from vanilla blacklist check) -->
@@ -198,6 +207,94 @@
         </do_if>
       </do_if>
       <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}?">
+        <!-- ERR_NO_CARGO_SPACE diagnostics (clamp vars still in scope on early-exit path). -->
+        <set_value name="$gtCargoFailClampReason" exact="''"/>
+        <set_value name="$gtCargoFailPreAmount" exact="0"/>
+        <set_value name="$gtCargoFailDealAmount" exact="0"/>
+        <set_value name="$gtCargoFailDiagPrimary" exact="''"/>
+        <set_value name="$gtCargoFailDiagHold" exact="''"/>
+        <set_value name="$gtCargoFailDiagBatch" exact="''"/>
+        <set_value name="$gtCargoFailBatchLegIndex" exact="0"/>
+        <set_value name="$gtCargoFailBatchLegTotal" exact="0"/>
+        <do_if value="$failreason == 'ERR_NO_CARGO_SPACE'">
+          <set_value name="$gtCargoFailClampReason" exact="if $clampreason? then $clampreason else 'unknown'"/>
+          <set_value name="$gtCargoFailPreAmount" exact="if this.$gtCargoPreClampAmount? then this.$gtCargoPreClampAmount else (if $preamount? then $preamount else 0)"/>
+          <set_value name="$gtCargoFailDealAmount" exact="if this.$gtCargoPreClampDealAmount? then this.$gtCargoPreClampDealAmount else (if $tradedeal.amount? then $tradedeal.amount else $gtCargoFailPreAmount)"/>
+          <set_value name="$gtCargoWare" exact="@$tradedeal.ware"/>
+          <do_if value="$gtCargoWare?">
+            <do_if value="$isbuying">
+              <set_value name="$gtCargoFailDiagPrimary" exact="'Ship free for ' + @$gtCargoWare.name + ': ' + this.ship.cargo.{$gtCargoWare}.free + ' / max ' + this.ship.cargo.{$gtCargoWare}.max + ' (aboard: ' + this.ship.cargo.{$gtCargoWare}.count + ')'"/>
+            </do_if>
+            <do_else>
+              <set_value name="$gtPartnerCargoCount" exact="if $targetobject? and $targetobject.exists then $targetobject.cargo.{$gtCargoWare}.count else 0"/>
+              <set_value name="$gtPartnerCargoTarget" exact="if $targetobject? and $targetobject.exists then $targetobject.cargo.{$gtCargoWare}.target else 0"/>
+              <set_value name="$gtPartnerCargoGap" exact="[$gtPartnerCargoTarget - $gtPartnerCargoCount, 0].max"/>
+              <set_value name="$gtCargoFailDiagPrimary" exact="'Partner storage for ' + @$gtCargoWare.name + ': ' + $gtPartnerCargoCount + ' / target ' + $gtPartnerCargoTarget + ' (gap ' + $gtPartnerCargoGap + ')'"/>
+            </do_else>
+          </do_if>
+          <set_value name="$gtCargoFailDiagHold" exact="'Total hold: ' + (this.ship.cargo.capacity.all - this.ship.cargo.free.all) + ' / ' + this.ship.cargo.capacity.all + ' used (' + this.ship.cargo.free.all + ' free)'"/>
+          <set_value name="$gtCargoOnboardSummary" exact="'none'"/>
+          <set_value name="$gtCargoOnboardList" exact="this.ship.cargo.list"/>
+          <do_if value="$gtCargoOnboardList? and $gtCargoOnboardList.count gt 0">
+            <set_value name="$gtCargoOnboardSummary" exact="''"/>
+            <do_all exact="$gtCargoOnboardList.count" counter="$gtcosi">
+              <set_value name="$gtCosWare" exact="$gtCargoOnboardList.{$gtcosi}"/>
+              <set_value name="$gtCosCount" exact="this.ship.cargo.{$gtCosWare}.count"/>
+              <do_if value="$gtCosCount gt 0">
+                <do_if value="$gtCargoOnboardSummary != ''">
+                  <set_value name="$gtCargoOnboardSummary" exact="$gtCargoOnboardSummary + ', '"/>
+                </do_if>
+                <set_value name="$gtCargoOnboardSummary" exact="$gtCargoOnboardSummary + @$gtCosWare.name + ' x' + $gtCosCount"/>
+              </do_if>
+            </do_all>
+            <do_if value="$gtCargoOnboardSummary == ''">
+              <set_value name="$gtCargoOnboardSummary" exact="'none'"/>
+            </do_if>
+          </do_if>
+          <set_value name="$gtCargoFailDiagHold" exact="$gtCargoFailDiagHold + '\nOnboard: ' + $gtCargoOnboardSummary"/>
+          <do_if value="global.$GT_MK42_ActiveTradeBatch? and global.$GT_MK42_ActiveTradeBatch.{this.ship}?">
+            <set_value name="$gtCargoBatch" exact="global.$GT_MK42_ActiveTradeBatch.{this.ship}"/>
+            <set_value name="$gtCargoFailBatchLegTotal" exact="if $gtCargoBatch.$LegCount? then $gtCargoBatch.$LegCount else 0"/>
+            <do_if value="$gtCargoBatch.$Legs? and $gtCargoBatch.$Legs.count gt 0">
+              <do_all exact="$gtCargoBatch.$Legs.count" counter="$gtcbli">
+                <set_value name="$gtCargoBatchLeg" exact="$gtCargoBatch.$Legs.{$gtcbli}"/>
+                <set_value name="$gtCargoBatchLegMatch" exact="false"/>
+                <do_if value="$gtCargoWare? and $gtCargoBatchLeg.$Ware? and $gtCargoBatchLeg.$Ware == $gtCargoWare">
+                  <do_if value="$isbuying and $gtCargoBatchLeg.$PlannedBuy? and $gtCargoBatchLeg.$PlannedBuy gt 0">
+                    <set_value name="$gtCargoBatchLegMatch" exact="true"/>
+                  </do_if>
+                  <do_elseif value="not $isbuying and $gtCargoBatchLeg.$PlannedSell? and $gtCargoBatchLeg.$PlannedSell gt 0">
+                    <set_value name="$gtCargoBatchLegMatch" exact="true"/>
+                  </do_elseif>
+                </do_if>
+                <do_if value="$gtCargoBatchLegMatch">
+                  <set_value name="$gtCargoFailBatchLegIndex" exact="if $gtCargoBatchLeg.$LegIndex? then $gtCargoBatchLeg.$LegIndex else $gtcbli"/>
+                  <do_if value="$gtCargoFailPreAmount == 0">
+                    <do_if value="$isbuying and $gtCargoBatchLeg.$PlannedBuy? and $gtCargoBatchLeg.$PlannedBuy gt 0">
+                      <set_value name="$gtCargoFailPreAmount" exact="$gtCargoBatchLeg.$PlannedBuy"/>
+                      <set_value name="$gtCargoFailDealAmount" exact="$gtCargoBatchLeg.$PlannedBuy"/>
+                    </do_if>
+                    <do_elseif value="not $isbuying and $gtCargoBatchLeg.$PlannedSell? and $gtCargoBatchLeg.$PlannedSell gt 0">
+                      <set_value name="$gtCargoFailPreAmount" exact="$gtCargoBatchLeg.$PlannedSell"/>
+                      <set_value name="$gtCargoFailDealAmount" exact="$gtCargoBatchLeg.$PlannedSell"/>
+                    </do_elseif>
+                  </do_if>
+                  <break/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <set_value name="$gtCargoFailDiagBatch" exact="'MK4-2 batch ' + $gtCargoFailBatchLegTotal + ' leg(s)'"/>
+            <do_if value="$gtCargoFailBatchLegIndex gt 0">
+              <set_value name="$gtCargoFailDiagBatch" exact="$gtCargoFailDiagBatch + ', matched leg ' + $gtCargoFailBatchLegIndex"/>
+            </do_if>
+            <do_if value="$gtCargoBatch.$CargoFreeAtQueue? and $gtCargoBatch.$CargoCapacityAtQueue?">
+              <set_value name="$gtCargoFailDiagBatch" exact="$gtCargoFailDiagBatch + ' (hold at queue: ' + ($gtCargoBatch.$CargoCapacityAtQueue - $gtCargoBatch.$CargoFreeAtQueue) + '/' + $gtCargoBatch.$CargoCapacityAtQueue + ' used)'"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <set_value name="$gtCargoFailDiagBatch" exact="'Single-leg trade (no MK4-2 batch snapshot)'"/>
+          </do_else>
+        </do_if>
         <set_value name="$failure_data" exact="table[
           $Ship = this.ship,
           $pilot = this.ship.pilot,
@@ -206,7 +303,15 @@
           $ware = @$tradedeal.ware,
           $partner = @$targetobject,
           $isBuying = $isbuying,
-          $timestamp = player.age
+          $timestamp = player.age,
+          $clampReason = $gtCargoFailClampReason,
+          $preAmount = $gtCargoFailPreAmount,
+          $dealAmount = $gtCargoFailDealAmount,
+          $diagPrimary = $gtCargoFailDiagPrimary,
+          $diagHold = $gtCargoFailDiagHold,
+          $diagBatch = $gtCargoFailDiagBatch,
+          $batchLegIndex = $gtCargoFailBatchLegIndex,
+          $batchLegTotal = $gtCargoFailBatchLegTotal
         ]"/>
         
         <do_if value="not global.$GT_TradeFailureQueue?">
@@ -214,6 +319,12 @@
         </do_if>
         
         <append_to_list name="global.$GT_TradeFailureQueue" exact="$failure_data"/>
+        <do_if value="this.$gtCargoPreClampAmount?">
+          <remove_value name="this.$gtCargoPreClampAmount"/>
+        </do_if>
+        <do_if value="this.$gtCargoPreClampDealAmount?">
+          <remove_value name="this.$gtCargoPreClampDealAmount"/>
+        </do_if>
         
         <!-- EVENT-DRIVEN: Signal MD cue directly (no polling needed) -->
         <signal_objects object="player.galaxy" param="'GT_TradeFailure'"/>

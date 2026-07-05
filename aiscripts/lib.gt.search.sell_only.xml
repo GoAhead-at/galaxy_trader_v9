@@ -1,0 +1,237 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Unified cargo clearance / sell_only trade builder.
+     Tier 1: buyers that can absorb the full on-board amount for a ware (best profit wins).
+     Tier 2: partial buyers only when no full-load buyer exists (largest absorbable, then profit). -->
+<aiscript name="lib.gt.search.sell_only" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <params>
+    <param name="ship" default="this.ship"/>
+    <param name="buyOffers" default="[]"/>
+    <param name="homeSector" default="null"/>
+    <param name="maxDistance" default="0" comment="Gate distance from homeSector; 0 = no distance filter"/>
+    <param name="distancePenalty" default="0.1"/>
+    <param name="priorityWares" default="[]"/>
+    <param name="priorityScoreMultiplier" default="125"/>
+    <param name="debugchance" default="0"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <create_list name="$sortedTrades"/>
+      <set_value name="$bestTrade" exact="null"/>
+      <set_value name="$bestScore" exact="0"/>
+      <set_value name="$haveBest" exact="false"/>
+
+      <do_if value="not $ship? or not @$ship.exists or not $buyOffers? or $buyOffers.count == 0">
+        <wait exact="1ms" comment="Cooperative yield before immediate return (wake-loop guard)"/>
+        <return value="table[
+          $Found = false,
+          $BestTrade = null,
+          $BestScore = 0,
+          $SortedTrades = $sortedTrades
+        ]"/>
+      </do_if>
+
+      <set_value name="$gtsoHome" exact="if $homeSector? and $homeSector.exists then $homeSector else $ship.sector"/>
+      <set_value name="$gtsoDistPenalty" exact="if $distancePenalty? and $distancePenalty ge 0 then $distancePenalty else 0.1"/>
+      <set_value name="$gtsoMaxDist" exact="if $maxDistance? then $maxDistance else 0"/>
+      <set_value name="$gtsoDedupe" exact="table[]"/>
+      <create_list name="$gtsoCandidates"/>
+      <set_value name="$gtsoMultPct" exact="if $priorityScoreMultiplier? then $priorityScoreMultiplier else 125"/>
+      <do_if value="$gtsoMultPct lt 125"><set_value name="$gtsoMultPct" exact="125"/></do_if>
+      <do_if value="$gtsoMultPct gt 300"><set_value name="$gtsoMultPct" exact="300"/></do_if>
+      <set_value name="$gtsoMult" exact="$gtsoMultPct / 100.0"/>
+      <set_value name="$gtsoPriorityWares" exact="if $priorityWares? and $priorityWares != null then $priorityWares else []"/>
+
+      <do_all exact="$buyOffers.count" counter="$gtsoi">
+        <set_value name="$gtsoOffer" exact="$buyOffers.{$gtsoi}"/>
+        <do_if value="not $gtsoOffer? or not @$gtsoOffer.exists or not $gtsoOffer.available">
+          <continue/>
+        </do_if>
+        <set_value name="$gtsoWare" exact="if $gtsoOffer.ware? then @$gtsoOffer.ware else null"/>
+        <do_if value="not $gtsoWare? or $ship.cargo.{$gtsoWare}.count le 0">
+          <continue/>
+        </do_if>
+
+        <set_value name="$gtsoShipAmt" exact="$ship.cargo.{$gtsoWare}.count"/>
+        <set_value name="$gtsoBuyer" exact="null"/>
+        <do_if value="$gtsoOffer.buyer? and @$gtsoOffer.buyer.exists">
+          <set_value name="$gtsoBuyer" exact="@$gtsoOffer.buyer"/>
+        </do_if>
+        <do_elseif value="$gtsoOffer.owner? and @$gtsoOffer.owner.exists">
+          <set_value name="$gtsoBuyer" exact="@$gtsoOffer.owner"/>
+        </do_elseif>
+        <do_if value="not $gtsoBuyer?">
+          <continue/>
+        </do_if>
+
+        <set_value name="$gtsoSellStation" exact="if $gtsoOffer.owner? then @$gtsoOffer.owner else $gtsoBuyer"/>
+        <set_value name="$gtsoDist" exact="-1"/>
+        <do_if value="$gtsoSellStation? and $gtsoSellStation.sector? and $gtsoHome? and $gtsoHome.exists">
+          <do_if value="$gtsoSellStation.sector == $gtsoHome">
+            <set_value name="$gtsoDist" exact="0"/>
+          </do_if>
+          <do_else>
+            <set_value name="$gtsoDist" exact="$gtsoHome.gatedistance.{$gtsoSellStation.sector}"/>
+          </do_else>
+        </do_if>
+        <do_if value="$gtsoMaxDist gt 0 and ($gtsoDist lt 0 or $gtsoDist gt $gtsoMaxDist)">
+          <continue/>
+        </do_if>
+
+        <set_value name="$gtsoOfferAmt" exact="@$gtsoOffer.offeramount.{$ship}"/>
+        <do_if value="not $gtsoOfferAmt? or $gtsoOfferAmt le 0">
+          <set_value name="$gtsoOfferAmt" exact="if @$gtsoOffer.amount gt 0 then @$gtsoOffer.amount else 0"/>
+        </do_if>
+        <set_value name="$gtsoDemandGap" exact="0"/>
+        <do_if value="$gtsoBuyer.cargo.{$gtsoWare}.target? and $gtsoBuyer.cargo.{$gtsoWare}.target gt 0">
+          <set_value name="$gtsoDemandGap" exact="[0, $gtsoBuyer.cargo.{$gtsoWare}.target - $gtsoBuyer.cargo.{$gtsoWare}.count].max"/>
+        </do_if>
+        <set_value name="$gtsoAbsorbable" exact="[$gtsoShipAmt, $gtsoOfferAmt].min"/>
+        <do_if value="$gtsoDemandGap gt 0">
+          <set_value name="$gtsoAbsorbable" exact="[$gtsoAbsorbable, $gtsoDemandGap].min"/>
+        </do_if>
+        <do_if value="$gtsoAbsorbable le 0">
+          <continue/>
+        </do_if>
+
+        <set_value name="$gtsoReplace" exact="false"/>
+        <do_if value="not $gtsoDedupe.{$gtsoBuyer}?">
+          <set_value name="$gtsoDedupe.{$gtsoBuyer}" exact="table[]"/>
+          <set_value name="$gtsoReplace" exact="true"/>
+        </do_if>
+        <do_elseif value="not $gtsoDedupe.{$gtsoBuyer}.{$gtsoWare}?">
+          <set_value name="$gtsoReplace" exact="true"/>
+        </do_elseif>
+        <do_else>
+          <set_value name="$gtsoPrev" exact="$gtsoDedupe.{$gtsoBuyer}.{$gtsoWare}"/>
+          <do_if value="$gtsoAbsorbable gt $gtsoPrev.$Absorbable">
+            <set_value name="$gtsoReplace" exact="true"/>
+          </do_if>
+          <do_elseif value="$gtsoAbsorbable == $gtsoPrev.$Absorbable and $gtsoOffer.unitprice gt $gtsoPrev.$UnitPrice">
+            <set_value name="$gtsoReplace" exact="true"/>
+          </do_elseif>
+        </do_else>
+
+        <do_if value="$gtsoReplace">
+          <set_value name="$gtsoDistFactor" exact="1.0 + ([0, $gtsoDist].max * $gtsoDistPenalty)"/>
+          <set_value name="$gtsoUnitPriceCr" exact="(($gtsoOffer.unitprice / 1Cr)f)"/>
+          <set_value name="$gtsoProfitScore" exact="($gtsoAbsorbable * [$gtsoUnitPriceCr, 1.0].max) / $gtsoDistFactor"/>
+          <set_value name="$gtsoIsPriority" exact="false"/>
+          <do_if value="$gtsoPriorityWares.count gt 0">
+            <do_all exact="$gtsoPriorityWares.count" counter="$gtsoPwi">
+              <do_if value="$gtsoPriorityWares.{$gtsoPwi} == $gtsoWare">
+                <set_value name="$gtsoIsPriority" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="$gtsoIsPriority">
+            <set_value name="$gtsoProfitScore" exact="$gtsoProfitScore * $gtsoMult"/>
+          </do_if>
+          <set_value name="$gtsoIsFullLoad" exact="$gtsoAbsorbable ge $gtsoShipAmt"/>
+          <set_value name="$gtsoTradeAmount" exact="if $gtsoIsFullLoad then $gtsoShipAmt else $gtsoAbsorbable"/>
+          <set_value name="$gtsoSortKey" exact="if $gtsoIsFullLoad then (1000000000000L + $gtsoProfitScore) else ($gtsoAbsorbable * 1000000 + $gtsoProfitScore)"/>
+          <set_value name="$gtsoDedupe.{$gtsoBuyer}.{$gtsoWare}" exact="table[
+            $Offer = $gtsoOffer,
+            $Ware = $gtsoWare,
+            $Buyer = $gtsoBuyer,
+            $SellStation = $gtsoSellStation,
+            $Absorbable = $gtsoAbsorbable,
+            $TradeAmount = $gtsoTradeAmount,
+            $Distance = $gtsoDist,
+            $UnitPrice = $gtsoOffer.unitprice,
+            $ProfitScore = $gtsoProfitScore,
+            $IsFullLoad = $gtsoIsFullLoad,
+            $SortKey = $gtsoSortKey
+          ]"/>
+        </do_if>
+      </do_all>
+
+      <set_value name="$gtsoBuyerKeys" exact="$gtsoDedupe.keys.list"/>
+      <do_all exact="$gtsoBuyerKeys.count" counter="$gtsoBki">
+        <set_value name="$gtsoBuyerKey" exact="$gtsoBuyerKeys.{$gtsoBki}"/>
+        <do_if value="not $gtsoBuyerKey? or not $gtsoDedupe.{$gtsoBuyerKey}?">
+          <continue/>
+        </do_if>
+        <set_value name="$gtsoWareKeys" exact="$gtsoDedupe.{$gtsoBuyerKey}.keys.list"/>
+        <do_all exact="$gtsoWareKeys.count" counter="$gtsoWki">
+          <set_value name="$gtsoWareKey" exact="$gtsoWareKeys.{$gtsoWki}"/>
+          <set_value name="$gtsoRow" exact="$gtsoDedupe.{$gtsoBuyerKey}.{$gtsoWareKey}"/>
+          <do_if value="not $gtsoRow? or not $gtsoRow.$Offer?">
+            <continue/>
+          </do_if>
+          <append_to_list name="$gtsoCandidates" exact="$gtsoRow"/>
+        </do_all>
+      </do_all>
+
+      <do_if value="$gtsoCandidates.count == 0">
+        <wait exact="1ms" comment="Cooperative yield before immediate return (wake-loop guard)"/>
+        <return value="table[
+          $Found = false,
+          $BestTrade = null,
+          $BestScore = 0,
+          $SortedTrades = $sortedTrades
+        ]"/>
+      </do_if>
+
+      <!-- Per ware: drop partial candidates when any full-load buyer exists for that ware. -->
+      <set_value name="$gtsoWareHasFull" exact="table[]"/>
+      <do_all exact="$gtsoCandidates.count" counter="$gtsoFci">
+        <set_value name="$gtsoFcRow" exact="$gtsoCandidates.{$gtsoFci}"/>
+        <do_if value="$gtsoFcRow.$IsFullLoad? and $gtsoFcRow.$IsFullLoad and $gtsoFcRow.$Ware?">
+          <set_value name="$gtsoWareHasFull.{$gtsoFcRow.$Ware}" exact="true"/>
+        </do_if>
+      </do_all>
+
+      <do_all exact="$gtsoCandidates.count" counter="$gtsoCbi">
+        <set_value name="$gtsoCand" exact="$gtsoCandidates.{$gtsoCbi}"/>
+        <do_if value="not $gtsoCand? or not $gtsoCand.$Ware?">
+          <continue/>
+        </do_if>
+        <do_if value="not $gtsoCand.$IsFullLoad? or not $gtsoCand.$IsFullLoad">
+          <do_if value="$gtsoWareHasFull.{$gtsoCand.$Ware}? and $gtsoWareHasFull.{$gtsoCand.$Ware}">
+            <continue/>
+          </do_if>
+        </do_if>
+        <append_to_list name="$sortedTrades" exact="table[
+          $IsSellOnly = true,
+          $Ware = $gtsoCand.$Ware,
+          $SellOffer = $gtsoCand.$Offer,
+          $SellStation = $gtsoCand.$SellStation,
+          $Amount = $gtsoCand.$TradeAmount,
+          $Score = $gtsoCand.$ProfitScore,
+          $ClearanceSortKey = $gtsoCand.$SortKey,
+          $ClearanceFullLoad = if $gtsoCand.$IsFullLoad? then $gtsoCand.$IsFullLoad else false,
+          $ClearanceAbsorbable = $gtsoCand.$Absorbable,
+          $BuyStation = $ship,
+          $BuySector = $ship.sector,
+          $Distance = $gtsoCand.$Distance,
+          $UnitProfit = $gtsoCand.$UnitPrice,
+          $BuyPrice = 0,
+          $SellPrice = $gtsoCand.$UnitPrice,
+          $ProfitPerUnit = $gtsoCand.$UnitPrice,
+          $Profit = ($gtsoCand.$UnitPrice * $gtsoCand.$TradeAmount)
+        ]"/>
+      </do_all>
+
+      <sort_list list="$sortedTrades" sortbyvalue="loop.element.$ClearanceSortKey" sortdescending="true"/>
+
+      <do_if value="$sortedTrades.count gt 0">
+        <set_value name="$bestTrade" exact="$sortedTrades.{1}"/>
+        <set_value name="$bestScore" exact="if $bestTrade.$Score? then $bestTrade.$Score else 0"/>
+        <set_value name="$haveBest" exact="true"/>
+      </do_if>
+
+      <do_if value="$debugchance gt 0 and $haveBest">
+        <debug_text text="'[GT-Clearance] ' + $ship.idcode + ': built ' + $sortedTrades.count + ' sell_only candidate(s); best ' + (if $bestTrade.$Ware? then @$bestTrade.$Ware.name else '?') + ' x' + (if $bestTrade.$Amount? then $bestTrade.$Amount else 0) + ' fullLoad=' + (if $bestTrade.$ClearanceFullLoad? and $bestTrade.$ClearanceFullLoad then 'Y' else 'N') + ' score=' + $bestScore" chance="$debugchance"/>
+      </do_if>
+
+      <wait exact="1ms" comment="Cooperative yield before return (wake-loop guard)"/>
+      <return value="table[
+        $Found = $haveBest,
+        $BestTrade = $bestTrade,
+        $BestScore = $bestScore,
+        $SortedTrades = $sortedTrades
+      ]"/>
+    </actions>
+  </attention>
+</aiscript>

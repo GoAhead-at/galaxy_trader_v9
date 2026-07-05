@@ -2992,8 +2992,20 @@
               <resume label="run_search_pipeline"/>
             </do_if>
             <do_elseif value="event.param == 'GT_Trade_Found'">
+              <!-- Persist interrupt payload before resume (locals lost across wait boundaries). -->
+              <set_value name="$waitSignalData" exact="event.param2"/>
+              <set_value name="$waitSignalTradeList" exact="[]"/>
+              <set_value name="$waitSignalSearchMethod" exact="''"/>
+              <do_if value="$waitSignalData? and $waitSignalData != null">
+                <set_value name="$waitSignalTradeList" exact="@$waitSignalData.$TradeList"/>
+                <set_value name="$waitSignalSearchMethod" exact="@$waitSignalData.$SearchMethod"/>
+              </do_if>
+              <do_if value="$waitSignalTradeList != null and $waitSignalTradeList.count gt 0">
+                <set_value name="this.$tradeListFromSignal" exact="$waitSignalTradeList"/>
+                <set_value name="this.$searchMethodFromSignal" exact="if $waitSignalSearchMethod != null and $waitSignalSearchMethod != '' then $waitSignalSearchMethod else ''"/>
+              </do_if>
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': INTERRUPT FIRED: GT_Trade_Found received at game time ' + player.age" chance="100"/>
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': INTERRUPT FIRED: GT_Trade_Found received at game time ' + player.age + ' (trades=' + (if $waitSignalTradeList != null then $waitSignalTradeList.count else 0) + ')'" chance="100"/>
                 <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade found by MD system - proceeding with execution'" chance="100"/>
               </do_if>
               <!-- Reset retry counter on successful trade -->
@@ -3167,6 +3179,10 @@
         <set_value name="$searchIgnoreCarrierAux" exact="if $searchParams.$IgnoreCarrierAux? then @$searchParams.$IgnoreCarrierAux else $effectiveIgnoreCarrierAux"/>
         <set_value name="$searchFactionPriority" exact="if $searchParams.$FactionPriority? then @$searchParams.$FactionPriority else $gt_factionpriority"/>
         <set_value name="$searchMode" exact="if $searchParams.$SearchMode? then @$searchParams.$SearchMode else 'buy_and_sell'"/>
+        <set_value name="this.$pipelineSearchMode" exact="$searchMode"/>
+        <do_if value="$searchMode? and $searchMode == 'sell_only' and (not $searchWareBasket? or $searchWareBasket.count == 0)">
+          <set_value name="$searchWareBasket" exact="this.ship.cargo.list"/>
+        </do_if>
         <set_value name="$forceLiveSearch" exact="if $searchParams.$ForceLiveSearch? then @$searchParams.$ForceLiveSearch else false"/>
         <set_value name="$searchPhase" exact="if $searchParams.$Phase? then @$searchParams.$Phase else 'live'"/>
         <set_value name="$searchCacheReadOffset" exact="if $searchParams.$CacheReadOffset? then @$searchParams.$CacheReadOffset else 0"/>
@@ -3421,73 +3437,33 @@
             <param name="debugchance" value="@this.$debugchance"/>
           </run_script>
           <!-- SAVEGAME GUARD -->
+          <do_if value="not $searchMode? and this.$pipelineSearchMode?">
+            <set_value name="$searchMode" exact="this.$pipelineSearchMode"/>
+          </do_if>
           <do_if value="not $searchMode?">
             <signal_objects object="player.galaxy" param="'GT_Search_Abort'" param2="table[$Ship = this.ship]"/>
             <resume label="no_trade_retry"/>
           </do_if>
 
-          <do_if value="$searchMode? and $searchMode == 'sell_only'">
-            <create_list name="$sellOnlyTrades"/>
+          <do_if value="($searchMode? and $searchMode == 'sell_only') or (this.$pipelineSearchMode? and this.$pipelineSearchMode == 'sell_only')">
             <set_value name="$liveBuyOffers" exact="[]"/>
-            <do_if value="$liveResult?">
-              <do_if value="$liveResult.$BuyOffers?">
-                <set_value name="$liveBuyOffers" exact="@$liveResult.$BuyOffers"/>
-              </do_if>
+            <do_if value="$liveResult? and $liveResult.$BuyOffers?">
+              <set_value name="$liveBuyOffers" exact="@$liveResult.$BuyOffers"/>
             </do_if>
-            <do_if value="$liveBuyOffers.count gt 0">
-              <do_all exact="$liveBuyOffers.count" counter="$offerIdx">
-                <set_value name="$sellOffer" exact="$liveBuyOffers.{$offerIdx}"/>
-                <set_value name="$sellWare" exact="if $sellOffer? and $sellOffer.ware? then @$sellOffer.ware else null"/>
-                <do_if value="not $sellWare?">
-                  <continue/>
-                </do_if>
-
-                <set_value name="$shipWareAmount" exact="this.ship.cargo.{$sellWare}.count"/>
-                <set_value name="$tradeAmount" exact="[$shipWareAmount, $sellOffer.amount].min"/>
-                <do_if value="$tradeAmount le 0">
-                  <continue/>
-                </do_if>
-
-                <set_value name="$sellDistance" exact="$searchHomeSector.gatedistance.{$sellOffer.owner}"/>
-                <do_if value="$sellDistance lt 0 or $sellDistance gt $searchMaxDistance">
-                  <continue/>
-                </do_if>
-
-                <set_value name="$distanceFactor" exact="1.0 + ($sellDistance * $gt_distancepenalty)"/>
-                <set_value name="$sellUnitPriceCr" exact="($sellOffer.unitprice / 1Cr)i"/>
-                <set_value name="$sellScore" exact="($tradeAmount * [$sellUnitPriceCr, 1].max) / $distanceFactor"/>
-                <append_to_list name="$sellOnlyTrades" exact="table[
-                  $IsSellOnly = true,
-                  $Ware = $sellWare,
-                  $SellOffer = $sellOffer,
-                  $SellStation = $sellOffer.owner,
-                  $Amount = $tradeAmount,
-                  $Score = $sellScore,
-                  $BuyStation = this.ship,
-                  $BuySector = this.ship.sector,
-                  $Distance = $sellDistance,
-                  $UnitProfit = $sellOffer.unitprice,
-                  $BuyPrice = 0,
-                  $SellPrice = $sellOffer.unitprice,
-                  $ProfitPerUnit = $sellOffer.unitprice,
-                  $Profit = ($sellOffer.unitprice * $tradeAmount)
-                ]"/>
-              </do_all>
-              <!-- AI locals do not survive waits inside do_all loops; yield once after the batch. -->
-              <wait exact="this.$gt_yieldMs * 1ms"/>
-            </do_if>
-
-            <run_script name="'lib.gt.score.trades'" result="$scoreResult">
-              <param name="tradeList" value="$sellOnlyTrades"/>
+            <run_script name="'lib.gt.search.sell_only'" result="$scoreResult">
+              <param name="ship" value="this.ship"/>
+              <param name="buyOffers" value="$liveBuyOffers"/>
+              <param name="homeSector" value="$searchHomeSector"/>
+              <param name="maxDistance" value="$searchMaxDistance"/>
+              <param name="distancePenalty" value="if $gt_distancepenalty? then $gt_distancepenalty else 0.1"/>
               <param name="priorityWares" value="if $effectivePriorityWares? then $effectivePriorityWares else []"/>
               <param name="priorityScoreMultiplier" value="if $effectivePriorityScoreMultiplier? then $effectivePriorityScoreMultiplier else 125"/>
+              <param name="debugchance" value="@this.$debugchance"/>
             </run_script>
             <set_value name="$pipelineSearchMethod" exact="'live_sell_only'"/>
             <set_value name="$scoreFound" exact="false"/>
-            <do_if value="$scoreResult?">
-              <do_if value="$scoreResult.$Found?">
-                <set_value name="$scoreFound" exact="@$scoreResult.$Found"/>
-              </do_if>
+            <do_if value="$scoreResult? and $scoreResult.$Found?">
+              <set_value name="$scoreFound" exact="@$scoreResult.$Found"/>
             </do_if>
             <do_if value="$scoreFound">
               <set_value name="$pipelineFound" exact="true"/>
@@ -3934,13 +3910,22 @@
           <do_all exact="$pipelineTradeList.count" counter="$freshIdx">
             <set_value name="$freshTrade" exact="$pipelineTradeList.{$freshIdx}"/>
             <set_value name="$freshKeep" exact="false"/>
-            <do_if value="$freshTrade? and $freshTrade.$IsSellOnly? and $freshTrade.$SellOffer?">
-              <set_value name="$freshSellAmt" exact="@$freshTrade.$SellOffer.offeramount.{this.ship}"/>
-              <do_if value="(not $freshSellAmt? or $freshSellAmt le 0) and @$freshTrade.$SellOffer.amount gt 0">
-                <set_value name="$freshSellAmt" exact="@$freshTrade.$SellOffer.amount"/>
+            <do_if value="$freshTrade? and $freshTrade.$IsSellOnly? and $freshTrade.$SellOffer? and $freshTrade.$Amount? and $freshTrade.$Amount gt 0">
+              <set_value name="$freshSellAmt" exact="$freshTrade.$Amount"/>
+              <set_value name="$freshSellReason" exact="null"/>
+              <set_value name="$freshSellBuyer" exact="null"/>
+              <do_if value="$freshTrade.$SellOffer.buyer?">
+                <set_value name="$freshSellBuyer" exact="@$freshTrade.$SellOffer.buyer"/>
               </do_if>
-              <do_if value="$freshSellAmt? and $freshSellAmt gt 0">
-                <set_value name="$freshKeep" exact="true"/>
+              <do_if value="$freshSellBuyer == null and $freshTrade.$SellOffer.owner?">
+                <set_value name="$freshSellBuyer" exact="@$freshTrade.$SellOffer.owner"/>
+              </do_if>
+              <do_if value="$freshSellBuyer != null">
+                <clamp_trade_amount trade="$freshTrade.$SellOffer" amount="$freshSellAmt" buyer="$freshSellBuyer" seller="this.assignedcontrolled" result="$freshSellAmt" reason="$freshSellReason"/>
+                <do_if value="$freshSellAmt? and $freshSellAmt gt 0">
+                  <set_value name="$freshTrade.$Amount" exact="$freshSellAmt"/>
+                  <set_value name="$freshKeep" exact="true"/>
+                </do_if>
               </do_if>
             </do_if>
             <do_elseif value="$freshTrade? and $freshTrade.$BuyOffer? and $freshTrade.$SellOffer?">
@@ -3982,7 +3967,7 @@
           $Found = $pipelineFound,
           $TradeList = $pipelineTradeList,
           $SearchMethod = $pipelineSearchMethod,
-          $SearchType = if $searchMode? and $searchMode == 'sell_only' then 'clearance' else 'live',
+          $SearchType = if this.$pipelineSearchMode? and this.$pipelineSearchMode == 'sell_only' then 'clearance' else 'live',
           $HomeSector = $searchHomeSector
         ]"/>
         <resume label="wait_for_response"/>

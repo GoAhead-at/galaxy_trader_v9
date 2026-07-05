@@ -983,19 +983,18 @@
         
         <!-- Deterministic stale-PE scrub driven by centralized status computation. -->
         <do_if value="$peStatus.$ShouldClearPE">
-          <set_value name="global.$GT_Ships.{$ship}.$PilotExchange" exact="false"/>
+          <run_actions ref="md.GT_Libraries_General.GT_ShipOpState">
+            <param name="ship" value="$ship"/>
+            <param name="opState" value="'PilotExchange'"/>
+            <param name="active" value="false"/>
+            <param name="refreshName" value="true"/>
+            <param name="reason" value="'register_pilot_stale_pe_clear'"/>
+          </run_actions>
           <do_if value="global.$GT_RedistributePendingDockByShip? and $ship.idcode?">
             <remove_value name="global.$GT_RedistributePendingDockByShip.{'$' + $ship.idcode}"/>
           </do_if>
           <do_if value="global.$GT_RedistributePendingDockSinceByShip? and $ship.idcode?">
             <remove_value name="global.$GT_RedistributePendingDockSinceByShip.{'$' + $ship.idcode}"/>
-          </do_if>
-          <do_if value="$ship.pilot? and $ship.pilot.exists">
-            <run_actions ref="md.GT_Ship_State_Utilities.GT_RequestShipNameRefresh">
-              <param name="ship" value="$ship"/>
-              <param name="pilot" value="$ship.pilot"/>
-              <param name="reason" value="'stale_pilot_exchange_clear'"/>
-            </run_actions>
           </do_if>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-ShipMgmt] Cleared stale PilotExchange flag for ' + $ship.idcode + ' (current=' + $peStatus.$CurrentOrder + ', caller=' + $peStatus.$CurrentCallerOrder + ', hadPending=' + $peStatus.$HasPendingDock + ')'" chance="100"/>
@@ -2860,170 +2859,30 @@
           </do_if>
         </do_if>
         
-        <!-- Operational State Prefix (REPAIR, RESUPPLY, MAINTENANCE, ESCAPE, REROUTE, CLEARANCE) -->
-        <!-- These are ADDITIONAL to status prefixes and respect user configuration -->
-        <!-- Default to true if setting doesn't exist (backwards compatibility with older saves) -->
+        <!-- Operational state labels (multi-flag: CB + RR + CL can coexist). Shared with pattern {OPSTATE}. -->
         <do_if value="(not $useConfig) or not global.$GT_GlobalSettings.$ShipNaming.$DisplayOperationalState? or @global.$GT_GlobalSettings.$ShipNaming.$DisplayOperationalState">
-          <set_value name="$operationalState" exact="''"/>
-          
-          <!-- Check for repair/resupply state -->
-          <!-- IMPORTANT: Do not depend on GT_Ships entry existing (subordinates can temporarily drop out of GT_Ships). -->
-          <!-- Resupply state is tracked via GT_ResupplyOrders, so we can show [RESUPPLY] even if GT_Ships entry is missing. -->
-          <set_value name="$hasRepair" exact="false"/>
-          <set_value name="$hasResupply" exact="false"/>
-          
-          <!-- Check if ship has active resupply order (GT maintenance tracking) -->
-          <do_if value="global.$GT_ResupplyOrders? and global.$GT_ResupplyOrders.{$ship}?">
-            <set_value name="$hasResupply" exact="true"/>
-          </do_if>
-
-          <!-- Fleet resupply / "Change Equipment" orders on subordinates may not be tracked in GT_ResupplyOrders.
-               Use vanilla active order IDs as a fallback, but only for GT ships or subordinates of GT ships. -->
-          <set_value name="$isGTRelated" exact="false"/>
-          <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
-            <set_value name="$isGTRelated" exact="true"/>
-          </do_if>
-          <do_else>
-            <set_value name="$commander" exact="@$ship.commander"/>
-            <do_if value="$commander? and global.$GT_Ships? and global.$GT_Ships.{$commander}?">
-              <set_value name="$isGTRelated" exact="true"/>
+          <run_actions ref="md.GT_Ship_Naming_Pattern.GT_Build_OpState_Labels" result="$opStateLabels">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          <do_all exact="$opStateLabels.count" counter="$opLabelIdx">
+            <set_value name="$opLabelRow" exact="$opStateLabels.{$opLabelIdx}"/>
+            <do_if value="not $opLabelRow? or not $opLabelRow.$Abbr? or $opLabelRow.$Abbr == ''">
+              <continue/>
             </do_if>
-          </do_else>
-
-          <do_if value="$isGTRelated">
-            <set_value name="$activeOrderId" exact="@$ship.order.id"/>
-            <do_if value="$activeOrderId == 'Equip' or $activeOrderId == 'Resupply'">
-              <set_value name="$hasResupply" exact="true"/>
+            <set_value name="$opLabelBracket" exact="'[' + $opLabelRow.$Abbr + ']'"/>
+            <do_if value="$opLabelRow.$StateType? and $opLabelRow.$StateType == 'CustomBlacklist'">
+              <set_value name="$opLabelBracket" exact="'\033#FFFFFF00#' + $opLabelBracket + '\033X'"/>
             </do_if>
-            <do_elseif value="$activeOrderId == 'Repair'">
-              <set_value name="$hasRepair" exact="true"/>
+            <do_elseif value="$opLabelRow.$StateType? and $opLabelRow.$StateType == 'Unreachable'">
+              <set_value name="$opLabelBracket" exact="'\033#FFCC0000#' + $opLabelBracket + '\033X'"/>
             </do_elseif>
-          </do_if>
-          
-          <!-- GT_Ships-derived states (repair/reroute/clearance) are only available if ship is registered -->
-          <set_value name="$shipData" exact="null"/>
-          <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
-            <set_value name="$shipData" exact="global.$GT_Ships.{$ship}"/>
-            
-            <!-- Check if ship has active repair order -->
-            <do_if value="$shipData.$NeedsRepair? and $shipData.$NeedsRepair">
-              <set_value name="$hasRepair" exact="true"/>
-            </do_if>
-            
-            <!-- Check for escape state (ship is actively trying to leave a blacklisted sector) -->
-            <do_if value="$shipData.$Escaping? and $shipData.$Escaping">
-              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
-                <param name="stateType" value="'Escape'"/>
-              </run_actions>
-              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
-            </do_if>
-
-            <!-- Check for reroute state (destination threatened/blacklisted) -->
-            <do_if value="$operationalState == '' and $shipData.$Rerouting? and $shipData.$Rerouting and not $hasRepair and not $hasResupply">
-              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
-                <param name="stateType" value="'Reroute'"/>
-              </run_actions>
-              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
-            </do_if>
-            
-            <!-- Check for cargo safety disposal state -->
-            <do_if value="$shipData.$CargoDisposal? and $shipData.$CargoDisposal">
-              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
-                <param name="stateType" value="'Clearance'"/>
-              </run_actions>
-              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
-            </do_if>
-
-            <!-- Check for unreachable routes state (all current profitable routes blocked by blacklist/pathing) -->
-            <!-- Show this in red for quick visual diagnosis -->
-            <do_if value="$operationalState == '' and $shipData.$Unreachable? and $shipData.$Unreachable">
-              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
-                <param name="stateType" value="'Unreachable'"/>
-              </run_actions>
-              <set_value name="$operationalState" exact="'\033#FFCC0000#[' + $abbr + ']\033X'"/>
-            </do_if>
-
-            <!-- Pilot exchange state (centralized status check to avoid stale PE display). -->
-            <set_value name="$showPilotExchangeState" exact="false"/>
-            <do_if value="md.GT_Ship_State_Utilities.GT_CheckPilotExchangeStatus?">
-              <run_actions ref="md.GT_Ship_State_Utilities.GT_CheckPilotExchangeStatus" result="$namePeStatus">
-                <param name="ship" value="$ship"/>
-              </run_actions>
-              <do_if value="$namePeStatus.$ShouldKeepPE">
-                <set_value name="$showPilotExchangeState" exact="true"/>
-              </do_if>
-            </do_if>
-            <do_elseif value="$shipData.$PilotExchange? and $shipData.$PilotExchange">
-              <!-- Backward-compatible fallback if utility is unavailable for any reason. -->
-              <set_value name="$showPilotExchangeState" exact="true"/>
-            </do_elseif>
-            <do_if value="$showPilotExchangeState">
-              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
-                <param name="stateType" value="'PilotExchange'"/>
-              </run_actions>
-              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
-            </do_if>
-          </do_if>
-          
-          <!-- Determine operational state text using abbreviations (only if not overridden by reroute/clearance above) -->
-          <do_if value="$operationalState == ''">
-            <do_if value="$hasRepair and $hasResupply">
-              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
-                <param name="stateType" value="'Maintenance'"/>
-              </run_actions>
-              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
-            </do_if>
-            <do_elseif value="$hasRepair">
-              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
-                <param name="stateType" value="'Repair'"/>
-              </run_actions>
-              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
-            </do_elseif>
-            <do_elseif value="$hasResupply">
-              <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
-                <param name="stateType" value="'Resupply'"/>
-              </run_actions>
-              <set_value name="$operationalState" exact="'[' + $abbr + ']'"/>
-            </do_elseif>
-          </do_if>
-          
-          <!-- Add operational state to appropriate list based on user config -->
-          <!-- Default to prefix if setting doesn't exist (backwards compatibility) -->
-          <do_if value="$operationalState != ''">
             <do_if value="(not $useConfig) or not global.$GT_GlobalSettings.$ShipNaming.$OperationalStatePosition? or @global.$GT_GlobalSettings.$ShipNaming.$OperationalStatePosition == 'prefix'">
-              <append_to_list name="$prefixElements" exact="$operationalState"/>
+              <append_to_list name="$prefixElements" exact="$opLabelBracket"/>
             </do_if>
             <do_else>
-              <append_to_list name="$suffixElements" exact="$operationalState"/>
+              <append_to_list name="$suffixElements" exact="$opLabelBracket"/>
             </do_else>
-          </do_if>
-        </do_if>
-
-        <!-- Custom blacklist prefix tag:
-             Show for commander ships with active MK3 custom blacklist and for their subordinates. -->
-        <set_value name="$showCustomBlacklistTag" exact="false"/>
-        <set_value name="$mk3BlacklistOwnerForTag" exact="$ship"/>
-        <set_value name="$isShipAffectedByCustomBlacklist" exact="false"/>
-        <do_if value="$ship.commander? and $ship.commander.exists">
-          <do_if value="$ship.commander.defaultorder?">
-            <do_if value="@$ship.commander.defaultorder.id == 'GalaxyTraderMK3'">
-              <set_value name="$mk3BlacklistOwnerForTag" exact="$ship.commander"/>
-              <set_value name="$isShipAffectedByCustomBlacklist" exact="true"/>
-            </do_if>
-          </do_if>
-        </do_if>
-        <do_elseif value="$ship.defaultorder? and @$ship.defaultorder.id == 'GalaxyTraderMK3'">
-          <set_value name="$mk3BlacklistOwnerForTag" exact="$ship"/>
-          <set_value name="$isShipAffectedByCustomBlacklist" exact="true"/>
-        </do_elseif>
-        <do_if value="$isShipAffectedByCustomBlacklist and global.$GT_MK3FactionBlacklist? and global.$GT_MK3FactionBlacklist.$ShipSelections? and global.$GT_MK3FactionBlacklist.$ShipSelections.{$mk3BlacklistOwnerForTag}? and global.$GT_MK3FactionBlacklist.$ShipSelections.{$mk3BlacklistOwnerForTag}.keys.count gt 0">
-          <set_value name="$showCustomBlacklistTag" exact="true"/>
-        </do_if>
-        <do_if value="$showCustomBlacklistTag">
-          <run_actions ref="md.GT_Ship_Management.Get_State_Abbreviation" result="$abbr">
-            <param name="stateType" value="'CustomBlacklist'"/>
-          </run_actions>
-          <append_to_list name="$prefixElements" exact="'\033#FFFFFF00#[' + $abbr + ']\033X'"/>
+          </do_all>
         </do_if>
 
         <!-- Home sector (legacy mode) -->
@@ -3250,6 +3109,52 @@
       </actions>
     </library>
 
+    <!-- Unified ship name refresh: derive pilot stats from registries, then build + apply name. -->
+    <library name="GT_RefreshShipName" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="pilot" default="null"/>
+        <param name="nameType" default="'trader'"/>
+        <param name="xp" default="null"/>
+        <param name="level" default="null"/>
+        <param name="rank" default="null"/>
+        <param name="skillLevel" default="null"/>
+      </params>
+      <actions>
+        <do_if value="not $ship? or not @$ship.exists">
+          <return value="false"/>
+        </do_if>
+        <do_if value="not $pilot? or $pilot == null">
+          <set_value name="$pilot" exact="if $ship.pilot? and $ship.pilot.exists then $ship.pilot else null"/>
+        </do_if>
+        <set_value name="$xpVal" exact="$xp"/>
+        <set_value name="$levelVal" exact="$level"/>
+        <set_value name="$rankVal" exact="$rank"/>
+        <set_value name="$skillVal" exact="$skillLevel"/>
+        <do_if value="$pilot? and $pilot.exists and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}?">
+          <do_if value="not $xpVal?">
+            <set_value name="$xpVal" exact="@global.$GT_Pilots.{$pilot}.$XP"/>
+          </do_if>
+          <do_if value="not $levelVal?">
+            <set_value name="$levelVal" exact="@global.$GT_Pilots.{$pilot}.$Level"/>
+          </do_if>
+          <do_if value="not $rankVal?">
+            <set_value name="$rankVal" exact="@global.$GT_Pilots.{$pilot}.$CurrentRank"/>
+          </do_if>
+        </do_if>
+        <run_actions ref="md.GT_Ship_Management.GT_Process_Ship_Name_Refresh" result="$refreshResult">
+          <param name="ship" value="$ship"/>
+          <param name="pilot" value="$pilot"/>
+          <param name="xp" value="$xpVal"/>
+          <param name="level" value="$levelVal"/>
+          <param name="rank" value="$rankVal"/>
+          <param name="nameType" value="$nameType"/>
+          <param name="skillLevel" value="$skillVal"/>
+        </run_actions>
+        <return value="$refreshResult"/>
+      </actions>
+    </library>
+
     <!-- Unified ship name refresh: derive nameType, sync pilot tag, build + dedupe via Update_Ship_Name -->
     <library name="GT_Process_Ship_Name_Refresh" purpose="run_actions">
       <params>
@@ -3315,7 +3220,7 @@
         <do_if value="$signalParam.$nameType?">
           <set_value name="$nameType" exact="$signalParam.$nameType"/>
         </do_if>
-        <run_actions ref="md.GT_Ship_Management.GT_Process_Ship_Name_Refresh" result="$refreshDone">
+        <run_actions ref="md.GT_Ship_Management.GT_RefreshShipName" result="$refreshDone">
           <param name="ship" value="$ship"/>
           <param name="pilot" value="$pilot"/>
           <param name="xp" value="@$signalParam.$xp"/>
@@ -3323,6 +3228,36 @@
           <param name="rank" value="@$signalParam.$rank"/>
           <param name="nameType" value="$nameType"/>
           <param name="skillLevel" value="@$signalParam.$skillLevel"/>
+        </run_actions>
+      </actions>
+    </cue>
+
+    <!-- Unified ship op-state transitions from AI (lib.gt.ship.opstate) -->
+    <cue name="ListenForShipOpState" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_Ship_OpState'"/>
+      </conditions>
+      <actions>
+        <set_value name="$signalParam" exact="event.param2"/>
+        <set_value name="$ship" exact="@$signalParam.$Ship"/>
+        <set_value name="$active" exact="true"/>
+        <do_if value="$signalParam.$active?">
+          <set_value name="$active" exact="$signalParam.$active"/>
+        </do_if>
+        <set_value name="$refreshName" exact="true"/>
+        <do_if value="$signalParam.$refreshName?">
+          <set_value name="$refreshName" exact="$signalParam.$refreshName"/>
+        </do_if>
+        <set_value name="$reason" exact="''"/>
+        <do_if value="$signalParam.$reason?">
+          <set_value name="$reason" exact="$signalParam.$reason"/>
+        </do_if>
+        <run_actions ref="md.GT_Libraries_General.GT_ShipOpState">
+          <param name="ship" value="$ship"/>
+          <param name="opState" value="@$signalParam.$opState"/>
+          <param name="active" value="$active"/>
+          <param name="refreshName" value="$refreshName"/>
+          <param name="reason" value="$reason"/>
         </run_actions>
       </actions>
     </cue>

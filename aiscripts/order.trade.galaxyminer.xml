@@ -1347,6 +1347,10 @@
           </do_for_each>
           <do_if value="$gatherSectorEval?"><remove_value name="$gatherSectorEval"/></do_if>
           <do_if value="$wareEval?">
+            <do_if value="this.$minerPostSliceUnreachable? and this.$minerPostSliceUnreachable.{$wareEval}?">
+              <set_value name="$wareIsMineable" exact="false"/>
+              <remove_value name="this.$minerPostSliceUnreachable.{$wareEval}"/>
+            </do_if>
             <!-- Reachable for downstream gates (CARGO-FIRST, overflow, phys gate) means the engine
                  can route to a discovered asteroid this slice — not merely that resources.exists. -->
             <set_value name="this.$minerScoreWareReachable.{$wareEval}" exact="$wareIsMineable"/>
@@ -1445,9 +1449,35 @@
       <remove_value name="this.$minerScoreBestWares"/>
       <remove_value name="this.$minerScoreIndex"/>
       <do_if value="this.$checkDemandFirst">
-        <do_if value="$bestWares.count gt 0">
-          <set_value name="$bestWare" exact="$bestWares.random"/>
+        <!-- Prefer highest-urgency ware that still has primary delivery headroom (below
+             overflow threshold). Raw urgency alone can pick a capped ware (e.g. Silicon
+             urgency=5, hasPrimaryCapacity=false) while another mineable ware still has room,
+             leaving empty-bay miners in overflow standby after a depletion pivot. -->
+        <set_value name="$capacityPickUrgency" exact="-1"/>
+        <create_list name="$capacityPickWares"/>
+        <do_all exact="$candidateWares.count" counter="$capwi">
+          <set_value name="$capWare" exact="$candidateWares.{$capwi}"/>
+          <do_if value="$capWare? and $wareReachable? and $wareReachable.{$capWare}? and $wareReachable.{$capWare} and $wareHasPrimaryCapacity? and $wareHasPrimaryCapacity.{$capWare}? and $wareHasPrimaryCapacity.{$capWare}">
+            <set_value name="$capUrgency" exact="if $wareUrgency? and $wareUrgency.{$capWare}? then $wareUrgency.{$capWare} else 0"/>
+            <do_if value="$capUrgency gt $capacityPickUrgency">
+              <set_value name="$capacityPickUrgency" exact="$capUrgency"/>
+              <set_value name="$capacityPickWares" exact="[$capWare]"/>
+            </do_if>
+            <do_elseif value="$capUrgency == $capacityPickUrgency and not $capacityPickWares.indexof.{$capWare}">
+              <append_to_list name="$capacityPickWares" exact="$capWare"/>
+            </do_elseif>
+          </do_if>
+        </do_all>
+        <do_if value="$capacityPickWares.count gt 0">
+          <set_value name="$bestWare" exact="$capacityPickWares.random"/>
+          <set_value name="$bestUrgency" exact="$capacityPickUrgency"/>
+          <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Demand pick with primary capacity: ' + $bestWare.name + ' urgency=' + $bestUrgency" chance="this.$debugchance"/>
         </do_if>
+        <do_elseif value="$bestWares.count gt 0">
+          <set_value name="$bestWare" exact="$bestWares.random"/>
+        </do_elseif>
+        <remove_value name="$capacityPickUrgency"/>
+        <remove_value name="$capacityPickWares"/>
       </do_if>
       <do_else>
         <set_value name="$bestWares" exact="this.$minerScoreReachablePickList"/>
@@ -1582,19 +1612,24 @@
           <!--       has zero room to mine another cubic meter so it MUST deliver first     -->
           <!--       (this is exactly the BLV-869 report: cargoFree=0/35800, full of        -->
           <!--       Silicon, scored Ore, stuck in overflow wait forever)                    -->
+          <!--   (d) Bay holds a different ware that is no longer mineable (field          -->
+          <!--       depleted) while scoring picked another reachable ware - deliver         -->
+          <!--       stale cargo first (option 1: sell then re-score on next slice).         -->
           <!--                                                                              -->
-          <!-- The "scoring picked a different ware than cargo" condition that previously   -->
-          <!-- gated this block was too aggressive: a ship with 5% Ice in the bay and 95%   -->
-          <!-- free space scored on a fresh, reachable Ore opportunity should KEEP mining   -->
-          <!-- Ore, not divert to deliver 5% of Ice. The vanilla mining routine handles     -->
-          <!-- the Ice on the natural deliver-cycle once Ore is mined.                      -->
+          <!-- The "scoring picked a different ware than cargo" condition when the stale     -->
+          <!-- ware is still mineable was intentionally excluded: a ship with 5% Ice in    -->
+          <!-- the bay and 95% free space scored on Ore should KEEP mining Ore.             -->
           <!-- ============================================================================ -->
           <set_value name="$cargoFirstNoScoring" exact="not $selectedWare? or $selectedWare == null"/>
           <set_value name="$cargoFirstUnreachable" exact="not $cargoFirstNoScoring and $wareReachable? and $wareReachable.{$selectedWare}? and not $wareReachable.{$selectedWare}"/>
           <set_value name="$cargoFirstCargoFull" exact="this.ship.cargo.free.all le 0"/>
-          <set_value name="$cargoFirstShouldOverride" exact="$cargoFirstNoScoring or $cargoFirstUnreachable or $cargoFirstCargoFull"/>
-          <do_if value="$cargoFirstShouldOverride and ($cargoFirstNoScoring or $selectedWare != $cargoFirstBestWare)">
-            <set_value name="$cargoFirstReason" exact="if $cargoFirstNoScoring then 'no scoring winner' else (if $cargoFirstCargoFull then 'cargo is FULL (' + (this.ship.cargo.capacity.all - this.ship.cargo.free.all) + '/' + this.ship.cargo.capacity.all + ') - cannot mine more without delivering, scoring picked ' + $selectedWare.name + ' (urgency=' + (if $wareUrgency? and $wareUrgency.{$selectedWare}? then $wareUrgency.{$selectedWare} else 0) + ')' else 'scoring picked ' + $selectedWare.name + ' (urgency=' + (if $wareUrgency? and $wareUrgency.{$selectedWare}? then $wareUrgency.{$selectedWare} else 0) + ') but it is unreachable - no discovered asteroid in range') + '; cargo holds ' + $cargoFirstBestAmount + ' ' + $cargoFirstBestWare.name + ' with a willing primary buyer'"/>
+          <set_value name="$cargoFirstStaleDepleted" exact="false"/>
+          <do_if value="$cargoFirstBestWare? and $cargoFirstBestWare != null and $selectedWare? and $selectedWare != null and $cargoFirstBestWare != $selectedWare and $wareReachable? and $wareReachable.{$cargoFirstBestWare}? and not $wareReachable.{$cargoFirstBestWare}">
+            <set_value name="$cargoFirstStaleDepleted" exact="true"/>
+          </do_if>
+          <set_value name="$cargoFirstShouldOverride" exact="$cargoFirstNoScoring or $cargoFirstUnreachable or $cargoFirstCargoFull or $cargoFirstStaleDepleted"/>
+          <do_if value="$cargoFirstShouldOverride and ($cargoFirstNoScoring or $cargoFirstStaleDepleted or $selectedWare != $cargoFirstBestWare)">
+            <set_value name="$cargoFirstReason" exact="if $cargoFirstNoScoring then 'no scoring winner' else (if $cargoFirstStaleDepleted then 'stale cargo ' + $cargoFirstBestWare.name + ' no longer mineable while scoring picked ' + $selectedWare.name + ' - deliver before re-score' else (if $cargoFirstCargoFull then 'cargo is FULL (' + (this.ship.cargo.capacity.all - this.ship.cargo.free.all) + '/' + this.ship.cargo.capacity.all + ') - cannot mine more without delivering, scoring picked ' + $selectedWare.name + ' (urgency=' + (if $wareUrgency? and $wareUrgency.{$selectedWare}? then $wareUrgency.{$selectedWare} else 0) + ')' else 'scoring picked ' + $selectedWare.name + ' (urgency=' + (if $wareUrgency? and $wareUrgency.{$selectedWare}? then $wareUrgency.{$selectedWare} else 0) + ') but it is unreachable - no discovered asteroid in range') + '; cargo holds ' + $cargoFirstBestAmount + ' ' + $cargoFirstBestWare.name + ' with a willing primary buyer')"/>
             <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': CARGO-FIRST override - ' + $cargoFirstReason + '. Switching selected to ' + $cargoFirstBestWare.name + ' so the mining routine delivers existing cargo before mining anything new.'" chance="this.$debugchance"/>
             <set_value name="$selectedWare" exact="$cargoFirstBestWare"/>
             <set_value name="$bestWare" exact="$cargoFirstBestWare"/>
@@ -1611,6 +1646,7 @@
             <do_if value="$wareReachable?">
               <set_value name="$wareReachable.{$cargoFirstBestWare}" exact="true"/>
             </do_if>
+            <set_value name="this.$minerDeliveryOnlySlice" exact="true"/>
           </do_if>
           <do_if value="not $cargoFirstShouldOverride">
             <!-- Diagnostic: ship has deliverable cargo with a willing buyer but the gate
@@ -1621,6 +1657,7 @@
           <remove_value name="$cargoFirstNoScoring"/>
           <remove_value name="$cargoFirstUnreachable"/>
           <remove_value name="$cargoFirstCargoFull"/>
+          <remove_value name="$cargoFirstStaleDepleted"/>
           <remove_value name="$cargoFirstShouldOverride"/>
         </do_if>
         <do_if value="$cargoFirstBestWare?"><remove_value name="$cargoFirstBestWare"/></do_if>
@@ -2341,7 +2378,8 @@
       <set_value name="$resolvedSector" exact="null"/>
       <set_value name="$resolvedPos" exact="null"/>
       <set_value name="$sliceGatherSpaces" exact="if this.$minerSliceGatherSpaces? then this.$minerSliceGatherSpaces else []"/>
-      <do_if value="this.ship.cargo.free.all gt 0 and $selectedWare? and $selectedWare != null and $sliceGatherSpaces.count gt 0">
+      <set_value name="$deliveryOnlySlice" exact="this.$minerDeliveryOnlySlice? and this.$minerDeliveryOnlySlice"/>
+      <do_if value="not $deliveryOnlySlice and this.ship.cargo.free.all gt 0 and $selectedWare? and $selectedWare != null and $sliceGatherSpaces.count gt 0">
         <include_interrupt_actions ref="GetBlacklistgroup"/>
         <set_value name="$locateBlacklistGroup" exact="if $blacklistgroup? then $blacklistgroup else null"/>
         <set_value name="$searchYieldMs" exact="15"/>
@@ -2402,6 +2440,10 @@
           <remove_value name="$blacklistgroup"/>
         </do_if>
       </do_if>
+      <do_if value="$deliveryOnlySlice">
+        <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Delivery-only slice for ' + $selectedWare.name + ' - skipping asteroid locate (sell in-bay cargo)'" chance="this.$debugchance"/>
+      </do_if>
+      <remove_value name="$deliveryOnlySlice"/>
       <remove_value name="$sliceGatherSpaces"/>
 
       <!-- Run GT mining routine fork in time slices so GT maintenance/training can run between cycles -->
@@ -2413,6 +2455,7 @@
         <param name="precomputedgatherspaces" value="if this.$minerSliceGatherSpaces? then this.$minerSliceGatherSpaces else []"/>
         <param name="resolvedsector" value="$resolvedSector"/>
         <param name="resolvedpos" value="$resolvedPos"/>
+        <param name="deliveryonly" value="if this.$minerDeliveryOnlySlice? then this.$minerDeliveryOnlySlice else false"/>
         <param name="playerStationsOnly" value="this.$playerStationsOnly"/>
         <param name="primaryTargetStations" value="$demandStations"/>
         <param name="blockedstations" value="if this.$effectiveBlockedStations? then this.$effectiveBlockedStations else []"/>
@@ -2432,9 +2475,20 @@
         <param name="duration" value="this.$demandRecheckInterval"/>
         <param name="debugchance" value="this.$debugchance"/>
       </run_script>
+      <remove_value name="this.$minerDeliveryOnlySlice"/>
       <remove_value name="this.$minerSliceGatherSpaces"/>
       <remove_value name="$resolvedSector"/>
       <remove_value name="$resolvedPos"/>
+
+      <!-- Field depleted mid-slice: mark ware unreachable for the next scoring pass. -->
+      <do_if value="this.ship.$gtDepletedMiningWare?">
+        <do_if value="not this.$minerPostSliceUnreachable?">
+          <set_value name="this.$minerPostSliceUnreachable" exact="table[]"/>
+        </do_if>
+        <set_value name="this.$minerPostSliceUnreachable.{this.ship.$gtDepletedMiningWare}" exact="true"/>
+        <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Field depleted for ' + this.ship.$gtDepletedMiningWare.name + ' during slice - will skip on next re-score'" chance="this.$debugchance"/>
+        <remove_value name="this.ship.$gtDepletedMiningWare"/>
+      </do_if>
 
       <!-- Detect delivery completion and emit one XP event per delivery slice -->
       <set_value name="$cargoAfterDelivery" exact="0"/>
@@ -2667,6 +2721,7 @@
     <do_if value="this.$minerScoreCandidateWares?"><remove_value name="this.$minerScoreCandidateWares"/></do_if>
     <do_if value="this.$minerScoreGatherSpaces?"><remove_value name="this.$minerScoreGatherSpaces"/></do_if>
     <do_if value="this.$minerSliceGatherSpaces?"><remove_value name="this.$minerSliceGatherSpaces"/></do_if>
+    <do_if value="this.$minerDeliveryOnlySlice?"><remove_value name="this.$minerDeliveryOnlySlice"/></do_if>
     <do_if value="this.$minerScoreDemandStations?"><remove_value name="this.$minerScoreDemandStations"/></do_if>
     <do_if value="this.$minerScoreWareUrgency?"><remove_value name="this.$minerScoreWareUrgency"/></do_if>
     <do_if value="this.$minerScoreWareHasPrimaryCapacity?"><remove_value name="this.$minerScoreWareHasPrimaryCapacity"/></do_if>

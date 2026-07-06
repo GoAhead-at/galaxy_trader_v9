@@ -3468,9 +3468,9 @@
             <do_if value="$matchResult? and $matchResult.$TradeList?">
               <set_value name="$matchTradeListRaw" exact="@$matchResult.$TradeList"/>
             </do_if>
-            <set_value name="$execCargoUtilPct" exact="[10,[(if this.$gt_cargotarget? then this.$gt_cargotarget else (if this.$effectiveCargoTarget? then this.$effectiveCargoTarget else 80)), 100].min].max"/>
             <set_value name="$execIsIsolated" exact="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{this.ship}?"/>
-            <set_value name="$execApplyCargoUtil" exact="not $execIsIsolated"/>
+            <!-- Cache-refresh live search uses fleet-min; per-ship cargotarget applies at cache read only. -->
+            <set_value name="$execApplyCargoUtil" exact="false"/>
             <set_value name="$execFilterPassLabel" exact="'pre-score'"/>
             <set_value name="$matchBeforeExecFilter" exact="$matchTradeListRaw.count"/>
             <create_list name="$matchTradeListForCache"/>
@@ -3577,30 +3577,7 @@
               <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Executable filter (' + $execFilterPassLabel + '): before=' + $matchBeforeExecFilter + ', after=' + $matchTradeList.count + ', removed=' + ($matchBeforeExecFilter - $matchTradeList.count)" chance="100"/>
             </do_if>
 
-            <!-- 5a) Ship-route ranking for this ship (unified consumer Target B). -->
-            <set_value name="$liveRouteMaxEntries" exact="50"/>
-            <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries?">
-              <set_value name="$liveRouteMaxEntries" exact="@global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries"/>
-            </do_if>
-            <set_value name="$liveRouteDistPenalty" exact="if $gt_distancepenalty? then ($gt_distancepenalty / 50.0) else (if this.$effectiveDistancePenalty? then (this.$effectiveDistancePenalty / 50.0) else 0.1)"/>
-            <run_script name="'lib.gt.cache.score_for_ship'" result="$shipRouteScoreResult">
-              <param name="tradeList" value="$matchTradeList"/>
-              <param name="ship" value="this.ship"/>
-              <param name="distancePenalty" value="$liveRouteDistPenalty"/>
-              <param name="blacklistGroup" value="if this.$blacklistgroup? then this.$blacklistgroup else blacklistgroup.civilian"/>
-              <param name="maxEntries" value="$liveRouteMaxEntries"/>
-              <param name="debugchance" value="@this.$debugchance"/>
-            </run_script>
-            <set_value name="$shipRouteTradeList" exact="[]"/>
-            <do_if value="$shipRouteScoreResult? and $shipRouteScoreResult.$SortedTrades?">
-              <set_value name="$shipRouteTradeList" exact="@$shipRouteScoreResult.$SortedTrades"/>
-            </do_if>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $shipRouteTradeList.count gt 0">
-              <set_value name="$liveRouteTopScore" exact="if $shipRouteScoreResult? and $shipRouteScoreResult.$BestScore? then @$shipRouteScoreResult.$BestScore else 0"/>
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Live ship-route scored ' + $shipRouteTradeList.count + ' trades (top ShipScore=' + $liveRouteTopScore + ', pool=' + $matchTradeList.count + ')'" chance="100"/>
-            </do_if>
-
-            <!-- 5b) Cache refresh: write station-side survivors (no writer cargo util / ship clamp). -->
+            <!-- 5b) Cache refresh: write station-side survivors (fleet-min live search; ship-agnostic rows). -->
             <do_if value="$matchTradeListForCache.count gt 0">
               <run_script name="'lib.gt.cache.write'" result="$liveCacheWriteResult">
                 <param name="tradeList" value="$matchTradeListForCache"/>
@@ -3613,25 +3590,43 @@
               </run_script>
             </do_if>
 
-            <!-- 5c) Priority wares + diversify on ship-route list (home $Score unchanged on rows). -->
-            <run_script name="'lib.gt.score.trades'" result="$scoreResult">
-              <param name="tradeList" value="$shipRouteTradeList"/>
-              <param name="priorityWares" value="if $effectivePriorityWares? then $effectivePriorityWares else []"/>
-              <param name="priorityScoreMultiplier" value="if $effectivePriorityScoreMultiplier? then $effectivePriorityScoreMultiplier else 125"/>
-              <param name="diversifyByWare" value="true"/>
-              <param name="useShipRouteScore" value="true"/>
+            <!-- 5c) Re-read cache with per-ship cargotarget selection (do not execute fleet-min live rows directly). -->
+            <set_value name="$postRefreshCacheResult" exact="null"/>
+            <run_script name="'lib.gt.cache.search'" result="$postRefreshCacheResult">
+              <param name="ship" value="this.ship"/>
+              <param name="searchMode" value="$searchMode"/>
+              <param name="homeSector" value="$searchHomeSector"/>
+              <param name="maxDistance" value="$searchMaxDistance"/>
+              <param name="wareBasket" value="$searchWareBasket"/>
+              <param name="minROI" value="$searchMinROI"/>
+              <param name="minAbsoluteProfit" value="$searchMinAbsoluteProfit"/>
+              <param name="minCargoUtilPercent" value="if $gt_cargotarget? then $gt_cargotarget else (if this.$effectiveCargoTarget? then this.$effectiveCargoTarget else (if this.$gt_cargotarget? then this.$gt_cargotarget else 80))"/>
+              <param name="ignoreBuildStorage" value="$searchIgnoreBuildStorage"/>
+              <param name="ignoreCarrierAux" value="$searchIgnoreCarrierAux"/>
+              <param name="requireNonPlayerDeliveryStation" value="if $searchIgnorePlayerPricing? then $searchIgnorePlayerPricing else (if this.$effectiveIgnorePlayerPricing? then this.$effectiveIgnorePlayerPricing else false)"/>
+              <param name="maxEntries" value="if global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries? then @global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries else 50"/>
+              <param name="cacheMaxAge" value="if global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$CacheTTL? then @global.$GT_GlobalSettings.$Fleet.$CacheTTL else 300s"/>
+              <param name="cacheDropoffTolerance" value="if global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$CacheDropoffTolerance? then @global.$GT_GlobalSettings.$Fleet.$CacheDropoffTolerance else 15"/>
+              <param name="sellPriceMax" value="$searchSellPriceMax"/>
+              <param name="buyPriceMin" value="$searchBuyPriceMin"/>
+              <param name="bypassPlayerSellerPricing" value="$searchBypassPlayerSellerPricing"/>
+              <param name="ignoreTradeRules" value="$searchIgnoreTradeRules"/>
+              <param name="cacheReadOffset" value="$searchCacheReadOffset"/>
+              <param name="distancePenalty" value="if $gt_distancepenalty? then $gt_distancepenalty else (if this.$effectiveDistancePenalty? then (this.$effectiveDistancePenalty / 50.0) else 0.1)"/>
+              <param name="blacklistGroup" value="if this.$blacklistgroup? then this.$blacklistgroup else blacklistgroup.civilian"/>
             </run_script>
-
-            <set_value name="$pipelineSearchMethod" exact="'live_ship_route'"/>
-            <set_value name="$scoreFound" exact="false"/>
-            <do_if value="$scoreResult?">
-              <do_if value="$scoreResult.$Found?">
-                <set_value name="$scoreFound" exact="@$scoreResult.$Found"/>
-              </do_if>
+            <set_value name="$postRefreshFound" exact="false"/>
+            <do_if value="$postRefreshCacheResult? and $postRefreshCacheResult.$Found?">
+              <set_value name="$postRefreshFound" exact="@$postRefreshCacheResult.$Found"/>
             </do_if>
-            <do_if value="$scoreFound">
+            <do_if value="$postRefreshFound">
               <set_value name="$pipelineFound" exact="true"/>
-              <set_value name="$pipelineTradeList" exact="if $scoreResult.$SortedTrades? then @$scoreResult.$SortedTrades else []"/>
+              <set_value name="$pipelineSearchMethod" exact="'cache'"/>
+              <set_value name="$pipelineTradeList" exact="if $postRefreshCacheResult.$TradeList? then @$postRefreshCacheResult.$TradeList else []"/>
+            </do_if>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$postRefreshCount" exact="if $postRefreshCacheResult? and $postRefreshCacheResult.$TradeList? then @$postRefreshCacheResult.$TradeList.count else 0"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Post-refresh cache re-read ' + (if $postRefreshFound then 'HIT' else 'MISS') + ' (trades=' + $postRefreshCount + ')'" chance="100"/>
             </do_if>
           </do_else>
         </do_else>
@@ -5567,9 +5562,9 @@
                   <set_value name="$finalSellAmount" exact="$finalAmount"/>
                 </do_if>
 
-                <!-- HARD FILTER: Minimum cargo utilization threshold (live/cache/fallback only; excluded in isolated mode) -->
+                <!-- Min cargo applies at cache read only; live_fallback still gated here. -->
                 <set_value name="$isIsolatedForCargoFilter" exact="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{this.ship}?"/>
-                <set_value name="$applyMinCargoUtilFilter" exact="not $isSellOnlyTrade and not $isIsolatedForCargoFilter and ($searchMethod == 'live' or $searchMethod == 'live_ship_route' or $searchMethod == 'cache' or $searchMethod == 'live_fallback')"/>
+                <set_value name="$applyMinCargoUtilFilter" exact="not $isSellOnlyTrade and not $isIsolatedForCargoFilter and ($searchMethod == 'live' or $searchMethod == 'live_fallback')"/>
                 <do_if value="$applyMinCargoUtilFilter">
                   <set_value name="$utilWare" exact="null"/>
                   <do_if value="$currentTrade.$Ware?">

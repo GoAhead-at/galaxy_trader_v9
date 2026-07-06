@@ -80,7 +80,23 @@ ffi.cdef[[
     bool InstallShieldMod(UniverseID defensibleid, UniverseID contextid, const char* group, const char* wareid);
     bool GetInstalledEngineMod2(UniverseID objectid, UIEngineMod2* enginemod);
     bool GetInstalledShipMod2(UniverseID shipid, UIShipMod2* shipmod);
+    uint64_t ConvertStringTo64Bit(const char* idcode);
 ]]
+
+-- X4 serializes component IDs as "12345ULL" in MD->Lua strings; strip suffix before tonumber.
+local function NormalizeUniverseIdString(str)
+    str = tostring(str)
+    str = string.gsub(str, "^%s+", "")
+    str = string.gsub(str, "%s+$", "")
+    if string.sub(str, 1, 2) == "0x" then
+        return str
+    end
+    str = string.gsub(str, "[Uu][Ll][Ll]$", "")
+    str = string.gsub(str, "[Ll][Ll]$", "")
+    str = string.gsub(str, "[Uu][Ll]$", "")
+    str = string.gsub(str, "[Uu]$", "")
+    return str
+end
 
 -- Convert a serialized UniverseID string to a 64-bit universe ID.
 local function ConvertStringTo64Bit(str)
@@ -89,18 +105,30 @@ local function ConvertStringTo64Bit(str)
         return 0
     end
 
-    local num
-    if type(str) == "string" and string.sub(str, 1, 2) == "0x" then
-        num = tonumber(string.sub(str, 3), 16)
-    else
-        num = tonumber(str)
-    end
-
-    if not num then
-        logDebug(string.format("ERROR: Failed to convert '%s' to number", tostring(str)), "ERROR")
+    local normalized = NormalizeUniverseIdString(str)
+    if normalized == "" then
+        logDebug("ERROR: Empty normalized ID passed to ConvertStringTo64Bit", "ERROR")
         return 0
     end
-    return ffi.cast("uint64_t", num)
+
+    local num
+    if string.sub(normalized, 1, 2) == "0x" then
+        num = tonumber(string.sub(normalized, 3), 16)
+    else
+        num = tonumber(normalized)
+    end
+
+    if num then
+        return C.ConvertStringTo64Bit(tostring(num))
+    end
+
+    local ok, fromC = pcall(C.ConvertStringTo64Bit, normalized)
+    if ok and fromC and fromC ~= 0 then
+        return fromC
+    end
+
+    logDebug(string.format("ERROR: Failed to convert '%s' to number", tostring(str)), "ERROR")
+    return ffi.cast("uint64_t", 0)
 end
 
 -- Split pipe-separated parameters (format: "type|shipId|componentId|contextId|group")
@@ -119,14 +147,14 @@ local function ToUniverseID(value)
         return ffi.cast("uint64_t", 0)
     end
 
-    local valueType = type(value)
-    if valueType == "string" or valueType == "number" then
-        return ConvertStringTo64Bit(tostring(value))
-    end
-
     local ok, converted = pcall(ConvertIDTo64Bit, value)
     if ok and converted and converted ~= 0 then
         return converted
+    end
+
+    local valueType = type(value)
+    if valueType == "string" or valueType == "number" then
+        return ConvertStringTo64Bit(tostring(value))
     end
 
     logDebug(string.format("ERROR: Failed to convert component payload to UniverseID: %s", tostring(value)), "ERROR")
@@ -197,6 +225,59 @@ local function IsGTEngineModWareId(wareId)
         or wareId == "mod_penalty_light"
         or wareId == "mod_penalty_moderate"
         or wareId == "mod_penalty_severe"
+end
+
+local function ReadInstalledSlotWares(shipId)
+    local shipBuf = ffi.new("UIShipMod2")
+    local engineBuf = ffi.new("UIEngineMod2")
+    local hasShip = C.GetInstalledShipMod2(shipId, shipBuf)
+    local hasEngine = C.GetInstalledEngineMod2(shipId, engineBuf)
+    local shipWare = hasShip and SafeCString(shipBuf.Ware) or "none"
+    local engineWare = hasEngine and SafeCString(engineBuf.Ware) or "none"
+    if shipWare == "" then
+        shipWare = "none"
+    end
+    if engineWare == "" then
+        engineWare = "none"
+    end
+    return hasShip, shipWare, hasEngine, engineWare
+end
+
+local function PublishProbeResult(shipComponent, shipIdCode, hasShip, shipWare, hasEngine, engineWare)
+    local shipNonGT = hasShip and not IsGTShipModWareId(shipWare)
+    local engineNonGT = hasEngine and not IsGTEngineModWareId(engineWare)
+
+    local playerId = ConvertStringTo64Bit(tostring(C.GetPlayerID()))
+    SetNPCBlackboard(playerId, "$GT_ModProbe_ShipWare", shipWare)
+    SetNPCBlackboard(playerId, "$GT_ModProbe_EngineWare", engineWare)
+    SetNPCBlackboard(playerId, "$GT_ModProbe_ShipNonGT", shipNonGT and 1 or 0)
+    SetNPCBlackboard(playerId, "$GT_ModProbe_EngineNonGT", engineNonGT and 1 or 0)
+
+    SignalObject(playerId, "gt_mods_probe", ConvertStringToLuaID(NormalizeUniverseIdString(shipComponent)))
+    return shipNonGT, engineNonGT
+end
+
+local function GT_ProbeSlots(_, params)
+    if not params then
+        logDebug("ERROR: GT_Mods.Probe called with nil params", "ERROR")
+        return
+    end
+
+    local payload = ParseModPayload(params)
+    if not payload.component then
+        logDebug(string.format("ERROR: Invalid GT_Mods.Probe params format: %s", tostring(params)), "ERROR")
+        return
+    end
+
+    local shipIdCode = payload.shipIdCode or "UNKNOWN"
+    local shipId = ToUniverseID(payload.component)
+    local hasShip, shipWare, hasEngine, engineWare = ReadInstalledSlotWares(shipId)
+    local shipNonGT, engineNonGT = PublishProbeResult(payload.component, shipIdCode, hasShip, shipWare, hasEngine, engineWare)
+
+    logDebug(string.format(
+        "Probe ship=%s shipWare=%s engineWare=%s shipNonGT=%s engineNonGT=%s",
+        shipIdCode, shipWare, engineWare, tostring(shipNonGT), tostring(engineNonGT)
+    ), "WARNING")
 end
 
 local function GT_DismantleDetectedGTMods(_, params)
@@ -315,7 +396,32 @@ local function GT_InstallMod(_, params)
     local shipId = ToUniverseID(payload.component)
     local wareId = payload.wareId
 
-    -- logDebug(string.format("Install request type=%s shipId=%s ware=%s", tostring(type), tostring(shipIdStr), tostring(wareId)), "WARNING")
+    local hasShip, shipWare, hasEngine, engineWare = ReadInstalledSlotWares(shipId)
+    if type == "ship" then
+        if hasShip and not IsGTShipModWareId(shipWare) then
+            logDebug(string.format(
+                "Install blocked ship=%s foreign ship mod ware=%s (requested=%s)",
+                shipIdStr, shipWare, tostring(wareId)
+            ), "WARNING")
+            PublishProbeResult(payload.component, shipIdStr, hasShip, shipWare, hasEngine, engineWare)
+            return
+        end
+        if hasShip and IsGTShipModWareId(shipWare) and shipWare == wareId then
+            return
+        end
+    elseif type == "engine" or type == "thruster" then
+        if hasEngine and not IsGTEngineModWareId(engineWare) then
+            logDebug(string.format(
+                "Install blocked ship=%s foreign engine mod ware=%s (requested=%s)",
+                shipIdStr, engineWare, tostring(wareId)
+            ), "WARNING")
+            PublishProbeResult(payload.component, shipIdStr, hasShip, shipWare, hasEngine, engineWare)
+            return
+        end
+        if hasEngine and IsGTEngineModWareId(engineWare) and engineWare == wareId then
+            return
+        end
+    end
 
     if type == "ship" then
         local ok, success = pcall(C.InstallShipMod, shipId, wareId)
@@ -388,6 +494,14 @@ local function init()
         logDebug("Registered event: GT_Mods.DismantleDetected")
     else
         logDebug("Failed to register event: GT_Mods.DismantleDetected", "ERROR")
+        return false
+    end
+
+    local success4 = pcall(RegisterEvent, "GT_Mods.Probe", GT_ProbeSlots)
+    if success4 then
+        logDebug("Registered event: GT_Mods.Probe")
+    else
+        logDebug("Failed to register event: GT_Mods.Probe", "ERROR")
         return false
     end
     

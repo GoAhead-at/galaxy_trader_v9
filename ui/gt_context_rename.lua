@@ -107,8 +107,11 @@ function menu.buttonGTRenameConfirm(isconfirmed)
             if newname ~= currentName then
                 -- Store rename data in NPCBlackboard for MD to read
                 -- Store newName separately to avoid table access issues
-                local playerId = ConvertStringTo64Bit(tostring(C.GetPlayerID()))
-                SetNPCBlackboard(playerId, "$GT_ContextRename_NewName", newname)
+                local playerBbId = (_G.GT_PlayerBridge and _G.GT_PlayerBridge.GetPlayerBlackboardId and _G.GT_PlayerBridge.GetPlayerBlackboardId())
+                    or ConvertStringToLuaID(tostring(C.GetPlayerID()))
+                local playerSignalId = (_G.GT_PlayerBridge and _G.GT_PlayerBridge.GetPlayerSignalId and _G.GT_PlayerBridge.GetPlayerSignalId())
+                    or ConvertStringTo64Bit(tostring(C.GetPlayerID()))
+                SetNPCBlackboard(playerBbId, "$GT_ContextRename_NewName", newname)
 
                 -- Multi-rename support: apply same name to all selected ships.
                 -- Non-GT ships are filtered on MD side (GT service guard).
@@ -134,7 +137,7 @@ function menu.buttonGTRenameConfirm(isconfirmed)
                 end
 
                 for _, targetComponent in ipairs(targets) do
-                    SignalObject(playerId, "gt_context_rename_confirmed", ConvertStringToLuaID(tostring(targetComponent)))
+                    SignalObject(playerSignalId, "gt_context_rename_confirmed", ConvertStringToLuaID(tostring(targetComponent)))
                 end
                 DebugError(string.format("[GT Context Rename] Signaled MD for %d component(s), newName=%s", #targets, newname))
             end
@@ -292,8 +295,9 @@ RegisterEvent("gt.openRenameContext", function(_, component)
             -- Get original name from NPCBlackboard (set by MD script)
             -- MD uses: player.entity.$GT_ContextRename_OriginalName
             -- Lua reads: GetNPCBlackboard(playerId, "$GT_ContextRename_OriginalName")
-            local playerId = ConvertStringTo64Bit(tostring(C.GetPlayerID()))
-            local originalName = GetNPCBlackboard(playerId, "$GT_ContextRename_OriginalName")
+            local playerBbId = (_G.GT_PlayerBridge and _G.GT_PlayerBridge.GetPlayerBlackboardId and _G.GT_PlayerBridge.GetPlayerBlackboardId())
+                or ConvertStringToLuaID(tostring(C.GetPlayerID()))
+            local originalName = GetNPCBlackboard(playerBbId, "$GT_ContextRename_OriginalName")
             
             DebugError(string.format("[GT Context Rename] Lua: Original name from blackboard: %s", tostring(originalName)))
             

@@ -256,15 +256,12 @@ local function PublishProbeResult(shipComponent, shipIdCode, hasShip, shipWare, 
     local shipNonGT = hasShip and not IsGTShipModWareId(shipWare)
     local engineNonGT = hasEngine and not IsGTEngineModWareId(engineWare)
 
-    local playerBbId = GetPlayerBlackboardId()
-    local playerSignalId = GetPlayerSignalId()
-    SetNPCBlackboard(playerBbId, "$GT_ModProbe_ShipWare", shipWare)
-    SetNPCBlackboard(playerBbId, "$GT_ModProbe_EngineWare", engineWare)
-    SetNPCBlackboard(playerBbId, "$GT_ModProbe_ShipNonGT", shipNonGT and 1 or 0)
-    SetNPCBlackboard(playerBbId, "$GT_ModProbe_EngineNonGT", engineNonGT and 1 or 0)
-    SetNPCBlackboard(playerBbId, "$GT_ModProbe_ShipIdCode", shipIdCode or "UNKNOWN")
+    if _G.GT_PlayerBridge and _G.GT_PlayerBridge.StoreModProbeByIdCode then
+        _G.GT_PlayerBridge.StoreModProbeByIdCode(shipIdCode, shipWare, engineWare, shipNonGT, engineNonGT)
+    end
 
-    -- Pass idcode back to MD; MD ship objects from raise_lua_event strings do not round-trip as event.param2.
+    local playerSignalId = (_G.GT_PlayerBridge and _G.GT_PlayerBridge.GetPlayerSignalId and _G.GT_PlayerBridge.GetPlayerSignalId())
+        or GetPlayerSignalId()
     SignalObject(playerSignalId, "gt_mods_probe", shipIdCode or "UNKNOWN")
     return shipNonGT, engineNonGT
 end

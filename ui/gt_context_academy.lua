@@ -63,7 +63,17 @@ local function debugLog(msg)
     DebugError("[GT Academy] " .. tostring(msg))
 end
 
-local function getPlayerId64()
+local function getPlayerBlackboardId()
+    if _G.GT_PlayerBridge and _G.GT_PlayerBridge.GetPlayerBlackboardId then
+        return _G.GT_PlayerBridge.GetPlayerBlackboardId()
+    end
+    return ConvertStringToLuaID(tostring(C.GetPlayerID()))
+end
+
+local function getPlayerSignalId()
+    if _G.GT_PlayerBridge and _G.GT_PlayerBridge.GetPlayerSignalId then
+        return _G.GT_PlayerBridge.GetPlayerSignalId()
+    end
     return ConvertStringTo64Bit(tostring(C.GetPlayerID()))
 end
 
@@ -171,7 +181,7 @@ end
 -- ---------------------------------------------------------------------------
 
 local function snapshotContext()
-    local playerId = getPlayerId64()
+    local playerId = getPlayerBlackboardId()
     local courses  = readBlackboardList(playerId, "$GT_Academy_Courses")
     if not courses then
         debugLog("snapshotContext: no $GT_Academy_Courses on blackboard")
@@ -248,7 +258,7 @@ local function chooseCourse(component, course, ctx)
         course.targetLevel, course.scaledCost, centiCredits, course.scaledDuration, tostring(component)
     ))
 
-    SignalObject(playerId, "gt_academy_course_chosen", ConvertStringToLuaID(tostring(component)))
+    SignalObject(getPlayerSignalId(), "gt_academy_course_chosen", ConvertStringToLuaID(tostring(component)))
 end
 
 -- ---------------------------------------------------------------------------

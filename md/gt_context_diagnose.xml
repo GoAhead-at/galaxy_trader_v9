@@ -1439,8 +1439,8 @@
         </do_if>
         <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Ignore Player Pricing', $Status = 'INFO', $Detail = if $ignorePlayerPricing then 'true (MK3 buys from player at any price, sells only to NPCs)' else 'false']"/>
         <do_if value="$ignorePlayerPricing and $orderId == 'GalaxyTraderMK3'">
-          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'IPP Policy Snapshot', $Status = 'INFO', $Detail = 'Player suppliers: any sell price (supplemental scan). Buyers: NPC only. Score/profit: supplier cost treated as zero.']"/>
-          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'IPP Runtime Note', $Status = 'INFO', $Detail = 'NPC suppliers still compete on score. MinPlayerMoney purchase gate skipped for player-supplier pairs (internal economy). Vanilla buy leg may still move credits at execution.']"/>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'IPP Policy Snapshot', $Status = 'INFO', $Detail = 'Player suppliers: any sell price (supplemental scan). Buyers: NPC only. Score/profit: supplier cost treated as zero (gross NPC sell income).']"/>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'IPP Runtime Note', $Status = 'INFO', $Detail = 'NPC suppliers still compete on score. Player-supplier pairs: MinPlayerMoney skipped, buy clamp ignores buyer_money, trade_found uses gross income, cache skips margin ROI/dropoff, buy leg create_trade_order internal=true (no credit transfer).']"/>
         </do_if>
         <!-- IPP scan stats are appended to Sec8 after the supplier/buyer loops below populate
              the counters. The scan loop sets $diagIppPlayerSuppliersAdded / $diagIppPlayerBuyersRejected. -->
@@ -1635,12 +1635,12 @@
         </do_if>
         <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Priority Wares', $Status = 'INFO', $Detail = $priorityWaresDetail]"/>
 
-        <!-- Faction Priority (MK3 only - 10% score bonus for own stations) -->
+        <!-- Faction Priority (MK3 only - 100% score bonus for own stations) -->
         <set_value name="$factionPriority" exact="false"/>
         <do_if value="$gtOrder? and $gtOrder.$factionpriority?">
           <set_value name="$factionPriority" exact="$gtOrder.$factionpriority"/>
         </do_if>
-        <set_value name="$factionPriorityDetail" exact="if $factionPriority then 'On (+10% own stations)' else 'Off'"/>
+        <set_value name="$factionPriorityDetail" exact="if $factionPriority then 'On (+100% own stations)' else (if $ignorePlayerPricing and $orderId == 'GalaxyTraderMK3' then 'Off (IPP player-supplier still +100%)' else 'Off')"/>
         <do_if value="$orderId == 'GalaxyTraderMK1' or $orderId == 'GalaxyTraderMK2' or $orderId == 'GalaxyMiner'">
           <set_value name="$factionPriorityDetail" exact="'N/A'"/>
         </do_if>
@@ -3806,6 +3806,8 @@
             <set_value name="$diagCacheMinROI" exact="$effectiveROI"/>
           </do_if>
           <set_value name="$cvReasonHist" exact="[]"/>
+          <set_value name="$cvIppEntryCount" exact="0"/>
+          <set_value name="$cvIppPassCount" exact="0"/>
 
           <!-- Count unique wares + cargo compatibility across ALL cache entries (mirrors lib.gt.cache.search). -->
           <!-- NOTE: Must NOT combine @ and ? operators (X4 rule: @$x? is invalid) -->
@@ -4014,6 +4016,16 @@
               <set_value name="$tempRuntimeOk" exact="true"/>
               <set_value name="$cvReason" exact="''"/>
               <set_value name="$cvDetail" exact="''"/>
+              <set_value name="$cvEntryIppSupplier" exact="false"/>
+              <do_if value="$wareEntry.$PlayerFreeSupplier? and $wareEntry.$PlayerFreeSupplier">
+                <set_value name="$cvEntryIppSupplier" exact="true"/>
+              </do_if>
+              <do_elseif value="$ignorePlayerPricing and $orderId == 'GalaxyTraderMK3' and $tempBuyStationOk and @$tempBuyStation.isplayerowned">
+                <set_value name="$cvEntryIppSupplier" exact="true"/>
+              </do_elseif>
+              <do_if value="$cvEntryIppSupplier">
+                <set_value name="$cvIppEntryCount" operation="add"/>
+              </do_if>
               <set_value name="$cacheEntryTs" exact="if $wareEntry.$CachedAt? then @$wareEntry.$CachedAt else (if $wareEntry.$Timestamp? then @$wareEntry.$Timestamp else null)"/>
               <set_value name="$tempPreBuyAmt" exact="0"/>
               <set_value name="$tempPreSellAmt" exact="0"/>
@@ -4187,7 +4199,8 @@
                   <set_value name="$cvReason" exact="'min_profit'"/>
                   <set_value name="$cvDetail" exact="'' + ($wareEntry.$Profit / 100) + ' Cr lt ' + ($diagCacheMinProfit / 100) + ' Cr'"/>
                 </do_if>
-                <do_if value="$cvReason == '' and $diagCacheMinROI gt 0 and $wareEntry.$BuyPrice? and $wareEntry.$BuyPrice gt 0 and $wareEntry.$UnitProfit?">
+                <!-- IPP gross-income entries: skip margin-based ROI (UnitProfit is NPC sell price, not spread). -->
+                <do_if value="$cvReason == '' and not $cvEntryIppSupplier and $diagCacheMinROI gt 0 and $wareEntry.$BuyPrice? and $wareEntry.$BuyPrice gt 0 and $wareEntry.$UnitProfit?">
                   <set_value name="$cvEntryROI" exact="($wareEntry.$UnitProfit * 100) / $wareEntry.$BuyPrice"/>
                   <do_if value="$cvEntryROI lt $diagCacheMinROI">
                     <set_value name="$cvReason" exact="'min_roi'"/>
@@ -4199,7 +4212,16 @@
                 <do_if value="@$wareEntry.$BuyOffer.exists and @$wareEntry.$SellOffer.exists">
                   <set_value name="$cvCurBuy" exact="@$wareEntry.$BuyOffer.unitprice"/>
                   <set_value name="$cvCurSell" exact="@$wareEntry.$SellOffer.unitprice"/>
-                  <do_if value="$cvCurBuy? and $cvCurSell? and $cvCurBuy gt 0">
+                  <do_if value="$cvEntryIppSupplier and $cvCurSell? and $cvCurSell gt 0">
+                    <!-- IPP: compare NPC gross sell price drift only (supplier price irrelevant). -->
+                    <set_value name="$cvCurUnitProfit" exact="$cvCurSell"/>
+                    <set_value name="$cvProfitDropPct" exact="(($wareEntry.$UnitProfit - $cvCurUnitProfit) * 100) / $wareEntry.$UnitProfit"/>
+                    <do_if value="$cvProfitDropPct gt $diagCacheDropoff">
+                      <set_value name="$cvReason" exact="'profit_dropoff'"/>
+                      <set_value name="$cvDetail" exact="'IPP gross drop ' + $cvProfitDropPct + '% gt tol ' + $diagCacheDropoff + '%'"/>
+                    </do_if>
+                  </do_if>
+                  <do_elseif value="$cvCurBuy? and $cvCurSell? and $cvCurBuy gt 0">
                     <set_value name="$cvCurUnitProfit" exact="$cvCurSell - $cvCurBuy"/>
                     <do_if value="$cvCurUnitProfit le 0">
                       <set_value name="$cvReason" exact="'profit_dropoff'"/>
@@ -4211,7 +4233,7 @@
                         <set_value name="$cvDetail" exact="'drop ' + $cvProfitDropPct + '% gt tol ' + $diagCacheDropoff + '%'"/>
                       </do_if>
                     </do_elseif>
-                  </do_if>
+                  </do_elseif>
                 </do_if>
               </do_if>
               <do_if value="$cvReason == '' and $diagBandPriceCheckActive">
@@ -4362,7 +4384,7 @@
                   </do_elseif>
                 </do_if>
               </do_if>
-              <do_if value="$cvReason == '' and not $wareEntry.$IsSellOnly? and $wareEntry.$BuyOffer? and @$wareEntry.$BuyOffer.exists and $wareEntry.$SellOffer? and @$wareEntry.$SellOffer.exists">
+              <do_if value="$cvReason == '' and not $cvEntryIppSupplier and not $wareEntry.$IsSellOnly? and $wareEntry.$BuyOffer? and @$wareEntry.$BuyOffer.exists and $wareEntry.$SellOffer? and @$wareEntry.$SellOffer.exists">
                 <do_if value="$wareEntry.$BuyOffer.unitprice? and $wareEntry.$SellOffer.unitprice? and ($wareEntry.$SellOffer.unitprice - $wareEntry.$BuyOffer.unitprice) le 0">
                   <set_value name="$cvReason" exact="'live_profit_nonpositive'"/>
                 </do_if>
@@ -4372,6 +4394,9 @@
               <do_if value="$tempRuntimeOk">
                 <set_value name="$cacheRuntimeReadableCount" operation="add"/>
                 <set_value name="$cvPassCount" operation="add"/>
+                <do_if value="$cvEntryIppSupplier">
+                  <set_value name="$cvIppPassCount" operation="add"/>
+                </do_if>
               </do_if>
               <do_elseif value="$cvReason != ''">
                 <!-- X4 tables cannot use runtime string keys ($table.{$reason}); use list rows instead. -->
@@ -4394,6 +4419,9 @@
                 <set_value name="$cvBuyLabel" exact="if $tempBuyStationOk and $tempBuyStation.knownname? then @$tempBuyStation.knownname else '(no buy)'"/>
                 <set_value name="$cvSellLabel" exact="if $tempSellStationOk and $tempSellStation.knownname? then @$tempSellStation.knownname else '(no sell)'"/>
                 <set_value name="$cvRoute" exact="$cvBuyLabel + ' -> ' + $cvSellLabel"/>
+                <do_if value="$cvEntryIppSupplier">
+                  <set_value name="$cvRoute" exact="$cvBuyLabel + ' [player] -> ' + $cvSellLabel + ' [NPC]'"/>
+                </do_if>
                 <set_value name="$cvVolPerUnit2" exact="if $tempWare? and $tempWare.volume? then $tempWare.volume else 1"/>
                 <set_value name="$cvAmtShow" exact="if $tempPreSellAmt? and $tempPreSellAmt gt 0 then $tempPreSellAmt else (if $wareEntry.$Amount? then $wareEntry.$Amount else 0)"/>
                 <set_value name="$cvVolShow" exact="$cvAmtShow * $cvVolPerUnit2"/>
@@ -4401,7 +4429,16 @@
                 <set_value name="$cvAmtVolCol" exact="'' + $cvAmtShow + ' / ' + $cvCapShow + ' m3'"/>
                 <set_value name="$cvScoreCol" exact="'' + (if $wareEntry.$Score? then ($wareEntry.$Score)i else 0)"/>
                 <set_value name="$cvStatus" exact="if $tempRuntimeOk then 'PASS' else 'FAIL'"/>
+                <do_if value="$cvEntryIppSupplier and $tempRuntimeOk">
+                  <set_value name="$cvStatus" exact="'PASS [IPP]'"/>
+                </do_if>
+                <do_elseif value="$cvEntryIppSupplier and not $tempRuntimeOk">
+                  <set_value name="$cvStatus" exact="'FAIL [IPP]'"/>
+                </do_elseif>
                 <set_value name="$cvReasonCol" exact="if $tempRuntimeOk then '' else ($cvReason + (if $cvDetail != '' then (' (' + $cvDetail + ')') else ''))"/>
+                <do_if value="$cvEntryIppSupplier and $tempRuntimeOk">
+                  <set_value name="$cvReasonCol" exact="'IPP: gross NPC income; ROI/margin/dropoff bypassed; internal buy leg at execution'"/>
+                </do_if>
                 <append_to_list name="$cvDataRows" exact="table[$Check = ('#' + $wi + ' ' + $cvWareLabel), $Status = $cvStatus, $Detail = $cvRoute, $Col4 = $cvAmtVolCol, $Col5 = $cvScoreCol, $Col6 = $cvReasonCol]"/>
               </do_if>
 
@@ -4741,6 +4778,10 @@
             </do_all>
           </do_if>
           <append_to_list name="$sec7v.$Rows" exact="table[$Check = 'Summary', $Status = if $cvPassCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $cvPassCount + ' / ' + $cacheEntryCount + ' PASS (mirrors lib.gt.cache.search per-ship gates)']"/>
+          <do_if value="$ignorePlayerPricing and $orderId == 'GalaxyTraderMK3'">
+            <append_to_list name="$sec7v.$Rows" exact="table[$Check = 'IPP Cache Policy', $Status = 'INFO', $Detail = 'Player-supplier entries: gross NPC income, skip margin ROI + negative-margin dropoff, supplier price band bypassed, require NPC delivery']"/>
+            <append_to_list name="$sec7v.$Rows" exact="table[$Check = 'IPP Cache Entries', $Status = if $cvIppEntryCount gt 0 then 'INFO' else 'WARN', $Detail = '' + $cvIppPassCount + ' / ' + $cvIppEntryCount + ' player-supplier entries PASS (tagged [IPP] in per-entry rows)']"/>
+          </do_if>
           <append_to_list name="$sec7v.$Rows" exact="table[$Check = 'Fail Histogram', $Status = if $cvPassCount lt $cacheEntryCount then 'WARN' else 'PASS', $Detail = $cvFailHistDetail]"/>
           <do_if value="$cacheEntryCount gt $cvMaxRows">
             <append_to_list name="$sec7v.$Rows" exact="table[$Check = 'Row Cap', $Status = 'INFO', $Detail = 'Showing first ' + $cvMaxRows + ' of ' + $cacheEntryCount + ' entries (cache sorted by score desc)']"/>
@@ -5741,6 +5782,10 @@
         <set_value name="$bestNpcSupplierPairScore" exact="0"/>
         <set_value name="$bestNpcSupplierPairDesc" exact="'none'"/>
         <set_value name="$diagIsolatedForCargoFilter" exact="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?"/>
+        <set_value name="$diagEnableMinCargoUtil" exact="not $diagIsolatedForCargoFilter"/>
+        <do_if value="$orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2'">
+          <set_value name="$diagEnableMinCargoUtil" exact="$useMinCargoThreshold and not $diagIsolatedForCargoFilter"/>
+        </do_if>
 
         <!-- Blacklist group for distance checks -->
         <do_if value="not $blacklistgroup?">
@@ -6002,6 +6047,7 @@
             <set_value name="$pairSelectionScore" exact="0"/>
             <set_value name="$pdSortKey" exact="0"/>
             <set_value name="$pairHasDistances" exact="false"/>
+            <set_value name="$diagScoreFromGates" exact="false"/>
             <set_value name="$buyDist" exact="-1"/>
             <set_value name="$sellDist" exact="-1"/>
             <set_value name="$homeToSellDist" exact="-1"/>
@@ -6274,6 +6320,11 @@
                   <set_value name="$pairReason" exact="'no_profit (sell=' + ($sellPrice / 100) + ' le buy=' + ($buyPrice / 100) + ')'"/>
                   <set_value name="$rejectNoProfit" operation="add"/>
                 </do_if>
+                <do_elseif value="$diagPairPlayerFreeSupplier and $sellPrice le 0">
+                  <set_value name="$pairVerdict" exact="'FAIL'"/>
+                  <set_value name="$pairReason" exact="'ipp_no_npc_income (NPC sell price le 0)'"/>
+                  <set_value name="$rejectNoProfit" operation="add"/>
+                </do_elseif>
               </do_else>
             </do_if>
 
@@ -6484,10 +6535,21 @@
               </do_if>
               <do_if value="$diagClampBuySeller != null">
                 <set_value name="$diagClampReason" exact="null"/>
-                <clamp_trade_amount trade="$sellOffer" amount="$diagClampAmount" buyer="$ship" seller="$diagClampBuySeller" result="$diagClampAmount" reason="$diagClampReason"/>
+                <do_if value="$diagPairPlayerFreeSupplier">
+                  <!-- IPP internal buy: seller stock + ship cargo only (never buyer_money). -->
+                  <clamp_trade_amount trade="$sellOffer" amount="$diagClampAmount" seller="$diagClampBuySeller" result="$diagClampAmount" reason="$diagClampReason"/>
+                  <set_value name="$diagIppCargoMax" exact="($cargoFree / $volumePerUnit)i"/>
+                  <do_if value="$diagClampAmount gt $diagIppCargoMax">
+                    <set_value name="$diagClampAmount" exact="$diagIppCargoMax"/>
+                    <set_value name="$diagClampReason" exact="'buyer_cargo'"/>
+                  </do_if>
+                </do_if>
+                <do_else>
+                  <clamp_trade_amount trade="$sellOffer" amount="$diagClampAmount" buyer="$ship" seller="$diagClampBuySeller" result="$diagClampAmount" reason="$diagClampReason"/>
+                </do_else>
                 <do_if value="not $diagClampAmount? or $diagClampAmount le 0">
                   <set_value name="$pairVerdict" exact="'FAIL'"/>
-                  <set_value name="$pairReason" exact="'supplier_clamp_zero (' + (if $diagClampReason? then $diagClampReason else 'seller_cargo') + ')'"/>
+                  <set_value name="$pairReason" exact="'supplier_clamp_zero (' + (if $diagClampReason? then $diagClampReason else 'seller_cargo') + (if $diagPairPlayerFreeSupplier then '; IPP buy clamp ignores buyer_money' else '') + ')'"/>
                   <set_value name="$rejectSupplierClamp" operation="add"/>
                 </do_if>
               </do_if>
@@ -6592,7 +6654,14 @@
             <do_if value="$pairVerdict == 'PASS' and not $diagPairPlayerFreeSupplier">
               <do_if value="$totalProfit le 0">
                 <set_value name="$pairVerdict" exact="'FAIL'"/>
-                <set_value name="$pairReason" exact="'profit_recalc_nonpositive (' + ($totalProfit / 100) + ' Cr)'"/>
+                <set_value name="$pairReason" exact="'profit_recalc_nonpositive (' + ($totalProfit / 100) + ' Cr margin)'"/>
+                <set_value name="$rejectProfitRecalc" operation="add"/>
+              </do_if>
+            </do_if>
+            <do_if value="$pairVerdict == 'PASS' and $diagPairPlayerFreeSupplier">
+              <do_if value="$totalProfit le 0">
+                <set_value name="$pairVerdict" exact="'FAIL'"/>
+                <set_value name="$pairReason" exact="'ipp_profit_recalc_nonpositive (' + ($totalProfit / 100) + ' Cr gross NPC income)'"/>
                 <set_value name="$rejectProfitRecalc" operation="add"/>
               </do_if>
             </do_if>
@@ -6662,7 +6731,7 @@
                    distanceFactor = 1.0 + scoreDistance * gt_distpenalty
                    grossProfitCr  = (totalProfit / 1Cr)i   (Cr units, integer — avoids money/float mix)
                    score          = grossProfitCr / distanceFactor
-                   factionBonus   = 1.1 if factionPriority and either station player-owned
+                   factionBonus   = 2.0 if (factionPriority or IPP player-supplier) and either station player-owned
                                   = 1.0 otherwise
                    score          = score * factionBonus
 
@@ -6675,6 +6744,29 @@
 
                  MK3/MK4 validation sort: selectionScore = adjustedScore / (1 + ship→buy × weight)
                  after optional priority-ware multiplier (mirrors lib.gt.score.trades + selection_sort). -->
+            <!-- Gatedistance fallback when pathfind budget is exhausted: lib.gt.tradematch scores on
+                 home→buy + buy→sell gatedistance, not full path distance. Without this, late-scan
+                 pairs (often IPP player suppliers) PASS validation but show score '-' and are
+                 omitted from Best IPP Pair / runtime dispatch preview. -->
+            <do_if value="not $pairHasDistances and $buyStation? and $buyStation.exists and $sellStation? and $sellStation.exists">
+              <set_value name="$diagHomeForDist" exact="if $homeSector? and $homeSector.exists then $homeSector else $ship.sector"/>
+              <set_value name="$buyDist" exact="$diagHomeForDist.gatedistance.{$buyStation}"/>
+              <set_value name="$routeLeg" exact="0"/>
+              <do_if value="$buyStation.sector? and $sellStation.sector? and $buyStation.sector != $sellStation.sector">
+                <do_if value="$blacklistgroup? and $blacklistgroup != null">
+                  <set_value name="$routeLeg" exact="$buyStation.sector.gatedistance.{$sellStation.sector}.{$blacklistgroup}.{$ship}"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$routeLeg" exact="$buyStation.sector.gatedistance.{$sellStation.sector}"/>
+                </do_else>
+              </do_if>
+              <do_if value="$buyDist ge 0 and $routeLeg ge 0">
+                <set_value name="$pairHasDistances" exact="true"/>
+                <set_value name="$diagScoreFromGates" exact="true"/>
+                <set_value name="$sellDist" exact="$routeLeg"/>
+                <set_value name="$homeToSellDist" exact="$diagHomeForDist.gatedistance.{$sellStation}"/>
+              </do_if>
+            </do_if>
             <do_if value="$pairHasDistances and $buyDist ge 0 and $sellDist ge 0">
               <set_value name="$routeLeg" exact="if $buyStation.sector == $sellStation.sector then 0 else $sellDist"/>
               <do_if value="$routeLeg lt 0">
@@ -6708,8 +6800,8 @@
               <do_else>
                 <set_value name="$scoreGrossCr" exact="($totalProfit / 1Cr)i"/>
                 <set_value name="$pairScore" exact="$scoreGrossCr / $scoreDistanceFactor"/>
-                <do_if value="$factionPriority and ($buyStation.isplayerowned or $sellStation.isplayerowned)">
-                  <set_value name="$pairScore" exact="$pairScore * 1.1"/>
+                <do_if value="($factionPriority or $diagPairPlayerFreeSupplier) and ($buyStation.isplayerowned or $sellStation.isplayerowned)">
+                  <set_value name="$pairScore" exact="$pairScore * 2.0"/>
                 </do_if>
               </do_else>
             </do_if>
@@ -6785,8 +6877,8 @@
               <set_value name="$pdRoute" exact="$pdRoute + ' [H→B ' + $buyDist + '+route ' + $pdRouteLeg + '=' + $scoreDistance + 'j]'"/>
             </do_if>
             <set_value name="$pdROIPart" exact="if $diagPairPlayerFreeSupplier then 'IPP gross' else ('ROI ' + $roi + '%')"/>
-            <set_value name="$pdProfitStr" exact="(if $diagPairPlayerFreeSupplier then ('buy ' + ($buyPrice / 100) + 'Cr/u eff 0 · ~') else '') + ($totalProfit / 100) + 'Cr' + ' &#183; ' + $pdROIPart"/>
-            <set_value name="$pdScoreStr" exact="if not $pairHasDistances then '-' else ('' + ($pairScore)i + (if $pairShowSel then (' · sel ' + ($pairSelectionScore)i) else ''))"/>
+            <set_value name="$pdProfitStr" exact="(if $diagPairPlayerFreeSupplier then ('buy ' + ($buyPrice / 100) + 'Cr/u internal 0 · ~') else '') + ($totalProfit / 100) + 'Cr' + ' &#183; ' + $pdROIPart"/>
+            <set_value name="$pdScoreStr" exact="if $pairScore le 0 then '-' else ('' + ($pairScore)i + (if $pairShowSel then (' · sel ' + ($pairSelectionScore)i) else '') + (if $diagScoreFromGates? and $diagScoreFromGates then ' gate' else ''))"/>
             <set_value name="$pdStatus" exact="$pairVerdict"/>
             <do_if value="$diagPairPlayerFreeSupplier">
               <set_value name="$pdStatus" exact="$pairVerdict + ' [IPP]'"/>
@@ -6796,7 +6888,7 @@
               <set_value name="$pdReason" exact="$pairReason"/>
             </do_if>
             <do_elseif value="$diagPairPlayerFreeSupplier">
-              <set_value name="$pdReason" exact="'IPP: gross sell income; profit/ROI/money gates bypassed'"/>
+              <set_value name="$pdReason" exact="'IPP: gross NPC sell income; internal buy leg (no credits); profit/ROI/min-money/margin gates bypassed at search, cache, and trade_found'"/>
             </do_elseif>
             <!-- Always capture PASS rows (executable trades for this ship); cap only the FAIL rows so a
                  flood of trade-rule rejections cannot crowd the executable pairs out of the display. -->
@@ -7433,7 +7525,7 @@
             <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'MK4 Pair Legend', $Status = 'INFO', $Detail = 'Every evaluated supply pair is listed with the per-ship verdict + reason. PASS = executable now; FAIL = rejected (e.g. mk4_trade_rules = customer build storage disallows the source faction). [player]/[NPC] = supplier ownership.']"/>
           </do_if>
           <do_if value="$ignorePlayerPricing and $orderId == 'GalaxyTraderMK3'">
-            <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'IPP Pair Legend', $Status = 'INFO', $Detail = '[IPP] = player-owned supplier; buy cost scored as zero; profit/ROI/money gates bypassed. [NPC] = non-player supplier. Runtime still picks highest score overall.']"/>
+            <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'IPP Pair Legend', $Status = 'INFO', $Detail = '[IPP] = player-owned supplier; gross NPC income scoring; internal buy leg (no credit transfer); profit/ROI/min-money/margin gates bypassed. [NPC] = non-player supplier. Runtime still picks highest score overall.']"/>
           </do_if>
           <do_all exact="$pairDetails.count" counter="$pi">
             <append_to_list name="$sec8b.$Rows" exact="$pairDetails.{$pi}"/>

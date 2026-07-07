@@ -752,6 +752,9 @@
     <set_value name="$commanderOrder" exact="null"/>
     <do_if value="$isSubordinate">
       <set_value name="$commanderOrder" exact="this.ship.commander.defaultorder"/>
+      <do_if value="$commanderOrder? and @$commanderOrder.id == 'Assist' and $commanderOrder.$baseorder? and @$commanderOrder.$baseorder.id == 'GalaxyTraderMK3'">
+        <set_value name="$commanderOrder" exact="$commanderOrder.$baseorder"/>
+      </do_if>
     </do_if>
     
     <!-- Sector Whitelist -->
@@ -1533,7 +1536,9 @@
       
       <!-- Re-inherit settings from commander if this is a subordinate -->
       <do_if value="this.ship.commander and this.ship.commander.exists and this.ship.commander != this.ship">
-        <set_value name="$commanderOrder" exact="this.ship.commander.defaultorder"/>
+        <run_script name="'lib.gt.commander_order.resolve'" result="$commanderOrder">
+          <param name="ship" value="this.ship"/>
+        </run_script>
         <do_if value="$commanderOrder?">
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Re-inheriting settings from commander ' + this.ship.commander.idcode" chance="100"/>
@@ -2426,7 +2431,9 @@
 
       <set_value name="$_isSubordinateNow" exact="this.ship.commander and this.ship.commander.exists and this.ship.commander != this.ship"/>
       <do_if value="$_isSubordinateNow">
-        <set_value name="$_commanderOrderNow" exact="this.ship.commander.defaultorder"/>
+        <run_script name="'lib.gt.commander_order.resolve'" result="$_commanderOrderNow">
+          <param name="ship" value="this.ship"/>
+        </run_script>
         <do_if value="$_commanderOrderNow?">
           <!-- Build a signature for commander settings that affect trade searching / routing -->
           <set_value name="$_cmdAutoWares" exact="if $_commanderOrderNow.$autowares? then $_commanderOrderNow.$autowares else $effectiveAutoWares"/>
@@ -3139,6 +3146,14 @@
         <!-- Defensive: $effectiveIgnorePlayerPricing is a v4-only local. Legacy saves resumed mid-attention
              may not have it (the per-script <patch> backfills only the this.$ instance var, not the local). -->
         <set_value name="$searchIgnorePlayerPricing" exact="if $searchParams.$IgnorePlayerPricing? then @$searchParams.$IgnorePlayerPricing else (if $effectiveIgnorePlayerPricing? then $effectiveIgnorePlayerPricing else (if this.$effectiveIgnorePlayerPricing? then this.$effectiveIgnorePlayerPricing else false))"/>
+        <!-- Subordinates: authoritative commander GT order (unwrap Assist -> baseorder) wins over stale request params. -->
+        <run_script name="'lib.gt.commander_order.resolve'" result="$_searchCmdOrder">
+          <param name="ship" value="this.ship"/>
+        </run_script>
+        <do_if value="$_searchCmdOrder? and $_searchCmdOrder.$ignoreplayerpricing?">
+          <set_value name="$searchIgnorePlayerPricing" exact="$_searchCmdOrder.$ignoreplayerpricing"/>
+          <set_value name="this.$effectiveIgnorePlayerPricing" exact="$_searchCmdOrder.$ignoreplayerpricing"/>
+        </do_if>
         <set_value name="$searchIgnoreMK1Supply" exact="if $searchParams.$IgnoreMK1Supply? then @$searchParams.$IgnoreMK1Supply else $effectiveIgnoreMK1Supply"/>
         <set_value name="$searchIgnoreBuildStorage" exact="if $searchParams.$IgnoreBuildStorage? then @$searchParams.$IgnoreBuildStorage else $effectiveIgnoreBuildStorage"/>
         <set_value name="$searchIgnoreCarrierAux" exact="if $searchParams.$IgnoreCarrierAux? then @$searchParams.$IgnoreCarrierAux else $effectiveIgnoreCarrierAux"/>
@@ -3447,6 +3462,7 @@
               <param name="minAbsoluteProfit" value="$searchMinAbsoluteProfit"/>
               <param name="distancePenalty" value="$gt_distancepenalty"/>
               <param name="factionPriority" value="$searchFactionPriority"/>
+              <param name="maxTradesPerWare" value="if global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxTradesPerWare? then @global.$GT_GlobalSettings.$Performance.$MaxTradesPerWare else 20"/>
               <param name="ignoreBuildStorage" value="$searchIgnoreBuildStorage"/>
               <param name="ignoreCarrierAux" value="$searchIgnoreCarrierAux"/>
               <param name="allowIllegal" value="$searchAllowIllegal"/>
@@ -4235,6 +4251,17 @@
               <set_value name="$isSellOnlyTrade" exact="false"/>
               <do_if value="$currentTrade.$IsSellOnly? and $currentTrade.$IsSellOnly">
                 <set_value name="$isSellOnlyTrade" exact="true"/>
+              </do_if>
+
+              <!-- MK3 IPP: player-supplier pairs use gross sell income and internal buy legs (no credits on load). -->
+              <set_value name="$validationIppSupplier" exact="false"/>
+              <do_if value="not $isSellOnlyTrade">
+                <do_if value="$currentTrade.$PlayerFreeSupplier? and $currentTrade.$PlayerFreeSupplier and this.$effectiveIgnorePlayerPricing?">
+                  <set_value name="$validationIppSupplier" exact="true"/>
+                </do_if>
+                <do_elseif value="this.$effectiveIgnorePlayerPricing? and $currentTrade.$BuyOffer? and @$currentTrade.$BuyOffer.owner.isplayerowned">
+                  <set_value name="$validationIppSupplier" exact="true"/>
+                </do_elseif>
               </do_if>
               
               <!-- Extract buy station (may be null for sell-only trades) -->
@@ -5400,13 +5427,34 @@
                     <set_value name="$buyClampSeller" exact="@$currentTrade.$BuyOffer.owner"/>
                   </do_if>
                   <do_if value="$buyClampSeller != null">
-                    <clamp_trade_amount 
-                      trade="$currentTrade.$BuyOffer" 
-                      amount="$finalBuyAmount" 
-                      buyer="this.assignedcontrolled" 
-                      seller="$buyClampSeller" 
-                      result="$finalBuyAmount"
-                      reason="$buyClampReason"/>
+                    <do_if value="$validationIppSupplier">
+                      <!-- IPP internal buy: seller stock + ship cargo only (never buyer_money). -->
+                      <set_value name="$ippBuyClampBase" exact="$finalBuyAmount"/>
+                      <clamp_trade_amount
+                        trade="$currentTrade.$BuyOffer"
+                        amount="$ippBuyClampBase"
+                        seller="$buyClampSeller"
+                        result="$finalBuyAmount"
+                        reason="$buyClampReason"/>
+                      <set_value name="$ippBuyWareVol" exact="1"/>
+                      <do_if value="$currentTrade.$BuyOffer.ware? and @$currentTrade.$BuyOffer.ware.volume gt 0">
+                        <set_value name="$ippBuyWareVol" exact="@$currentTrade.$BuyOffer.ware.volume"/>
+                      </do_if>
+                      <set_value name="$ippBuyCargoMax" exact="(this.ship.cargo.free.all / $ippBuyWareVol)i"/>
+                      <do_if value="$finalBuyAmount gt $ippBuyCargoMax">
+                        <set_value name="$finalBuyAmount" exact="$ippBuyCargoMax"/>
+                        <set_value name="$buyClampReason" exact="'buyer_cargo'"/>
+                      </do_if>
+                    </do_if>
+                    <do_else>
+                      <clamp_trade_amount 
+                        trade="$currentTrade.$BuyOffer" 
+                        amount="$finalBuyAmount" 
+                        buyer="this.assignedcontrolled" 
+                        seller="$buyClampSeller" 
+                        result="$finalBuyAmount"
+                        reason="$buyClampReason"/>
+                    </do_else>
                   </do_if>
                   <do_else>
                     <set_value name="$tradesRejectedCargo" operation="add"/>
@@ -5646,9 +5694,14 @@
                   <!-- Calculate final amount for profit calculation -->
                   <set_value name="$finalAmountForProfit" exact="if $isSellOnlyTrade then $finalSellAmount else $finalBuyAmount"/>
                   
-                  <!-- ALWAYS recalculate profit: (sellPrice - buyPrice) * finalAmount -->
-                  <!-- This validates against current market prices, not cached values -->
-                  <set_value name="$recalculatedProfitRAW" exact="($sellPriceForRecalc - $buyPriceForRecalc) * $finalAmountForProfit"/>
+                  <!-- ALWAYS recalculate profit against live offer prices (not cached values).
+                       IPP player-supplier: gross NPC sell income only (buy leg is internal / zero cost). -->
+                  <do_if value="$validationIppSupplier">
+                    <set_value name="$recalculatedProfitRAW" exact="$sellPriceForRecalc * $finalAmountForProfit"/>
+                  </do_if>
+                  <do_else>
+                    <set_value name="$recalculatedProfitRAW" exact="($sellPriceForRecalc - $buyPriceForRecalc) * $finalAmountForProfit"/>
+                  </do_else>
                   <set_value name="$finalProfitRAW" exact="$recalculatedProfitRAW"/>
                   <set_value name="$profitRecalculated" exact="true"/>
                   
@@ -6176,13 +6229,10 @@
           </do_if>
           
           <!-- Offers valid - proceed with order creation -->
-          <!-- CRITICAL FIX: Explicitly set internal="false" to ensure vanilla counts trade orders in "credits due from trades" -->
-          <!-- Vanilla's GetCreditsDueFromPlayerTrades() only counts trade orders with internal="false" -->
-          <!-- INVESTIGATION: Subordinates still not counted - may be vanilla limitation (excludes ships with commanders) -->
-          <!-- Vanilla TradeRoutine pattern: internal="not $blacklist_override?" (usually false) -->
-          <!-- NOTE: Even with internal="false", vanilla may exclude subordinates from credits due count -->
-          <!-- This appears to be a vanilla design decision - subordinates' finances are part of commander's finances -->
-          <set_value name="$tradeOrderInternal" exact="false"/>
+          <!-- Per-leg internal flags (MK4 pattern): player-owned station legs are internal (no credit transfer).
+               IPP player-supplier buy legs are always internal; NPC sell legs stay external for payout tracking. -->
+          <set_value name="$tradeSellLegInternal" exact="false"/>
+          <set_value name="$tradeBuyLegInternal" exact="false"/>
 
           <!-- AUTHORITATIVE MinPlayerMoney guard — BUDGET CLAMP (race-free) -->
           <!-- This runs in the AI script with NO yield between check and create_trade_order,
@@ -6199,6 +6249,9 @@
           <do_elseif value="this.$effectiveIgnorePlayerPricing? and not $isSellOnlyTradeForPending and $pendingTrade.$BuyOffer? and @$pendingTrade.$BuyOffer.owner.isplayerowned">
             <set_value name="$ippPlayerSupplier" exact="true"/>
           </do_elseif>
+          <do_if value="$ippPlayerSupplier">
+            <set_value name="$tradeBuyLegInternal" exact="true"/>
+          </do_if>
           <do_if value="not $ippPlayerSupplier">
           <set_value name="$aiBuyPrice" exact="0"/>
           <do_if value="$pendingTrade.$BuyOffer? and $pendingTrade.$BuyOffer.unitprice?">
@@ -6273,7 +6326,7 @@
           <!-- Vanilla pattern (order.trade.routine): queue SELL first as immediate,
                then queue BUY as immediate so BUY displaces SELL and runs first. -->
           <do_if value="$pendingTrade.$SellOffer?">
-            <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$SellOffer" amount="$finalSellAmount" immediate="true" internal="$tradeOrderInternal"/>
+            <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$SellOffer" amount="$finalSellAmount" immediate="true" internal="$tradeSellLegInternal"/>
             <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <set_value name="$sellOfferAmountAfterOrder" exact="@$pendingTrade.$SellOffer.offeramount.{this.ship}"/>
               <set_value name="$sellDesiredAfterOrder" exact="@$pendingTrade.$SellOffer.desiredamount"/>
@@ -6284,11 +6337,11 @@
                 chance="100"/>
             </do_if>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Created SELL trade order (internal=' + $tradeOrderInternal + ', isSubordinate=' + $isSubordinate + ', hasCommander=' + (if this.ship.commander? and this.ship.commander.exists then 'true' else 'false') + ')'" chance="100"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Created SELL trade order (internal=' + $tradeSellLegInternal + ', isSubordinate=' + $isSubordinate + ', hasCommander=' + (if this.ship.commander? and this.ship.commander.exists then 'true' else 'false') + ')'" chance="100"/>
             </do_if>
           </do_if>
           <do_if value="not $isSellOnlyTradeForPending and $pendingTrade.$BuyOffer?">
-            <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$BuyOffer" amount="$finalBuyAmount" immediate="true" internal="$tradeOrderInternal"/>
+            <create_trade_order object="this.ship" tradeoffer="$pendingTrade.$BuyOffer" amount="$finalBuyAmount" immediate="true" internal="$tradeBuyLegInternal"/>
             <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <set_value name="$buyOfferAmountAfterOrder" exact="@$pendingTrade.$BuyOffer.offeramount.{this.ship}"/>
               <set_value name="$buyDesiredAfterOrder" exact="@$pendingTrade.$BuyOffer.desiredamount"/>
@@ -6299,7 +6352,7 @@
                 chance="100"/>
             </do_if>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Created BUY trade order (internal=' + $tradeOrderInternal + ', isSubordinate=' + $isSubordinate + ', hasCommander=' + (if this.ship.commander? and this.ship.commander.exists then 'true' else 'false') + ')'" chance="100"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Created BUY trade order (internal=' + $tradeBuyLegInternal + ', ipp=' + $ippPlayerSupplier + ', isSubordinate=' + $isSubordinate + ', hasCommander=' + (if this.ship.commander? and this.ship.commander.exists then 'true' else 'false') + ')'" chance="100"/>
             </do_if>
           </do_if>
 

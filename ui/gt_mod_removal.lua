@@ -243,17 +243,29 @@ local function ReadInstalledSlotWares(shipId)
     return hasShip, shipWare, hasEngine, engineWare
 end
 
+local function GetPlayerBlackboardId()
+    return ConvertStringToLuaID(tostring(C.GetPlayerID()))
+end
+
+local function GetPlayerSignalId()
+    -- Vanilla UI scripts signal the player with a 64-bit UniverseID, not a LuaID.
+    return ConvertStringTo64Bit(tostring(C.GetPlayerID()))
+end
+
 local function PublishProbeResult(shipComponent, shipIdCode, hasShip, shipWare, hasEngine, engineWare)
     local shipNonGT = hasShip and not IsGTShipModWareId(shipWare)
     local engineNonGT = hasEngine and not IsGTEngineModWareId(engineWare)
 
-    local playerId = ConvertStringTo64Bit(tostring(C.GetPlayerID()))
-    SetNPCBlackboard(playerId, "$GT_ModProbe_ShipWare", shipWare)
-    SetNPCBlackboard(playerId, "$GT_ModProbe_EngineWare", engineWare)
-    SetNPCBlackboard(playerId, "$GT_ModProbe_ShipNonGT", shipNonGT and 1 or 0)
-    SetNPCBlackboard(playerId, "$GT_ModProbe_EngineNonGT", engineNonGT and 1 or 0)
+    local playerBbId = GetPlayerBlackboardId()
+    local playerSignalId = GetPlayerSignalId()
+    SetNPCBlackboard(playerBbId, "$GT_ModProbe_ShipWare", shipWare)
+    SetNPCBlackboard(playerBbId, "$GT_ModProbe_EngineWare", engineWare)
+    SetNPCBlackboard(playerBbId, "$GT_ModProbe_ShipNonGT", shipNonGT and 1 or 0)
+    SetNPCBlackboard(playerBbId, "$GT_ModProbe_EngineNonGT", engineNonGT and 1 or 0)
+    SetNPCBlackboard(playerBbId, "$GT_ModProbe_ShipIdCode", shipIdCode or "UNKNOWN")
 
-    SignalObject(playerId, "gt_mods_probe", ConvertStringToLuaID(NormalizeUniverseIdString(shipComponent)))
+    -- Pass idcode back to MD; MD ship objects from raise_lua_event strings do not round-trip as event.param2.
+    SignalObject(playerSignalId, "gt_mods_probe", shipIdCode or "UNKNOWN")
     return shipNonGT, engineNonGT
 end
 

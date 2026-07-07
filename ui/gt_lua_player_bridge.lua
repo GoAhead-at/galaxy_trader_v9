@@ -21,14 +21,22 @@ function GT_PlayerBridge.GetPlayerSignalId()
     return ConvertStringTo64Bit(tostring(C.GetPlayerID()))
 end
 
-function GT_PlayerBridge.StoreModProbeByIdCode(shipIdCode, shipWare, engineWare, shipNonGT, engineNonGT)
+local function ModProbeCacheKey(shipIdCode)
     local idCode = shipIdCode or "UNKNOWN"
+    if string.sub(idCode, 1, 1) == "$" then
+        return idCode
+    end
+    return "$" .. idCode
+end
+
+function GT_PlayerBridge.StoreModProbeByIdCode(shipIdCode, shipWare, engineWare, shipNonGT, engineNonGT)
+    local cacheKey = ModProbeCacheKey(shipIdCode)
     local playerBbId = GT_PlayerBridge.GetPlayerBlackboardId()
     local cache = GetNPCBlackboard(playerBbId, "$GT_ModProbeByShip")
     if type(cache) ~= "table" then
         cache = {}
     end
-    cache[idCode] = {
+    cache[cacheKey] = {
         ShipWare = shipWare or "none",
         EngineWare = engineWare or "none",
         ShipNonGT = shipNonGT and 1 or 0,
@@ -38,13 +46,18 @@ function GT_PlayerBridge.StoreModProbeByIdCode(shipIdCode, shipWare, engineWare,
 end
 
 function GT_PlayerBridge.ClearModProbeByIdCode(shipIdCode)
-    local idCode = shipIdCode or "UNKNOWN"
+    local cacheKey = ModProbeCacheKey(shipIdCode)
     local playerBbId = GT_PlayerBridge.GetPlayerBlackboardId()
     local cache = GetNPCBlackboard(playerBbId, "$GT_ModProbeByShip")
     if type(cache) ~= "table" then
         return
     end
-    cache[idCode] = nil
+    cache[cacheKey] = nil
+    -- Legacy bare idcode entries from older bridge builds.
+    local bareId = shipIdCode or "UNKNOWN"
+    if bareId ~= cacheKey then
+        cache[bareId] = nil
+    end
     SetNPCBlackboard(playerBbId, "$GT_ModProbeByShip", cache)
 end
 

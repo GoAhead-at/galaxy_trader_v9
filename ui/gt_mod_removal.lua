@@ -266,6 +266,116 @@ local function PublishProbeResult(shipComponent, shipIdCode, hasShip, shipWare, 
     return shipNonGT, engineNonGT
 end
 
+local function NormalizeDesiredWareId(wareId)
+    if wareId == nil or wareId == "" or wareId == "null" or wareId == "none" then
+        return "none"
+    end
+    return tostring(wareId)
+end
+
+local function ParseReconcilePayload(params)
+    local packets = SplitParams(params, "|")
+    return {
+        component = packets[1],
+        shipIdCode = packets[2] or "UNKNOWN",
+        desiredShipWare = NormalizeDesiredWareId(packets[3]),
+        desiredEngineWare = NormalizeDesiredWareId(packets[4]),
+        reason = packets[5] or "reconcile",
+        packets = packets,
+    }
+end
+
+local function InstallShipModWare(shipId, wareId, shipIdCode)
+    local ok, success = pcall(C.InstallShipMod, shipId, wareId)
+    if not ok then
+        logDebug(string.format("InstallShipMod raised error for ship ID %s ware %s: %s", shipIdCode, wareId, tostring(success)), "ERROR")
+        return false
+    end
+    if not success then
+        logDebug(string.format("Failed to install ship mod (%s) on ship ID: %s", wareId, shipIdCode), "ERROR")
+        return false
+    end
+    return true
+end
+
+local function InstallEngineModWare(shipId, wareId, shipIdCode)
+    local ok, success = pcall(C.InstallEngineMod, shipId, wareId)
+    if not ok then
+        logDebug(string.format("InstallEngineMod raised error for ship ID %s ware %s: %s", shipIdCode, wareId, tostring(success)), "ERROR")
+        return false
+    end
+    if not success then
+        logDebug(string.format("Failed to install engine mod (%s) on ship ID: %s", wareId, shipIdCode), "ERROR")
+        return false
+    end
+    return true
+end
+
+-- Authoritative reconcile: read slots via C API, remove/install GT mods only.
+-- Params: component|idcode|desiredShipWare|desiredEngineWare|reason
+local function GT_ReconcileSlots(_, params)
+    if not params then
+        logDebug("ERROR: GT_Mods.Reconcile called with nil params", "ERROR")
+        return
+    end
+
+    local payload = ParseReconcilePayload(params)
+    if not payload.component then
+        logDebug(string.format("ERROR: Invalid GT_Mods.Reconcile params format: %s", tostring(params)), "ERROR")
+        return
+    end
+
+    local shipIdCode = payload.shipIdCode or "UNKNOWN"
+    local shipId = ToUniverseID(payload.component)
+    local desiredShip = payload.desiredShipWare
+    local desiredEngine = payload.desiredEngineWare
+    local reason = payload.reason or "reconcile"
+
+    local hasShip, shipWare, hasEngine, engineWare = ReadInstalledSlotWares(shipId)
+
+    if hasShip and not IsGTShipModWareId(shipWare) then
+        -- Foreign ship mod: never touch.
+    elseif desiredShip == "none" then
+        if hasShip and IsGTShipModWareId(shipWare) then
+            C.DismantleShipMod(shipId)
+            hasShip, shipWare, hasEngine, engineWare = ReadInstalledSlotWares(shipId)
+        end
+    else
+        if hasShip and IsGTShipModWareId(shipWare) and shipWare ~= desiredShip then
+            C.DismantleShipMod(shipId)
+            hasShip, shipWare, hasEngine, engineWare = ReadInstalledSlotWares(shipId)
+        end
+        if not hasShip or shipWare == "none" then
+            InstallShipModWare(shipId, desiredShip, shipIdCode)
+            hasShip, shipWare, hasEngine, engineWare = ReadInstalledSlotWares(shipId)
+        end
+    end
+
+    if hasEngine and not IsGTEngineModWareId(engineWare) then
+        -- Foreign engine mod: never touch.
+    elseif desiredEngine == "none" then
+        if hasEngine and IsGTEngineModWareId(engineWare) then
+            C.DismantleEngineMod(shipId)
+            hasShip, shipWare, hasEngine, engineWare = ReadInstalledSlotWares(shipId)
+        end
+    else
+        if hasEngine and IsGTEngineModWareId(engineWare) and engineWare ~= desiredEngine then
+            C.DismantleEngineMod(shipId)
+            hasShip, shipWare, hasEngine, engineWare = ReadInstalledSlotWares(shipId)
+        end
+        if not hasEngine or engineWare == "none" then
+            InstallEngineModWare(shipId, desiredEngine, shipIdCode)
+            hasShip, shipWare, hasEngine, engineWare = ReadInstalledSlotWares(shipId)
+        end
+    end
+
+    hasShip, shipWare, hasEngine, engineWare = ReadInstalledSlotWares(shipId)
+    logDebug(string.format(
+        "Reconcile ship=%s reason=%s desiredShip=%s desiredEngine=%s observedShip=%s observedEngine=%s",
+        shipIdCode, reason, desiredShip, desiredEngine, shipWare, engineWare
+    ), "WARNING")
+end
+
 local function GT_ProbeSlots(_, params)
     if not params then
         logDebug("ERROR: GT_Mods.Probe called with nil params", "ERROR")
@@ -511,6 +621,14 @@ local function init()
         logDebug("Registered event: GT_Mods.Probe")
     else
         logDebug("Failed to register event: GT_Mods.Probe", "ERROR")
+        return false
+    end
+
+    local success5 = pcall(RegisterEvent, "GT_Mods.Reconcile", GT_ReconcileSlots)
+    if success5 then
+        logDebug("Registered event: GT_Mods.Reconcile")
+    else
+        logDebug("Failed to register event: GT_Mods.Reconcile", "ERROR")
         return false
     end
     

@@ -182,11 +182,21 @@
         </do_elseif>
         <do_else>
           <set_value name="$basePilotName" exact="$pilot.name"/>
-          <set_value name="global.$GT_Pilots.{$pilot}.$OriginalPilotName" exact="$basePilotName"/>
           <set_value name="$baseNameSource" exact="'current_name_backfill'"/>
+          <!-- Never persist an empty base name (mid-transfer entities can report ''):
+               a persisted empty $OriginalPilotName would tag the pilot as "(T:x) " forever. -->
+          <do_if value="$basePilotName != null and $basePilotName != ''">
+            <set_value name="global.$GT_Pilots.{$pilot}.$OriginalPilotName" exact="$basePilotName"/>
+          </do_if>
         </do_else>
         <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-ShipMgmt] Update_Pilot_Name_Tag base resolve: pilot=' + $pilot.name + ', source=' + $baseNameSource + ', baseName=' + $basePilotName" chance="100"/>
+        </do_if>
+        <do_if value="$basePilotName == null or $basePilotName == ''">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-ShipMgmt] Update_Pilot_Name_Tag skipped: empty base name for pilot (id=' + (if $pilot.idcode? then $pilot.idcode else 'NONE') + ', source=' + $baseNameSource + ')'" chance="100"/>
+          </do_if>
+          <return value="false"/>
         </do_if>
 
         <set_value name="$newPilotName" exact="'(T:' + $pilotLevel + ') ' + $basePilotName"/>
@@ -1909,8 +1919,10 @@
           </do_all>
           <do_if value="$matchCount != 1">
             <set_value name="$resolved" exact="null"/>
+            <!-- Reset only on failure so the next tier starts clean; a successful
+                 resolve must keep $matchCount == 1 for callers gating on $MatchCount. -->
+            <set_value name="$matchCount" exact="0"/>
           </do_if>
-          <set_value name="$matchCount" exact="0"/>
         </do_if>
 
         <do_if value="not $resolved and $stableKey != '' and $ship and $ship.exists">
@@ -2079,8 +2091,33 @@
           <set_value name="$rebound" exact="true"/>
         </do_if>
         <do_elseif value="$registryKey and $registryKey != $targetPilot and global.$GT_Pilots.{$registryKey}? and global.$GT_Pilots.{$targetPilot}?">
+          <!-- Both rows exist (target was freshly registered before the rebind ran).
+               Merge instead of dropping the old row: the row with the higher XP carries the
+               real progression and wins wholesale; identity fields missing on the winner are
+               backfilled from the loser. -->
+          <set_value name="$srcXP" exact="if global.$GT_Pilots.{$registryKey}.$XP? then global.$GT_Pilots.{$registryKey}.$XP else 0"/>
+          <set_value name="$tgtXP" exact="if global.$GT_Pilots.{$targetPilot}.$XP? then global.$GT_Pilots.{$targetPilot}.$XP else 0"/>
+          <do_if value="$srcXP ge $tgtXP">
+            <set_value name="$loserRow" exact="global.$GT_Pilots.{$targetPilot}"/>
+            <set_value name="global.$GT_Pilots.{$targetPilot}" exact="global.$GT_Pilots.{$registryKey}"/>
+          </do_if>
+          <do_else>
+            <set_value name="$loserRow" exact="global.$GT_Pilots.{$registryKey}"/>
+          </do_else>
+          <do_if value="(not global.$GT_Pilots.{$targetPilot}.$OriginalPilotName? or global.$GT_Pilots.{$targetPilot}.$OriginalPilotName == '') and $loserRow.$OriginalPilotName? and $loserRow.$OriginalPilotName != ''">
+            <set_value name="global.$GT_Pilots.{$targetPilot}.$OriginalPilotName" exact="$loserRow.$OriginalPilotName"/>
+          </do_if>
+          <do_if value="(not global.$GT_Pilots.{$targetPilot}.$PilotName? or global.$GT_Pilots.{$targetPilot}.$PilotName == '') and $loserRow.$PilotName? and $loserRow.$PilotName != ''">
+            <set_value name="global.$GT_Pilots.{$targetPilot}.$PilotName" exact="$loserRow.$PilotName"/>
+          </do_if>
+          <do_if value="(not global.$GT_Pilots.{$targetPilot}.$StableIdentity? or global.$GT_Pilots.{$targetPilot}.$StableIdentity == '') and $loserRow.$StableIdentity? and $loserRow.$StableIdentity != ''">
+            <set_value name="global.$GT_Pilots.{$targetPilot}.$StableIdentity" exact="$loserRow.$StableIdentity"/>
+          </do_if>
           <remove_value name="global.$GT_Pilots.{$registryKey}"/>
           <set_value name="$rebound" exact="true"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-ShipMgmt] Rebind_Pilot_Registry merge: srcXP=' + $srcXP + ', tgtXP=' + $tgtXP + ', winner=' + (if $srcXP ge $tgtXP then 'source' else 'target') + ', pilot=' + (if $targetPilot.name? then $targetPilot.name else 'NONE')" chance="100"/>
+          </do_if>
         </do_elseif>
 
         <do_if value="not global.$GT_Pilots?">
@@ -3333,10 +3370,12 @@
           <do_if value="not global.$GT_Pilots.{$pilot}.$TrainingCompleted?">
             <set_value name="global.$GT_Pilots.{$pilot}.$TrainingCompleted" exact="[]"/>
           </do_if>
-          <do_if value="not global.$GT_Pilots.{$pilot}.$PilotName?">
+          <!-- Only backfill names from the live entity when it reports a non-empty name;
+               mid-transfer entities can briefly report '' and must not poison the registry. -->
+          <do_if value="not global.$GT_Pilots.{$pilot}.$PilotName? and $pilot.name? and $pilot.name != ''">
             <set_value name="global.$GT_Pilots.{$pilot}.$PilotName" exact="$pilot.name"/>
           </do_if>
-          <do_if value="not global.$GT_Pilots.{$pilot}.$OriginalPilotName?">
+          <do_if value="not global.$GT_Pilots.{$pilot}.$OriginalPilotName? and $pilot.name? and $pilot.name != ''">
             <set_value name="global.$GT_Pilots.{$pilot}.$OriginalPilotName" exact="$pilot.name"/>
           </do_if>
           <do_if value="not global.$GT_Pilots.{$pilot}.$PilotID? or global.$GT_Pilots.{$pilot}.$PilotID == ''">

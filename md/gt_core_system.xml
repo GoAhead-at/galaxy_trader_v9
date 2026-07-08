@@ -224,7 +224,56 @@
         </do_if>
       </actions>
     </cue>
-    
+
+    <!-- One-shot save repair: registry rows stuck in 'ejected' whose key entity no longer
+         exists (pilot was rescued but the rebind failed, e.g. premature rebind onto the
+         dying spacesuit entity in older versions). Scans the player fleet for the live
+         crew actor via stable identity and rebinds through the normal rescue pipeline.
+         Runs once per load, no rescheduling. -->
+    <cue name="RepairOrphanedEjectedPilotRowsOnLoad" instantiate="true" version="1">
+      <conditions>
+        <event_game_loaded/>
+      </conditions>
+      <delay exact="25s"/>
+      <actions>
+        <set_value name="$orphans" exact="[]"/>
+        <do_if value="global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
+          <do_all exact="global.$GT_Pilots.keys.count" counter="$oi">
+            <set_value name="$oKey" exact="global.$GT_Pilots.keys.{$oi}"/>
+            <do_if value="not $oKey.exists and global.$GT_Pilots.{$oKey}.$Status? and global.$GT_Pilots.{$oKey}.$Status == 'ejected' and global.$GT_Pilots.{$oKey}.$StableIdentity? and global.$GT_Pilots.{$oKey}.$StableIdentity != ''">
+              <append_to_list name="$orphans" exact="$oKey"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <do_if value="$orphans.count gt 0">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-LoadHeal] RepairOrphanedEjectedPilotRowsOnLoad: found ' + $orphans.count + ' orphaned ejected pilot row(s)'" chance="100"/>
+          </do_if>
+          <find_ship_by_true_owner name="$fleetShips" faction="faction.player" space="player.galaxy" class="[class.ship_s, class.ship_m, class.ship_l, class.ship_xl]" multiple="true" checkoperational="true"/>
+          <do_all exact="$orphans.count" counter="$ri">
+            <set_value name="$orphanKey" exact="$orphans.{$ri}"/>
+            <set_value name="$orphanStable" exact="global.$GT_Pilots.{$orphanKey}.$StableIdentity"/>
+            <set_value name="$repaired" exact="false"/>
+            <do_all exact="$fleetShips.count" counter="$si">
+              <do_if value="not $repaired">
+                <set_value name="$scanShip" exact="$fleetShips.{$si}"/>
+                <do_if value="$scanShip.exists and $scanShip.people? and $scanShip.people.count gt 0">
+                  <run_actions ref="md.GT_CoreSystem.TryRescueSpecificEjectedPilotOnShip" result="$repaired">
+                    <param name="ship" value="$scanShip"/>
+                    <param name="registryPilotHint" value="$orphanKey"/>
+                    <param name="source" value="'load_orphan_repair'"/>
+                  </run_actions>
+                </do_if>
+              </do_if>
+            </do_all>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-LoadHeal] RepairOrphanedEjectedPilotRowsOnLoad: orphan ' + $ri + '/' + $orphans.count + ' stable=' + $orphanStable + ' repaired=' + $repaired" chance="100"/>
+            </do_if>
+          </do_all>
+        </do_if>
+      </actions>
+    </cue>
+
     <!-- Ship Registration System -->
     <cue name="RegisterShip" instantiate="true">
       <conditions>
@@ -1113,6 +1162,9 @@
       <actions>
         <set_value name="$result" exact="false"/>
         <do_if value="not $ship or not $ship.exists">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Core] HandleRescueRebindForEjectedPilot: rescue ship missing, source=' + $source" chance="100"/>
+          </do_if>
           <return value="false"/>
         </do_if>
 
@@ -1156,6 +1208,9 @@
         </do_if>
 
         <do_if value="not $wasEjected">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Core] HandleRescueRebindForEjectedPilot: no ejected registry row (live=' + (if $livePilot and $livePilot.exists and $livePilot.name? then $livePilot.name else 'NONE') + ', stable=' + $stableKey + ', source=' + $source + ')'" chance="100"/>
+          </do_if>
           <return value="false"/>
         </do_if>
 
@@ -1200,12 +1255,38 @@
           <do_if value="$tierRes.$Pilot? and $tierRes.$Pilot.exists">
             <set_value name="$resolvedPilot" exact="$tierRes.$Pilot"/>
           </do_if>
-          <do_elseif value="$resolveHint and $resolveHint.exists">
-            <set_value name="$resolvedPilot" exact="$resolveHint"/>
-          </do_elseif>
+          <do_else>
+            <!-- No blind $resolveHint fallback here: at pickup time the last-known ref is the
+                 destroy-time / spacesuit entity about to die. Rebinding onto it flips the row
+                 out of 'ejected' and clears eject scratch state, permanently orphaning the
+                 pilot. Keep eject state intact so the delayed ship-scan fallbacks can recover. -->
+            <set_value name="$resolvedPilot" exact="null"/>
+          </do_else>
         </do_if>
 
         <do_if value="not ($resolvedPilot and $resolvedPilot.exists)">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Core] HandleRescueRebindForEjectedPilot: live crew actor not resolved yet on ship=' + $ship.idcode + ' (stable=' + $stableKey + ', source=' + $source + ') - keeping eject state for delayed rescan'" chance="100"/>
+          </do_if>
+          <return value="false"/>
+        </do_if>
+
+        <!-- Final gate: never complete the rebind onto an entity that is still sitting in a
+             spacesuit or is not verifiably aboard the rescue ship. -->
+        <do_if value="$resolvedPilot.ship? and $resolvedPilot.ship.exists and $resolvedPilot.ship.isclass.spacesuit">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Core] HandleRescueRebindForEjectedPilot: resolved pilot still in spacesuit, ship=' + $ship.idcode + ', source=' + $source + ' - keeping eject state'" chance="100"/>
+          </do_if>
+          <return value="false"/>
+        </do_if>
+        <run_actions ref="md.GT_Ship_Management.Pilot_Is_On_Ship" result="$resolvedOnShip">
+          <param name="pilot" value="$resolvedPilot"/>
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        <do_if value="not $resolvedOnShip">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Core] HandleRescueRebindForEjectedPilot: resolved pilot not aboard ship=' + $ship.idcode + ' (pilot=' + (if $resolvedPilot.name? then $resolvedPilot.name else 'NONE') + ', source=' + $source + ') - keeping eject state'" chance="100"/>
+          </do_if>
           <return value="false"/>
         </do_if>
 

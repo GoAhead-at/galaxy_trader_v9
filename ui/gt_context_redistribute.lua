@@ -129,30 +129,74 @@ local function getPilotExchangeBusyShipIdSet()
     return peBusyShipIdSet
 end
 
-local function publishMapSelectionShipCount()
-    requestPilotExchangeBusyShipRefresh()
-    getPilotExchangeBusyShipIdSet()
-    local ships = {}
+local PLAN_MODE = {
+    FLEET_RULES = "fleet_rules",
+    FORCED_PAIR = "forced_pair",
+}
+
+local menu = Helper.getMenu("MapMenu")
+
+local function countRawMapSelectedShips()
     local seen = {}
-    local pilotIndex = getGTPilotIndexByShipId()
-    local interactMenu = Helper.getMenu("InteractMenu")
-    if interactMenu and interactMenu.selectedplayerships then
-        for _, ship in ipairs(interactMenu.selectedplayerships) do
-            tryAddEligibleGTShip(ship, ships, seen, pilotIndex, {})
-        end
-    elseif menu and menu.selectedcomponents then
-        for id, _ in pairs(menu.selectedcomponents) do
-            local selectedComponent = ConvertStringTo64Bit(tostring(id))
-            if selectedComponent and selectedComponent ~= 0 and C.IsComponentClass(selectedComponent, "ship") then
-                tryAddEligibleGTShip(selectedComponent, ships, seen, pilotIndex, {})
+    local count = 0
+    local function countShip(ship)
+        ship = asComponentId(ship)
+        if ship and ship ~= 0 and C.IsComponentClass(ship, "ship") then
+            local key = tostring(ship)
+            if not seen[key] then
+                seen[key] = true
+                count = count + 1
             end
         end
     end
-    local count = #ships
-    if GT_PlayerBridge and GT_PlayerBridge.GetPlayerBlackboardId then
-        SetNPCBlackboard(GT_PlayerBridge.GetPlayerBlackboardId(), "$GT_PilotExchange_SelectionShipCount", count)
+    if menu and menu.selectedcomponents then
+        for id, _ in pairs(menu.selectedcomponents) do
+            countShip(ConvertStringTo64Bit(tostring(id)))
+        end
+    end
+    local interactMenu = Helper.getMenu("InteractMenu")
+    if interactMenu and interactMenu.selectedplayerships then
+        for _, ship in ipairs(interactMenu.selectedplayerships) do
+            countShip(ship)
+        end
     end
     return count
+end
+
+local function appendMapAndInteractSelectedGTShips(ships, seen, pilotIndex, opts)
+    if menu and menu.selectedcomponents then
+        for id, _ in pairs(menu.selectedcomponents) do
+            local selectedComponent = ConvertStringTo64Bit(tostring(id))
+            if selectedComponent and selectedComponent ~= 0 and C.IsComponentClass(selectedComponent, "ship") then
+                tryAddEligibleGTShip(selectedComponent, ships, seen, pilotIndex, opts)
+            end
+        end
+    end
+    local interactMenu = Helper.getMenu("InteractMenu")
+    if interactMenu and interactMenu.selectedplayerships then
+        for _, ship in ipairs(interactMenu.selectedplayerships) do
+            tryAddEligibleGTShip(ship, ships, seen, pilotIndex, opts)
+        end
+    end
+end
+
+local lastMapSelectionPublishKey = nil
+local publishMapSelectionShipCount
+local maybePublishMapSelectionShipCount
+
+local function buildMapSelectionPublishKey()
+    if not menu or not menu.selectedcomponents then
+        return ""
+    end
+    local ids = {}
+    for id, _ in pairs(menu.selectedcomponents) do
+        local selectedComponent = ConvertStringTo64Bit(tostring(id))
+        if selectedComponent and selectedComponent ~= 0 and C.IsComponentClass(selectedComponent, "ship") then
+            table.insert(ids, tostring(id))
+        end
+    end
+    table.sort(ids)
+    return table.concat(ids, ",")
 end
 
 local function logMapSelectionState(trigger)
@@ -193,25 +237,30 @@ local function logMapSelectionState(trigger)
         .. " publishedBlackboardCount=" .. tostring(publishMapSelectionShipCount()))
 end
 
-local menu = Helper.getMenu("MapMenu")
-local pendingRedistributeCommander = nil
 local pendingRedistributeSelection = false
+local pendingSelectionForcedPair = false
 local pendingRedistributeFleet = false
 local pendingPilotExchangeCommanderFleet = nil
 local pendingSelectionDispatch = nil
 local pilotDataRefreshRequestedAt = 0
 local PILOT_DATA_REFRESH_TIMEOUT = 5.0
 local PILOT_DATA_FLEET_REUSE_MAX_AGE = 60.0
-local pendingSwapShipsByPair = {}
 local completedSwapByPair = {}
-local pendingDockAssignmentsByPair = {}
-local pendingReleaseRetries = {}
 local pendingPostSwapRefreshRetries = {}
+local pendingDockAssignmentsByPair = {}
+local pendingSwapShipsByPair = {}
+local pendingReleaseRetries = {}
+local pendingDockRetryQueue = {}
+local pendingDockExchangePlan = nil
+local pendingDockSwapQueue = nil
+local DOCK_ASSIGN_RETRY_INTERVAL = 30.0
 local pendingDirectSwapQueue = nil
 local directSwapWatchState = {}
 local directSwapWatchLastProbeAt = 0
 local DIRECT_SWAP_WATCH_PROBE_INTERVAL = 0.75
 local DIRECT_SWAP_DEFER_FALLBACK_SEC = 5.0
+-- PerformCrewExchange2 can update assignedpilot before crew pods launch; probe long enough to catch intransit.
+local DIRECT_SWAP_SETTLE_MIN_SEC = 5.0
 local pilotIndexCacheByShipId = nil
 
 local function invalidatePilotIndexCache()
@@ -248,6 +297,21 @@ local function isShipInPendingRedistribution(ship, idcode)
             return true
         end
     end
+    if codeKey ~= "" then
+        local plan = pendingDockExchangePlan
+        if plan and plan.active and plan.shipIds and plan.shipIds[codeKey] then
+            return true
+        end
+        local queue = pendingDirectSwapQueue
+        if queue and queue.active then
+            for i = queue.index, #queue.items do
+                local item = queue.items[i]
+                if item and (tostring(item.leftCode) == codeKey or tostring(item.rightCode) == codeKey) then
+                    return true
+                end
+            end
+        end
+    end
     for _, item in ipairs(pendingReleaseRetries) do
         if item and codeKey ~= "" and (tostring(item.left or "") == codeKey or tostring(item.right or "") == codeKey) then
             return true
@@ -271,8 +335,6 @@ local function clearPendingRedistributionForShip(idcode)
             pendingDockAssignmentsByPair[key] = nil
         end
     end
-    -- Clear remembered swap pairs as well to avoid stale growth if an exchange is cancelled early.
-    -- Swap execution now receives authoritative ship objects from MD, so we do not depend on this cache.
     for key, pair in pairs(pendingSwapShipsByPair) do
         if pair and (tostring(pair.left or "") == codeKey or tostring(pair.right or "") == codeKey) then
             pendingSwapShipsByPair[key] = nil
@@ -294,6 +356,16 @@ local function clearPendingRedistributionForShip(idcode)
         if item and (tostring(item.left or "") == codeKey or tostring(item.right or "") == codeKey) then
             table.remove(pendingPostSwapRefreshRetries, i)
         end
+    end
+    for i = #pendingDockRetryQueue, 1, -1 do
+        local item = pendingDockRetryQueue[i]
+        if item and (tostring(item.leftCode or "") == codeKey or tostring(item.rightCode or "") == codeKey) then
+            table.remove(pendingDockRetryQueue, i)
+        end
+    end
+    local plan = pendingDockExchangePlan
+    if plan and plan.shipIds then
+        plan.shipIds[codeKey] = nil
     end
     local queue = pendingDirectSwapQueue
     if queue and queue.active and codeKey ~= "" then
@@ -340,6 +412,52 @@ local function publishPilotExchangeRelease(leftCode, rightCode, leftShip, rightS
     })
 end
 
+local function schedulePilotExchangeReleaseRetry(leftCode, rightCode, leftShip, rightShip)
+    if not leftCode or not rightCode then
+        return
+    end
+    table.insert(pendingReleaseRetries, {
+        left = tostring(leftCode),
+        right = tostring(rightCode),
+        leftShip = leftShip or 0,
+        rightShip = rightShip or 0,
+        dueAt = getElapsedTime() + 2.0,
+        attemptsLeft = 5,
+    })
+end
+
+local function sendDockingLogbookMessage(leftShip, rightShip, station)
+    if type(AddUITriggeredEvent) ~= "function" then
+        return
+    end
+    local leftName = GetComponentData(leftShip, "name") or "Unknown Ship"
+    local rightName = GetComponentData(rightShip, "name") or "Unknown Ship"
+    local leftCode = GetComponentData(leftShip, "idcode") or "UNK"
+    local rightCode = GetComponentData(rightShip, "idcode") or "UNK"
+    local stationName = GetComponentData(station, "name") or "Unknown Station"
+    local stationCode = GetComponentData(station, "idcode") or "UNK"
+
+    local title = ReadText(77000, 3120)
+    local template = ReadText(77000, 3121) or ""
+    local values = {
+        tostring(leftName), tostring(leftCode),
+        tostring(rightName), tostring(rightCode),
+        tostring(stationName), tostring(stationCode),
+    }
+    local message = tostring(template):gsub("%%(%d+)", function(idx)
+        local n = tonumber(idx)
+        if n and values[n] ~= nil then
+            return values[n]
+        end
+        return "%" .. tostring(idx)
+    end)
+
+    AddUITriggeredEvent("GT_Redistribute", "Logbook", {
+        title = title,
+        message = message,
+    })
+end
+
 local function publishPostSwapNameRefresh(leftCode, rightCode, leftShip, rightShip)
     if type(AddUITriggeredEvent) ~= "function" then
         return
@@ -360,20 +478,6 @@ local function publishPostSwapNameRefresh(leftCode, rightCode, leftShip, rightSh
     else
         debugLog("PostSwapNameRefresh could not request GT pilot data refresh")
     end
-end
-
-local function schedulePilotExchangeReleaseRetry(leftCode, rightCode, leftShip, rightShip)
-    if not leftCode or not rightCode then
-        return
-    end
-    table.insert(pendingReleaseRetries, {
-        left = tostring(leftCode),
-        right = tostring(rightCode),
-        leftShip = leftShip or 0,
-        rightShip = rightShip or 0,
-        dueAt = getElapsedTime() + 2.0,
-        attemptsLeft = 5,
-    })
 end
 
 local function schedulePostSwapNameRefreshRetry(leftCode, rightCode, leftShip, rightShip)
@@ -470,57 +574,6 @@ local function getCallerOrderIdFromParams(params)
     return nil
 end
 
-local function orderIsPilotExchange(orderdef, callerId)
-    return orderdef == "DockAndPilotExchange"
-        or (orderdef == "DockAndWait" and callerId == "DockAndPilotExchange")
-end
-
-local function shipHasActiveOrQueuedPilotExchangeOrder(ship)
-    local shipId = asComponentId(ship)
-    if not shipId or shipId == 0 then
-        return false
-    end
-
-    local defaultOrder = getDefaultOrderId(ship)
-    if defaultOrder == "DockAndPilotExchange" then
-        return true
-    end
-    if defaultOrder == "DockAndWait" then
-        local params = getOrderParamsSafe(shipId, 1)
-        if orderIsPilotExchange(defaultOrder, getCallerOrderIdFromParams(params)) then
-            return true
-        end
-    end
-
-    local numOrders = tonumber(C.GetNumOrders(shipId) or 0) or 0
-    if numOrders <= 1 then
-        return false
-    end
-
-    local orders = ffi.new("Order[?]", numOrders)
-    local count = tonumber(C.GetOrders(orders, numOrders, shipId) or 0) or 0
-    if count <= 0 then
-        return false
-    end
-
-    for i = 0, count - 1 do
-        local orderdef = orders[i].orderdef and ffi.string(orders[i].orderdef) or ""
-        if orderdef == "DockAndPilotExchange" then
-            return true
-        end
-        if orderdef == "DockAndWait" then
-            local orderIdx = tonumber(orders[i].queueidx) or (i + 1)
-            local params = getOrderParamsSafe(shipId, orderIdx)
-            local callerId = getCallerOrderIdFromParams(params)
-            if orderIsPilotExchange(orderdef, callerId) then
-                return true
-            end
-        end
-    end
-
-    return false
-end
-
 local function shipHasActiveOrQueuedDockAndTrain(ship)
     local shipId = asComponentId(ship)
     if not shipId or shipId == 0 then
@@ -542,6 +595,41 @@ local function shipHasActiveOrQueuedDockAndTrain(ship)
         local orderdef = orders[i].orderdef and ffi.string(orders[i].orderdef) or ""
         if orderdef == "DockAndTrain" then
             return true
+        end
+    end
+
+    return false
+end
+
+local function shipHasActiveOrQueuedPilotExchangeOrder(ship)
+    local shipId = asComponentId(ship)
+    if not shipId or shipId == 0 then
+        return false
+    end
+
+    local numOrders = tonumber(C.GetNumOrders(shipId) or 0) or 0
+    if numOrders <= 0 then
+        return false
+    end
+
+    local orders = ffi.new("Order[?]", numOrders)
+    local count = tonumber(C.GetOrders(orders, numOrders, shipId) or 0) or 0
+    if count <= 0 then
+        return false
+    end
+
+    for i = 0, count - 1 do
+        local orderdef = orders[i].orderdef and ffi.string(orders[i].orderdef) or ""
+        if orderdef == "DockAndPilotExchange" then
+            return true
+        end
+        if orderdef == "DockAndWait" then
+            local orderIdx = tonumber(orders[i].queueidx) or (i + 1)
+            local params = getOrderParamsSafe(shipId, orderIdx)
+            local callerId = getCallerOrderIdFromParams(params)
+            if callerId == "DockAndPilotExchange" then
+                return true
+            end
         end
     end
 
@@ -612,10 +700,10 @@ end
 
 -- Planning exclusion only: already queued for exchange (not operational busy - those defer at execution).
 local function shipIsAlreadyQueuedForPilotExchange(ship, idcode)
-    if shipIsInDirectSwapQueue(idcode) then
+    if shipHasActiveOrQueuedPilotExchangeOrder(ship) then
         return true
     end
-    if shipHasActiveOrQueuedPilotExchangeOrder(ship) then
+    if shipIsInDirectSwapQueue(idcode) then
         return true
     end
     if isShipInPendingRedistribution(ship, idcode) then
@@ -631,24 +719,48 @@ local function shipIsAlreadyQueuedForPilotExchange(ship, idcode)
     return false
 end
 
+local function addPilotExchangeBusyId(ids, seen, code)
+    code = tostring(code or "")
+    if code ~= "" and not seen[code] then
+        seen[code] = true
+        table.insert(ids, code)
+    end
+end
+
 local function publishDirectQueueBusyShipIds()
     local ids = {}
     local seen = {}
-    local queue = pendingDirectSwapQueue
-    if queue and queue.active then
-        for i = queue.index, #queue.items do
-            local item = queue.items[i]
-            if item then
-                for _, code in ipairs({ item.leftCode, item.rightCode }) do
-                    code = tostring(code or "")
-                    if code ~= "" and not seen[code] then
-                        seen[code] = true
-                        table.insert(ids, code)
-                    end
-                end
-            end
+
+    -- All ships in the active exchange plan stay busy until their pair completes.
+    local plan = pendingDockExchangePlan
+    if plan and plan.active and plan.shipIds then
+        for code, _ in pairs(plan.shipIds) do
+            addPilotExchangeBusyId(ids, seen, code)
         end
     end
+
+    for _, item in pairs(pendingDockAssignmentsByPair) do
+        if item then
+            addPilotExchangeBusyId(ids, seen, item.left)
+            addPilotExchangeBusyId(ids, seen, item.right)
+        end
+    end
+    for _, pair in pairs(pendingSwapShipsByPair) do
+        if pair then
+            addPilotExchangeBusyId(ids, seen, pair.left)
+            addPilotExchangeBusyId(ids, seen, pair.right)
+        end
+    end
+
+    local directQueue = pendingDirectSwapQueue
+    if directQueue and directQueue.active and directQueue.index and directQueue.index <= #directQueue.items then
+        local item = directQueue.items[directQueue.index]
+        if item then
+            addPilotExchangeBusyId(ids, seen, item.leftCode)
+            addPilotExchangeBusyId(ids, seen, item.rightCode)
+        end
+    end
+
     if GT_PlayerBridge and GT_PlayerBridge.GetPlayerBlackboardId then
         local playerId = GT_PlayerBridge.GetPlayerBlackboardId()
         if playerId then
@@ -694,6 +806,61 @@ local function pairKey(leftCode, rightCode)
     return b .. "|" .. a
 end
 
+local function rememberSwapPair(leftCode, rightCode, leftShip, rightShip)
+    if not leftCode or not rightCode or not leftShip or not rightShip then
+        return
+    end
+    pendingSwapShipsByPair[pairKey(leftCode, rightCode)] = {
+        left = leftShip,
+        right = rightShip,
+        leftCode = tostring(leftCode),
+        rightCode = tostring(rightCode),
+    }
+end
+
+local function getRememberedSwapPair(leftCode, rightCode)
+    return pendingSwapShipsByPair[pairKey(leftCode, rightCode)]
+end
+
+local function removePairFromDockSwapQueue(leftCode, rightCode)
+    local queue = pendingDockSwapQueue
+    if not queue or not queue.items then
+        return
+    end
+    local pk = pairKey(leftCode, rightCode)
+    local newItems = {}
+    for _, item in ipairs(queue.items) do
+        if item and pairKey(item.leftCode, item.rightCode) ~= pk then
+            table.insert(newItems, item)
+        end
+    end
+    queue.items = newItems
+    if #newItems == 0 then
+        queue.active = false
+        pendingDockSwapQueue = nil
+    end
+end
+
+local function requestDockOrdersFromMD(leftShip, rightShip, leftCode, rightCode)
+    if type(AddUITriggeredEvent) ~= "function" then
+        return false
+    end
+    if (not leftShip) or leftShip == 0 or (not rightShip) or rightShip == 0 then
+        return false
+    end
+    if not leftCode or not rightCode then
+        return false
+    end
+    AddUITriggeredEvent("GT_Redistribute", "AssignDockOrders", {
+        left = tostring(leftCode),
+        right = tostring(rightCode),
+        leftObj = ConvertStringToLuaID(tostring(leftShip)),
+        rightObj = ConvertStringToLuaID(tostring(rightShip)),
+        immediate = true,
+    })
+    return true
+end
+
 local function swapPairKeyForState(a, b)
     return pairKey(a and a.idcode, b and b.idcode)
 end
@@ -711,23 +878,6 @@ local function dedupeSwaps(swaps)
         end
     end
     return out
-end
-
-local function rememberSwapPair(leftCode, rightCode, leftShip, rightShip)
-    if not leftCode or not rightCode or not leftShip or not rightShip then
-        return
-    end
-    pendingSwapShipsByPair[pairKey(leftCode, rightCode)] = {
-        left = leftShip,
-        right = rightShip,
-    }
-end
-
-local function popRememberedSwapPair(leftCode, rightCode)
-    local key = pairKey(leftCode, rightCode)
-    local pair = pendingSwapShipsByPair[key]
-    pendingSwapShipsByPair[key] = nil
-    return pair
 end
 
 local function resolveShipFromIdCode(idcode)
@@ -1049,6 +1199,32 @@ local function tryAddEligibleGTShip(ship, ships, seen, pilotIndex, opts)
     end
 end
 
+publishMapSelectionShipCount = function()
+    requestPilotExchangeBusyShipRefresh()
+    getPilotExchangeBusyShipIdSet()
+    local ships = {}
+    local seen = {}
+    local pilotIndex = getGTPilotIndexByShipId()
+    local menuOpts = { forPlanDisplay = true, quietReject = true, quietUnavailable = true }
+    appendMapAndInteractSelectedGTShips(ships, seen, pilotIndex, menuOpts)
+    local count = #ships
+    local bridge = _G.GT_PlayerBridge or GT_PlayerBridge
+    if bridge and bridge.GetPlayerBlackboardId then
+        SetNPCBlackboard(bridge.GetPlayerBlackboardId(), "$GT_PilotExchange_SelectionShipCount", count)
+    end
+    logPilotExchangeMenu("publishMapSelectionShipCount eligibleGT=" .. tostring(count))
+    return count
+end
+
+maybePublishMapSelectionShipCount = function(force)
+    local key = buildMapSelectionPublishKey()
+    if not force and key == lastMapSelectionPublishKey then
+        return
+    end
+    lastMapSelectionPublishKey = key
+    return publishMapSelectionShipCount()
+end
+
 local function smallerAndLargerShip(a, b)
     if a.rank < b.rank then
         return a, b
@@ -1277,6 +1453,20 @@ local function formatShipPilotLine(name, idcode, size, level)
 end
 
 local function buildSwapPlanLine(ships, swap)
+    if swap.forcedPair then
+        local leftEntry = findShipEntry(ships, swap.left) or findShipEntryByIdcode(ships, swap.leftIdcode)
+        local rightEntry = findShipEntry(ships, swap.right) or findShipEntryByIdcode(ships, swap.rightIdcode)
+        if not leftEntry or not rightEntry then
+            return nil
+        end
+        local leftName = GetComponentData(leftEntry.ship, "name") or tostring(leftEntry.idcode)
+        local rightName = GetComponentData(rightEntry.ship, "name") or tostring(rightEntry.idcode)
+        return formatTextId(
+            31317,
+            leftName, tostring(leftEntry.idcode), tostring(leftEntry.size), tostring(leftEntry.level),
+            rightName, tostring(rightEntry.idcode), tostring(rightEntry.size), tostring(rightEntry.level)
+        )
+    end
     if not swap.smallIdcode or not swap.largeIdcode then
         return nil
     end
@@ -1463,6 +1653,31 @@ local function filterShipsForSwapPlanning(ships)
         end
     end
     return out
+end
+
+local function filterShipsForForcedPairPlanning(ships)
+    local out = {}
+    for _, ship in ipairs(ships or {}) do
+        if ship.ship and ship.pilot and not ship.exchangeQueued then
+            table.insert(out, ship)
+        end
+    end
+    return out
+end
+
+local function planForcedPairSwap(shipA, shipB)
+    if not shipA or not shipB or not shipA.ship or not shipB.ship then
+        return {}
+    end
+    return {
+        {
+            left = shipA.ship,
+            right = shipB.ship,
+            leftIdcode = shipA.idcode,
+            rightIdcode = shipB.idcode,
+            forcedPair = true,
+        },
+    }
 end
 
 local function shipEntryForPlanLine(ships, idcode, pilotIndex)
@@ -1823,70 +2038,6 @@ local function buildRendezvousGroups(swaps)
     return groups
 end
 
-local function requestDockOrdersFromMD(leftShip, rightShip, leftCode, rightCode)
-    if type(AddUITriggeredEvent) ~= "function" then
-        return false
-    end
-    if (not leftShip) or leftShip == 0 or (not rightShip) or rightShip == 0 then
-        return false
-    end
-    if not leftCode or not rightCode then
-        return false
-    end
-    AddUITriggeredEvent("GT_Redistribute", "AssignDockOrders", {
-        left = tostring(leftCode),
-        right = tostring(rightCode),
-        leftObj = ConvertStringToLuaID(tostring(leftShip)),
-        rightObj = ConvertStringToLuaID(tostring(rightShip)),
-        immediate = true,
-    })
-    return true
-end
-
-local function requestCycleDockOrdersFromMD(cycleId, ships, swaps)
-    if type(AddUITriggeredEvent) ~= "function" then
-        return false
-    end
-    if not cycleId or cycleId == "" or not ships or #ships < 3 or not swaps or #swaps < 1 then
-        return false
-    end
-
-    local shipPayload = {}
-    for i, ship in ipairs(ships) do
-        local idcode = GetComponentData(ship, "idcode")
-        if not idcode or idcode == "" then
-            return false
-        end
-        shipPayload[i] = {
-            idcode = tostring(idcode),
-            obj = ConvertStringToLuaID(tostring(ship)),
-        }
-    end
-
-    local swapPayload = {}
-    for i, swap in ipairs(swaps) do
-        local leftCode = GetComponentData(swap.left, "idcode")
-        local rightCode = GetComponentData(swap.right, "idcode")
-        if not leftCode or not rightCode then
-            return false
-        end
-        swapPayload[i] = {
-            left = tostring(leftCode),
-            right = tostring(rightCode),
-            leftObj = ConvertStringToLuaID(tostring(swap.left)),
-            rightObj = ConvertStringToLuaID(tostring(swap.right)),
-        }
-    end
-
-    AddUITriggeredEvent("GT_Redistribute", "AssignCycleDockOrders", {
-        cycleId = tostring(cycleId),
-        ships = shipPayload,
-        swaps = swapPayload,
-        immediate = true,
-    })
-    return true
-end
-
 local function pilotKey(pilot)
     if pilot == nil then
         return ""
@@ -1911,16 +2062,25 @@ local function pilotsWereExchanged(left, right, preLeftPilot, preRightPilot)
     return nowLeft == wasRight and nowRight == wasLeft
 end
 
-local function fireCycleSwapCompleteIfNeeded(item, leftCode, rightCode, left, right)
-    if item and item.cycleId and item.cycleId ~= "" and type(AddUITriggeredEvent) == "function" then
-        AddUITriggeredEvent("GT_Redistribute", "CycleSwapComplete", {
-            cycleId = tostring(item.cycleId),
-            left = tostring(leftCode),
-            right = tostring(rightCode),
-            leftObj = ConvertStringToLuaID(tostring(left or 0)),
-            rightObj = ConvertStringToLuaID(tostring(right or 0)),
-        })
+local function shipHasSeatedPilot(ship)
+    local pilot = GetComponentData(ship, "assignedpilot")
+    return pilot ~= nil and pilot ~= 0
+end
+
+-- PerformCrewExchange2 can report swapped assignedpilot while crew pods are still in flight.
+-- Do not complete GT settlement until vanilla checkonly passes and both pilots are seated.
+local function directSwapFullySettled(left, right, preLeftPilot, preRightPilot)
+    if not pilotsWereExchanged(left, right, preLeftPilot, preRightPilot) then
+        return false, "awaiting_pilot_swap"
     end
+    if not shipHasSeatedPilot(left) or not shipHasSeatedPilot(right) then
+        return false, "awaiting_pilot_seated"
+    end
+    local ok, reason = trySwapCaptains(left, right, false)
+    if not ok then
+        return false, reason ~= "" and reason or "awaiting_transfer"
+    end
+    return true, ""
 end
 
 local function finishDirectSwapQueueIfDone(queue)
@@ -1930,11 +2090,14 @@ local function finishDirectSwapQueueIfDone(queue)
         clearDirectSwapWatchState()
         publishDirectQueueBusyShipIds()
         requestPilotExchangeBusyShipRefresh()
+        if type(AddUITriggeredEvent) == "function" then
+            AddUITriggeredEvent("GT_Redistribute", "PilotExchangeQueueFinished", {})
+        end
         debugLog("Direct swap queue finished")
     end
 end
 
-local function markDirectSwapCompleted(leftCode, rightCode, left, right)
+local function recordDirectSwapCompleted(leftCode, rightCode)
     local keyA, keyB = tostring(leftCode), tostring(rightCode)
     if keyA > keyB then
         keyA, keyB = keyB, keyA
@@ -1944,9 +2107,16 @@ local function markDirectSwapCompleted(leftCode, rightCode, left, right)
         right = tostring(rightCode),
         done = true,
     }
-    publishPilotExchangeRenameState(leftCode, rightCode, false)
+end
+
+local function applyDirectSwapPostCompletion(leftCode, rightCode, left, right)
+    recordDirectSwapCompleted(leftCode, rightCode)
     publishPostSwapNameRefresh(leftCode, rightCode, left, right)
     schedulePostSwapNameRefreshRetry(leftCode, rightCode, left, right)
+end
+
+local function markDirectSwapCompleted(leftCode, rightCode, left, right)
+    applyDirectSwapPostCompletion(leftCode, rightCode, left, right)
 end
 
 local function resolveSwapShipPair(leftCode, rightCode, leftShip, rightShip)
@@ -1984,6 +2154,8 @@ local function attemptDirectSwap(leftCode, rightCode, leftShip, rightShip)
         publishPilotExchangeRenameState(leftCode, rightCode, false)
         return "fail", reason
     end
+    publishDirectQueueBusyShipIds()
+    requestPilotExchangeBusyShipRefresh()
     publishPilotExchangeRenameState(leftCode, rightCode, true)
     ok, reason = trySwapCaptains(left, right, true)
     if not ok then
@@ -1993,10 +2165,7 @@ local function attemptDirectSwap(leftCode, rightCode, leftShip, rightShip)
         publishPilotExchangeRenameState(leftCode, rightCode, false)
         return "fail", reason
     end
-    if pilotsWereExchanged(left, right, preLeftPilot, preRightPilot) then
-        markDirectSwapCompleted(leftCode, rightCode, left, right)
-        return "ok", ""
-    end
+    -- Always probe settlement: assignedpilot can cross-match before physical pod transfer finishes.
     return "settle", "awaiting_transfer", preLeftPilot, preRightPilot
 end
 
@@ -2005,9 +2174,20 @@ local function attemptDirectSwapSettlement(item, leftCode, rightCode, leftShip, 
     if not left or left == 0 or not right or right == 0 then
         return "fail", "invalid_ship"
     end
-    if pilotsWereExchanged(left, right, item.preLeftPilot, item.preRightPilot) then
-        markDirectSwapCompleted(leftCode, rightCode, left, right)
+    local now = getElapsedTime()
+    if not item.settlementStartedAt then
+        item.settlementStartedAt = now
+    end
+    if now - item.settlementStartedAt < DIRECT_SWAP_SETTLE_MIN_SEC then
+        return "defer", "awaiting_transfer"
+    end
+    local settled, settleReason = directSwapFullySettled(left, right, item.preLeftPilot, item.preRightPilot)
+    if settled then
         return "ok", ""
+    end
+    if pilotsWereExchanged(left, right, item.preLeftPilot, item.preRightPilot) then
+        debugLog("Direct swap awaiting pod settlement left=" .. tostring(leftCode) .. " right=" .. tostring(rightCode)
+            .. " reason=" .. tostring(settleReason or "awaiting_transfer"))
     end
     if isShipOrderCritical(left) or isShipOrderCritical(right) then
         return "defer", "critical_order"
@@ -2019,6 +2199,9 @@ local function attemptDirectSwapSettlement(item, leftCode, rightCode, leftShip, 
         end
         publishPilotExchangeRenameState(leftCode, rightCode, false)
         return "fail", reason
+    end
+    if pilotsWereExchanged(left, right, item.preLeftPilot, item.preRightPilot) then
+        return "defer", settleReason or "awaiting_transfer"
     end
     return "defer", "awaiting_transfer"
 end
@@ -2069,6 +2252,7 @@ local function processDirectSwapQueue()
         item.awaitingSettlement = true
         item.preLeftPilot = preLeftPilot
         item.preRightPilot = preRightPilot
+        item.settlementStartedAt = now
         seedDirectSwapWatchState(left, right)
         publishDirectQueueBusyShipIds()
         queue.nextRetryAt = now + DIRECT_SWAP_WATCH_PROBE_INTERVAL
@@ -2078,13 +2262,17 @@ local function processDirectSwapQueue()
     end
 
     debugLog("Direct swap completed left=" .. tostring(leftCode) .. " right=" .. tostring(rightCode)
-        .. (item.awaitingSettlement and " (settled)" or ""))
-    fireCycleSwapCompleteIfNeeded(item, leftCode, rightCode, left, right)
+        .. (item.awaitingSettlement and " (settled)" or "")
+        .. " progress=" .. tostring(queue.index) .. "/" .. tostring(#queue.items))
     item.awaitingSettlement = false
     queue.index = queue.index + 1
     queue.nextRetryAt = 0
     publishDirectQueueBusyShipIds()
+    requestPilotExchangeBusyShipRefresh()
+    publishPilotExchangeRenameState(leftCode, rightCode, false)
+    applyDirectSwapPostCompletion(leftCode, rightCode, left, right)
     finishDirectSwapQueueIfDone(queue)
+    return
 end
 
 local function getActiveDirectSwapPairShips()
@@ -2149,16 +2337,7 @@ end
 
 local function dispatchDirectExchangePlan(groups, logPrefix)
     local items = {}
-    for gi, group in ipairs(groups or {}) do
-        local cycleId = nil
-        if group.kind == "cycle" and group.ships then
-            local idParts = {}
-            for _, ship in ipairs(group.ships) do
-                table.insert(idParts, tostring(GetComponentData(ship, "idcode") or "UNK"))
-            end
-            table.sort(idParts)
-            cycleId = "pe_cycle_" .. table.concat(idParts, "_") .. "_" .. tostring(gi)
-        end
+    for _, group in ipairs(groups or {}) do
         for _, swap in ipairs(group.swaps or {}) do
             local leftCode = GetComponentData(swap.left, "idcode")
             local rightCode = GetComponentData(swap.right, "idcode")
@@ -2168,7 +2347,6 @@ local function dispatchDirectExchangePlan(groups, logPrefix)
                     right = swap.right,
                     leftCode = tostring(leftCode),
                     rightCode = tostring(rightCode),
-                    cycleId = cycleId,
                 })
             end
         end
@@ -2189,18 +2367,452 @@ local function dispatchDirectExchangePlan(groups, logPrefix)
     publishDirectQueueBusyShipIds()
     requestPilotExchangeBusyShipRefresh()
     if logPrefix then
-        debugLog(logPrefix .. " direct exchange queue swaps=" .. tostring(#items))
+        debugLog(logPrefix .. " direct exchange queue swaps=" .. tostring(#items)
+            .. " (sequential; expect ~5 game min per pair when crew pods are in flight)")
     end
     processDirectSwapQueue()
     return #items, 0
 end
 
-local function dispatchRendezvousPlan(groups, logPrefix)
-    return dispatchDirectExchangePlan(groups, logPrefix)
+local function processDockSwapQueue()
+    local queue = pendingDockSwapQueue
+    if not queue or not queue.active or not queue.items then
+        return false
+    end
+
+    local anyRequested = false
+    for _, item in ipairs(queue.items) do
+        if item and item.left and item.right then
+            local leftCode = tostring(item.leftCode or GetComponentData(item.left, "idcode") or "")
+            local rightCode = tostring(item.rightCode or GetComponentData(item.right, "idcode") or "")
+            item.leftCode = leftCode
+            item.rightCode = rightCode
+            if leftCode ~= "" and rightCode ~= "" then
+                local pk = pairKey(leftCode, rightCode)
+                local inRetryQueue = false
+                for _, retryItem in ipairs(pendingDockRetryQueue) do
+                    if retryItem and pairKey(retryItem.leftCode, retryItem.rightCode) == pk then
+                        inRetryQueue = true
+                        break
+                    end
+                end
+                local completedPair = completedSwapByPair[pk]
+                local swapInProgress = pendingSwapShipsByPair[pk]
+                if not inRetryQueue
+                    and not (completedPair and completedPair.done)
+                    and not swapInProgress
+                    and not pendingDockAssignmentsByPair[pk] then
+                    local assigned = requestDockOrdersFromMD(item.left, item.right, leftCode, rightCode)
+                    if assigned then
+                        pendingDockAssignmentsByPair[pk] = {
+                            left = leftCode,
+                            right = rightCode,
+                            leftShip = item.left,
+                            rightShip = item.right,
+                        }
+                        anyRequested = true
+                        debugLog("Dock assignment requested for " .. leftCode .. " <-> " .. rightCode)
+                    end
+                end
+            end
+        end
+    end
+
+    if anyRequested then
+        publishDirectQueueBusyShipIds()
+        requestPilotExchangeBusyShipRefresh()
+    end
+    return anyRequested
 end
 
-local function dispatchSwapPairs(swaps, logPrefix)
-    return dispatchRendezvousPlan(buildRendezvousGroups(swaps), logPrefix)
+local function finishDockExchangePlanIfDone()
+    local plan = pendingDockExchangePlan
+    if not plan or not plan.active then
+        return
+    end
+    if (plan.completedPairs or 0) < (plan.totalPairs or 0) then
+        return
+    end
+    if next(pendingDockAssignmentsByPair) ~= nil or next(pendingSwapShipsByPair) ~= nil then
+        return
+    end
+    plan.active = false
+    pendingDockExchangePlan = nil
+    publishDirectQueueBusyShipIds()
+    requestPilotExchangeBusyShipRefresh()
+    if type(AddUITriggeredEvent) == "function" then
+        AddUITriggeredEvent("GT_Redistribute", "PilotExchangeQueueFinished", {})
+    end
+    debugLog("Dock exchange plan finished pairs=" .. tostring(plan.completedPairs or 0))
+end
+
+local function recordDockPairCompleted(leftCode, rightCode)
+    local plan = pendingDockExchangePlan
+    if plan and plan.active then
+        plan.completedPairs = (plan.completedPairs or 0) + 1
+        if plan.shipIds then
+            plan.shipIds[tostring(leftCode or "")] = nil
+            plan.shipIds[tostring(rightCode or "")] = nil
+        end
+    end
+    finishDockExchangePlanIfDone()
+    publishDirectQueueBusyShipIds()
+    requestPilotExchangeBusyShipRefresh()
+end
+
+local function completeDockSwap(leftCode, rightCode, left, right)
+    local pairKeyStr = pairKey(leftCode, rightCode)
+    debugLog("Dock swap completed left=" .. tostring(leftCode) .. " right=" .. tostring(rightCode))
+    publishPilotExchangeRelease(leftCode, rightCode, left, right)
+    schedulePilotExchangeReleaseRetry(leftCode, rightCode, left, right)
+    publishPilotExchangeRenameState(leftCode, rightCode, false)
+    completedSwapByPair[pairKeyStr] = {
+        left = tostring(leftCode),
+        right = tostring(rightCode),
+        done = true,
+    }
+    pendingSwapShipsByPair[pairKeyStr] = nil
+    applyDirectSwapPostCompletion(leftCode, rightCode, left, right)
+    recordDockPairCompleted(leftCode, rightCode)
+    removePairFromDockSwapQueue(leftCode, rightCode)
+    publishDirectQueueBusyShipIds()
+    requestPilotExchangeBusyShipRefresh()
+end
+
+local function abortDockSwap(leftCode, rightCode, left, right, reason)
+    debugLog("Dock swap aborted left=" .. tostring(leftCode) .. " right=" .. tostring(rightCode)
+        .. " reason=" .. tostring(reason or "unknown"))
+    publishPilotExchangeRelease(leftCode, rightCode, left, right)
+    publishPilotExchangeRenameState(leftCode, rightCode, false)
+    pendingSwapShipsByPair[pairKey(leftCode, rightCode)] = nil
+    recordDockPairCompleted(leftCode, rightCode)
+    removePairFromDockSwapQueue(leftCode, rightCode)
+    publishDirectQueueBusyShipIds()
+    requestPilotExchangeBusyShipRefresh()
+end
+
+local function processDockSettlementQueue()
+    local now = getElapsedTime()
+    for pairKeyStr, item in pairs(pendingSwapShipsByPair) do
+        if not item then
+            pendingSwapShipsByPair[pairKeyStr] = nil
+        elseif item.awaitingSettlement then
+            local status, reason = attemptDirectSwapSettlement(
+                item,
+                item.leftCode,
+                item.rightCode,
+                item.left,
+                item.right
+            )
+            if status == "ok" then
+                completeDockSwap(item.leftCode, item.rightCode, item.left, item.right)
+            elseif status == "fail" then
+                abortDockSwap(item.leftCode, item.rightCode, item.left, item.right, reason)
+            end
+        elseif item.awaitingSwapRetry and (not item.nextRetryAt or now >= item.nextRetryAt) then
+            local status, reason, preLeftPilot, preRightPilot = attemptDirectSwap(
+                item.leftCode,
+                item.rightCode,
+                item.left,
+                item.right
+            )
+            if status == "settle" then
+                item.awaitingSwapRetry = false
+                item.awaitingSettlement = true
+                item.preLeftPilot = preLeftPilot
+                item.preRightPilot = preRightPilot
+                item.settlementStartedAt = now
+                item.nextRetryAt = nil
+                pendingSwapShipsByPair[pairKeyStr] = item
+                seedDirectSwapWatchState(item.left, item.right)
+                publishDirectQueueBusyShipIds()
+                requestPilotExchangeBusyShipRefresh()
+                debugLog("Dock swap transfer started left=" .. tostring(item.leftCode) .. " right=" .. tostring(item.rightCode))
+            elseif status == "defer" then
+                item.nextRetryAt = now + DIRECT_SWAP_DEFER_FALLBACK_SEC
+                pendingSwapShipsByPair[pairKeyStr] = item
+            elseif status == "fail" then
+                abortDockSwap(item.leftCode, item.rightCode, item.left, item.right, reason)
+            end
+        end
+    end
+end
+
+local function executeSwapByIdCode(payload)
+    if type(payload) ~= "table" then
+        return
+    end
+    local leftCode = payload.left or payload.leftCode
+    local rightCode = payload.right or payload.rightCode
+    if not leftCode or not rightCode then
+        return
+    end
+    debugLog("Swap execution event received left=" .. tostring(leftCode) .. " right=" .. tostring(rightCode))
+    local pairKeyStr = pairKey(leftCode, rightCode)
+    local completed = completedSwapByPair[pairKeyStr]
+    if completed and completed.done then
+        debugLog("Swap execution skipped (already completed) pair=" .. tostring(pairKeyStr))
+        return
+    end
+    local activeSwap = pendingSwapShipsByPair[pairKeyStr]
+    if activeSwap and (activeSwap.awaitingSettlement or activeSwap.awaitingSwapRetry) then
+        debugLog("Swap execution skipped (swap in progress) pair=" .. tostring(pairKeyStr))
+        return
+    end
+
+    local left = asComponentId(payload.leftUid or payload.leftObj)
+    local right = asComponentId(payload.rightUid or payload.rightObj)
+    local rememberedPair = getRememberedSwapPair(leftCode, rightCode)
+    if (not left or left == 0) then
+        left = rememberedPair and rememberedPair.left or nil
+    end
+    if (not right or right == 0) then
+        right = rememberedPair and rememberedPair.right or nil
+    end
+    if not left or left == 0 or not right or right == 0 then
+        left = resolveShipFromIdCode(leftCode)
+        right = resolveShipFromIdCode(rightCode)
+    end
+    local resolvedLeftCode = (left and left ~= 0) and tostring(GetComponentData(left, "idcode") or "") or ""
+    local resolvedRightCode = (right and right ~= 0) and tostring(GetComponentData(right, "idcode") or "") or ""
+    if resolvedLeftCode ~= tostring(leftCode) then
+        left = resolveShipFromIdCode(leftCode)
+        resolvedLeftCode = (left and left ~= 0) and tostring(GetComponentData(left, "idcode") or "") or ""
+    end
+    if resolvedRightCode ~= tostring(rightCode) then
+        right = resolveShipFromIdCode(rightCode)
+        resolvedRightCode = (right and right ~= 0) and tostring(GetComponentData(right, "idcode") or "") or ""
+    end
+    if not left or left == 0 or not right or right == 0 then
+        abortDockSwap(leftCode, rightCode, left, right, "invalid_ship")
+        debugLog("Swap execution aborted: invalid IDs left=" .. tostring(leftCode) .. " right=" .. tostring(rightCode))
+        return
+    end
+    if resolvedLeftCode ~= tostring(leftCode) or resolvedRightCode ~= tostring(rightCode) then
+        abortDockSwap(leftCode, rightCode, left, right, "resolved_mismatch")
+        debugLog("Swap execution aborted: resolved mismatch expected=" .. tostring(leftCode) .. "/" .. tostring(rightCode)
+            .. " got=" .. tostring(resolvedLeftCode) .. "/" .. tostring(resolvedRightCode))
+        return
+    end
+
+    local status, reason, preLeftPilot, preRightPilot = attemptDirectSwap(leftCode, rightCode, left, right)
+    debugLog("Swap execution result left=" .. tostring(leftCode) .. " right=" .. tostring(rightCode)
+        .. " status=" .. tostring(status) .. " reason=" .. tostring(reason))
+    if status == "settle" then
+        pendingSwapShipsByPair[pairKeyStr] = {
+            left = left,
+            right = right,
+            leftCode = tostring(leftCode),
+            rightCode = tostring(rightCode),
+            awaitingSettlement = true,
+            preLeftPilot = preLeftPilot,
+            preRightPilot = preRightPilot,
+            settlementStartedAt = getElapsedTime(),
+        }
+        seedDirectSwapWatchState(left, right)
+        publishDirectQueueBusyShipIds()
+        requestPilotExchangeBusyShipRefresh()
+        debugLog("Dock swap awaiting pod settlement left=" .. tostring(leftCode) .. " right=" .. tostring(rightCode))
+        return
+    end
+    if status == "defer" then
+        pendingSwapShipsByPair[pairKeyStr] = {
+            left = left,
+            right = right,
+            leftCode = tostring(leftCode),
+            rightCode = tostring(rightCode),
+            awaitingSwapRetry = true,
+            nextRetryAt = getElapsedTime() + DIRECT_SWAP_DEFER_FALLBACK_SEC,
+        }
+        publishPilotExchangeRenameState(leftCode, rightCode, true)
+        publishDirectQueueBusyShipIds()
+        requestPilotExchangeBusyShipRefresh()
+        return
+    end
+    if status == "ok" then
+        completeDockSwap(leftCode, rightCode, left, right)
+        return
+    end
+    abortDockSwap(leftCode, rightCode, left, right, reason)
+end
+
+local function handleDockAssignResult(payload)
+    local status, leftCode, rightCode, stationCode, reason = nil, nil, nil, nil, nil
+    if type(payload) == "table" then
+        status = payload.status
+        leftCode = payload.left or payload.leftCode
+        rightCode = payload.right or payload.rightCode
+        stationCode = payload.station or payload.stationCode
+        reason = payload.reason
+    elseif type(payload) == "string" then
+        local a, b, c, d, e = string.match(payload, "^([^|]*)|([^|]*)|([^|]*)|([^|]*)|?(.*)$")
+        status, leftCode, rightCode, stationCode, reason = a, b, c, d, e
+    end
+
+    if status == "fail" and (not reason or reason == "") then
+        reason = stationCode
+        stationCode = nil
+    end
+
+    if not status or not leftCode or not rightCode then
+        debugLog("Dock assignment result ignored: invalid payload")
+        return
+    end
+
+    local pairKeyStr = pairKey(leftCode, rightCode)
+    local pending = pendingDockAssignmentsByPair[pairKeyStr]
+    pendingDockAssignmentsByPair[pairKeyStr] = nil
+
+    if status == "ok" then
+        local leftShip = pending and pending.leftShip or resolveShipFromIdCode(leftCode)
+        local rightShip = pending and pending.rightShip or resolveShipFromIdCode(rightCode)
+        local station = nil
+        if stationCode and stationCode ~= "" then
+            station = C.ConvertStringTo64Bit(tostring(stationCode))
+        end
+
+        rememberSwapPair(leftCode, rightCode, leftShip, rightShip)
+        completedSwapByPair[pairKeyStr] = nil
+        publishPilotExchangeRenameState(leftCode, rightCode, true)
+        publishDirectQueueBusyShipIds()
+        requestPilotExchangeBusyShipRefresh()
+        if leftShip and leftShip ~= 0 and rightShip and rightShip ~= 0 and station and station ~= 0 then
+            sendDockingLogbookMessage(leftShip, rightShip, station)
+        end
+        debugLog("Queued pilot swap docking orders for " .. tostring(leftCode) .. " <-> " .. tostring(rightCode) .. " station=" .. tostring(stationCode or ""))
+        return
+    end
+
+    debugLog("Dock assignment failed for " .. tostring(leftCode) .. " <-> " .. tostring(rightCode) .. " reason=" .. tostring(reason or "unknown"))
+    if reason == "no_station" or reason == "station_full" then
+        local leftShip = pending and pending.leftShip or resolveShipFromIdCode(leftCode)
+        local rightShip = pending and pending.rightShip or resolveShipFromIdCode(rightCode)
+        if leftShip and leftShip ~= 0 and rightShip and rightShip ~= 0 then
+            table.insert(pendingDockRetryQueue, {
+                left = leftShip,
+                right = rightShip,
+                leftCode = tostring(leftCode),
+                rightCode = tostring(rightCode),
+                reason = tostring(reason or ""),
+                nextRetryAt = getElapsedTime() + DOCK_ASSIGN_RETRY_INTERVAL,
+            })
+            debugLog("Dock assignment retry scheduled for " .. tostring(leftCode) .. " <-> " .. tostring(rightCode) .. " reason=" .. tostring(reason))
+        end
+    else
+        recordDockPairCompleted(leftCode, rightCode)
+    end
+end
+
+local function processPendingReleaseRetries()
+    if #pendingReleaseRetries == 0 then
+        return
+    end
+    local now = getElapsedTime()
+    for i = #pendingReleaseRetries, 1, -1 do
+        local item = pendingReleaseRetries[i]
+        if item and now >= (item.dueAt or 0) then
+            publishPilotExchangeRelease(item.left, item.right, item.leftShip, item.rightShip)
+            item.attemptsLeft = (item.attemptsLeft or 0) - 1
+            if item.attemptsLeft > 0 then
+                item.dueAt = now + 2.0
+                pendingReleaseRetries[i] = item
+            else
+                table.remove(pendingReleaseRetries, i)
+            end
+        end
+    end
+end
+
+local function retryFailedDockAssignments()
+    if #pendingDockRetryQueue == 0 then
+        return
+    end
+    local now = getElapsedTime()
+    for i = #pendingDockRetryQueue, 1, -1 do
+        local item = pendingDockRetryQueue[i]
+        if item and now >= (item.nextRetryAt or 0) then
+            local assigned = requestDockOrdersFromMD(item.left, item.right, item.leftCode, item.rightCode)
+            if assigned then
+                pendingDockAssignmentsByPair[pairKey(item.leftCode, item.rightCode)] = {
+                    left = tostring(item.leftCode),
+                    right = tostring(item.rightCode),
+                    leftShip = item.left,
+                    rightShip = item.right,
+                }
+                table.remove(pendingDockRetryQueue, i)
+            else
+                item.nextRetryAt = now + DOCK_ASSIGN_RETRY_INTERVAL
+                pendingDockRetryQueue[i] = item
+            end
+        end
+    end
+end
+
+local function dispatchDockExchangePlan(groups, logPrefix)
+    local swaps = {}
+    for _, group in ipairs(groups or {}) do
+        for _, swap in ipairs(group.swaps or {}) do
+            table.insert(swaps, swap)
+        end
+    end
+
+    if #swaps == 0 then
+        return 0, 0
+    end
+
+    local shipIds = {}
+    for _, swap in ipairs(swaps) do
+        local leftCode = GetComponentData(swap.left, "idcode")
+        local rightCode = GetComponentData(swap.right, "idcode")
+        if leftCode then
+            shipIds[tostring(leftCode)] = true
+        end
+        if rightCode then
+            shipIds[tostring(rightCode)] = true
+        end
+    end
+
+    pendingDockExchangePlan = {
+        active = true,
+        totalPairs = #swaps,
+        completedPairs = 0,
+        shipIds = shipIds,
+    }
+    local queueItems = {}
+    for _, swap in ipairs(swaps) do
+        local leftCode = GetComponentData(swap.left, "idcode") or "LEFT"
+        local rightCode = GetComponentData(swap.right, "idcode") or "RIGHT"
+        table.insert(queueItems, {
+            left = swap.left,
+            right = swap.right,
+            leftCode = tostring(leftCode),
+            rightCode = tostring(rightCode),
+        })
+    end
+    pendingDockSwapQueue = {
+        active = #queueItems > 0,
+        items = queueItems,
+        logPrefix = logPrefix,
+    }
+    pendingDirectSwapQueue = nil
+    clearDirectSwapWatchState()
+    publishDirectQueueBusyShipIds()
+    requestPilotExchangeBusyShipRefresh()
+
+    local requestCount = 0
+    if processDockSwapQueue() then
+        requestCount = #queueItems
+    end
+
+    if logPrefix then
+        debugLog(logPrefix .. " dock exchange dispatch pairs=" .. tostring(#swaps)
+            .. " parallel assignRequested=" .. tostring(requestCount > 0))
+    end
+    return #swaps, (#swaps > 0 and requestCount == 0) and 1 or 0
+end
+
+local function dispatchRendezvousPlan(groups, logPrefix)
+    return dispatchDockExchangePlan(groups, logPrefix)
 end
 
 local function collectSelectedShips(fallbackComponent)
@@ -2209,30 +2821,16 @@ local function collectSelectedShips(fallbackComponent)
     local ships = {}
     local seen = {}
     local pilotIndex = getGTPilotIndexByShipId()
-    local rawSelectedShipCount = 0
-
-    if menu and menu.selectedcomponents then
-        for id, _ in pairs(menu.selectedcomponents) do
-            local selectedComponent = ConvertStringTo64Bit(tostring(id))
-            if selectedComponent and selectedComponent ~= 0 and C.IsComponentClass(selectedComponent, "ship") then
-                rawSelectedShipCount = rawSelectedShipCount + 1
-                tryAddEligibleGTShip(selectedComponent, ships, seen, pilotIndex, { forPlanDisplay = true })
-            end
-        end
-    end
+    local collectOpts = { forPlanDisplay = true }
+    appendMapAndInteractSelectedGTShips(ships, seen, pilotIndex, collectOpts)
 
     local fallbackId = "none"
     if fallbackComponent then
         fallbackId = tostring(GetComponentData(fallbackComponent, "idcode") or fallbackComponent)
+        tryAddEligibleGTShip(fallbackComponent, ships, seen, pilotIndex, collectOpts)
     end
-    logPilotExchangeMenu("collectSelectedShips rawSelectedShipCount=" .. tostring(rawSelectedShipCount)
-        .. " eligibleShipCount=" .. tostring(#ships)
+    logPilotExchangeMenu("collectSelectedShips eligibleShipCount=" .. tostring(#ships)
         .. " fallback=" .. fallbackId)
-
-    if #ships == 0 and fallbackComponent then
-        tryAddEligibleGTShip(fallbackComponent, ships, seen, pilotIndex, { forPlanDisplay = true })
-        logPilotExchangeMenu("collectSelectedShips after fallback eligibleShipCount=" .. tostring(#ships))
-    end
 
     return ships
 end
@@ -2264,20 +2862,6 @@ local function collectAllEligibleGTShips()
     return ships
 end
 
-local function collectFleetShips(commanderComponent)
-    local commander = ConvertIDTo64Bit(commanderComponent)
-    local ships = {}
-    local seen = {}
-    local pilotIndex = getGTPilotIndexByShipId()
-
-    tryAddEligibleGTShip(commanderComponent, ships, seen, pilotIndex, { commanderId = commander })
-    local subs = GetSubordinates(commander) or {}
-    for _, sub in ipairs(subs) do
-        tryAddEligibleGTShip(sub, ships, seen, pilotIndex, { commanderId = commander })
-    end
-    return ships
-end
-
 local function collectFleetShipsForPlan(commanderComponent)
     requestPilotExchangeBusyShipRefresh()
     getPilotExchangeBusyShipIdSet()
@@ -2295,144 +2879,6 @@ local function collectFleetShipsForPlan(commanderComponent)
         .. tostring(GetComponentData(commander, "idcode") or commander)
         .. " eligibleShipCount=" .. tostring(#ships))
     return ships
-end
-
-local function redistribute(commanderComponent)
-    local commander = ConvertIDTo64Bit(commanderComponent)
-    if not commander or commander == 0 then
-        return
-    end
-
-    local ships = collectFleetShips(commanderComponent)
-    debugLog("Fleet setup for redistribution (eligible ships=" .. tostring(#ships) .. "):")
-    for _, s in ipairs(ships) do
-        debugLog(" - " .. tostring(s.idcode)
-            .. " class=" .. tostring(s.size)
-            .. " level=" .. tostring(s.level)
-            .. " levelSource=" .. tostring(s.levelSource)
-            .. " order=" .. tostring(s.orderId)
-            .. " commanderOrder=" .. tostring(s.commanderOrderId))
-    end
-    if #ships < 2 then
-        notify("Pilot redistribution: not enough eligible GT ships in fleet.")
-        return
-    end
-
-    local swaps = {}
-    local usedShips = {}  -- ships already committed to a swap (ensures each ship appears in at most one pair)
-    local commanderShip = nil
-    local subordinates = {}
-    for _, s in ipairs(ships) do
-        if s.isCommander then
-            commanderShip = s
-        else
-            table.insert(subordinates, s)
-        end
-    end
-
-    local function addSwap(srcShip, dstShip, reason)
-        if not srcShip or not dstShip then
-            return
-        end
-        local srcLevelBefore = srcShip.level
-        local dstLevelBefore = dstShip.level
-        table.insert(swaps, { left = srcShip.ship, right = dstShip.ship })
-        usedShips[srcShip.idcode] = true
-        usedShips[dstShip.idcode] = true
-        srcShip.pilot, dstShip.pilot = dstShip.pilot, srcShip.pilot
-        srcShip.level, dstShip.level = dstShip.level, srcShip.level
-        debugLog("Rank swap (" .. tostring(reason or "rule") .. "): "
-            .. tostring(srcShip.idcode) .. "(lvl " .. tostring(srcLevelBefore) .. ", " .. tostring(srcShip.size) .. "->" .. tostring(dstShip.size) .. ") <-> "
-            .. tostring(dstShip.idcode) .. "(lvl " .. tostring(dstLevelBefore) .. ", " .. tostring(dstShip.size) .. "->" .. tostring(srcShip.size) .. ")")
-    end
-
-    -- Round 1: Fleet commander only if a same-class subordinate is on a higher penalty tier (not merely higher level within tier).
-    if commanderShip then
-        local cmdTier = skillTier(commanderShip.level)
-        local bestForCommander = nil
-        local bestTier = nil
-        for _, src in ipairs(subordinates) do
-            if (not usedShips[src.idcode]) and src.rank == commanderShip.rank then
-                local st = skillTier(src.level)
-                if st > cmdTier then
-                    if (not bestForCommander)
-                        or st > bestTier
-                        or (st == bestTier and src.level > bestForCommander.level) then
-                        bestForCommander = src
-                        bestTier = st
-                    end
-                end
-            end
-        end
-        if bestForCommander then
-            addSwap(bestForCommander, commanderShip, "commander_round")
-        else
-            debugLog("Commander round: no same-class subordinate on a higher penalty tier for commander "
-                .. tostring(commanderShip.idcode) .. " (cmdTier=" .. tostring(cmdTier) .. ")")
-        end
-    end
-
-    -- Round 2: Subordinate-only priority assignment by destination class (XL -> L -> M).
-    local classPriority = { 4, 3, 2 }
-    for _, dstRank in ipairs(classPriority) do
-        local destinations = {}
-        for _, dst in ipairs(subordinates) do
-            if (not usedShips[dst.idcode]) and dst.rank == dstRank then
-                table.insert(destinations, dst)
-            end
-        end
-        table.sort(destinations, compareTargetPriorityWithinClass)
-        if #destinations > 0 then
-            local order = {}
-            for _, d in ipairs(destinations) do
-                table.insert(order, tostring(d.idcode) .. ":lvl" .. tostring(d.level))
-            end
-            debugLog("Priority round rank " .. tostring(dstRank) .. " destination order (lowest first): " .. table.concat(order, ", "))
-        end
-
-        for _, dst in ipairs(destinations) do
-            if not usedShips[dst.idcode] then
-                local bestSource = nil
-                for _, src in ipairs(subordinates) do
-                    if (not usedShips[src.idcode]) and src.idcode ~= dst.idcode then
-                        local classRuleOk = (src.rank < dst.rank) -- strictly lower class to higher class
-                        local levelRuleOk = (src.level > dst.level) -- destination must strictly improve
-                        if classRuleOk and levelRuleOk then
-                            local modHigh = performanceModifier(src.level, dst.rank)
-                            local modLow = performanceModifier(dst.level, src.rank)
-                            local noPenalty = (modHigh >= 0 and modLow >= 0)
-                            if noPenalty then
-                                if (not bestSource)
-                                    or (src.level > bestSource.level)
-                                    or (src.level == bestSource.level and src.rank > bestSource.rank) then
-                                    bestSource = src
-                                end
-                            end
-                        end
-                    end
-                end
-
-                if bestSource then
-                    addSwap(bestSource, dst, "priority_round_rank_" .. tostring(dstRank))
-                else
-                    debugLog("Priority round rank " .. tostring(dstRank) .. ": no valid source for destination "
-                        .. tostring(dst.idcode) .. " lvl=" .. tostring(dst.level))
-                end
-            end
-        end
-    end
-
-    if #swaps == 0 then
-        notify("Pilot redistribution: pilots already optimally distributed (level-to-class rank), or no penalty-free cross-class swaps possible.")
-        debugLog("No swaps selected after commander + class-priority evaluation.")
-        return
-    end
-
-    local requestCount = 0
-    local failCount = 0
-    requestCount, failCount = dispatchSwapPairs(swaps, "Redistribution dispatch for commander " .. tostring(GetComponentData(commander, "idcode") or "UNKNOWN"))
-
-    notify("Pilot redistribution dispatch started. Pairs: " .. tostring(requestCount) .. " requested, " .. tostring(failCount) .. " failed.")
 end
 
 local function runPilotExchangePlanForShips(ships, setupLogLabel, dispatchLogPrefix, opts)
@@ -2455,10 +2901,23 @@ local function runPilotExchangePlanForShips(ships, setupLogLabel, dispatchLogPre
         return
     end
 
-    local swappableShips = filterShipsForSwapPlanning(ships)
+    local planMode = opts.planMode or PLAN_MODE.FLEET_RULES
+    local swappableShips = {}
     local swaps = {}
-    if #swappableShips >= 2 then
-        swaps = planSelectionSwaps(swappableShips)
+    if planMode == PLAN_MODE.FORCED_PAIR then
+        swappableShips = filterShipsForForcedPairPlanning(ships)
+        if #swappableShips < 2 then
+            notifyText(31311)
+            return
+        end
+        swaps = planForcedPairSwap(swappableShips[1], swappableShips[2])
+        logPilotExchangeMenu("forced pair plan left=" .. tostring(swappableShips[1].idcode)
+            .. " right=" .. tostring(swappableShips[2].idcode))
+    else
+        swappableShips = filterShipsForSwapPlanning(ships)
+        if #swappableShips >= 2 then
+            swaps = planSelectionSwaps(swappableShips)
+        end
     end
     local groups = buildRendezvousGroups(swaps)
     local queuedSwapLines = buildQueuedSwapLinesForShips(ships)
@@ -2494,8 +2953,19 @@ local function redistributeCommanderFleetExchange(commanderComponent)
 end
 
 local function redistributeSelection(triggerComponent)
+    local rawSelectedCount = countRawMapSelectedShips()
     local ships = collectSelectedShips(triggerComponent)
-    runPilotExchangePlanForShips(ships, "Selection setup for pilot exchange", "Selection pilot exchange dispatch")
+    local planMode = PLAN_MODE.FLEET_RULES
+    if pendingSelectionForcedPair or rawSelectedCount == 2 then
+        planMode = PLAN_MODE.FORCED_PAIR
+    end
+    pendingSelectionForcedPair = false
+    logPilotExchangeMenu("redistributeSelection rawSelectedCount=" .. tostring(rawSelectedCount)
+        .. " eligibleShipCount=" .. tostring(#ships)
+        .. " planMode=" .. tostring(planMode))
+    runPilotExchangePlanForShips(ships, "Selection setup for pilot exchange", "Selection pilot exchange dispatch", {
+        planMode = planMode,
+    })
 end
 
 local function redistributeAllGtShips()
@@ -2525,158 +2995,6 @@ local function cancelPendingSelectionExchange()
     pendingSelectionDispatch = nil
 end
 
-local function executeSwapByIdCode(payload)
-    if type(payload) ~= "table" then
-        return
-    end
-    local leftCode = payload.left or payload.leftCode
-    local rightCode = payload.right or payload.rightCode
-    if not leftCode or not rightCode then
-        return
-    end
-    debugLog("Swap execution event received left=" .. tostring(leftCode) .. " right=" .. tostring(rightCode))
-    local keyA, keyB = tostring(leftCode), tostring(rightCode)
-    if keyA > keyB then
-        keyA, keyB = keyB, keyA
-    end
-    local pairKey = keyA .. "|" .. keyB
-    local completed = completedSwapByPair[pairKey]
-    if completed and completed.done then
-        debugLog("Swap execution skipped (already completed) pair=" .. tostring(pairKey))
-        return
-    end
-
-    local left = asComponentId(payload.leftUid or payload.leftObj)
-    local right = asComponentId(payload.rightUid or payload.rightObj)
-    local rememberedPair = popRememberedSwapPair(leftCode, rightCode)
-    if (not left or left == 0) then
-        left = rememberedPair and rememberedPair.left or nil
-    end
-    if (not right or right == 0) then
-        right = rememberedPair and rememberedPair.right or nil
-    end
-    if not left or left == 0 or not right or right == 0 then
-        left = resolveShipFromIdCode(leftCode)
-        right = resolveShipFromIdCode(rightCode)
-    end
-    -- Enforce that resolved IDs match the expected pair idcodes before executing.
-    local resolvedLeftCode = (left and left ~= 0) and tostring(GetComponentData(left, "idcode") or "") or ""
-    local resolvedRightCode = (right and right ~= 0) and tostring(GetComponentData(right, "idcode") or "") or ""
-    if resolvedLeftCode ~= tostring(leftCode) then
-        left = resolveShipFromIdCode(leftCode)
-        resolvedLeftCode = (left and left ~= 0) and tostring(GetComponentData(left, "idcode") or "") or ""
-    end
-    if resolvedRightCode ~= tostring(rightCode) then
-        right = resolveShipFromIdCode(rightCode)
-        resolvedRightCode = (right and right ~= 0) and tostring(GetComponentData(right, "idcode") or "") or ""
-    end
-    debugLog("Swap execution resolved leftCode=" .. tostring(leftCode) .. " leftShip=" .. tostring(left or 0)
-        .. " rightCode=" .. tostring(rightCode) .. " rightShip=" .. tostring(right or 0)
-        .. " resolvedLeftCode=" .. tostring(resolvedLeftCode) .. " resolvedRightCode=" .. tostring(resolvedRightCode))
-    if not left or left == 0 or not right or right == 0 then
-        publishPilotExchangeRelease(leftCode, rightCode, left, right)
-        publishPilotExchangeRenameState(leftCode, rightCode, false)
-        notify("Pilot swap failed: invalid ship IDs for queued exchange.")
-        debugLog("Swap execution aborted: invalid IDs left=" .. tostring(leftCode) .. " right=" .. tostring(rightCode))
-        return
-    end
-    if resolvedLeftCode ~= tostring(leftCode) or resolvedRightCode ~= tostring(rightCode) then
-        publishPilotExchangeRelease(leftCode, rightCode, left, right)
-        publishPilotExchangeRenameState(leftCode, rightCode, false)
-        notify("Pilot swap failed: resolved ships do not match queued pair.")
-        debugLog("Swap execution aborted: resolved mismatch expected=" .. tostring(leftCode) .. "/" .. tostring(rightCode)
-            .. " got=" .. tostring(resolvedLeftCode) .. "/" .. tostring(resolvedRightCode))
-        return
-    end
-
-    local ok, reason = trySwapCaptains(left, right)
-    debugLog("Swap execution result left=" .. tostring(leftCode) .. " right=" .. tostring(rightCode) .. " ok=" .. tostring(ok) .. " reason=" .. tostring(reason))
-    local cycleId = payload.cycleId or payload.cycleID or payload.CycleId
-    if ok and cycleId and tostring(cycleId) ~= "" then
-        if type(AddUITriggeredEvent) == "function" then
-            AddUITriggeredEvent("GT_Redistribute", "CycleSwapComplete", {
-                cycleId = tostring(cycleId),
-                left = tostring(leftCode),
-                right = tostring(rightCode),
-                leftObj = ConvertStringToLuaID(tostring(left)),
-                rightObj = ConvertStringToLuaID(tostring(right)),
-            })
-        end
-        completedSwapByPair[pairKey] = {
-            left = tostring(leftCode),
-            right = tostring(rightCode),
-            done = true,
-        }
-        publishPostSwapNameRefresh(leftCode, rightCode, left, right)
-        schedulePostSwapNameRefreshRetry(leftCode, rightCode, left, right)
-        return
-    end
-
-    publishPilotExchangeRelease(leftCode, rightCode, left, right)
-    schedulePilotExchangeReleaseRetry(leftCode, rightCode, left, right)
-    publishPilotExchangeRenameState(leftCode, rightCode, false)
-    if ok then
-        completedSwapByPair[pairKey] = {
-            left = tostring(leftCode),
-            right = tostring(rightCode),
-            done = true,
-        }
-        publishPostSwapNameRefresh(leftCode, rightCode, left, right)
-        schedulePostSwapNameRefreshRetry(leftCode, rightCode, left, right)
-    else
-        notify("Pilot swap failed (" .. tostring(reason) .. "): " .. tostring(leftCode) .. " <-> " .. tostring(rightCode))
-    end
-end
-
-local function handleDockAssignResult(payload)
-    local status, leftCode, rightCode, stationCode, reason = nil, nil, nil, nil, nil
-    if type(payload) == "table" then
-        status = payload.status
-        leftCode = payload.left or payload.leftCode
-        rightCode = payload.right or payload.rightCode
-        stationCode = payload.station or payload.stationCode
-        reason = payload.reason
-    elseif type(payload) == "string" then
-        local a, b, c, d, e = string.match(payload, "^([^|]*)|([^|]*)|([^|]*)|([^|]*)|?(.*)$")
-        status, leftCode, rightCode, stationCode, reason = a, b, c, d, e
-    end
-
-    if status == "fail" and (not reason or reason == "") then
-        reason = stationCode
-        stationCode = nil
-    end
-
-    if not status or not leftCode or not rightCode then
-        debugLog("Dock assignment result ignored: invalid payload")
-        return
-    end
-
-    local keyA, keyB = tostring(leftCode), tostring(rightCode)
-    if keyA > keyB then
-        keyA, keyB = keyB, keyA
-    end
-    local pairKey = keyA .. "|" .. keyB
-    local pending = pendingDockAssignmentsByPair[pairKey]
-    pendingDockAssignmentsByPair[pairKey] = nil
-
-    if status == "ok" then
-        local leftShip = pending and pending.leftShip or resolveShipFromIdCode(leftCode)
-        local rightShip = pending and pending.rightShip or resolveShipFromIdCode(rightCode)
-        local station = nil
-        if stationCode and stationCode ~= "" then
-            station = C.ConvertStringTo64Bit(tostring(stationCode))
-        end
-
-        rememberSwapPair(leftCode, rightCode, leftShip, rightShip)
-        completedSwapByPair[pairKey] = nil
-        publishPilotExchangeRenameState(leftCode, rightCode, true)
-        debugLog("Queued pilot swap docking orders for " .. tostring(leftCode) .. " <-> " .. tostring(rightCode) .. " station=" .. tostring(stationCode or ""))
-        return
-    end
-
-    debugLog("Dock assignment failed for " .. tostring(leftCode) .. " <-> " .. tostring(rightCode) .. " reason=" .. tostring(reason or "unknown"))
-end
-
 local function requestFreshPilotDataAndRedistributeSelection(triggerComponent)
     local trigger = asComponentId(triggerComponent)
     logPilotExchangeMenu("requestFreshPilotDataAndRedistributeSelection trigger="
@@ -2692,10 +3010,13 @@ local function requestFreshPilotDataAndRedistributeSelection(triggerComponent)
     end
 
     pendingRedistributeSelection = trigger
-    pendingRedistributeCommander = nil
+    pendingSelectionForcedPair = (countRawMapSelectedShips() == 2)
     pendingRedistributeFleet = false
     pendingPilotExchangeCommanderFleet = nil
     pilotDataRefreshRequestedAt = getElapsedTime()
+    logPilotExchangeMenu("requestFreshPilotDataAndRedistributeSelection forcedPair="
+        .. tostring(pendingSelectionForcedPair)
+        .. " rawSelectedCount=" .. tostring(countRawMapSelectedShips()))
     invalidatePilotIndexCache()
     Mods.GalaxyTrader.PilotData.requestRefresh()
     debugLog("Requested fresh GT pilot data for selection exchange trigger " .. tostring(GetComponentData(trigger, "idcode") or "UNKNOWN"))
@@ -2725,33 +3046,12 @@ local function requestFreshPilotDataAndRedistributeFleet(hqComponent)
 
     pendingRedistributeFleet = true
     pendingRedistributeSelection = false
-    pendingRedistributeCommander = nil
+    pendingSelectionForcedPair = false
     pendingPilotExchangeCommanderFleet = nil
     pilotDataRefreshRequestedAt = getElapsedTime()
     invalidatePilotIndexCache()
     Mods.GalaxyTrader.PilotData.requestRefresh()
     debugLog("Requested fresh GT pilot data for fleet exchange from HQ " .. tostring(GetComponentData(hq, "idcode") or "UNKNOWN"))
-end
-
-local function requestFreshPilotDataAndRedistribute(commanderComponent)
-    local commander = asComponentId(commanderComponent)
-    if not commander or commander == 0 then
-        return
-    end
-    if not Mods or not Mods.GalaxyTrader or not Mods.GalaxyTrader.PilotData or type(Mods.GalaxyTrader.PilotData.requestRefresh) ~= "function" then
-        notify("Pilot redistribution unavailable: GT pilot data bridge missing.")
-        debugLog("Cannot refresh GT pilot data: Mods.GalaxyTrader.PilotData.requestRefresh unavailable")
-        return
-    end
-
-    pendingRedistributeCommander = commander
-    pendingRedistributeSelection = false
-    pendingRedistributeFleet = false
-    pendingPilotExchangeCommanderFleet = nil
-    pilotDataRefreshRequestedAt = getElapsedTime()
-    invalidatePilotIndexCache()
-    Mods.GalaxyTrader.PilotData.requestRefresh()
-    debugLog("Requested fresh GT pilot data for redistribution commander " .. tostring(GetComponentData(commander, "idcode") or "UNKNOWN"))
 end
 
 local function requestFreshPilotDataAndCommanderFleetExchange(commanderComponent)
@@ -2778,48 +3078,26 @@ local function requestFreshPilotDataAndCommanderFleetExchange(commanderComponent
 
     pendingPilotExchangeCommanderFleet = commander
     pendingRedistributeSelection = false
+    pendingSelectionForcedPair = false
     pendingRedistributeFleet = false
-    pendingRedistributeCommander = nil
     pilotDataRefreshRequestedAt = getElapsedTime()
     invalidatePilotIndexCache()
     Mods.GalaxyTrader.PilotData.requestRefresh()
     debugLog("Requested fresh GT pilot data for commander fleet exchange " .. tostring(GetComponentData(commander, "idcode") or "UNKNOWN"))
 end
 
-local function processPendingRedistributeAfterRefresh()
-    if not pendingRedistributeCommander then
+local function processPendingPilotDataRefreshTimeout()
+    if not (pendingRedistributeSelection or pendingRedistributeFleet or pendingPilotExchangeCommanderFleet) then
         return
     end
     local now = getElapsedTime()
     if (pilotDataRefreshRequestedAt > 0) and (now - pilotDataRefreshRequestedAt > PILOT_DATA_REFRESH_TIMEOUT) then
-        debugLog("GT pilot data refresh timeout for redistribution")
-        pendingRedistributeCommander = nil
+        debugLog("GT pilot data refresh timeout for pilot exchange")
         pendingRedistributeSelection = false
+        pendingSelectionForcedPair = false
         pendingRedistributeFleet = false
         pendingPilotExchangeCommanderFleet = nil
         pilotDataRefreshRequestedAt = 0
-    end
-end
-
-local function processPendingReleaseRetries()
-    if #pendingReleaseRetries == 0 then
-        return
-    end
-    local now = getElapsedTime()
-    for i = #pendingReleaseRetries, 1, -1 do
-        local item = pendingReleaseRetries[i]
-        if item and now >= (item.dueAt or 0) then
-            publishPilotExchangeRelease(item.left, item.right, item.leftShip, item.rightShip)
-            item.attemptsLeft = (item.attemptsLeft or 0) - 1
-            if item.attemptsLeft > 0 then
-                item.dueAt = now + 2.0
-                pendingReleaseRetries[i] = item
-                debugLog("ReleaseDockHold retry scheduled left=" .. tostring(item.left) .. " right=" .. tostring(item.right) .. " remaining=" .. tostring(item.attemptsLeft))
-            else
-                table.remove(pendingReleaseRetries, i)
-                debugLog("ReleaseDockHold retries completed left=" .. tostring(item.left) .. " right=" .. tostring(item.right))
-            end
-        end
     end
 end
 
@@ -2849,31 +3127,40 @@ if menu and menu.update then
     local originalUpdate = menu.update
     menu.update = function(...)
         originalUpdate(...)
-        processPendingRedistributeAfterRefresh()
+        maybePublishMapSelectionShipCount()
+        processPendingPilotDataRefreshTimeout()
         processPendingReleaseRetries()
+        retryFailedDockAssignments()
+        processDockSettlementQueue()
+        processDockSwapQueue()
         processPendingPostSwapRefreshRetries()
     end
 end
 
 function onUpdate()
-    processPendingRedistributeAfterRefresh()
-    tickDirectSwapQueue()
+    maybePublishMapSelectionShipCount()
+    processPendingPilotDataRefreshTimeout()
     processPendingReleaseRetries()
+    retryFailedDockAssignments()
+    processDockSettlementQueue()
+    processDockSwapQueue()
     processPendingPostSwapRefreshRetries()
 end
 SetScript("onUpdate", onUpdate)
 
 if menu then
     RegisterEvent("interact", function()
+        maybePublishMapSelectionShipCount(true)
         logMapSelectionState("interact")
     end)
     RegisterEvent("updateselectedcomponents", function()
+        maybePublishMapSelectionShipCount(true)
         logMapSelectionState("updateselectedcomponents")
     end)
 end
 
-RegisterEvent("gt.redistributePilots", function(_, commanderComponent)
-    requestFreshPilotDataAndRedistribute(commanderComponent)
+RegisterEvent("gt.publishPilotExchangeSelectionCount", function()
+    publishMapSelectionShipCount()
 end)
 
 RegisterEvent("gt.redistributePilotsSelection", function(_, triggerComponent)
@@ -2901,42 +3188,6 @@ GT_PilotExchangePlan.hasPending = function()
     return pendingSelectionDispatch ~= nil
 end
 debugLog("Pilot exchange plan handlers registered")
-
-RegisterEvent("GT_PilotData.Update", function()
-    invalidatePilotIndexCache()
-    if pendingRedistributeFleet then
-        pendingRedistributeFleet = false
-        pendingRedistributeSelection = false
-        pendingRedistributeCommander = nil
-        pendingPilotExchangeCommanderFleet = nil
-        pilotDataRefreshRequestedAt = 0
-        redistributeAllGtShips()
-        return
-    end
-    if pendingRedistributeSelection and pendingRedistributeSelection ~= 0 then
-        local trigger = pendingRedistributeSelection
-        pendingRedistributeSelection = false
-        pendingRedistributeCommander = nil
-        pendingPilotExchangeCommanderFleet = nil
-        pilotDataRefreshRequestedAt = 0
-        redistributeSelection(trigger)
-        return
-    end
-    if pendingPilotExchangeCommanderFleet and pendingPilotExchangeCommanderFleet ~= 0 then
-        local commander = pendingPilotExchangeCommanderFleet
-        pendingPilotExchangeCommanderFleet = nil
-        pendingRedistributeCommander = nil
-        pilotDataRefreshRequestedAt = 0
-        redistributeCommanderFleetExchange(commander)
-        return
-    end
-    if pendingRedistributeCommander and pendingRedistributeCommander ~= 0 then
-        local commander = pendingRedistributeCommander
-        pendingRedistributeCommander = nil
-        pilotDataRefreshRequestedAt = 0
-        redistribute(commander)
-    end
-end)
 
 RegisterEvent("gt.redistributeDockAssignResult", function(a, b, c, d)
     local payload = nil
@@ -2990,44 +3241,41 @@ RegisterEvent("gt.executePilotSwap", function(a, b, c, d)
                     }
                     break
                 end
-                left, right = string.match(v, "^([^|]+)|([^|]+)$")
-                if left and right and left ~= "" and right ~= "" then
-                    payload = {
-                        left = left,
-                        right = right,
-                        leftCode = left,
-                        rightCode = right,
-                    }
-                    break
-                end
             end
         end
     end
-    if not payload then
-        for _, v in ipairs(args) do
-            if type(v) == "string" then
-                local left = string.match(v, "left%s*=%s*([A-Z0-9%-]+)")
-                local right = string.match(v, "right%s*=%s*([A-Z0-9%-]+)")
-                if left and right and left ~= "" and right ~= "" then
-                    payload = {
-                        left = left,
-                        right = right,
-                        leftCode = left,
-                        rightCode = right,
-                    }
-                    break
-                end
-            end
-        end
+    if payload then
+        executeSwapByIdCode(payload)
+    else
+        debugLog("Swap execution event payload missing/invalid")
     end
-    if not payload then
-        debugLog("Swap execution event payload missing/invalid argTypes="
-            .. tostring(type(a)) .. "," .. tostring(type(b)) .. ","
-            .. tostring(type(c)) .. "," .. tostring(type(d))
-            .. " firstArg=" .. tostring(a))
+end)
+
+RegisterEvent("GT_PilotData.Update", function()
+    invalidatePilotIndexCache()
+    if pendingRedistributeFleet then
+        pendingRedistributeFleet = false
+        pendingRedistributeSelection = false
+        pendingSelectionForcedPair = false
+        pendingPilotExchangeCommanderFleet = nil
+        pilotDataRefreshRequestedAt = 0
+        redistributeAllGtShips()
         return
     end
-    executeSwapByIdCode(payload)
+    if pendingRedistributeSelection and pendingRedistributeSelection ~= 0 then
+        local trigger = pendingRedistributeSelection
+        pendingRedistributeSelection = false
+        pendingPilotExchangeCommanderFleet = nil
+        pilotDataRefreshRequestedAt = 0
+        redistributeSelection(trigger)
+        return
+    end
+    if pendingPilotExchangeCommanderFleet and pendingPilotExchangeCommanderFleet ~= 0 then
+        local commander = pendingPilotExchangeCommanderFleet
+        pendingPilotExchangeCommanderFleet = nil
+        pilotDataRefreshRequestedAt = 0
+        redistributeCommanderFleetExchange(commander)
+    end
 end)
 
 debugLog("Redistribution context integration loaded")

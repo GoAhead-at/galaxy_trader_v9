@@ -197,8 +197,8 @@ local menu = Helper.getMenu("MapMenu")
 local pendingRedistributeCommander = nil
 local pendingRedistributeSelection = false
 local pendingRedistributeFleet = false
+local pendingPilotExchangeCommanderFleet = nil
 local pendingSelectionDispatch = nil
-local pendingPlanPreview = nil
 local pilotDataRefreshRequestedAt = 0
 local PILOT_DATA_REFRESH_TIMEOUT = 5.0
 local PILOT_DATA_FLEET_REUSE_MAX_AGE = 60.0
@@ -1693,7 +1693,7 @@ local function requestAcceptLogbookMessages(groups)
     debugLog("Accept logbook queued groups=" .. tostring(#payload.groups))
 end
 
-local function buildSelectionExchangePlanSections(ships, swaps, groups, rendezvousLines, extra)
+local function buildSelectionExchangePlanSections(ships, swaps, groups, extra)
     extra = extra or {}
     swaps = swaps or {}
     groups = groups or buildRendezvousGroups(swaps)
@@ -1707,7 +1707,6 @@ local function buildSelectionExchangePlanSections(ships, swaps, groups, rendezvo
 
     return {
         swapLines = swapLines,
-        rendezvousLines = rendezvousLines or {},
         unchangedLines = unchangedLines,
         queuedSwapLines = extra.queuedSwapLines or {},
         readOnly = extra.readOnly == true,
@@ -1723,41 +1722,8 @@ local function planOverlayHasContent(sections)
         or #(sections.queuedSwapLines or {}) > 0
 end
 
-local function requestStationPreviewAndOpenPlan(ships, swaps, groups)
-    local sections = buildSelectionExchangePlanSections(ships, swaps, groups, nil)
-    if not sections or #sections.swapLines == 0 then
-        return false
-    end
-    if type(AddUITriggeredEvent) ~= "function" then
-        debugLog("Station preview unavailable: AddUITriggeredEvent missing")
-        return false
-    end
-    pendingPlanPreview = {
-        sections = sections,
-    }
-    AddUITriggeredEvent("GT_Redistribute", "PreviewStations", buildStationPreviewPayload(groups))
-    return true
-end
-
-local function openPlanPreviewWithRendezvous()
-    if not pendingPlanPreview or not pendingPlanPreview.sections then
-        return false
-    end
-    local playerId = GT_PlayerBridge and GT_PlayerBridge.GetPlayerBlackboardId and GT_PlayerBridge.GetPlayerBlackboardId()
-    if playerId then
-        pendingPlanPreview.sections.rendezvousLines = readBlackboardStringList(
-            playerId, "$GT_PilotExchange_Plan_RendezvousLines")
-    end
-    local sections = pendingPlanPreview.sections
-    pendingPlanPreview = nil
-    if GT_PilotExchangePlan and GT_PilotExchangePlan.openOverlay then
-        return GT_PilotExchangePlan.openOverlay(sections)
-    end
-    return false
-end
-
 local function openPilotExchangePlanOverlayDirect(ships, swaps, groups, extra)
-    local sections = buildSelectionExchangePlanSections(ships, swaps, groups, {}, extra)
+    local sections = buildSelectionExchangePlanSections(ships, swaps, groups, extra)
     if not planOverlayHasContent(sections) then
         return false
     end
@@ -1781,11 +1747,9 @@ local function openExcludedOnlyPilotExchangePlanOverlay(ships)
         return false
     end
     pendingSelectionDispatch = nil
-    pendingPlanPreview = nil
     if GT_PilotExchangePlan and GT_PilotExchangePlan.openOverlay then
         return GT_PilotExchangePlan.openOverlay({
             swapLines = {},
-            rendezvousLines = {},
             unchangedLines = unchangedLines,
             readOnly = true,
         })
@@ -1852,7 +1816,7 @@ local function buildRendezvousGroups(swaps)
         if #ships <= 2 and #comp == 1 then
             table.insert(groups, { kind = "pair", swaps = comp })
         else
-            -- Cycle: 3-4 linked hulls (e.g. S/M/L or S/M/L/XL chain) share one station.
+            -- Cycle: 3-4 linked hulls (e.g. S/M/L or S/M/L/XL chain), sequential pod swaps.
             table.insert(groups, { kind = "cycle", ships = ships, swaps = comp })
         end
     end
@@ -2314,6 +2278,25 @@ local function collectFleetShips(commanderComponent)
     return ships
 end
 
+local function collectFleetShipsForPlan(commanderComponent)
+    requestPilotExchangeBusyShipRefresh()
+    getPilotExchangeBusyShipIdSet()
+    local commander = ConvertIDTo64Bit(commanderComponent)
+    local ships = {}
+    local seen = {}
+    local pilotIndex = getGTPilotIndexByShipId()
+    local collectOpts = { commanderId = commander, forPlanDisplay = true }
+
+    tryAddEligibleGTShip(commanderComponent, ships, seen, pilotIndex, collectOpts)
+    for _, sub in ipairs(GetSubordinates(commander) or {}) do
+        tryAddEligibleGTShip(sub, ships, seen, pilotIndex, collectOpts)
+    end
+    logPilotExchangeMenu("collectFleetShipsForPlan commander="
+        .. tostring(GetComponentData(commander, "idcode") or commander)
+        .. " eligibleShipCount=" .. tostring(#ships))
+    return ships
+end
+
 local function redistribute(commanderComponent)
     local commander = ConvertIDTo64Bit(commanderComponent)
     if not commander or commander == 0 then
@@ -2505,6 +2488,11 @@ local function runPilotExchangePlanForShips(ships, setupLogLabel, dispatchLogPre
         .. " readOnly=" .. tostring(not hasNewSwaps))
 end
 
+local function redistributeCommanderFleetExchange(commanderComponent)
+    local ships = collectFleetShipsForPlan(commanderComponent)
+    runPilotExchangePlanForShips(ships, "Commander fleet setup for pilot exchange", "Commander fleet pilot exchange dispatch")
+end
+
 local function redistributeSelection(triggerComponent)
     local ships = collectSelectedShips(triggerComponent)
     runPilotExchangePlanForShips(ships, "Selection setup for pilot exchange", "Selection pilot exchange dispatch")
@@ -2513,7 +2501,6 @@ end
 local function redistributeAllGtShips()
     local ships = collectAllEligibleGTShips()
     runPilotExchangePlanForShips(ships, "HQ fleet setup for pilot exchange", "Fleet pilot exchange dispatch", {
-        skipStationPreview = true,
         quietSetupLog = true,
     })
 end
@@ -2536,7 +2523,6 @@ end
 
 local function cancelPendingSelectionExchange()
     pendingSelectionDispatch = nil
-    pendingPlanPreview = nil
 end
 
 local function executeSwapByIdCode(payload)
@@ -2708,6 +2694,7 @@ local function requestFreshPilotDataAndRedistributeSelection(triggerComponent)
     pendingRedistributeSelection = trigger
     pendingRedistributeCommander = nil
     pendingRedistributeFleet = false
+    pendingPilotExchangeCommanderFleet = nil
     pilotDataRefreshRequestedAt = getElapsedTime()
     invalidatePilotIndexCache()
     Mods.GalaxyTrader.PilotData.requestRefresh()
@@ -2739,6 +2726,7 @@ local function requestFreshPilotDataAndRedistributeFleet(hqComponent)
     pendingRedistributeFleet = true
     pendingRedistributeSelection = false
     pendingRedistributeCommander = nil
+    pendingPilotExchangeCommanderFleet = nil
     pilotDataRefreshRequestedAt = getElapsedTime()
     invalidatePilotIndexCache()
     Mods.GalaxyTrader.PilotData.requestRefresh()
@@ -2759,10 +2747,43 @@ local function requestFreshPilotDataAndRedistribute(commanderComponent)
     pendingRedistributeCommander = commander
     pendingRedistributeSelection = false
     pendingRedistributeFleet = false
+    pendingPilotExchangeCommanderFleet = nil
     pilotDataRefreshRequestedAt = getElapsedTime()
     invalidatePilotIndexCache()
     Mods.GalaxyTrader.PilotData.requestRefresh()
     debugLog("Requested fresh GT pilot data for redistribution commander " .. tostring(GetComponentData(commander, "idcode") or "UNKNOWN"))
+end
+
+local function requestFreshPilotDataAndCommanderFleetExchange(commanderComponent)
+    local commander = asComponentId(commanderComponent)
+    logPilotExchangeMenu("requestFreshPilotDataAndCommanderFleetExchange commander="
+        .. tostring(GetComponentData(commander, "idcode") or commander or "nil"))
+    if not commander or commander == 0 then
+        notifyText(31311)
+        return
+    end
+    if not Mods or not Mods.GalaxyTrader or not Mods.GalaxyTrader.PilotData or type(Mods.GalaxyTrader.PilotData.requestRefresh) ~= "function" then
+        notify("Pilot exchange unavailable: GT pilot data bridge missing.")
+        debugLog("Cannot refresh GT pilot data for commander fleet exchange: Mods.GalaxyTrader.PilotData.requestRefresh unavailable")
+        return
+    end
+
+    if pilotDataCacheIsFresh() then
+        logPilotExchangeMenu("commander fleet exchange: reusing fresh pilot data (age="
+            .. tostring(string.format("%.1f", getElapsedTime() - (Mods.GalaxyTrader.PilotData.getLastUpdate() or 0)))
+            .. "s)")
+        redistributeCommanderFleetExchange(commander)
+        return
+    end
+
+    pendingPilotExchangeCommanderFleet = commander
+    pendingRedistributeSelection = false
+    pendingRedistributeFleet = false
+    pendingRedistributeCommander = nil
+    pilotDataRefreshRequestedAt = getElapsedTime()
+    invalidatePilotIndexCache()
+    Mods.GalaxyTrader.PilotData.requestRefresh()
+    debugLog("Requested fresh GT pilot data for commander fleet exchange " .. tostring(GetComponentData(commander, "idcode") or "UNKNOWN"))
 end
 
 local function processPendingRedistributeAfterRefresh()
@@ -2775,6 +2796,7 @@ local function processPendingRedistributeAfterRefresh()
         pendingRedistributeCommander = nil
         pendingRedistributeSelection = false
         pendingRedistributeFleet = false
+        pendingPilotExchangeCommanderFleet = nil
         pilotDataRefreshRequestedAt = 0
     end
 end
@@ -2850,14 +2872,6 @@ if menu then
     end)
 end
 
-RegisterEvent("gt.pilotExchangeStationPreviewReady", function()
-    debugLog("Station preview ready for pilot exchange plan overlay")
-    if not openPlanPreviewWithRendezvous() then
-        pendingSelectionDispatch = nil
-        notifyText(31313)
-    end
-end)
-
 RegisterEvent("gt.redistributePilots", function(_, commanderComponent)
     requestFreshPilotDataAndRedistribute(commanderComponent)
 end)
@@ -2874,11 +2888,17 @@ RegisterEvent("gt.redistributePilotsFleet", function(_, hqComponent)
     requestFreshPilotDataAndRedistributeFleet(hqComponent)
 end)
 
+RegisterEvent("gt.redistributePilotsCommanderFleet", function(_, commanderComponent)
+    logPilotExchangeMenu("gt.redistributePilotsCommanderFleet event received commander="
+        .. tostring(commanderComponent))
+    requestFreshPilotDataAndCommanderFleetExchange(commanderComponent)
+end)
+
 GT_PilotExchangePlan = GT_PilotExchangePlan or {}
 GT_PilotExchangePlan.onAccept = dispatchPendingSelectionExchange
 GT_PilotExchangePlan.onCancel = cancelPendingSelectionExchange
 GT_PilotExchangePlan.hasPending = function()
-    return pendingSelectionDispatch ~= nil or pendingPlanPreview ~= nil
+    return pendingSelectionDispatch ~= nil
 end
 debugLog("Pilot exchange plan handlers registered")
 
@@ -2888,6 +2908,7 @@ RegisterEvent("GT_PilotData.Update", function()
         pendingRedistributeFleet = false
         pendingRedistributeSelection = false
         pendingRedistributeCommander = nil
+        pendingPilotExchangeCommanderFleet = nil
         pilotDataRefreshRequestedAt = 0
         redistributeAllGtShips()
         return
@@ -2896,8 +2917,17 @@ RegisterEvent("GT_PilotData.Update", function()
         local trigger = pendingRedistributeSelection
         pendingRedistributeSelection = false
         pendingRedistributeCommander = nil
+        pendingPilotExchangeCommanderFleet = nil
         pilotDataRefreshRequestedAt = 0
         redistributeSelection(trigger)
+        return
+    end
+    if pendingPilotExchangeCommanderFleet and pendingPilotExchangeCommanderFleet ~= 0 then
+        local commander = pendingPilotExchangeCommanderFleet
+        pendingPilotExchangeCommanderFleet = nil
+        pendingRedistributeCommander = nil
+        pilotDataRefreshRequestedAt = 0
+        redistributeCommanderFleetExchange(commander)
         return
     end
     if pendingRedistributeCommander and pendingRedistributeCommander ~= 0 then

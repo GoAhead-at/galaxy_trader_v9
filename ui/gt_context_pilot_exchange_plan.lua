@@ -23,7 +23,6 @@ GT_PilotExchangePlan = GT_PilotExchangePlan or {}
 local LIST_PAGE_TEXT = 77000
 local TITLE_TEXT_ID = 31315
 local SWAPS_HEADER_TEXT_ID = 31316
-local RENDEZVOUS_HEADER_TEXT_ID = 31318
 local QUEUED_HEADER_TEXT_ID = 31343
 local UNCHANGED_HEADER_TEXT_ID = 31324
 local MENU_WIDTH = 1024
@@ -69,12 +68,6 @@ local function buildPlanContentRows(plan)
         table.insert(rows, { kind = "spacer" })
         addSection(QUEUED_HEADER_TEXT_ID, "Queued exchanges:")
         addLines(plan.queuedSwapLines)
-    end
-
-    if plan.rendezvousLines and #plan.rendezvousLines > 0 then
-        table.insert(rows, { kind = "spacer" })
-        addSection(RENDEZVOUS_HEADER_TEXT_ID, "Rendezvous:")
-        addLines(plan.rendezvousLines)
     end
 
     if plan.unchangedLines and #plan.unchangedLines > 0 then

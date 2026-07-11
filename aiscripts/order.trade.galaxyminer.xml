@@ -187,6 +187,22 @@
       </do_if>
     </do_if>
 
+    <!-- Station-only home config: derive homeSector so Stay At Home and gather scoring have a sector anchor. -->
+    <do_if value="(not $homeSector? or not $homeSector.exists) and $homeStation? and $homeStation.exists and $homeStation.sector? and @$homeStation.sector.exists">
+      <set_value name="$homeSector" exact="@$homeStation.sector"/>
+      <set_value name="$homePosition" exact="[$homeSector, $homeSector.coreposition]"/>
+      <set_value name="$homePositionValid" exact="true"/>
+      <do_if value="this.ship.order? and this.ship.order.exists and @this.ship.order.id == 'GalaxyMiner'">
+        <edit_order_param order="this.ship.order" param="'homePosition'" value="$homePosition"/>
+        <edit_order_param order="this.ship.order" param="'homeSector'" value="$homeSector"/>
+      </do_if>
+      <do_if value="this.ship.defaultorder? and this.ship.defaultorder.exists and this.ship.defaultorder.id == 'GalaxyMiner'">
+        <edit_order_param order="this.ship.defaultorder" param="'homePosition'" value="$homePosition"/>
+        <edit_order_param order="this.ship.defaultorder" param="'homeSector'" value="$homeSector"/>
+      </do_if>
+      <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Derived homeSector from homeStation ' + $homeStation.idcode + ' -> ' + $homeSector.knownname" chance="$debugchance"/>
+    </do_if>
+
     <!-- Canonicalize home config:
          keep both values when provided, but runtime anchoring prefers the station sector.
          The explicit home sector is a fallback for stationless miners. -->
@@ -252,6 +268,10 @@
     <set_value name="this.$allowillegal" exact="$allowillegal"/>
     <set_value name="this.$enforceRouteIllegalLegality" exact="$enforceRouteIllegalLegality"/>
     <set_value name="this.$stayAtHome" exact="$stayAtHome"/>
+    <set_value name="this.$minerStayHomeSector" exact="null"/>
+    <do_if value="this.$stayAtHome and this.$homeSector? and this.$homeSector.exists">
+      <set_value name="this.$minerStayHomeSector" exact="this.$homeSector"/>
+    </do_if>
     <set_value name="this.$idleParking" exact="$idleParking"/>
     <set_value name="this.$logbookentries" exact="$logbookentries"/>
     <!-- Clamp collector-drone buy amount to [0, ship's unit-bay capacity]. Published to
@@ -616,6 +636,37 @@
         </do_if>
       </do_if>
 
+      <!-- Runtime sync for stayAtHome and home-sector anchor (Stay At Home locks to one sector, not whole cluster). -->
+      <set_value name="this.$stayAtHome" exact="if $stayAtHome? then $stayAtHome else false"/>
+      <do_if value="this.ship.defaultorder? and this.ship.defaultorder.id == 'GalaxyMiner' and this.ship.defaultorder.$stayAtHome?">
+        <set_value name="this.$stayAtHome" exact="this.ship.defaultorder.$stayAtHome"/>
+      </do_if>
+      <do_elseif value="this.ship.commander? and this.ship.commander.exists and this.ship.commander != this.ship and this.ship.defaultorder? and this.ship.defaultorder.id == 'Assist' and this.ship.commander.defaultorder?">
+        <set_value name="$minerStayHomePolicyOrder" exact="this.ship.commander.defaultorder"/>
+        <do_if value="$minerStayHomePolicyOrder.id == 'Assist' and $minerStayHomePolicyOrder.$baseorder?">
+          <set_value name="$minerStayHomePolicyOrder" exact="$minerStayHomePolicyOrder.$baseorder"/>
+        </do_if>
+        <do_if value="$minerStayHomePolicyOrder? and $minerStayHomePolicyOrder.id == 'GalaxyMiner' and $minerStayHomePolicyOrder.$stayAtHome?">
+          <set_value name="this.$stayAtHome" exact="$minerStayHomePolicyOrder.$stayAtHome"/>
+        </do_if>
+      </do_elseif>
+      <do_if value="this.ship.defaultorder? and this.ship.defaultorder.id == 'GalaxyMiner' and this.ship.defaultorder.$homePosition? and this.ship.defaultorder.$homePosition.{1}? and this.ship.defaultorder.$homePosition.{1}.exists and this.ship.defaultorder.$homePosition.{1}.isclass.sector">
+        <set_value name="this.$homeSector" exact="this.ship.defaultorder.$homePosition.{1}"/>
+      </do_if>
+      <do_elseif value="this.ship.defaultorder? and this.ship.defaultorder.id == 'GalaxyMiner' and this.ship.defaultorder.$homePosition? and this.ship.defaultorder.$homePosition.{1}? and this.ship.defaultorder.$homePosition.{1}.sector? and this.ship.defaultorder.$homePosition.{1}.sector.exists">
+        <set_value name="this.$homeSector" exact="this.ship.defaultorder.$homePosition.{1}.sector"/>
+      </do_elseif>
+      <do_elseif value="this.ship.defaultorder? and this.ship.defaultorder.id == 'GalaxyMiner' and this.ship.defaultorder.$homeSector? and this.ship.defaultorder.$homeSector.exists">
+        <set_value name="this.$homeSector" exact="this.ship.defaultorder.$homeSector"/>
+      </do_elseif>
+      <do_if value="(not this.$homeSector? or not this.$homeSector.exists) and this.$homeStation? and this.$homeStation.exists and this.$homeStation.sector? and @this.$homeStation.sector.exists">
+        <set_value name="this.$homeSector" exact="@this.$homeStation.sector"/>
+      </do_if>
+      <set_value name="this.$minerStayHomeSector" exact="null"/>
+      <do_if value="this.$stayAtHome and this.$homeSector? and this.$homeSector.exists">
+        <set_value name="this.$minerStayHomeSector" exact="this.$homeSector"/>
+      </do_if>
+
       <!-- Re-read distance params from the active order source and apply GT pilot cap.
            Must run before demand/station/ware scoring. Vanilla XP mode uses order values only. -->
       <set_value name="$minerRuntimeMaxGatherRaw" exact="if $maxGatherDistance? then $maxGatherDistance else this.$maxGatherDistance"/>
@@ -715,12 +766,15 @@
       </run_script>
 
       <!-- Resolve home anchor.
-           Home Station defines the operating anchor when set; Home Sector is the fallback
-           for stationless miners. This keeps diagnostics and runtime range policy aligned. -->
+           Stay At Home uses homeSector only (sector-identity lock in multi-sector clusters).
+           Otherwise home station sector is the operating anchor when set. -->
       <set_value name="$range" exact="null"/>
-      <do_if value="this.$homeStation? and this.$homeStation.exists and this.$homeStation.sector?">
-        <set_value name="$range" exact="this.$homeStation.sector"/>
+      <do_if value="this.$minerStayHomeSector? and this.$minerStayHomeSector.exists">
+        <set_value name="$range" exact="this.$minerStayHomeSector"/>
       </do_if>
+      <do_elseif value="this.$homeStation? and this.$homeStation.exists and this.$homeStation.sector?">
+        <set_value name="$range" exact="this.$homeStation.sector"/>
+      </do_elseif>
       <do_elseif value="this.$homeSector? and this.$homeSector.exists">
         <set_value name="$range" exact="this.$homeSector"/>
       </do_elseif>
@@ -1162,8 +1216,8 @@
       <set_value name="$wareReachabilityRefSector" exact="if $range? and $range.isclass.sector then $range else (if $range? and $range.sector? then @$range.sector else this.sector)"/>
       <!-- Stay At Home: sector-identity lock for multi-sector clusters (intra-cluster gatedistance is 0).
            Do not use maxgatedistance=0 via lib.find.sectors.inrange - that expands to the whole cluster. -->
-      <do_if value="this.$stayAtHome and this.$homeSector? and this.$homeSector.exists">
-        <set_value name="$wareReachabilityGatherSpaces" exact="[this.$homeSector]"/>
+      <do_if value="this.$minerStayHomeSector? and this.$minerStayHomeSector.exists">
+        <set_value name="$wareReachabilityGatherSpaces" exact="[this.$minerStayHomeSector]"/>
       </do_if>
       <do_else>
         <run_script name="'lib.find.sectors.inrange'" result="$wareReachabilityGatherSpaces">
@@ -2462,8 +2516,8 @@
       <set_value name="$resolvedSector" exact="null"/>
       <set_value name="$resolvedPos" exact="null"/>
       <set_value name="$sliceGatherSpaces" exact="if this.$minerSliceGatherSpaces? then this.$minerSliceGatherSpaces else []"/>
-      <do_if value="this.$stayAtHome and this.$homeSector? and this.$homeSector.exists">
-        <set_value name="$sliceGatherSpaces" exact="[this.$homeSector]"/>
+      <do_if value="this.$minerStayHomeSector? and this.$minerStayHomeSector.exists">
+        <set_value name="$sliceGatherSpaces" exact="[this.$minerStayHomeSector]"/>
       </do_if>
       <set_value name="$deliveryOnlySlice" exact="this.$minerDeliveryOnlySlice? and this.$minerDeliveryOnlySlice"/>
       <do_if value="not $deliveryOnlySlice and this.ship.cargo.free.all gt 0 and $selectedWare? and $selectedWare != null and $sliceGatherSpaces.count gt 0">
@@ -2491,7 +2545,7 @@
           <param name="blacklistgroup" value="$locateBlacklistGroup"/>
           <param name="debugchance" value="this.$debugchance"/>
         </run_script>
-        <do_if value="$locateResult.$Found? and $locateResult.$Found and $locateResult.$Sector? and @$locateResult.$Sector.exists and (not this.$stayAtHome or not this.$homeSector? or not this.$homeSector.exists or $locateResult.$Sector == this.$homeSector)">
+        <do_if value="$locateResult.$Found? and $locateResult.$Found and $locateResult.$Sector? and @$locateResult.$Sector.exists and (not this.$minerStayHomeSector? or not this.$minerStayHomeSector.exists or $locateResult.$Sector == this.$minerStayHomeSector)">
           <set_value name="$resolvedSector" exact="$locateResult.$Sector"/>
           <set_value name="$resolvedPos" exact="$locateResult.$Pos"/>
           <do_if value="not this.$activeMiningWareDiscoverable?">
@@ -2534,12 +2588,12 @@
       <remove_value name="$sliceGatherSpaces"/>
 
       <!-- Run GT mining routine fork in time slices so GT maintenance/training can run between cycles -->
-      <set_value name="$strictGatherSector" exact="if this.$stayAtHome and this.$homeSector? and this.$homeSector.exists then this.$homeSector else null"/>
+      <set_value name="$strictGatherSector" exact="if this.$minerStayHomeSector? and this.$minerStayHomeSector.exists then this.$minerStayHomeSector else null"/>
       <run_script name="'order.mining.routine.gt'">
         <param name="warebasket" value="$runWareBasket"/>
         <param name="range" value="$range"/>
         <param name="strictgathersector" value="$strictGatherSector"/>
-        <param name="precomputedgatherspaces" value="if this.$stayAtHome and this.$homeSector? and this.$homeSector.exists then [] else (if this.$minerSliceGatherSpaces? then this.$minerSliceGatherSpaces else [])"/>
+        <param name="precomputedgatherspaces" value="if this.$minerStayHomeSector? and this.$minerStayHomeSector.exists then [] else (if this.$minerSliceGatherSpaces? then this.$minerSliceGatherSpaces else [])"/>
         <param name="resolvedsector" value="$resolvedSector"/>
         <param name="resolvedpos" value="$resolvedPos"/>
         <param name="deliveryonly" value="if this.$minerDeliveryOnlySlice? then this.$minerDeliveryOnlySlice else false"/>
@@ -2807,6 +2861,7 @@
     <do_if value="this.$minerGatherFilterIndex?"><remove_value name="this.$minerGatherFilterIndex"/></do_if>
     <do_if value="this.$minerScoreCandidateWares?"><remove_value name="this.$minerScoreCandidateWares"/></do_if>
     <do_if value="this.$minerScoreGatherSpaces?"><remove_value name="this.$minerScoreGatherSpaces"/></do_if>
+    <do_if value="this.$minerStayHomeSector?"><remove_value name="this.$minerStayHomeSector"/></do_if>
     <do_if value="this.$minerSliceGatherSpaces?"><remove_value name="this.$minerSliceGatherSpaces"/></do_if>
     <do_if value="this.$minerDeliveryOnlySlice?"><remove_value name="this.$minerDeliveryOnlySlice"/></do_if>
     <do_if value="this.$minerScoreDemandStations?"><remove_value name="this.$minerScoreDemandStations"/></do_if>

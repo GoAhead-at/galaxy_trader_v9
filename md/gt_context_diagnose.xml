@@ -1761,7 +1761,7 @@
           <set_value name="$distancePenalty" exact="$gtOrder.$distancepenalty"/>
         </do_if>
         <set_value name="$distancePenaltyDetail" exact="'' + $distancePenalty + '% (0=ignore dist, 100=strongly prefer close)'"/>
-        <do_if value="$orderId == 'GalaxyTraderMK1' or $orderId == 'GalaxyMiner'">
+        <do_if value="$orderId == 'GalaxyTraderMK1' or $orderId == 'GalaxyTraderMK2' or $orderId == 'GalaxyMiner'">
           <set_value name="$distancePenaltyDetail" exact="'N/A'"/>
         </do_if>
         <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Distance Penalty', $Status = 'INFO', $Detail = $distancePenaltyDetail]"/>
@@ -1991,6 +1991,7 @@
             </do_if>
           </do_if>
           <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Storage Thresholds (min/static/max)', $Status = 'INFO', $Detail = '' + $mk2MinStorage + '% / ' + $mk2StaticStorage + '% / ' + $mk2MaxStorage + '% (source must be ABOVE static; dest must be AT OR BELOW min' + (if $mk2OrderBidirectional then '; bidirectional ladder enforced' else '; independent thresholds') + ')']"/>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Selection Scoring', $Status = 'INFO', $Detail = 'Target demand only: score base = max(0, 100 - destination fill %). Lower storage = higher priority. Equal fill % adds random tiebreak at runtime (not reproducible in diagnose). Source surplus, route distance, and sticky lane no longer affect ware pick order.']"/>
 
           <!-- Per-source / per-ware static-storage gate evaluation.
                Mirrors the runtime gate at order.trade.galaxytraderMK2.xml line 1410:
@@ -5041,6 +5042,9 @@
         </do_if>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Offer Scan Mode', $Status = 'INFO', $Detail = $diagOfferScanModeDetail]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Sectors In Range', $Status = 'INFO', $Detail = '' + $searchSectors.count + ' sectors (distance=' + $diagSearchDistance + ')']"/>
+        <do_if value="$orderId == 'GalaxyTraderMK2'">
+          <append_to_list name="$sec8.$Rows" exact="table[$Check = 'MK2 Sector Scan Note', $Status = 'INFO', $Detail = 'Offer counts below are informational only. MK2 trades exclusively between configured source/destination stations - see Pair Details (MK2 pair eval) for eligibility and demand-ranked selection.']"/>
+        </do_if>
         <do_if value="$orderId == 'GalaxyMiner'">
           <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Miner Offer Ware Scope', $Status = if $diagMinerOfferWares.count gt 0 then 'PASS' else 'WARN', $Detail = $diagMinerOfferWaresDetail]"/>
         </do_if>
@@ -6087,6 +6091,9 @@
             </do_if>
           </do_all>
         </do_if>
+        <do_elseif value="$orderId == 'GalaxyTraderMK2'">
+          <!-- MK2 uses dedicated source/dest pair eval in sec8b; skip generic sector-wide tradematch scan. -->
+        </do_elseif>
         <do_else>
         <!-- Sell-driven pairing (mirrors lib.gt.tradematch.xml outer sell loop). -->
         <do_all exact="$allSellOffers.count" counter="$soi">
@@ -7115,6 +7122,7 @@
         </do_if>
 
         <!-- Add pair evaluation summary -->
+        <do_if value="$orderId != 'GalaxyTraderMK2'">
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Scoring Model', $Status = 'INFO', $Detail = 'Score distance = home→buy + buy→sell (route-aware)' + (if $diagUseSelectionSort then ('; validation sort = score / (1 + ship→buy × ' + $diagShipProxWeight + ') after priority boost') else '')]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Total Pairs Evaluated', $Status = 'INFO', $Detail = '' + $pairCount + (if $diagHitEvalCap then (' (cap ' + $diagPairEvalCap + ' reached — counts may be truncated)') else '')]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Pairs Passing All Checks', $Status = if $passCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $passCount + ' / ' + $pairCount + ' (executable parity — mirrors trade_found validation)']"/>
@@ -7168,6 +7176,10 @@
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Cargo Incompatible', $Status = if $rejectCargoType gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectCargoType]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Cargo Utilization Below Min', $Status = if $rejectCargoUtil gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectCargoUtil + (if not $useMinCargoThreshold then ' (filter disabled on order)' else if $diagIsolatedForCargoFilter then ' (ignored in isolated mode)' else '')]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Same Station (skipped)', $Status = 'INFO', $Detail = '' + $rejectSameStation]"/>
+        </do_if>
+        <do_else>
+          <append_to_list name="$sec8.$Rows" exact="table[$Check = 'MK2 Pair Search', $Status = 'INFO', $Detail = 'Skipped sector-wide tradematch scan. Eligibility and demand-ranked selection are in Pair Details (MK2 pair eval) below.']"/>
+        </do_else>
 
         <append_to_list name="$report.$Sections" exact="$sec8"/>
 
@@ -7263,6 +7275,7 @@
           <set_value name="$mk2PairCount" exact="0"/>
           <set_value name="$mk2PairPass" exact="0"/>
           <set_value name="$mk2FirstPassPair" exact="''"/>
+          <set_value name="$mk2BestDemandScore" exact="-1"/>
           <set_value name="$mk2PairSkipIllegal" exact="0"/>
           <set_value name="$mk2PairSkipNoSrc" exact="0"/>
           <set_value name="$mk2PairSkipSrcNoTarget" exact="0"/>
@@ -7588,24 +7601,56 @@
                   </do_if>
 
                   <do_if value="$pmStatus2 == 'PASS'">
-                    <set_value name="$pmReason2" exact="'eligible: bucket=' + $pmBucket + ' src=' + $pmSrcRatio + '% dst=' + $pmDstRatio + '% trade=' + $pmTradeAmount + ' units (final amount may be lower after fairness/reservation)'"/>
+                    <set_value name="$pmDemandScore" exact="[0, 100 - $pmDstRatio].max"/>
+                    <set_value name="$pmReason2" exact="'eligible: demand=' + $pmDemandScore + ' (dst ' + $pmDstRatio + '% fill) bucket=' + $pmBucket + ' src=' + $pmSrcRatio + '% trade=' + $pmTradeAmount + ' units (equal fill % uses random tiebreak at runtime; final amount may be lower after fairness/reservation)'"/>
                     <set_value name="$mk2PairPass" operation="add"/>
-                    <do_if value="$mk2FirstPassPair == ''">
-                      <set_value name="$mk2FirstPassPair" exact="$pmWare.name + ': ' + $pmRoute2"/>
+                    <do_if value="$pmDemandScore gt $mk2BestDemandScore">
+                      <set_value name="$mk2BestDemandScore" exact="$pmDemandScore"/>
+                      <set_value name="$mk2FirstPassPair" exact="$pmWare.name + ': ' + $pmRoute2 + ' (demand ' + $pmDemandScore + ', dst ' + $pmDstRatio + '% fill)'"/>
                     </do_if>
                   </do_if>
 
                   <set_value name="$mk2PairCount" operation="add"/>
                   <do_if value="$mk2PairRows.count lt $mk2RowCap">
-                    <append_to_list name="$mk2PairRows" exact="table[$Check = $pmWare.name, $Status = $pmStatus2, $Detail = $pmRoute2, $Col4 = 'src ' + $pmSrcRatio + '% / dst ' + $pmDstRatio + '%', $Col5 = (if $pmDist ge 0 then ('' + $pmDist + ' gates') else ''), $Col6 = $pmReason2]"/>
+                    <set_value name="$pmMk2SortKey" exact="if $pmStatus2 == 'PASS' then $pmDemandScore else -1"/>
+                    <set_value name="$pmMk2Col5" exact="if $pmStatus2 == 'PASS' then ('demand ' + $pmDemandScore + ' (dst ' + $pmDstRatio + '% fill)') else ''"/>
+                    <append_to_list name="$mk2PairRows" exact="table[$Check = $pmWare.name, $Status = $pmStatus2, $Detail = $pmRoute2, $Col4 = 'src ' + $pmSrcRatio + '% / dst ' + $pmDstRatio + '%', $Col5 = $pmMk2Col5, $Col6 = $pmReason2, $SortKey = $pmMk2SortKey]"/>
                   </do_if>
                 </do_all>
               </do_all>
             </do_all>
           </do_if>
 
+          <do_if value="$mk2PairRows.count gt 1">
+            <set_value name="$mk2PdClaimed" exact="[]"/>
+            <do_all exact="$mk2PairRows.count" counter="$mk2pci">
+              <append_to_list name="$mk2PdClaimed" exact="false"/>
+            </do_all>
+            <set_value name="$mk2PairRowsSorted" exact="[]"/>
+            <do_all exact="$mk2PairRows.count" counter="$mk2psi">
+              <set_value name="$mk2PdBestIdx" exact="0"/>
+              <set_value name="$mk2PdBestKey" exact="-1000000000.0"/>
+              <do_all exact="$mk2PairRows.count" counter="$mk2psk">
+                <do_if value="not $mk2PdClaimed.{$mk2psk}">
+                  <set_value name="$mk2PdRow" exact="$mk2PairRows.{$mk2psk}"/>
+                  <set_value name="$mk2PdRowKey" exact="if $mk2PdRow.$SortKey? then $mk2PdRow.$SortKey else -1"/>
+                  <do_if value="$mk2PdRowKey gt $mk2PdBestKey">
+                    <set_value name="$mk2PdBestKey" exact="$mk2PdRowKey"/>
+                    <set_value name="$mk2PdBestIdx" exact="$mk2psk"/>
+                  </do_if>
+                </do_if>
+              </do_all>
+              <do_if value="$mk2PdBestIdx gt 0">
+                <append_to_list name="$mk2PairRowsSorted" exact="$mk2PairRows.{$mk2PdBestIdx}"/>
+                <set_value name="$mk2PdClaimed.{$mk2PdBestIdx}" exact="true"/>
+              </do_if>
+            </do_all>
+            <set_value name="$mk2PairRows" exact="$mk2PairRowsSorted"/>
+          </do_if>
+
           <!-- Header row + skip summary so the player can read the picture at a glance. -->
           <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'MK2 Pairs Evaluated', $Status = if $mk2PairPass gt 0 then 'PASS' else (if $mk2PairCount == 0 then 'WARN' else 'FAIL'), $Detail = '' + $mk2PairCount + ' src*dst*ware combinations checked, ' + $mk2PairPass + ' PASS, ' + ($mk2PairCount - $mk2PairPass) + ' BLOCK (showing first ' + $mk2PairRows.count + ')']"/>
+          <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'MK2 Pair Legend', $Status = 'INFO', $Detail = 'Col5 demand score = max(0, 100 - destination fill %). Runtime picks highest demand; equal fill % adds random tiebreak (not shown here). Distance does not affect ware selection.']"/>
           <do_if value="$mk2NoBasketWares">
             <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'No Pairs', $Status = 'WARN', $Detail = 'No source/destination stations configured (see MK2 Specific section)']"/>
           </do_if>
@@ -8311,8 +8356,9 @@
              to them. -->
         <do_elseif value="$orderId == 'GalaxyTraderMK2' and $mk2PairCount gt 0">
           <do_if value="$mk2PairPass gt 0">
-            <set_value name="$verdict" exact="'TRADES AVAILABLE (MK2): ' + $mk2PairPass + ' of ' + $mk2PairCount + ' configured source/dest/ware combination(s) are eligible' + (if $mk2FirstPassPair != '' then ' (e.g. ' + $mk2FirstPassPair + ')' else '') + '. MK2 trades ONLY its assigned source/destination lists - the sector-wide Search Summary above does not apply to this order.'"/>
-            <append_to_list name="$suggestions" exact="'Eligible pairs exist, so a not-trading ship is limited by a runtime factor this diagnostic does not model: in-flight reservations and fleet fairness (sibling traders may have already claimed the destination intake), search cadence, or the ship currently running another order (e.g. Assist while a fleet subordinate) before it re-enters the MK2 loop. Reservations are intentionally not simulated here (see MK2 pair-eval note).'"/>
+            <set_value name="$verdict" exact="'TRADES AVAILABLE (MK2): ' + $mk2PairPass + ' of ' + $mk2PairCount + ' configured source/dest/ware combination(s) are eligible' + (if $mk2FirstPassPair != '' then ' (highest demand: ' + $mk2FirstPassPair + ')' else '') + '. MK2 trades ONLY its assigned source/destination lists - the sector-wide Search Summary above does not apply to this order.'"/>
+            <append_to_list name="$suggestions" exact="'Eligible pairs exist, so a not-trading ship is limited by a runtime factor this diagnostic does not model: in-flight reservations and fleet fairness (sibling traders may have already claimed the destination intake), search cadence, equal-fill random tiebreak, or the ship currently running another order (e.g. Assist while a fleet subordinate) before it re-enters the MK2 loop. Reservations are intentionally not simulated here (see MK2 pair-eval note).'"/>
+            <append_to_list name="$suggestions" exact="'Among eligible wares, runtime prefers the emptiest destination (lowest fill %). If several destinations share the same fill %, ware choice is random - use Pair Details demand scores to see which routes rank highest.'"/>
           </do_if>
           <do_else>
             <set_value name="$verdict" exact="'MK2 NO ELIGIBLE PAIRS: all ' + $mk2PairCount + ' configured source/dest/ware combination(s) are currently blocked - see the MK2 Skip Breakdown and Pair Details for the per-gate reasons (typically noDstOffer / noNeed / noSrcOffer).'"/>

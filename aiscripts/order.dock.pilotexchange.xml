@@ -47,7 +47,6 @@
 
   <attention min="unknown">
     <actions>
-      <set_value name="$holdTime" exact="2h"/>
       <set_value name="$arrived" exact="false"/>
 
       <do_if value="(this.ship.dock and (this.ship.dock.container == $destination)) or (this.ship.parkedat and ((this.ship.parkedat == $destination) or this.ship.parkedat.hascontext.{$destination}))">
@@ -65,6 +64,8 @@
       <do_if value="not $arrived">
         <debug_text text="'[GT PilotExchange] create DockAndWait ship=' + this.ship.idcode + ' station=' + $destination.idcode" chance="100"/>
         <set_command_action commandaction="commandaction.waitingtodock" param="$destination"/>
+        <!-- Parent DockAndPilotExchange pauses while DockAndWait runs; flag handoff so on_abort does not tear down the PE session. -->
+        <set_value name="this.$peDockHandoff" exact="true"/>
         <create_order name="$dockOrder" id="'DockAndWait'" object="this.ship" immediate="true">
           <param name="destination" value="$destination"/>
           <param name="building" value="false"/>
@@ -72,6 +73,7 @@
           <param name="dockfollowers" value="$destination.isclass.station"/>
           <param name="callerid" value="this.ship.order"/>
         </create_order>
+        <set_value name="this.$peDockOrder" exact="$dockOrder"/>
 
         <wait>
           <interrupt>
@@ -80,6 +82,9 @@
             </conditions>
           </interrupt>
         </wait>
+
+        <remove_value name="this.$peDockHandoff"/>
+        <remove_value name="this.$peDockOrder"/>
 
         <do_if value="(this.ship.dock and (this.ship.dock.container == $destination)) or (this.ship.parkedat and ((this.ship.parkedat == $destination) or this.ship.parkedat.hascontext.{$destination}))">
           <debug_text text="'[GT PilotExchange] arrived ship=' + this.ship.idcode + ' station=' + $destination.idcode" chance="100"/>
@@ -109,13 +114,22 @@
 
       <!-- Keep ship docked for exchange until explicit release signal.
            Failsafe timeout is aligned with MD swap-tracker timeout. -->
-      <wait max="$holdTime">
+      <set_value name="$holdTime" exact="2h"/>
+      <do_if value="$holdTime and typeof $holdTime != datatype.time">
+        <set_value name="$holdTime" exact="$holdTime * 1s"/>
+      </do_if>
+      <!-- Match DockAndTrain: normalize to whole seconds before wait (engine 1/12s raw
+           unit count otherwise makes multi-minute holds expire in ~1/12 of intended time). -->
+      <set_value name="$peHoldWaitTime" exact="($holdTime / 1s) * 1s"/>
+      <set_value name="this.$peHoldActive" exact="true"/>
+      <wait min="$peHoldWaitTime" max="$peHoldWaitTime">
         <interrupt>
           <conditions>
             <event_object_signalled object="this.ship" param="'GT_PilotExchange_Release'"/>
           </conditions>
         </interrupt>
       </wait>
+      <remove_value name="this.$peHoldActive"/>
       <debug_text text="'[GT PilotExchange] release/timeout ship=' + this.ship.idcode + ' station=' + $destination.idcode" chance="100"/>
       <signal_objects object="player.galaxy" param="'GT_PilotExchange_OrderState'" param2="table[
         $Ship = this.ship,
@@ -128,7 +142,36 @@
   </attention>
 
   <on_abort>
-    <!-- Always emit aborted for this order instance so MD can reliably clear PilotExchange state on cancel. -->
+    <!-- DockAndWait child pauses this script while the ship flies to the station.
+         That engine pause fires on_abort; it is NOT a player cancel or failure. -->
+    <set_value name="$isDockTransitHandoff" exact="false"/>
+    <do_if value="this.$peDockHandoff? and this.$peDockHandoff">
+      <set_value name="$isDockTransitHandoff" exact="true"/>
+    </do_if>
+    <do_if value="not $isDockTransitHandoff and this.$peDockOrder? and this.$peDockOrder.exists">
+      <set_value name="$isDockTransitHandoff" exact="true"/>
+    </do_if>
+    <do_if value="not $isDockTransitHandoff and this.ship.order? and @this.ship.order.id == 'DockAndWait' and this.ship.order.$callerid? and @this.ship.order.$callerid.id == 'DockAndPilotExchange'">
+      <set_value name="$isDockTransitHandoff" exact="true"/>
+    </do_if>
+    <do_if value="not $isDockTransitHandoff and this.ship.orders? and this.ship.orders.count gt 0">
+      <do_all exact="this.ship.orders.count" counter="$peoi">
+        <set_value name="$peOrder" exact="this.ship.orders.{$peoi}"/>
+        <do_if value="@$peOrder.id == 'DockAndWait' and $peOrder.$callerid? and @$peOrder.$callerid.id == 'DockAndPilotExchange'">
+          <set_value name="$isDockTransitHandoff" exact="true"/>
+          <break/>
+        </do_if>
+      </do_all>
+    </do_if>
+    <do_if value="$isDockTransitHandoff">
+      <debug_text text="'[GT PilotExchange] on_abort skipped (DockAndWait transit handoff - exchange still in progress) ship=' + this.ship.idcode" chance="100"/>
+      <return/>
+    </do_if>
+    <do_if value="this.$peHoldActive? and this.$peHoldActive">
+      <debug_text text="'[GT PilotExchange] on_abort skipped (docked hold - exchange/settlement in progress) ship=' + this.ship.idcode" chance="100"/>
+      <return/>
+    </do_if>
+
     <signal_objects object="player.galaxy" param="'GT_PilotExchange_OrderState'" param2="table[
       $Ship = this.ship,
       $ShipID = this.ship.idcode,

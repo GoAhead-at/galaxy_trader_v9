@@ -136,6 +136,10 @@ local PLAN_MODE = {
 
 local menu = Helper.getMenu("MapMenu")
 
+-- Forward declarations: map-selection helpers below call these before their definitions.
+local asComponentId
+local tryAddEligibleGTShip
+
 local function countRawMapSelectedShips()
     local seen = {}
     local count = 0
@@ -498,7 +502,7 @@ local function isGTOrder(orderId)
     return orderId and GT_ORDER_IDS[orderId] == true
 end
 
-local function asComponentId(entry)
+asComponentId = function(entry)
     if not entry then
         return nil
     end
@@ -1117,7 +1121,7 @@ local function shipIsFleetCommander(ship)
     return #subs > 0
 end
 
-local function tryAddEligibleGTShip(ship, ships, seen, pilotIndex, opts)
+tryAddEligibleGTShip = function(ship, ships, seen, pilotIndex, opts)
     opts = opts or {}
     ship = asComponentId(ship)
     if not ship or ship == 0 or seen[tostring(ship)] then

@@ -130,6 +130,12 @@ end
 
 local function onAccept()
     debugLog("Accept clicked")
+    if GT_PilotExchangePlan.playAcceptSoundIfPending then
+        local played = GT_PilotExchangePlan.playAcceptSoundIfPending()
+        debugLog("Accept sound hook played=" .. tostring(played))
+    else
+        debugLog("Accept sound hook missing on GT_PilotExchangePlan")
+    end
     if GT_PilotExchangePlan.onAccept then
         GT_PilotExchangePlan.onAccept()
     else

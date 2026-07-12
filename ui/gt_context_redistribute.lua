@@ -268,6 +268,13 @@ local DIRECT_SWAP_DEFER_FALLBACK_SEC = 5.0
 local DIRECT_SWAP_SETTLE_MIN_SEC = 5.0
 -- No vanilla Lua event for pod landing; probe on this interval only (never every frame).
 local DIRECT_SWAP_SETTLE_PROBE_INTERVAL = 5.0
+-- Hard cap on how long a leg may sit in settlement before we give up on the transfer.
+-- Grounded in vanilla crew-transfer bounds (libraries/parameters.xml, category "crewtransfer"):
+-- a pod is guaranteed to arrive within max_pod_launch_delay (15s) + max_travel_time (5min) = 315s,
+-- so no legitimate transfer can exceed that. Add a 60s safety window -> 375s. Past this the pod is
+-- genuinely never arriving; fail the leg so the caller can free the ships instead of holding them
+-- docked forever. This is the single explicit stop condition for a dead transfer.
+local DIRECT_SWAP_SETTLE_MAX_SEC = 375.0
 local pilotIndexCacheByShipId = nil
 local dockSwapQueueSkipLogged = {}
 
@@ -374,6 +381,23 @@ local function clearPendingRedistributionForShip(idcode)
     local plan = pendingDockExchangePlan
     if plan and plan.shipIds then
         plan.shipIds[codeKey] = nil
+    end
+    -- Purge the ship's legs from the dock-exchange queue too, so a lost ship's dead pair does not keep
+    -- a surviving hub flagged as "has an incomplete leg" forever (which would hold it docked at the end).
+    local dockQueue = pendingDockSwapQueue
+    if dockQueue and dockQueue.items then
+        local keptItems = {}
+        for _, item in ipairs(dockQueue.items) do
+            if item and (tostring(item.leftCode or "") == codeKey or tostring(item.rightCode or "") == codeKey) then
+                -- drop this leg
+            else
+                table.insert(keptItems, item)
+            end
+        end
+        if #keptItems ~= #dockQueue.items then
+            dockQueue.items = keptItems
+            dockQueue.active = #keptItems > 0
+        end
     end
     local queue = pendingDirectSwapQueue
     if queue and queue.active and codeKey ~= "" then
@@ -1201,49 +1225,6 @@ local function shipIsUnavailableForPilotExchange(ship, idcode, pilotData)
     return false, nil
 end
 
--- Mirrors gt_ship_management.xml Calculate_Performance_Modifier
-local function performanceModifier(level, rank)
-    if level <= 2 then
-        if rank == 1 then return 0 end
-        if rank == 2 then return -5 end
-        if rank == 3 then return -15 end
-        if rank == 4 then return -25 end
-    elseif level == 3 then
-        if rank == 1 then return 3 end
-        if rank == 2 then return 0 end
-        if rank == 3 then return -8 end
-        if rank == 4 then return -15 end
-    elseif level >= 4 and level <= 6 then
-        if rank == 1 then return 3 end
-        if rank == 2 then return 0 end
-        if rank == 3 then return -8 end
-        if rank == 4 then return -15 end
-    elseif level >= 7 and level <= 15 then
-        local modifier = 0
-        if level >= 12 then
-            if rank == 1 then modifier = 12
-            elseif rank == 2 then modifier = 9
-            elseif rank == 3 then modifier = 6
-            elseif rank == 4 then modifier = 3 end
-        elseif level >= 9 then
-            if rank == 1 then modifier = 9
-            elseif rank == 2 then modifier = 6
-            elseif rank == 3 then modifier = 3
-            elseif rank == 4 then modifier = 0 end
-        else -- 7-8
-            if rank == 1 then modifier = 6
-            elseif rank == 2 then modifier = 3
-            elseif rank == 3 then modifier = 0
-            elseif rank == 4 then modifier = -8 end
-        end
-        if level == 15 then
-            modifier = modifier + 3
-        end
-        return modifier
-    end
-    return 0
-end
-
 -- Penalty-tier index aligned with performanceModifier / Calculate_Performance_Modifier level branches.
 -- T1: 1-2 | T2: 3-6 | T3: 7-8 | T4: 9-11 | T5: 12-14 | T6: 15 (level 15 adds +3 in penalty math)
 local function skillTier(level)
@@ -1254,6 +1235,24 @@ local function skillTier(level)
     if l <= 11 then return 4 end
     if l <= 14 then return 5 end
     return 6
+end
+
+-- Minimum pilot level required to fly each ship class in the exchange planner.
+-- Index = class rank (1=S, 2=M, 3=L, 4=XL). A swap may only place a pilot into a ship
+-- whose class minimum the pilot meets; combined with cross-class inversion resolution this
+-- keeps the highest pilots in the highest classes.
+local CLASS_MIN_PILOT_LEVEL = { 1, 3, 6, 9 }
+
+local function pilotMeetsClassMinimum(level, rank)
+    local minLevel = CLASS_MIN_PILOT_LEVEL[rank] or 1
+    return (tonumber(level) or 0) >= minLevel
+end
+
+-- A swap exchanges the two ships' pilots, so each ship's incoming pilot must meet that ship's
+-- class minimum: the small ship receives the large ship's pilot and vice versa.
+local function swapMeetsClassMinimums(small, large)
+    return pilotMeetsClassMinimum(large.level, small.rank)
+        and pilotMeetsClassMinimum(small.level, large.rank)
 end
 
 -- Priority within same target class: lower-level targets first.
@@ -1433,9 +1432,7 @@ local function distinctClassRankCount(ships)
 end
 
 local function swapPassesSelectionGates(small, large)
-    local modSmall = performanceModifier(large.level, small.rank)
-    local modLarge = performanceModifier(small.level, large.rank)
-    if modSmall < 0 or modLarge < 0 then
+    if not swapMeetsClassMinimums(small, large) then
         return false
     end
     if small.isCommander and large.level < small.startLevel then
@@ -1950,9 +1947,7 @@ local function classifyUnchangedShipReasonId(ship, allShips)
                                 commanderBlock = true
                             end
                         end
-                        local modSmall = performanceModifier(large.level, small.rank)
-                        local modLarge = performanceModifier(small.level, large.rank)
-                        if modSmall < 0 or modLarge < 0 then
+                        if not swapMeetsClassMinimums(small, large) then
                             penaltyBlock = true
                         end
                     end
@@ -2417,10 +2412,21 @@ local function attemptDirectSwapSettlement(item, leftCode, rightCode, leftShip, 
     if now - item.settlementStartedAt < DIRECT_SWAP_SETTLE_MIN_SEC then
         return "defer", "awaiting_transfer"
     end
+    -- Bounded settlement wait. Never abort while either ship is running a critical order (it may be
+    -- genuinely mid-transfer); otherwise, once the vanilla-derived cap is exceeded a still-unsettled
+    -- leg is failed so the caller frees the ships instead of holding them docked forever.
+    local settlementTimedOut = (now - item.settlementStartedAt) >= DIRECT_SWAP_SETTLE_MAX_SEC
+        and not (isShipOrderCritical(left) or isShipOrderCritical(right))
     if not pilotsWereExchanged(left, right, item.preLeftPilot, item.preRightPilot) then
+        if settlementTimedOut then
+            return "fail", "settlement_timeout"
+        end
         return "defer", "awaiting_pilot_swap"
     end
     if not shipHasSeatedPilot(left) or not shipHasSeatedPilot(right) then
+        if settlementTimedOut then
+            return "fail", "settlement_timeout"
+        end
         return "defer", "awaiting_pilot_seated"
     end
     local settled, settleReason = directSwapFullySettled(left, right, item.preLeftPilot, item.preRightPilot)
@@ -2439,6 +2445,9 @@ local function attemptDirectSwapSettlement(item, leftCode, rightCode, leftShip, 
     end
     if isShipOrderCritical(left) or isShipOrderCritical(right) then
         return "defer", "critical_order"
+    end
+    if settlementTimedOut then
+        return "fail", "settlement_timeout"
     end
     return "defer", settleReason or "awaiting_transfer"
 end
@@ -3123,12 +3132,6 @@ local function dispatchDockExchangePlan(groups, logPrefix)
         end
     end
 
-    pendingDockExchangePlan = {
-        active = true,
-        totalPairs = #swaps,
-        completedPairs = 0,
-        shipIds = shipIds,
-    }
     local queueItems = {}
     for _, swap in ipairs(swaps) do
         local leftCode = GetComponentData(swap.left, "idcode") or "LEFT"
@@ -3140,20 +3143,58 @@ local function dispatchDockExchangePlan(groups, logPrefix)
             rightCode = tostring(rightCode),
         })
     end
-    pendingDockSwapQueue = {
-        active = #queueItems > 0,
-        items = queueItems,
-        logPrefix = logPrefix,
-    }
+
+    -- Merge into an in-flight plan instead of replacing it. A second Accept while earlier legs are
+    -- still docking/settling must not orphan those legs: wiping pendingDockSwapQueue.items (and the
+    -- direct-swap watch state) would strand ships on dock hold forever. When no plan is active we
+    -- start fresh; otherwise we append de-duplicated pairs and extend the existing plan.
+    local mergeIntoActive = pendingDockExchangePlan ~= nil and pendingDockExchangePlan.active
+        and pendingDockSwapQueue ~= nil and pendingDockSwapQueue.active and pendingDockSwapQueue.items ~= nil
+
+    local appendedPairs = 0
+    if mergeIntoActive then
+        local existingByPair = {}
+        for _, item in ipairs(pendingDockSwapQueue.items) do
+            if item and item.leftCode and item.rightCode then
+                existingByPair[pairKey(item.leftCode, item.rightCode)] = true
+            end
+        end
+        for code in pairs(shipIds) do
+            pendingDockExchangePlan.shipIds[code] = true
+        end
+        for _, item in ipairs(queueItems) do
+            local pk = pairKey(item.leftCode, item.rightCode)
+            if not existingByPair[pk] then
+                existingByPair[pk] = true
+                table.insert(pendingDockSwapQueue.items, item)
+                appendedPairs = appendedPairs + 1
+            end
+        end
+        pendingDockExchangePlan.totalPairs = (pendingDockExchangePlan.totalPairs or 0) + appendedPairs
+        pendingDockSwapQueue.active = #pendingDockSwapQueue.items > 0
+        pendingDockSwapQueue.logPrefix = logPrefix or pendingDockSwapQueue.logPrefix
+    else
+        pendingDockExchangePlan = {
+            active = true,
+            totalPairs = #swaps,
+            completedPairs = 0,
+            shipIds = shipIds,
+        }
+        pendingDockSwapQueue = {
+            active = #queueItems > 0,
+            items = queueItems,
+            logPrefix = logPrefix,
+        }
+        pendingDirectSwapQueue = nil
+        clearDirectSwapWatchState()
+    end
     dockSwapQueueSkipLogged = {}
-    pendingDirectSwapQueue = nil
-    clearDirectSwapWatchState()
     publishDirectQueueBusyShipIds()
     requestPilotExchangeBusyShipRefresh()
 
     local requestCount = 0
     if processDockSwapQueue() then
-        for _, item in ipairs(queueItems) do
+        for _, item in ipairs(pendingDockSwapQueue.items) do
             if item and item.leftCode and item.rightCode then
                 local pk = pairKey(item.leftCode, item.rightCode)
                 if pendingDockAssignmentsByPair[pk] then
@@ -3165,7 +3206,9 @@ local function dispatchDockExchangePlan(groups, logPrefix)
 
     if logPrefix then
         debugLog(logPrefix .. " dock exchange dispatch pairs=" .. tostring(#swaps)
-            .. " queueSize=" .. tostring(#queueItems)
+            .. " merged=" .. tostring(mergeIntoActive)
+            .. " appended=" .. tostring(mergeIntoActive and appendedPairs or #queueItems)
+            .. " queueSize=" .. tostring(#pendingDockSwapQueue.items)
             .. " parallel assignRequested=" .. tostring(requestCount))
     end
     return #swaps, (#swaps > 0 and requestCount == 0) and 1 or 0
@@ -3287,6 +3330,7 @@ local function runPilotExchangePlanForShips(ships, setupLogLabel, dispatchLogPre
         pendingSelectionDispatch = {
             groups = groups,
             logPrefix = dispatchLogPrefix,
+            source = opts.source,
         }
     else
         pendingSelectionDispatch = nil
@@ -3332,6 +3376,7 @@ local function redistributeAllGtShips()
     local ships = collectAllEligibleGTShips()
     runPilotExchangePlanForShips(ships, "HQ fleet setup for pilot exchange", "Fleet pilot exchange dispatch", {
         quietSetupLog = true,
+        source = "phq",
     })
 end
 
@@ -3547,6 +3592,21 @@ GT_PilotExchangePlan.onAccept = dispatchPendingSelectionExchange
 GT_PilotExchangePlan.onCancel = cancelPendingSelectionExchange
 GT_PilotExchangePlan.hasPending = function()
     return pendingSelectionDispatch ~= nil
+end
+-- Plan-accept acknowledgement sound (registered in libraries/sound_library.xml as
+-- gt_pilotexchange_accept). Fired from the overlay's onAccept BEFORE the plan is dispatched, so
+-- pendingSelectionDispatch is still set here. Only play for the Player-HQ fleet-wide planner
+-- (source == "phq"); the selection and commander-fleet planners stay silent.
+GT_PilotExchangePlan.playAcceptSoundIfPending = function()
+    if pendingSelectionDispatch == nil or pendingSelectionDispatch.source ~= "phq" then
+        return false
+    end
+    if type(PlaySound) ~= "function" then
+        debugLog("PlaySound unavailable; cannot play gt_pilotexchange_accept")
+        return false
+    end
+    PlaySound("gt_pilotexchange_accept")
+    return true
 end
 debugLog("Pilot exchange plan handlers registered")
 

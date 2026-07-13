@@ -54,7 +54,17 @@ local GT_ORDER_IDS = {
     GalaxyMiner = true,
 }
 
+local function isRedistributeDebugEnabled()
+    if _G.GT_PlayerBridge and _G.GT_PlayerBridge.IsDebugLoggingEnabled then
+        return _G.GT_PlayerBridge.IsDebugLoggingEnabled()
+    end
+    return false
+end
+
 local function debugLog(msg)
+    if not isRedistributeDebugEnabled() then
+        return
+    end
     DebugError("[GT Redistribute] " .. tostring(msg))
 end
 
@@ -97,6 +107,9 @@ local function notifyText(textId, ...)
 end
 
 local function logPilotExchangeMenu(msg)
+    if not isRedistributeDebugEnabled() then
+        return
+    end
     DebugError("[GT PilotExchange Menu] " .. tostring(msg))
 end
 
@@ -205,8 +218,11 @@ local function buildMapSelectionPublishKey()
 end
 
 local function logMapSelectionState(trigger)
+    if not isRedistributeDebugEnabled() then
+        return
+    end
     if not menu then
-        DebugError("[GT PilotExchange Menu] Lua map selection: MapMenu unavailable trigger=" .. tostring(trigger or ""))
+        logPilotExchangeMenu("Lua map selection: MapMenu unavailable trigger=" .. tostring(trigger or ""))
         return
     end
     local shipCount = 0
@@ -234,7 +250,7 @@ local function logMapSelectionState(trigger)
         table.sort(interactShipIds)
     end
 
-    DebugError("[GT PilotExchange Menu] Lua map selection trigger=" .. tostring(trigger or "")
+    logPilotExchangeMenu("Lua map selection trigger=" .. tostring(trigger or "")
         .. " mapSelectedShipCount=" .. tostring(shipCount)
         .. " mapShips=" .. table.concat(shipIds, ",")
         .. " interactSelectedShipCount=" .. tostring(interactShipCount)
@@ -1337,9 +1353,11 @@ tryAddEligibleGTShip = function(ship, ships, seen, pilotIndex, opts)
                         .. " reason=" .. tostring(unavailableReason or "unavailable"))
                 end
             else
-                debugLog("Eligible ship ignored: " .. tostring(idcode)
-                    .. " reason=missing_GT_level order=" .. tostring(order or "NONE")
-                    .. " commanderOrder=" .. tostring(commanderOrder or "NONE"))
+                if not opts.quietReject then
+                    debugLog("Eligible ship ignored: " .. tostring(idcode)
+                        .. " reason=missing_GT_level order=" .. tostring(order or "NONE")
+                        .. " commanderOrder=" .. tostring(commanderOrder or "NONE"))
+                end
             end
         end
     else
@@ -3224,7 +3242,7 @@ local function collectSelectedShips(fallbackComponent)
     local ships = {}
     local seen = {}
     local pilotIndex = getGTPilotIndexByShipId()
-    local collectOpts = { forPlanDisplay = true }
+    local collectOpts = { forPlanDisplay = true, quietReject = true, quietUnavailable = true }
     appendMapAndInteractSelectedGTShips(ships, seen, pilotIndex, collectOpts)
 
     local fallbackId = "none"
@@ -3272,7 +3290,7 @@ local function collectFleetShipsForPlan(commanderComponent)
     local ships = {}
     local seen = {}
     local pilotIndex = getGTPilotIndexByShipId()
-    local collectOpts = { commanderId = commander, forPlanDisplay = true }
+    local collectOpts = { commanderId = commander, forPlanDisplay = true, quietReject = true, quietUnavailable = true }
 
     tryAddEligibleGTShip(commanderComponent, ships, seen, pilotIndex, collectOpts)
     for _, sub in ipairs(GetSubordinates(commander) or {}) do

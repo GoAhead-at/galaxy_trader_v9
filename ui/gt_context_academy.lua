@@ -2,28 +2,22 @@
 -- Spec: DOCS/Spec/FEATURE_FLEET_ACADEMY.md
 --
 -- Renders a custom MapMenu context frame with one button per academy course.
--- Reads pilot/player/course state from the player NPC blackboard, computes
--- personalized cost (quadratic curve with floor) and duration (linear scale
--- with floor), and signals the chosen course back to MD via SignalObject.
+-- Supports multi-ship selection: each course row shows the count of eligible
+-- ships, summed cost, and max training duration across eligible pilots.
 --
 -- Blackboard keys produced by md.GT_Context_Academy.GT_AcademyAction:
---   $GT_Academy_PilotLevel       (int, 1..15)
---   $GT_Academy_PlayerMoney      (raw credits, *100)
---   $GT_Academy_PilotName        (string)
---   $GT_Academy_ShipName         (string)
---   $GT_Academy_Courses          (list of tables)
---     each (MD side):  { $Index, $TargetLevel, $ListedCost, $ListedDuration, $TextId }
---     each (Lua side): {  Index,  TargetLevel,  ListedCost,  ListedDuration,  TextId }
---     (X4 strips the `$` prefix from MD table keys when exposing to Lua.)
---   $GT_Academy_MinCostPercent   (number, e.g. 0.05)
---   $GT_Academy_MinDuration      (seconds, e.g. 300)
---   $GT_Academy_CostExponent     (number, e.g. 1.5)
+--   $GT_Academy_PlayerMoney         (credits)
+--   $GT_Academy_ShipEntries         (list: IdCode, PilotLevel, PilotName, ShipName)
+--   $GT_Academy_SelectedShipCount    (int)
+--   $GT_Academy_Courses              (list of course tables)
+--   $GT_Academy_MinCostPercent       (number)
+--   $GT_Academy_MinDuration          (seconds)
+--   $GT_Academy_CostExponent         (number)
 --
 -- Blackboard keys consumed by md.GT_Context_Academy.HandleAcademyCourseChosen:
 --   $GT_Academy_ChosenIndex
 --   $GT_Academy_ChosenLevel
---   $GT_Academy_ChosenCost      (raw credits, *100)
---   $GT_Academy_ChosenDuration  (seconds)
+--   $GT_Academy_ChosenEnrollments    (list: IdCode, Cost centi-cr, Duration sec)
 
 local ffi = require("ffi")
 local C = ffi.C
@@ -46,11 +40,13 @@ end
 -- Constants
 -- ---------------------------------------------------------------------------
 
-local MENU_WIDTH                = 460
-local LIST_PAGE_TEXT            = 77000
-local TOP_LEVEL_TITLE_TEXT_ID   = 9910
-local INSUFFICIENT_FUNDS_TEXT_ID = 9921
-local UNAVAILABLE_TEXT_ID       = 9922
+local MENU_WIDTH                   = 500
+local LIST_PAGE_TEXT               = 77000
+local TOP_LEVEL_TITLE_TEXT_ID      = 9910
+local INSUFFICIENT_FUNDS_TEXT_ID   = 9921
+local SHIPS_SELECTED_TEXT_ID       = 9925
+local ELIGIBLE_SHIPS_TEXT_ID       = 9926
+local NO_ELIGIBLE_SHIPS_TEXT_ID    = 9928
 
 local originalCreateContextFrame  = menu.createContextFrame
 local originalRefreshContextFrame = menu.refreshContextFrame
@@ -77,8 +73,6 @@ local function getPlayerSignalId()
     return ConvertStringTo64Bit(tostring(C.GetPlayerID()))
 end
 
--- Blackboard typed accessors with fallbacks. The list reader returns nil if
--- the key is missing or not a table, so callers can short-circuit cleanly.
 local function readBlackboardList(playerId, key)
     local raw = GetNPCBlackboard(playerId, key)
     return (type(raw) == "table") and raw or nil
@@ -89,21 +83,25 @@ local function readBlackboardNumber(playerId, key, fallback)
     return (type(raw) == "number") and raw or fallback
 end
 
-local function readBlackboardString(playerId, key, fallback)
-    local raw = GetNPCBlackboard(playerId, key)
-    return (type(raw) == "string") and raw or fallback
+local function normalizeShipEntry(raw, index)
+    if type(raw) ~= "table" then
+        return nil
+    end
+    local idCode = raw.IdCode or raw["$IdCode"] or raw.idCode
+    if not idCode or idCode == "" then
+        return nil
+    end
+    return {
+        idCode     = tostring(idCode),
+        pilotLevel = tonumber(raw.PilotLevel or raw["$PilotLevel"] or raw.pilotLevel) or 1,
+        pilotName  = raw.PilotName  or raw["$PilotName"]  or raw.pilotName  or "Pilot",
+        shipName   = raw.ShipName   or raw["$ShipName"]   or raw.shipName   or "Ship",
+        index      = index,
+    }
 end
 
 -- ---------------------------------------------------------------------------
 -- Course math
---
--- Cost formula:
---   listedCost is the PRICE for a level-1 pilot (the "headline" price).
---   For a pilot already at $current, scale by ((target - current) / (target - 1))^exponent
---   and floor at minPercent of listedCost.
--- Duration formula:
---   listedDuration scales linearly with the same level-difference ratio,
---   floored at minDuration seconds.
 -- ---------------------------------------------------------------------------
 
 local function calculateCost(listedCost, currentLevel, targetLevel, minPercent, exponent)
@@ -121,10 +119,6 @@ local function calculateCost(listedCost, currentLevel, targetLevel, minPercent, 
     if scale < minScale then
         scale = minScale
     end
-    -- Round to whole credits. (Inputs are already in Cr -- GetNPCBlackboard
-    -- auto-converts money-typed fields from centicredits when reading from
-    -- player.entity. Earlier code snapped to multiples of 100 Cr on the
-    -- centicredit assumption, which silently dropped two digits of precision.)
     return math.floor(listedCost * scale + 0.5)
 end
 
@@ -146,34 +140,61 @@ local function calculateDuration(listedDuration, currentLevel, targetLevel, minD
     return scaled
 end
 
-local function buildCourseLabel(course, currentLevel)
-    local cost = calculateCost(
-        course.listedCost,
-        currentLevel,
-        course.targetLevel,
-        course.minPercent,
-        course.costExponent
-    )
-    local duration = calculateDuration(
-        course.listedDuration,
-        currentLevel,
-        course.targetLevel,
-        course.minDuration
-    )
-    course.scaledCost = cost
-    course.scaledDuration = duration
-
+local function buildAggregatedCourseLabel(course, totalCost, maxDuration)
     local template = GT_UI.safeReadText(LIST_PAGE_TEXT, course.textId, nil)
     if template then
         local filled = template
-        filled = string.gsub(filled, "%%1", GT_UI.formatCreditsExact(cost))
-        filled = string.gsub(filled, "%%2", GT_UI.formatDurationMin(duration))
+        filled = string.gsub(filled, "%%1", GT_UI.formatCreditsExact(totalCost))
+        filled = string.gsub(filled, "%%2", GT_UI.formatDurationMin(maxDuration))
         return filled
     end
     return string.format("Level %d - %s / %s",
         course.targetLevel,
-        GT_UI.formatCreditsExact(cost),
-        GT_UI.formatDurationMin(duration))
+        GT_UI.formatCreditsExact(totalCost),
+        GT_UI.formatDurationMin(maxDuration))
+end
+
+local function aggregateCourseForShips(course, ships)
+    local totalCost = 0
+    local maxDuration = 0
+    local eligibleShips = {}
+
+    for _, shipInfo in ipairs(ships) do
+        if course.targetLevel > shipInfo.pilotLevel then
+            local cost = calculateCost(
+                course.listedCost,
+                shipInfo.pilotLevel,
+                course.targetLevel,
+                course.minPercent,
+                course.costExponent
+            )
+            local duration = calculateDuration(
+                course.listedDuration,
+                shipInfo.pilotLevel,
+                course.targetLevel,
+                course.minDuration
+            )
+            table.insert(eligibleShips, {
+                idCode         = shipInfo.idCode,
+                pilotLevel     = shipInfo.pilotLevel,
+                pilotName      = shipInfo.pilotName,
+                shipName       = shipInfo.shipName,
+                scaledCost     = cost,
+                scaledDuration = duration,
+            })
+            totalCost = totalCost + cost
+            if duration > maxDuration then
+                maxDuration = duration
+            end
+        end
+    end
+
+    return {
+        eligibleCount = #eligibleShips,
+        totalCost     = totalCost,
+        maxDuration   = maxDuration,
+        eligibleShips = eligibleShips,
+    }
 end
 
 -- ---------------------------------------------------------------------------
@@ -188,22 +209,35 @@ local function snapshotContext()
         return nil
     end
 
-    local pilotLevel   = readBlackboardNumber(playerId, "$GT_Academy_PilotLevel",     1)
-    local playerMoney  = readBlackboardNumber(playerId, "$GT_Academy_PlayerMoney",    0)
-    local pilotName    = readBlackboardString(playerId, "$GT_Academy_PilotName",      "Pilot")
-    local shipName     = readBlackboardString(playerId, "$GT_Academy_ShipName",       "Ship")
-    local minPercent   = readBlackboardNumber(playerId, "$GT_Academy_MinCostPercent", 0.05)
-    local minDuration  = readBlackboardNumber(playerId, "$GT_Academy_MinDuration",    300)
-    local costExponent = readBlackboardNumber(playerId, "$GT_Academy_CostExponent",   1.5)
+    local shipEntriesRaw = readBlackboardList(playerId, "$GT_Academy_ShipEntries")
+    if not shipEntriesRaw or #shipEntriesRaw < 1 then
+        debugLog("snapshotContext: no $GT_Academy_ShipEntries on blackboard")
+        return nil
+    end
 
-    -- MD `$Field` is exposed to Lua as `Field` (case preserved, `$` stripped).
-    -- The legacy `["$Field"]` and lowercase `field` lookups are kept as defensive
-    -- fallbacks but should never fire in normal operation.
-    local normalized = {}
+    local playerMoney = readBlackboardNumber(playerId, "$GT_Academy_PlayerMoney", 0)
+    local minPercent  = readBlackboardNumber(playerId, "$GT_Academy_MinCostPercent", 0.05)
+    local minDuration = readBlackboardNumber(playerId, "$GT_Academy_MinDuration", 300)
+    local costExponent = readBlackboardNumber(playerId, "$GT_Academy_CostExponent", 1.5)
+    local selectedShipCount = readBlackboardNumber(playerId, "$GT_Academy_SelectedShipCount", #shipEntriesRaw)
+
+    local ships = {}
+    for i = 1, #shipEntriesRaw do
+        local entry = normalizeShipEntry(shipEntriesRaw[i], i)
+        if entry then
+            table.insert(ships, entry)
+        end
+    end
+    if #ships < 1 then
+        debugLog("snapshotContext: ship entries present but none normalized")
+        return nil
+    end
+
+    local normalizedCourses = {}
     for i = 1, #courses do
         local c = courses[i]
         if type(c) == "table" then
-            table.insert(normalized, {
+            table.insert(normalizedCourses, {
                 index          = c.Index          or c["$Index"]          or c.index          or i,
                 targetLevel    = c.TargetLevel    or c["$TargetLevel"]    or c.targetLevel    or 0,
                 listedCost     = c.ListedCost     or c["$ListedCost"]     or c.listedCost     or 0,
@@ -217,45 +251,43 @@ local function snapshotContext()
     end
 
     return {
-        playerId    = playerId,
-        pilotLevel  = pilotLevel,
-        playerMoney = playerMoney,
-        pilotName   = pilotName,
-        shipName    = shipName,
-        courses     = normalized,
+        playerId          = playerId,
+        playerMoney       = playerMoney,
+        ships             = ships,
+        selectedShipCount = selectedShipCount,
+        courses           = normalizedCourses,
     }
 end
 
 -- ---------------------------------------------------------------------------
--- Course click → write blackboard + signal MD
+-- Course click -> write blackboard + signal MD
 -- ---------------------------------------------------------------------------
 
-local function chooseCourse(component, course, ctx)
-    if not course then return end
+local function chooseCourse(component, course, ctx, aggregate)
+    if not course or not aggregate or aggregate.eligibleCount < 1 then
+        return
+    end
 
     local playerId = ctx.playerId
-    -- Round-trip unit fix: GetNPCBlackboard auto-converts money-typed MD
-    -- fields from centi-credits to credits when handing them to Lua, but
-    -- SetNPCBlackboard does NOT reverse that conversion - whatever number
-    -- Lua writes lands raw on the player.entity blackboard. Every MD code
-    -- path downstream (logbook message templates, reward_player, the
-    -- insufficient-funds notification, debug texts) assumes the stored
-    -- value is in centi-credits and divides by 100 to display credits.
-    -- Pre-multiply by 100 here so the round-trip is consistent: the
-    -- button shows "272,166 Cr", MD's `$lockedCost / 100` displays
-    -- "272,166", and `($lockedCost * 1Cr) / 100` deducts exactly 272,166 Cr.
-    -- Without this pre-multiply the player is charged 1/100th of the
-    -- promised price (verified empirically: HAW-289's level-4 course
-    -- showed 272,166 Cr on the button but only 2,721 Cr in the logbook).
-    local centiCredits = math.floor(course.scaledCost * 100 + 0.5)
-    SetNPCBlackboard(playerId, "$GT_Academy_ChosenIndex",    course.index)
-    SetNPCBlackboard(playerId, "$GT_Academy_ChosenLevel",    course.targetLevel)
-    SetNPCBlackboard(playerId, "$GT_Academy_ChosenCost",     centiCredits)
-    SetNPCBlackboard(playerId, "$GT_Academy_ChosenDuration", course.scaledDuration)
+    local enrollments = {}
+    for _, shipInfo in ipairs(aggregate.eligibleShips) do
+        table.insert(enrollments, {
+            IdCode   = shipInfo.idCode,
+            Cost     = math.floor(shipInfo.scaledCost * 100 + 0.5),
+            Duration = shipInfo.scaledDuration,
+        })
+    end
+
+    SetNPCBlackboard(playerId, "$GT_Academy_ChosenIndex", course.index)
+    SetNPCBlackboard(playerId, "$GT_Academy_ChosenLevel", course.targetLevel)
+    SetNPCBlackboard(playerId, "$GT_Academy_ChosenEnrollments", enrollments)
 
     debugLog(string.format(
-        "Player chose Level %d course (cost=%d Cr -> %d centi-cr raw, duration=%d s) for ship %s",
-        course.targetLevel, course.scaledCost, centiCredits, course.scaledDuration, tostring(component)
+        "Player chose Level %d course for %d ship(s) (total=%d Cr, maxDuration=%d s)",
+        course.targetLevel,
+        aggregate.eligibleCount,
+        aggregate.totalCost,
+        aggregate.maxDuration
     ))
 
     SignalObject(getPlayerSignalId(), "gt_academy_course_chosen", ConvertStringToLuaID(tostring(component)))
@@ -265,9 +297,6 @@ end
 -- Frame rendering
 -- ---------------------------------------------------------------------------
 
--- Substitute %1, %2, ... placeholders in a localized template with the
--- supplied positional values. Mirrors X4's `%N`-style substitution rules:
--- only matches a literal `%<digit>`, leaves everything else alone.
 local function fillPlaceholders(template, ...)
     local args = { ... }
     return (string.gsub(template, "%%(%d)", function(n)
@@ -276,31 +305,32 @@ local function fillPlaceholders(template, ...)
     end))
 end
 
--- Renders one course entry: an enabled action button, or a disabled button
--- followed by an explanatory caption row. Splitting the caption onto its own
--- row avoids the visual overlap that "label\n(reason)" inside a single
--- fixed-height button caused in earlier versions.
 local function renderCourseRow(tbl, course, ctx, component)
-    local label = buildCourseLabel(course, ctx.pilotLevel)
+    local aggregate = aggregateCourseForShips(course, ctx.ships)
+    local label = buildAggregatedCourseLabel(course, aggregate.totalCost, aggregate.maxDuration)
 
-    if course.targetLevel <= ctx.pilotLevel then
+    local shipsCaptionTemplate = GT_UI.safeReadText(
+        LIST_PAGE_TEXT, ELIGIBLE_SHIPS_TEXT_ID, "(%1 ships)")
+    local shipsCaption = fillPlaceholders(shipsCaptionTemplate, aggregate.eligibleCount)
+
+    if aggregate.eligibleCount < 1 then
         local row = tbl:addRow(true, { fixed = true })
         GT_UI.createButton(row[1], label, { active = false })
-        local template = GT_UI.safeReadText(
-            LIST_PAGE_TEXT, UNAVAILABLE_TEXT_ID,
-            "Course unavailable - pilot %1 is already at or above this level")
-        GT_UI.addCaptionRow(tbl, "(" .. fillPlaceholders(template, ctx.pilotName) .. ")")
+        local noShipsTemplate = GT_UI.safeReadText(
+            LIST_PAGE_TEXT, NO_ELIGIBLE_SHIPS_TEXT_ID, "No eligible ships for this course")
+        GT_UI.addCaptionRow(tbl, "(" .. noShipsTemplate .. ")")
         return
     end
 
-    if ctx.playerMoney < course.scaledCost then
+    if ctx.playerMoney < aggregate.totalCost then
         local row = tbl:addRow(true, { fixed = true })
         GT_UI.createButton(row[1], label, { active = false })
+        GT_UI.addCaptionRow(tbl, shipsCaption)
         local template = GT_UI.safeReadText(
             LIST_PAGE_TEXT, INSUFFICIENT_FUNDS_TEXT_ID,
             "Insufficient funds for this course (need %1, have %2)")
         local note = fillPlaceholders(template,
-            GT_UI.formatCreditsExact(course.scaledCost),
+            GT_UI.formatCreditsExact(aggregate.totalCost),
             GT_UI.formatCreditsExact(ctx.playerMoney))
         GT_UI.addCaptionRow(tbl, "(" .. note .. ")")
         return
@@ -309,7 +339,7 @@ local function renderCourseRow(tbl, course, ctx, component)
     local row = tbl:addRow(true, { fixed = true })
     GT_UI.createButton(row[1], label, {
         onClick = function()
-            chooseCourse(component, course, ctx)
+            chooseCourse(component, course, ctx, aggregate)
             menu.noupdate = false
             if menu.refreshInfoFrame then
                 menu.refreshInfoFrame()
@@ -317,6 +347,7 @@ local function renderCourseRow(tbl, course, ctx, component)
             menu.closeContextMenu("back")
         end,
     })
+    GT_UI.addCaptionRow(tbl, shipsCaption)
 end
 
 function menu.createGTAcademyContext(frame)
@@ -335,18 +366,17 @@ function menu.createGTAcademyContext(frame)
         highlightMode = "off",
     })
 
-    -- Title
     local titleRow = tbl:addRow(nil, { fixed = true })
     titleRow[1]:createText(
         GT_UI.safeReadText(LIST_PAGE_TEXT, TOP_LEVEL_TITLE_TEXT_ID, "Trading Academy"),
         Helper.headerRowCenteredProperties)
 
-    -- Subtitle: pilot + ship + current level
+    local subtitleTemplate = GT_UI.safeReadText(
+        LIST_PAGE_TEXT, SHIPS_SELECTED_TEXT_ID, "%1 ships selected")
     GT_UI.addCaptionRow(tbl,
-        string.format("%s  -  %s  (Lvl %d)", ctx.pilotName, ctx.shipName, ctx.pilotLevel),
-        { color = nil })  -- nil → text_inactive default; explicit for clarity
+        fillPlaceholders(subtitleTemplate, ctx.selectedShipCount),
+        { color = nil })
 
-    -- Course rows
     if #ctx.courses == 0 then
         GT_UI.addEmptyRow(tbl, "(no academy courses available)", 1)
     else
@@ -355,13 +385,11 @@ function menu.createGTAcademyContext(frame)
         end
     end
 
-    -- Cancel button
     local cancelRow = tbl:addRow(true, { fixed = true })
-    GT_UI.createButton(cancelRow[1], ReadText(1001, 64), {  -- "Cancel"
+    GT_UI.createButton(cancelRow[1], ReadText(1001, 64), {
         onClick = function() menu.closeContextMenu("back") end,
     })
 
-    -- Adjust frame position if needed (mirrors gt_context_rename pattern)
     local neededheight = tbl.properties.y + tbl:getVisibleHeight()
     if frame.properties.y + neededheight + Helper.frameBorder > Helper.viewHeight then
         menu.contextMenuData.yoffset = Helper.viewHeight - neededheight - Helper.frameBorder

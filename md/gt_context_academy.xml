@@ -6,21 +6,262 @@
 
     Flow:
       1. AddAcademyAction listens to Interact_Menu_API.Get_Actions and adds
-         the top-level "Trading Academy" entry on player-owned GT-service ships
-         whose pilot is below the highest course's target level.
-      2. GT_AcademyAction publishes pilot/player context to the player NPC
+         the top-level "Trading Academy" entry when at least one selected
+         GT-service ship has a pilot below the highest course target level.
+      2. GT_AcademyAction publishes ship/course context to the player NPC
          blackboard and raises gt.openAcademyContext for the Lua submenu.
-      3. The Lua submenu computes personalized cost/duration with the
-         quadratic curve + floors and signals back via
-         gt_academy_course_chosen with locked-in numeric values.
-      4. HandleAcademyCourseChosen overrides any in-flight training, stores
-         $AcademyEnrollment, and queues manual training. The existing
-         HandleTrainingNeeded pipeline finds a station and dispatches the
-         DockAndTrain order; HandleStartTraining (and InitiateTraining for
-         player-piloted ships) consumes $AcademyEnrollment to apply the
-         locked-in cost and duration when the ship reaches the dock.
+      3. The Lua submenu aggregates personalized cost/duration per course
+         across all eligible ships in the selection and signals back via
+         gt_academy_course_chosen with a batch enrollment table.
+      4. HandleAcademyCourseChosen enrolls every eligible ship in the batch.
   -->
   <cues>
+
+    <!-- Highest configured academy course target (13 by default). -->
+    <library name="GT_Academy_GetMaxCourseLevel" purpose="run_actions">
+      <actions>
+        <set_value name="$maxCourseLevel" exact="0"/>
+        <do_if value="global.$GT_Config? and global.$GT_Config.$Academy? and global.$GT_Config.$Academy.$Courses?">
+          <do_all exact="global.$GT_Config.$Academy.$Courses.count" counter="$i">
+            <do_if value="global.$GT_Config.$Academy.$Courses.{$i}.$TargetLevel gt $maxCourseLevel">
+              <set_value name="$maxCourseLevel" exact="global.$GT_Config.$Academy.$Courses.{$i}.$TargetLevel"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <return value="$maxCourseLevel"/>
+      </actions>
+    </library>
+
+    <!-- Resolve a player ship object from its idcode (GT registry first). -->
+    <library name="GT_Academy_ResolveShipByIdCode" purpose="run_actions">
+      <params>
+        <param name="shipIdCode" default="''"/>
+      </params>
+      <actions>
+        <set_value name="$ship" exact="null"/>
+        <do_if value="$shipIdCode? and $shipIdCode != ''">
+          <do_if value="global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
+            <do_all exact="global.$GT_Ships.keys.count" counter="$ri">
+              <set_value name="$candidateShip" exact="global.$GT_Ships.keys.{$ri}"/>
+              <do_if value="$candidateShip? and $candidateShip.exists and $candidateShip.idcode? and $candidateShip.idcode == $shipIdCode">
+                <set_value name="$ship" exact="$candidateShip"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="not ($ship? and $ship.exists)">
+            <find_ship_by_true_owner name="$scanShips" faction="faction.player" space="player.galaxy" class="[class.ship_s, class.ship_m, class.ship_l, class.ship_xl]" multiple="true" checkoperational="true"/>
+            <do_if value="$scanShips? and $scanShips.count gt 0">
+              <do_all exact="$scanShips.count" counter="$si">
+                <set_value name="$candidateShip" exact="$scanShips.{$si}"/>
+                <do_if value="$candidateShip? and $candidateShip.exists and $candidateShip.idcode? and $candidateShip.idcode == $shipIdCode">
+                  <set_value name="$ship" exact="$candidateShip"/>
+                  <break/>
+                </do_if>
+              </do_all>
+            </do_if>
+          </do_if>
+        </do_if>
+        <return value="$ship"/>
+      </actions>
+    </library>
+
+    <!-- Build one ship entry when it passes GT/pilot/level gates (caller handles dedup). -->
+    <library name="GT_Academy_BuildShipEntryIfEligible" purpose="run_actions">
+      <params>
+        <param name="ship" default="null"/>
+        <param name="maxCourseLevel" default="0"/>
+      </params>
+      <actions>
+        <set_value name="$result" exact="table[$Eligible = false, $Entry = null]"/>
+        <do_if value="$ship? and $ship.exists and $ship.isclass.ship and $ship.isplayerowned and $ship.pilot?">
+          <run_actions ref="md.GLX_Lib_Orders.GLX_ShipIsInGTService" result="$isGTService">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          <do_if value="$isGTService">
+            <set_value name="$pilot" exact="$ship.pilot"/>
+            <set_value name="$pilotLevel" exact="1"/>
+            <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{$pilot}? and global.$GT_Pilots.{$pilot}.$Level?">
+              <set_value name="$pilotLevel" exact="global.$GT_Pilots.{$pilot}.$Level"/>
+            </do_if>
+            <do_if value="$pilotLevel lt $maxCourseLevel">
+              <set_value name="$result.$Eligible" exact="true"/>
+              <set_value name="$result.$Entry" exact="table[
+                $IdCode     = $ship.idcode,
+                $PilotLevel = $pilotLevel,
+                $PilotName  = $pilot.name,
+                $ShipName   = $ship.knownname
+              ]"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        <return value="$result"/>
+      </actions>
+    </library>
+
+    <!-- Collect GT academy-eligible ships from interact/map multi-selection. -->
+    <library name="GT_CollectAcademyEligibleShips" purpose="run_actions">
+      <params>
+        <param name="target" default="null"/>
+        <param name="eventParam" default="null"/>
+        <param name="maxCourseLevel" default="0"/>
+      </params>
+      <actions>
+        <set_value name="$entries" exact="[]"/>
+        <set_value name="$seen" exact="table[]"/>
+        <set_value name="$selList" exact="null"/>
+        <do_if value="$eventParam? and $eventParam.$selectedplayerships?">
+          <set_value name="$selList" exact="$eventParam.$selectedplayerships"/>
+        </do_if>
+        <do_if value="$selList?">
+          <set_value name="$listCount" exact="0"/>
+          <do_if value="$selList.count?">
+            <set_value name="$listCount" exact="$selList.count"/>
+          </do_if>
+          <do_if value="$listCount gt 0">
+            <do_all exact="$listCount" counter="$si">
+              <set_value name="$selShip" exact="$selList.{$si}"/>
+              <set_value name="$seenKey" exact="if $selShip? and $selShip.idcode? then '$' + $selShip.idcode else ''"/>
+              <do_if value="$seenKey != '' and not $seen.{$seenKey}?">
+                <run_actions ref="GT_Academy_BuildShipEntryIfEligible" result="$shipEntry">
+                  <param name="ship" value="$selShip"/>
+                  <param name="maxCourseLevel" value="$maxCourseLevel"/>
+                </run_actions>
+                <do_if value="$shipEntry.$Eligible">
+                  <append_to_list name="$entries" exact="$shipEntry.$Entry"/>
+                  <set_value name="$seen.{$seenKey}" exact="true"/>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_else>
+            <do_all exact="16" counter="$si">
+              <do_if value="$selList.{$si}?">
+                <set_value name="$selShip" exact="$selList.{$si}"/>
+                <set_value name="$seenKey" exact="if $selShip? and $selShip.idcode? then '$' + $selShip.idcode else ''"/>
+                <do_if value="$seenKey != '' and not $seen.{$seenKey}?">
+                  <run_actions ref="GT_Academy_BuildShipEntryIfEligible" result="$shipEntry">
+                    <param name="ship" value="$selShip"/>
+                    <param name="maxCourseLevel" value="$maxCourseLevel"/>
+                  </run_actions>
+                  <do_if value="$shipEntry.$Eligible">
+                    <append_to_list name="$entries" exact="$shipEntry.$Entry"/>
+                    <set_value name="$seen.{$seenKey}" exact="true"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_else>
+        </do_if>
+        <!-- Interact menu removes the right-click target from selectedplayerships; include it when eligible. -->
+        <do_if value="$target? and $target.exists and $target.isclass.ship and $target.isplayerowned and $target.pilot?">
+          <set_value name="$targetInList" exact="false"/>
+          <do_if value="$selList? and $selList.count? and $selList.count gt 0">
+            <do_all exact="$selList.count" counter="$si">
+              <do_if value="$selList.{$si} == $target">
+                <set_value name="$targetInList" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_if value="not $targetInList">
+            <set_value name="$seenKey" exact="if $target.idcode? then '$' + $target.idcode else ''"/>
+            <do_if value="$seenKey != '' and not $seen.{$seenKey}?">
+              <run_actions ref="GT_Academy_BuildShipEntryIfEligible" result="$shipEntry">
+                <param name="ship" value="$target"/>
+                <param name="maxCourseLevel" value="$maxCourseLevel"/>
+              </run_actions>
+              <do_if value="$shipEntry.$Eligible">
+                <append_to_list name="$entries" exact="$shipEntry.$Entry"/>
+                <set_value name="$seen.{$seenKey}" exact="true"/>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_if>
+        <return value="table[$Count = $entries.count, $Entries = $entries]"/>
+      </actions>
+    </library>
+
+    <!-- Enroll one ship/pilot in an academy course (shared by batch handler). -->
+    <library name="GT_EnrollShipInAcademy" purpose="run_actions">
+      <params>
+        <param name="ship" default="null"/>
+        <param name="targetLevel" default="0"/>
+        <param name="lockedCost" default="0Cr"/>
+        <param name="lockedDuration" default="0s"/>
+      </params>
+      <actions>
+        <set_value name="$result" exact="table[$Success = false, $Pilot = null]"/>
+        <do_if value="not ($ship? and $ship.exists and $ship.pilot?)">
+          <return value="$result"/>
+        </do_if>
+        <set_value name="$pilot" exact="$ship.pilot"/>
+        <run_actions ref="md.GLX_Lib_Orders.GLX_ShipIsInGTService" result="$isGTService">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        <do_if value="not $isGTService">
+          <return value="$result"/>
+        </do_if>
+        <do_if value="not global.$GT_Pilots? or not global.$GT_Pilots.{$pilot}?">
+          <run_actions ref="md.GT_Ship_Management.Register_Pilot">
+            <param name="pilot" value="$pilot"/>
+            <param name="ship"  value="$ship"/>
+          </run_actions>
+        </do_if>
+        <do_if value="not global.$GT_Pilots.{$pilot}?">
+          <return value="$result"/>
+        </do_if>
+        <set_value name="$pilotLevel" exact="1"/>
+        <do_if value="global.$GT_Pilots.{$pilot}.$Level?">
+          <set_value name="$pilotLevel" exact="global.$GT_Pilots.{$pilot}.$Level"/>
+        </do_if>
+        <do_if value="$targetLevel le $pilotLevel">
+          <return value="$result"/>
+        </do_if>
+        <do_if value="global.$GT_Pilots.{$pilot}.$TrainingState? and global.$GT_Pilots.{$pilot}.$TrainingState == 'training_in_progress'">
+          <signal_objects object="player.galaxy" param="'GT_Abort_Training'" param2="table[
+            $Pilot  = $pilot,
+            $Ship   = $ship,
+            $Reason = 'academy_override'
+          ]"/>
+        </do_if>
+        <set_value name="global.$GT_Pilots.{$pilot}.$AcademyEnrollment" exact="table[
+          $Level     = $targetLevel,
+          $Cost      = $lockedCost,
+          $Duration  = $lockedDuration,
+          $StartedAt = player.age
+        ]"/>
+        <set_value name="global.$GT_Pilots.{$pilot}.$PendingSkillLevel" exact="$targetLevel"/>
+        <run_actions ref="md.GT_Libraries_General.GT_SetTrainingBlocked">
+          <param name="pilot"         value="$pilot"/>
+          <param name="level"         value="$targetLevel"/>
+          <param name="set_xpblocked" value="true"/>
+        </run_actions>
+        <set_value name="global.$GT_Pilots.{$pilot}.$ManualTrainingRequested" exact="true"/>
+        <set_value name="global.$GT_Pilots.{$pilot}.$TrainingState" exact="'manual_training_queued'"/>
+        <remove_value name="global.$GT_Pilots.{$pilot}.$NextTrainingRetryAt"/>
+        <run_actions ref="md.GT_Libraries_General.GT_IsLogbookEnabled" result="$logbookEnabled">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        <do_if value="$logbookEnabled">
+          <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
+            <param name="Message"     value="{77000,9923}.[$pilot.name, $targetLevel, $lockedCost / 100, $lockedDuration / 60s, $ship.knownname]"/>
+            <param name="Category"    value="'upkeep'"/>
+            <param name="Title"       value="'Trading Academy: ' + $pilot.name + ' (' + $ship.knownname + ')'"/>
+            <param name="Object"      value="$ship"/>
+            <param name="Interaction" value="'showonmap'"/>
+            <param name="CheckGlobalSettings" value="false"/>
+          </run_actions>
+        </do_if>
+        <signal_objects object="player.galaxy" param="'GT_Training_Needed'" param2="table[
+          $Ship  = $ship,
+          $Pilot = $pilot
+        ]" delay="500ms"/>
+        <set_value name="$result.$Success" exact="true"/>
+        <set_value name="$result.$Pilot" exact="$pilot"/>
+        <return value="$result"/>
+      </actions>
+    </library>
 
     <!-- ============================================================== -->
     <!-- Add "Trading Academy" entry to the right-click context menu     -->
@@ -33,29 +274,15 @@
         <set_value name="$target" exact="event.param.$object"/>
         <set_value name="$useVanillaXPOnly" exact="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$XP? and global.$GT_GlobalSettings.$XP.$UseVanillaXPOnly? and global.$GT_GlobalSettings.$XP.$UseVanillaXPOnly"/>
 
-        <!-- Early exit for non-player ships / vanilla XP mode (matches AddRenameAction pattern) -->
         <do_if value="$target.isclass.{class.ship} and $target.isplayerowned and not $useVanillaXPOnly and global.$GT_Config? and global.$GT_Config.$Academy? and global.$GT_Config.$Academy.$Enabled">
-          <run_actions ref="md.GLX_Lib_Orders.GLX_ShipIsInGTService" result="$isGTService">
-            <param name="ship" value="$target"/>
-          </run_actions>
-          <do_if value="$isGTService and $target.pilot?">
-            <set_value name="$pilot" exact="$target.pilot"/>
-            <set_value name="$pilotLevel" exact="1"/>
-            <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{$pilot}? and global.$GT_Pilots.{$pilot}.$Level?">
-              <set_value name="$pilotLevel" exact="global.$GT_Pilots.{$pilot}.$Level"/>
-            </do_if>
-
-            <!-- Find the highest target level across all configured courses.
-                 Hide the entire menu entry if the pilot already meets/exceeds it
-                 (no point showing a menu where every course is filtered out). -->
-            <set_value name="$maxCourseLevel" exact="0"/>
-            <do_all exact="global.$GT_Config.$Academy.$Courses.count" counter="$i">
-              <do_if value="global.$GT_Config.$Academy.$Courses.{$i}.$TargetLevel gt $maxCourseLevel">
-                <set_value name="$maxCourseLevel" exact="global.$GT_Config.$Academy.$Courses.{$i}.$TargetLevel"/>
-              </do_if>
-            </do_all>
-
-            <do_if value="$pilotLevel lt $maxCourseLevel">
+          <run_actions ref="GT_Academy_GetMaxCourseLevel" result="$maxCourseLevel"/>
+          <do_if value="$maxCourseLevel gt 0">
+            <run_actions ref="GT_CollectAcademyEligibleShips" result="$academySelection">
+              <param name="target" value="$target"/>
+              <param name="eventParam" value="event.param"/>
+              <param name="maxCourseLevel" value="$maxCourseLevel"/>
+            </run_actions>
+            <do_if value="$academySelection.$Count ge 1">
               <signal_cue_instantly
                 cue="md.Interact_Menu_API.Add_Action"
                 param="table[
@@ -65,7 +292,7 @@
                   $callback = GT_AcademyAction
                 ]"/>
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT Academy] Added context entry for ship ' + $target.idcode + ' (pilot lvl ' + $pilotLevel + ', max course lvl ' + $maxCourseLevel + ')'" chance="100"/>
+                <debug_text text="'[GT Academy] Added context entry for ' + $academySelection.$Count + ' eligible ship(s); trigger=' + $target.idcode" chance="100"/>
               </do_if>
             </do_if>
           </do_if>
@@ -82,47 +309,50 @@
       </conditions>
       <actions>
         <set_value name="$component" exact="event.param.$object"/>
-        <!-- MD requires <return/> at top level of <actions>; use do_if/do_else to early-out. -->
-        <do_if value="not $component? or not $component.pilot?">
+        <do_if value="not $component? or not $component.exists">
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT Academy] GT_AcademyAction aborted: missing component or pilot'" chance="100"/>
+            <debug_text text="'[GT Academy] GT_AcademyAction aborted: missing component'" chance="100"/>
           </do_if>
         </do_if>
         <do_else>
-          <set_value name="$pilot" exact="$component.pilot"/>
-          <set_value name="$pilotLevel" exact="1"/>
-          <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{$pilot}? and global.$GT_Pilots.{$pilot}.$Level?">
-            <set_value name="$pilotLevel" exact="global.$GT_Pilots.{$pilot}.$Level"/>
+          <run_actions ref="GT_Academy_GetMaxCourseLevel" result="$maxCourseLevel"/>
+          <run_actions ref="GT_CollectAcademyEligibleShips" result="$academySelection">
+            <param name="target" value="$component"/>
+            <param name="eventParam" value="event.param"/>
+            <param name="maxCourseLevel" value="$maxCourseLevel"/>
+          </run_actions>
+          <do_if value="$academySelection.$Count lt 1">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT Academy] GT_AcademyAction aborted: no eligible ships in selection'" chance="100"/>
+            </do_if>
           </do_if>
+          <do_else>
+            <set_value name="player.entity.$GT_Academy_PlayerMoney" exact="player.money"/>
+            <set_value name="player.entity.$GT_Academy_ShipEntries" exact="$academySelection.$Entries"/>
+            <set_value name="player.entity.$GT_Academy_SelectedShipCount" exact="$academySelection.$Count"/>
 
-          <!-- Stash everything Lua needs on the player NPC blackboard -->
-          <set_value name="player.entity.$GT_Academy_PilotLevel"  exact="$pilotLevel"/>
-          <set_value name="player.entity.$GT_Academy_PlayerMoney" exact="player.money"/>
-          <set_value name="player.entity.$GT_Academy_PilotName"   exact="$pilot.name"/>
-          <set_value name="player.entity.$GT_Academy_ShipName"    exact="$component.knownname"/>
+            <create_list name="$courseList"/>
+            <do_all exact="global.$GT_Config.$Academy.$Courses.count" counter="$i">
+              <set_value name="$course" exact="global.$GT_Config.$Academy.$Courses.{$i}"/>
+              <append_to_list name="$courseList" exact="table[
+                $Index          = $i,
+                $TargetLevel    = $course.$TargetLevel,
+                $ListedCost     = $course.$ListedCost,
+                $ListedDuration = $course.$ListedDuration,
+                $TextId         = $course.$TextId
+              ]"/>
+            </do_all>
+            <set_value name="player.entity.$GT_Academy_Courses" exact="$courseList"/>
+            <set_value name="player.entity.$GT_Academy_MinCostPercent" exact="global.$GT_Config.$Academy.$MinCostPercent"/>
+            <set_value name="player.entity.$GT_Academy_MinDuration"    exact="global.$GT_Config.$Academy.$MinDuration"/>
+            <set_value name="player.entity.$GT_Academy_CostExponent"   exact="global.$GT_Config.$Academy.$CostExponent"/>
 
-          <!-- Build a serializable course list (Lua-friendly: no nested tables of objects) -->
-          <create_list name="$courseList"/>
-          <do_all exact="global.$GT_Config.$Academy.$Courses.count" counter="$i">
-            <set_value name="$course" exact="global.$GT_Config.$Academy.$Courses.{$i}"/>
-            <append_to_list name="$courseList" exact="table[
-              $Index          = $i,
-              $TargetLevel    = $course.$TargetLevel,
-              $ListedCost     = $course.$ListedCost,
-              $ListedDuration = $course.$ListedDuration,
-              $TextId         = $course.$TextId
-            ]"/>
-          </do_all>
-          <set_value name="player.entity.$GT_Academy_Courses" exact="$courseList"/>
-          <set_value name="player.entity.$GT_Academy_MinCostPercent" exact="global.$GT_Config.$Academy.$MinCostPercent"/>
-          <set_value name="player.entity.$GT_Academy_MinDuration"    exact="global.$GT_Config.$Academy.$MinDuration"/>
-          <set_value name="player.entity.$GT_Academy_CostExponent"   exact="global.$GT_Config.$Academy.$CostExponent"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT Academy] Opening academy submenu for ' + $academySelection.$Count + ' ship(s), courses=' + $courseList.count" chance="100"/>
+            </do_if>
 
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT Academy] Opening academy submenu for pilot ' + $pilot.name + ' (lvl ' + $pilotLevel + ', courses=' + $courseList.count + ')'" chance="100"/>
-          </do_if>
-
-          <raise_lua_event name="'gt.openAcademyContext'" param="$component"/>
+            <raise_lua_event name="'gt.openAcademyContext'" param="$component"/>
+          </do_else>
         </do_else>
       </actions>
     </cue>
@@ -130,157 +360,91 @@
     <!-- ============================================================== -->
     <!-- Lua signals back the chosen course - process the enrollment.    -->
     <!-- ============================================================== -->
-    <!-- The Lua side writes the selection to the player NPC blackboard:   -->
-    <!--   $GT_Academy_ChosenIndex     = course index in $GT_Config.$Academy.$Courses -->
-    <!--   $GT_Academy_ChosenLevel     = target level                       -->
-    <!--   $GT_Academy_ChosenCost      = locked-in cost (Cr in raw units)   -->
-    <!--   $GT_Academy_ChosenDuration  = locked-in duration in seconds      -->
-    <!-- and signals 'gt_academy_course_chosen' with the ship as event.param2. -->
     <cue name="HandleAcademyCourseChosen" instantiate="true">
       <conditions>
         <event_object_signalled object="player.entity" param="'gt_academy_course_chosen'"/>
       </conditions>
       <actions>
-        <!-- MD requires <return/> at top level of <actions>; we use a $abort flag
-             (set inside guards) and gate every subsequent step on "not $abort"
-             so failed validations short-circuit cleanly without nested <return/>s. -->
-        <set_value name="$ship" exact="event.param2"/>
         <set_value name="$abort" exact="false"/>
+        <set_value name="$targetLevel" exact="player.entity.$GT_Academy_ChosenLevel"/>
+        <set_value name="$enrollments" exact="player.entity.$GT_Academy_ChosenEnrollments"/>
 
-        <do_if value="not $ship? or not $ship.pilot?">
+        <do_if value="not $targetLevel? or $targetLevel le 0">
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT Academy] HandleAcademyCourseChosen aborted: missing ship or pilot'" chance="100"/>
+            <debug_text text="'[GT Academy] HandleAcademyCourseChosen aborted: missing target level'" chance="100"/>
           </do_if>
           <set_value name="$abort" exact="true"/>
         </do_if>
 
         <do_if value="not $abort">
-          <set_value name="$pilot"          exact="$ship.pilot"/>
-          <set_value name="$targetLevel"    exact="player.entity.$GT_Academy_ChosenLevel"/>
-          <set_value name="$lockedCost"     exact="player.entity.$GT_Academy_ChosenCost"/>
-          <set_value name="$lockedDuration" exact="player.entity.$GT_Academy_ChosenDuration"/>
-
-          <!-- Defensive validation: verify the ship is still a GT service candidate -->
-          <run_actions ref="md.GLX_Lib_Orders.GLX_ShipIsInGTService" result="$isGTService">
-            <param name="ship" value="$ship"/>
-          </run_actions>
-          <do_if value="not $isGTService">
+          <do_if value="not $enrollments? or not $enrollments.count? or $enrollments.count lt 1">
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT Academy] Enrollment rejected: ship ' + $ship.idcode + ' is no longer in GT service'" chance="100"/>
+              <debug_text text="'[GT Academy] HandleAcademyCourseChosen aborted: empty enrollment batch'" chance="100"/>
             </do_if>
             <set_value name="$abort" exact="true"/>
           </do_if>
         </do_if>
 
         <do_if value="not $abort">
-          <!-- Make sure the pilot has a registry entry; create one if missing -->
-          <do_if value="not global.$GT_Pilots? or not global.$GT_Pilots.{$pilot}?">
-            <run_actions ref="md.GT_Ship_Management.Register_Pilot">
-              <param name="pilot" value="$pilot"/>
-              <param name="ship"  value="$ship"/>
+          <set_value name="$totalCost" exact="0Cr"/>
+          <do_all exact="$enrollments.count" counter="$ei">
+            <set_value name="$batchEntry" exact="$enrollments.{$ei}"/>
+            <do_if value="$batchEntry.$Cost?">
+              <set_value name="$totalCost" exact="$totalCost + $batchEntry.$Cost"/>
+            </do_if>
+          </do_all>
+          <do_if value="player.money lt $totalCost">
+            <show_notification text="{77000,9921}.[$totalCost / 100, player.money / 100]" timeout="6s" priority="7"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT Academy] Enrollment rejected: insufficient funds (need ' + ($totalCost / 100) + ' Cr, have ' + (player.money / 100) + ' Cr)'" chance="100"/>
+            </do_if>
+            <set_value name="$abort" exact="true"/>
+          </do_if>
+        </do_if>
+
+        <do_if value="not $abort">
+          <set_value name="$enrolledCount" exact="0"/>
+          <set_value name="$firstPilotName" exact="''"/>
+          <do_all exact="$enrollments.count" counter="$ei">
+            <set_value name="$batchEntry" exact="$enrollments.{$ei}"/>
+            <set_value name="$shipIdCode" exact="if $batchEntry.$IdCode? then $batchEntry.$IdCode else ''"/>
+            <set_value name="$lockedCost" exact="if $batchEntry.$Cost? then $batchEntry.$Cost else 0Cr"/>
+            <set_value name="$lockedDuration" exact="if $batchEntry.$Duration? then $batchEntry.$Duration else 300"/>
+            <run_actions ref="GT_Academy_ResolveShipByIdCode" result="$ship">
+              <param name="shipIdCode" value="$shipIdCode"/>
             </run_actions>
-          </do_if>
-          <do_if value="not global.$GT_Pilots.{$pilot}?">
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT Academy] Enrollment aborted: pilot registry missing for ' + $pilot.name + ' even after register call'" chance="100"/>
+            <do_if value="$ship? and $ship.exists">
+              <run_actions ref="GT_EnrollShipInAcademy" result="$enrollResult">
+                <param name="ship" value="$ship"/>
+                <param name="targetLevel" value="$targetLevel"/>
+                <param name="lockedCost" value="$lockedCost"/>
+                <param name="lockedDuration" value="$lockedDuration"/>
+              </run_actions>
+              <do_if value="$enrollResult.$Success">
+                <set_value name="$enrolledCount" operation="add"/>
+                <do_if value="$firstPilotName == '' and $enrollResult.$Pilot?">
+                  <set_value name="$firstPilotName" exact="$enrollResult.$Pilot.name"/>
+                </do_if>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT Academy] Enrolled pilot ' + $enrollResult.$Pilot.name + ' (ship ' + $ship.idcode + ') in lvl ' + $targetLevel + ' course (cost: ' + ($lockedCost / 100) + ' Cr, duration: ' + ($lockedDuration / 60s) + ' min)'" chance="100"/>
+                </do_if>
+              </do_if>
             </do_if>
-            <set_value name="$abort" exact="true"/>
-          </do_if>
-        </do_if>
+          </do_all>
 
-        <do_if value="not $abort">
-          <!-- Validate target-level vs current level (defense in depth; Lua already filters) -->
-          <set_value name="$pilotLevel" exact="1"/>
-          <do_if value="global.$GT_Pilots.{$pilot}.$Level?">
-            <set_value name="$pilotLevel" exact="global.$GT_Pilots.{$pilot}.$Level"/>
-          </do_if>
-          <do_if value="$targetLevel le $pilotLevel">
-            <show_notification text="{77000,9922}.[$pilot.name]" timeout="6s" priority="6"/>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT Academy] Enrollment rejected: target lvl ' + $targetLevel + ' le pilot lvl ' + $pilotLevel" chance="100"/>
+          <do_if value="$enrolledCount ge 1">
+            <do_if value="$enrolledCount == 1 and $firstPilotName != ''">
+              <show_notification text="{77000,9920}.[$firstPilotName, $targetLevel]" timeout="8s" priority="7"/>
             </do_if>
-            <set_value name="$abort" exact="true"/>
+            <do_else>
+              <show_notification text="{77000,9927}.[$enrolledCount, $targetLevel]" timeout="8s" priority="7"/>
+            </do_else>
           </do_if>
-        </do_if>
-
-        <do_if value="not $abort">
-          <!-- Validate funds (player may have spent credits between menu open and click) -->
-          <do_if value="player.money lt $lockedCost">
-            <show_notification text="{77000,9921}.[$lockedCost / 100, player.money / 100]" timeout="6s" priority="7"/>
+          <do_else>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT Academy] Enrollment rejected: insufficient funds (need ' + ($lockedCost / 100) + ' Cr, have ' + (player.money / 100) + ' Cr)'" chance="100"/>
+              <debug_text text="'[GT Academy] Enrollment batch completed with zero successful enrollments'" chance="100"/>
             </do_if>
-            <set_value name="$abort" exact="true"/>
-          </do_if>
-        </do_if>
-
-        <do_if value="not $abort">
-          <!-- Override any in-flight training (override-policy choice) -->
-          <do_if value="global.$GT_Pilots.{$pilot}.$TrainingState? and global.$GT_Pilots.{$pilot}.$TrainingState == 'training_in_progress'">
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT Academy] Overriding in-flight training for pilot ' + $pilot.name" chance="100"/>
-            </do_if>
-            <signal_objects object="player.galaxy" param="'GT_Abort_Training'" param2="table[
-              $Pilot  = $pilot,
-              $Ship   = $ship,
-              $Reason = 'academy_override'
-            ]"/>
-          </do_if>
-
-          <!-- Stamp academy markers so HandleStartTraining (canonical path
-               via the AI script's GT_Start_Training signal) and the legacy
-               InitiateTraining cue (player-avatar dock) both consume the
-               locked-in cost/duration instead of the natural ladder. -->
-          <set_value name="global.$GT_Pilots.{$pilot}.$AcademyEnrollment" exact="table[
-            $Level    = $targetLevel,
-            $Cost     = $lockedCost,
-            $Duration = $lockedDuration,
-            $StartedAt = player.age
-          ]"/>
-
-          <!-- The completion handler reads $PendingSkillLevel to actually apply
-               the new skill rank (see HandleCompleteTraining / ProcessTrainingEvents). -->
-          <set_value name="global.$GT_Pilots.{$pilot}.$PendingSkillLevel" exact="$targetLevel"/>
-
-          <!-- Mark the pilot as needing training at the academy target level
-               (this is what the existing pipeline reads to know what to do). -->
-          <run_actions ref="md.GT_Libraries_General.GT_SetTrainingBlocked">
-            <param name="pilot"         value="$pilot"/>
-            <param name="level"         value="$targetLevel"/>
-            <param name="set_xpblocked" value="true"/>
-          </run_actions>
-
-          <set_value name="global.$GT_Pilots.{$pilot}.$ManualTrainingRequested" exact="true"/>
-          <set_value name="global.$GT_Pilots.{$pilot}.$TrainingState" exact="'manual_training_queued'"/>
-          <remove_value name="global.$GT_Pilots.{$pilot}.$NextTrainingRetryAt"/>
-
-          <!-- User-facing notification + logbook -->
-          <show_notification text="{77000,9920}.[$pilot.name, $targetLevel]" timeout="8s" priority="7"/>
-
-          <run_actions ref="md.GT_Libraries_General.GT_IsLogbookEnabled" result="$logbookEnabled">
-            <param name="ship" value="$ship"/>
-          </run_actions>
-          <do_if value="$logbookEnabled">
-            <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
-              <param name="Message"     value="{77000,9923}.[$pilot.name, $targetLevel, $lockedCost / 100, $lockedDuration / 60s, $ship.knownname]"/>
-              <param name="Category"    value="'upkeep'"/>
-              <param name="Title"       value="'Trading Academy: ' + $pilot.name + ' (' + $ship.knownname + ')'"/>
-              <param name="Object"      value="$ship"/>
-              <param name="Interaction" value="'showonmap'"/>
-              <param name="CheckGlobalSettings" value="false"/>
-            </run_actions>
-          </do_if>
-
-          <!-- Kick the existing training-needed pipeline immediately rather than
-               waiting for the next monitoring loop iteration. -->
-          <signal_objects object="player.galaxy" param="'GT_Training_Needed'" param2="table[
-            $Ship  = $ship,
-            $Pilot = $pilot
-          ]" delay="500ms"/>
-
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT Academy] Enrolled pilot ' + $pilot.name + ' (ship ' + $ship.idcode + ') in lvl ' + $targetLevel + ' course (cost: ' + ($lockedCost / 100) + ' Cr, duration: ' + ($lockedDuration / 60s) + ' min)'" chance="100"/>
-          </do_if>
+          </do_else>
         </do_if>
       </actions>
     </cue>

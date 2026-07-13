@@ -7,8 +7,18 @@ local GT_ModRemoval = {}
 
 -- Debug logging wrapper
 -- Note: X4 Lua only has DebugError and DebugWarning, not DebugLog
+local function isDebugLoggingEnabled()
+    if _G.GT_PlayerBridge and _G.GT_PlayerBridge.IsDebugLoggingEnabled then
+        return _G.GT_PlayerBridge.IsDebugLoggingEnabled()
+    end
+    return false
+end
+
 local function logDebug(message, level)
     level = level or "INFO"
+    if level ~= "ERROR" and not isDebugLoggingEnabled() then
+        return
+    end
     local prefix = "[GT-Mods-Lua] "
     if level == "ERROR" then
         DebugError(prefix .. message)
@@ -17,7 +27,7 @@ local function logDebug(message, level)
         DebugError(prefix .. message)
     else
         -- X4 Lua has no reliable normal debug logger for extension scripts.
-        -- Route INFO through DebugError as well so module load and event flow stay visible.
+        -- Route INFO through DebugError when debug logging is enabled.
         DebugError(prefix .. message)
     end
 end

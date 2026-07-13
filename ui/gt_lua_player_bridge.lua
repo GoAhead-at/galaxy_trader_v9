@@ -13,6 +13,11 @@ ffi.cdef[[
 
 local GT_PlayerBridge = {}
 
+local function IsPlayerBlackboardReady()
+    local playerId = tonumber(ConvertStringTo64Bit(tostring(C.GetPlayerID()))) or 0
+    return playerId ~= 0
+end
+
 function GT_PlayerBridge.GetPlayerBlackboardId()
     return ConvertStringToLuaID(tostring(C.GetPlayerID()))
 end
@@ -43,6 +48,15 @@ function GT_PlayerBridge.StoreModProbeByIdCode(shipIdCode, shipWare, engineWare,
         EngineNonGT = engineNonGT and 1 or 0,
     }
     SetNPCBlackboard(playerBbId, "$GT_ModProbeByShip", cache)
+end
+
+function GT_PlayerBridge.IsDebugLoggingEnabled()
+    if not IsPlayerBlackboardReady() then
+        return false
+    end
+    local playerBbId = GT_PlayerBridge.GetPlayerBlackboardId()
+    local raw = GetNPCBlackboard(playerBbId, "$GT_EnableDebugLogging")
+    return raw == true or raw == 1
 end
 
 function GT_PlayerBridge.ClearModProbeByIdCode(shipIdCode)

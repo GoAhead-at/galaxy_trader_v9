@@ -513,7 +513,6 @@ local function parseThreatData(threat_data_string)
     -- Simple format: "sector_macro1:level1:timestamp1|sector_macro2:level2:timestamp2|..."
     local threatened_macros = {}
     local entry_count = 0
-    local below_threshold = 0
     local invalid_entries = 0
     
     for sector_entry in string.gmatch(threat_data_string or "", "([^|]+)") do
@@ -528,15 +527,14 @@ local function parseThreatData(threat_data_string)
             local threat_level = tonumber(parts[2]) or 0
             local timestamp = tonumber(parts[3]) or 0
             
-            -- Only blacklist if threat level is above threshold and macro is valid
-            if threat_level >= GT_Blacklist.CONFIG.THREAT_LEVEL_THRESHOLD and sector_macro and sector_macro ~= "" and sector_macro ~= "nil" then
+            -- MD only includes sectors that already passed ShouldBlacklist; do not re-filter by
+            -- THREAT_LEVEL_THRESHOLD here (stale Lua init threshold caused voice+logbook with no route block).
+            if sector_macro and sector_macro ~= "" and sector_macro ~= "nil" then
                 table.insert(threatened_macros, sector_macro)
                 GT_Blacklist.blacklisted_sectors[sector_macro] = {
                     threat_level = threat_level,
                     timestamp = timestamp
                 }
-            elseif threat_level < GT_Blacklist.CONFIG.THREAT_LEVEL_THRESHOLD then
-                below_threshold = below_threshold + 1
             else
                 invalid_entries = invalid_entries + 1
             end
@@ -546,9 +544,8 @@ local function parseThreatData(threat_data_string)
     end
     
     logTrace(string.format(
-        "parseThreatData: entries=%d blacklisted=%d below_threshold=%d invalid=%d threshold=%d sample=[%s]",
-        entry_count, #threatened_macros, below_threshold, invalid_entries,
-        GT_Blacklist.CONFIG.THREAT_LEVEL_THRESHOLD,
+        "parseThreatData: entries=%d blacklisted=%d invalid=%d sample=[%s]",
+        entry_count, #threatened_macros, invalid_entries,
         summarizeMacroList(threatened_macros)
     ))
     debugLog(string.format("Found %d sector macros above threat threshold", #threatened_macros))

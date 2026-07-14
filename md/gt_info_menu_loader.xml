@@ -4,6 +4,27 @@
   <cues>
     <!-- PilotIdMap wire key: MD cannot stringify full uint64 NPC seeds &gt;2^53 without FP rounding.
          Split into 32-bit halves (exact small integers), Lua reconstructs decimal for MapMenu match. -->
+    <!-- Encode any large integer (NPC seed or npctemplate id) for Lua PilotIdMap without FP rounding. -->
+    <library name="LargeInt_U64Wire_ForPilotIdMap" purpose="run_actions">
+      <params>
+        <param name="value" default="null"/>
+      </params>
+      <actions>
+        <set_value name="$result" exact="''"/>
+        <do_if value="$value? and $value != null">
+          <set_value name="$lo32" exact="$value % 4294967296L"/>
+          <do_if value="$lo32 lt 0">
+            <set_value name="$lo32" exact="$lo32 + 4294967296L"/>
+          </do_if>
+          <set_value name="$hi32" exact="(($value - $lo32) / 4294967296L)i"/>
+          <do_if value="$hi32 ge 0 and $hi32 lt 4294967296 and $lo32 ge 0 and $lo32 lt 4294967296">
+            <set_value name="$result" exact="'u64p:' + $hi32 + ':' + $lo32"/>
+          </do_if>
+        </do_if>
+        <return value="$result"/>
+      </actions>
+    </library>
+
     <library name="Pilot_Seed_U64Wire_ForPilotIdMap" purpose="run_actions">
       <params>
         <param name="pilot" comment="NPC pilot entity"/>
@@ -11,16 +32,187 @@
       <actions>
         <set_value name="$result" exact="''"/>
         <do_if value="$pilot? and $pilot.exists and $pilot.seed?">
-          <!-- Normalise low 32-bit part to unsigned range first.
-               For signed seeds, MD modulo can be negative; without this, hi is off by +1 and decoded u64 shifts by +2^32. -->
-          <set_value name="$lo32" exact="$pilot.seed % 4294967296L"/>
-          <do_if value="$lo32 lt 0">
-            <set_value name="$lo32" exact="$lo32 + 4294967296L"/>
-          </do_if>
-          <set_value name="$hi32" exact="(($pilot.seed - $lo32) / 4294967296L)i"/>
-          <set_value name="$result" exact="'u64p:' + $hi32 + ':' + $lo32"/>
+          <run_actions ref="LargeInt_U64Wire_ForPilotIdMap" result="$result">
+            <param name="value" value="$pilot.seed"/>
+          </run_actions>
         </do_if>
         <return value="$result"/>
+      </actions>
+    </library>
+
+    <!-- Append npctemplate / crew-template keys to a PilotIdMap wire buffer (u64-safe). -->
+    <library name="Append_PilotIdMap_Template_Keys" purpose="run_actions">
+      <params>
+        <param name="mapData"/>
+        <param name="mapCount"/>
+        <param name="taggedName"/>
+        <param name="templateId" default="null"/>
+        <param name="templateWire" default="''"/>
+      </params>
+      <actions>
+        <do_if value="$taggedName != ''">
+          <do_if value="$templateWire? and $templateWire != ''">
+            <do_if value="$mapCount gt 0">
+              <set_value name="$mapData" exact="$mapData + '||'"/>
+            </do_if>
+            <set_value name="$mapData" exact="$mapData + $templateWire + '|' + $taggedName"/>
+            <set_value name="$mapCount" operation="add"/>
+          </do_if>
+          <do_elseif value="$templateId? and $templateId != null">
+            <run_actions ref="LargeInt_U64Wire_ForPilotIdMap" result="$templateWireFromId">
+              <param name="value" value="$templateId"/>
+            </run_actions>
+            <do_if value="$templateWireFromId != ''">
+              <do_if value="$mapCount gt 0">
+                <set_value name="$mapData" exact="$mapData + '||'"/>
+              </do_if>
+              <set_value name="$mapData" exact="$mapData + $templateWireFromId + '|' + $taggedName"/>
+              <set_value name="$mapCount" operation="add"/>
+            </do_if>
+          </do_elseif>
+        </do_if>
+        <return value="table[$MapData = $mapData, $MapCount = $mapCount]"/>
+      </actions>
+    </library>
+
+    <library name="Npctemplate_U64Wire_ForPilotIdMap" purpose="run_actions">
+      <params>
+        <param name="template" default="null"/>
+        <param name="wireHi" default="null"/>
+        <param name="wireLo" default="null"/>
+      </params>
+      <actions>
+        <set_value name="$result" exact="''"/>
+        <do_if value="$wireHi? and $wireLo? and $wireHi != null and $wireLo != null and $wireHi ge 0 and $wireHi lt 4294967296 and $wireLo ge 0 and $wireLo lt 4294967296">
+          <set_value name="$result" exact="'u64p:' + $wireHi + ':' + $wireLo"/>
+        </do_if>
+        <do_if value="$result == '' and $template? and $template != null and typeof $template != datatype.npctemplate">
+          <run_actions ref="LargeInt_U64Wire_ForPilotIdMap" result="$result">
+            <param name="value" value="$template"/>
+          </run_actions>
+        </do_if>
+        <return value="$result"/>
+      </actions>
+    </library>
+
+    <!-- Push PilotIdMap keys from a registry row (no live pilot entity required). -->
+    <library name="Raise_PilotIdMap_For_Registry_Row" purpose="run_actions">
+      <params>
+        <param name="registryKey"/>
+        <param name="crewTemplateWire" default="''"/>
+        <param name="extraTemplateId" default="null"/>
+      </params>
+      <actions>
+        <do_if value="$registryKey and global.$GT_Pilots? and global.$GT_Pilots.{$registryKey}?">
+          <set_value name="$pilotRow" exact="global.$GT_Pilots.{$registryKey}"/>
+          <run_actions ref="md.GT_Ship_Management.Build_PilotIdMap_Tagged_Name" result="$taggedName">
+            <param name="registryRow" value="$pilotRow"/>
+          </run_actions>
+          <do_if value="$taggedName != ''">
+            <set_value name="$mapData" exact="''"/>
+            <set_value name="$mapCount" exact="0"/>
+            <do_if value="$pilotRow.$StableIdentity? and $pilotRow.$StableIdentity != ''">
+              <set_value name="$mapData" exact="$pilotRow.$StableIdentity + '|' + $taggedName"/>
+              <set_value name="$mapCount" exact="1"/>
+            </do_if>
+            <set_value name="$tplWire" exact="if $crewTemplateWire? and $crewTemplateWire != '' then $crewTemplateWire else (if $pilotRow.$LastSarCrewTemplateWire? and $pilotRow.$LastSarCrewTemplateWire != '' then $pilotRow.$LastSarCrewTemplateWire else '')"/>
+            <do_if value="$tplWire == '' and $extraTemplateId? and $extraTemplateId != null">
+              <run_actions ref="Npctemplate_U64Wire_ForPilotIdMap" result="$tplWire">
+                <param name="template" value="$extraTemplateId"/>
+              </run_actions>
+            </do_if>
+            <do_if value="$tplWire == '' and $pilotRow.$LastSarCrewTemplateWireHi? and $pilotRow.$LastSarCrewTemplateWireHi != null and $pilotRow.$LastSarCrewTemplateWireLo? and $pilotRow.$LastSarCrewTemplateWireLo != null">
+              <run_actions ref="Npctemplate_U64Wire_ForPilotIdMap" result="$tplWire">
+                <param name="wireHi" value="$pilotRow.$LastSarCrewTemplateWireHi"/>
+                <param name="wireLo" value="$pilotRow.$LastSarCrewTemplateWireLo"/>
+              </run_actions>
+            </do_if>
+            <do_if value="$tplWire == '' and $pilotRow.$LastSarCrewTemplate? and $pilotRow.$LastSarCrewTemplate != null">
+              <run_actions ref="Npctemplate_U64Wire_ForPilotIdMap" result="$tplWire">
+                <param name="template" value="$pilotRow.$LastSarCrewTemplate"/>
+              </run_actions>
+            </do_if>
+            <run_actions ref="Append_PilotIdMap_Template_Keys" result="$tplAppend">
+              <param name="mapData" value="$mapData"/>
+              <param name="mapCount" value="$mapCount"/>
+              <param name="taggedName" value="$taggedName"/>
+              <param name="templateWire" value="$tplWire"/>
+            </run_actions>
+            <set_value name="$mapData" exact="$tplAppend.$MapData"/>
+            <set_value name="$mapCount" exact="$tplAppend.$MapCount"/>
+            <do_if value="$pilotRow.$LastDemotedTemplate? and $pilotRow.$LastDemotedTemplate != null">
+              <run_actions ref="Append_PilotIdMap_Template_Keys" result="$demotedAppend">
+                <param name="mapData" value="$mapData"/>
+                <param name="mapCount" value="$mapCount"/>
+                <param name="taggedName" value="$taggedName"/>
+                <param name="templateId" value="$pilotRow.$LastDemotedTemplate"/>
+              </run_actions>
+              <set_value name="$mapData" exact="$demotedAppend.$MapData"/>
+              <set_value name="$mapCount" exact="$demotedAppend.$MapCount"/>
+            </do_if>
+            <do_if value="$mapCount gt 0">
+              <raise_lua_event name="'GT_PilotIdMap.Update'" param="$mapData"/>
+            </do_if>
+          </do_if>
+        </do_if>
+      </actions>
+    </library>
+
+    <!-- Push PilotIdMap keys for one live pilot (merge snapshot for crew UI). -->
+    <library name="Raise_PilotIdMap_For_Live_Pilot" purpose="run_actions">
+      <params>
+        <param name="pilot"/>
+        <param name="extraTemplateId" default="null"/>
+      </params>
+      <actions>
+        <do_if value="$pilot and $pilot.exists and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}?">
+          <set_value name="$pilotRow" exact="global.$GT_Pilots.{$pilot}"/>
+          <run_actions ref="md.GT_Ship_Management.Build_PilotIdMap_Tagged_Name" result="$taggedName">
+            <param name="registryRow" value="$pilotRow"/>
+            <param name="pilotEntity" value="$pilot"/>
+          </run_actions>
+          <do_if value="$taggedName != ''">
+            <set_value name="$mapData" exact="''"/>
+            <set_value name="$mapCount" exact="0"/>
+            <do_if value="$pilotRow.$StableIdentity? and $pilotRow.$StableIdentity != ''">
+              <set_value name="$mapData" exact="$pilotRow.$StableIdentity + '|' + $taggedName"/>
+              <set_value name="$mapCount" exact="1"/>
+            </do_if>
+            <do_if value="$pilot.seed?">
+              <run_actions ref="Pilot_Seed_U64Wire_ForPilotIdMap" result="$pilotSeedWire">
+                <param name="pilot" value="$pilot"/>
+              </run_actions>
+              <do_if value="$pilotSeedWire != ''">
+                <do_if value="$mapCount gt 0">
+                  <set_value name="$mapData" exact="$mapData + '||'"/>
+                </do_if>
+                <set_value name="$mapData" exact="$mapData + $pilotSeedWire + '|' + $taggedName"/>
+                <set_value name="$mapCount" operation="add"/>
+              </do_if>
+            </do_if>
+            <run_actions ref="Append_PilotIdMap_Template_Keys" result="$liveTplAppend">
+              <param name="mapData" value="$mapData"/>
+              <param name="mapCount" value="$mapCount"/>
+              <param name="taggedName" value="$taggedName"/>
+              <param name="templateId" value="$extraTemplateId"/>
+            </run_actions>
+            <set_value name="$mapData" exact="$liveTplAppend.$MapData"/>
+            <set_value name="$mapCount" exact="$liveTplAppend.$MapCount"/>
+            <do_if value="$pilotRow.$LastDemotedTemplate? and $pilotRow.$LastDemotedTemplate != null">
+              <run_actions ref="Append_PilotIdMap_Template_Keys" result="$liveDemotedAppend">
+                <param name="mapData" value="$mapData"/>
+                <param name="mapCount" value="$mapCount"/>
+                <param name="taggedName" value="$taggedName"/>
+                <param name="templateId" value="$pilotRow.$LastDemotedTemplate"/>
+              </run_actions>
+              <set_value name="$mapData" exact="$liveDemotedAppend.$MapData"/>
+              <set_value name="$mapCount" exact="$liveDemotedAppend.$MapCount"/>
+            </do_if>
+            <do_if value="$mapCount gt 0">
+              <raise_lua_event name="'GT_PilotIdMap.Update'" param="$mapData"/>
+            </do_if>
+          </do_if>
+        </do_if>
       </actions>
     </library>
 
@@ -127,8 +319,13 @@
               </do_elseif>
               
               <do_if value="$nameToAdd != ''">
-                <set_value name="$pilotLevelForTag" exact="if global.$GT_Pilots.{$pilotObj}.$Level? then global.$GT_Pilots.{$pilotObj}.$Level else 1"/>
-                <set_value name="$taggedNameToAdd" exact="'(T:' + $pilotLevelForTag + ') ' + $nameToAdd"/>
+                <run_actions ref="md.GT_Ship_Management.Normalize_GT_Pilot_Base_Name" result="$nameToAdd">
+                  <param name="displayName" value="$nameToAdd"/>
+                </run_actions>
+                <run_actions ref="md.GT_Ship_Management.Build_PilotIdMap_Tagged_Name" result="$taggedNameToAdd">
+                  <param name="registryRow" value="global.$GT_Pilots.{$pilotObj}"/>
+                  <param name="pilotEntity" value="$pilotObj"/>
+                </run_actions>
                 <do_if value="$gtNameCount gt 0">
                   <set_value name="$gtNameData" exact="$gtNameData + '||'"/>
                   <set_value name="$gtNameMapData" exact="$gtNameMapData + '||'"/>
@@ -168,6 +365,14 @@
                   <set_value name="$gtPilotIdMapData" exact="$gtPilotIdMapData + $pilotObj.idcode + '|' + $taggedNameToAdd"/>
                   <set_value name="$gtPilotIdMapCount" operation="add"/>
                   <set_value name="$gtPilotIdMapFromPilotIdcode" operation="add"/>
+                </do_if>
+                <do_if value="global.$GT_Pilots.{$pilotObj}.$LastDemotedTemplate? and global.$GT_Pilots.{$pilotObj}.$LastDemotedTemplate != null">
+                  <do_if value="$gtPilotIdMapCount gt 0">
+                    <set_value name="$gtPilotIdMapData" exact="$gtPilotIdMapData + '||'"/>
+                  </do_if>
+                  <set_value name="$gtPilotIdMapData" exact="$gtPilotIdMapData + 's:' + global.$GT_Pilots.{$pilotObj}.$LastDemotedTemplate + '|' + $taggedNameToAdd"/>
+                  <set_value name="$gtPilotIdMapCount" operation="add"/>
+                  <set_value name="$gtPilotIdMapFromTemplate" operation="add"/>
                 </do_if>
                 <!-- npctemplate is NOT unique across pilots — do not add to PilotIdMap (collisions overwrote per-seed keys). -->
               </do_if>
@@ -242,12 +447,17 @@
               
               <do_if value="$pilot and $pilot.exists and global.$GT_Pilots.{$pilot}?">
                 <set_value name="$pilotData" exact="global.$GT_Pilots.{$pilot}"/>
+                <run_actions ref="md.GT_Ship_Management.Build_PilotIdMap_Tagged_Name" result="$taggedNameToAdd">
+                  <param name="registryRow" value="$pilotData"/>
+                  <param name="pilotEntity" value="$pilot"/>
+                </run_actions>
                 <set_value name="$pilotName" exact="if $pilot.name? then $pilot.name else 'NONE'"/>
-                <set_value name="$pilotLevelForTag" exact="if $pilotData.$Level? then $pilotData.$Level else 1"/>
-                <set_value name="$taggedNameToAdd" exact="'(T:' + $pilotLevelForTag + ') ' + $pilotName"/>
+                <run_actions ref="md.GT_Ship_Management.Normalize_GT_Pilot_Base_Name" result="$pilotName">
+                  <param name="displayName" value="$pilotName"/>
+                </run_actions>
 
                 <!-- PilotIdMap: multiple keys per pilot — StableIdentity + raw seed + idcode + template (names are not unique). -->
-                <do_if value="$pilotName != ''">
+                <do_if value="$taggedNameToAdd != ''">
                   <do_if value="$pilotData.$StableIdentity? and $pilotData.$StableIdentity != ''">
                     <do_if value="$gtPilotIdMapCount gt 0">
                       <set_value name="$gtPilotIdMapData" exact="$gtPilotIdMapData + '||'"/>
@@ -417,8 +627,13 @@
             </do_elseif>
             
             <do_if value="$nameToAdd != ''">
-              <set_value name="$pilotLevelForTag" exact="if global.$GT_Pilots.{$pilotObj}.$Level? then global.$GT_Pilots.{$pilotObj}.$Level else 1"/>
-              <set_value name="$taggedNameToAdd" exact="'(T:' + $pilotLevelForTag + ') ' + $nameToAdd"/>
+              <run_actions ref="md.GT_Ship_Management.Normalize_GT_Pilot_Base_Name" result="$nameToAdd">
+                <param name="displayName" value="$nameToAdd"/>
+              </run_actions>
+              <run_actions ref="md.GT_Ship_Management.Build_PilotIdMap_Tagged_Name" result="$taggedNameToAdd">
+                <param name="registryRow" value="global.$GT_Pilots.{$pilotObj}"/>
+                <param name="pilotEntity" value="$pilotObj"/>
+              </run_actions>
               <do_if value="$gtNameCount gt 0">
                 <set_value name="$gtNameData" exact="$gtNameData + '||'"/>
                 <set_value name="$gtNameMapData" exact="$gtNameMapData + '||'"/>
@@ -459,7 +674,35 @@
                 <set_value name="$gtPilotIdMapCount" operation="add"/>
                 <set_value name="$gtPilotIdMapFromPilotIdcode" operation="add"/>
               </do_if>
-              <!-- npctemplate not unique — omitted from PilotIdMap -->
+              <do_if value="$pOD.$LastDemotedTemplate? and $pOD.$LastDemotedTemplate != null">
+                <run_actions ref="LargeInt_U64Wire_ForPilotIdMap" result="$demotedTplWire">
+                  <param name="value" value="$pOD.$LastDemotedTemplate"/>
+                </run_actions>
+                <do_if value="$demotedTplWire != ''">
+                  <do_if value="$gtPilotIdMapCount gt 0">
+                    <set_value name="$gtPilotIdMapData" exact="$gtPilotIdMapData + '||'"/>
+                  </do_if>
+                  <set_value name="$gtPilotIdMapData" exact="$gtPilotIdMapData + $demotedTplWire + '|' + $taggedNameToAdd"/>
+                  <set_value name="$gtPilotIdMapCount" operation="add"/>
+                  <set_value name="$gtPilotIdMapFromTemplate" operation="add"/>
+                </do_if>
+              </do_if>
+              <do_if value="$pOD.$LastSarCrewTemplate? and $pOD.$LastSarCrewTemplate != null">
+                <set_value name="$sarTplWire" exact="if $pOD.$LastSarCrewTemplateWire? and $pOD.$LastSarCrewTemplateWire != '' then $pOD.$LastSarCrewTemplateWire else ''"/>
+                <do_if value="$sarTplWire == ''">
+                  <run_actions ref="Npctemplate_U64Wire_ForPilotIdMap" result="$sarTplWire">
+                    <param name="template" value="$pOD.$LastSarCrewTemplate"/>
+                  </run_actions>
+                </do_if>
+                <do_if value="$sarTplWire != ''">
+                  <do_if value="$gtPilotIdMapCount gt 0">
+                    <set_value name="$gtPilotIdMapData" exact="$gtPilotIdMapData + '||'"/>
+                  </do_if>
+                  <set_value name="$gtPilotIdMapData" exact="$gtPilotIdMapData + $sarTplWire + '|' + $taggedNameToAdd"/>
+                  <set_value name="$gtPilotIdMapCount" operation="add"/>
+                  <set_value name="$gtPilotIdMapFromTemplate" operation="add"/>
+                </do_if>
+              </do_if>
             </do_if>
           </do_all>
         </do_if>

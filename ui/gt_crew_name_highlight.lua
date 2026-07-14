@@ -186,6 +186,22 @@ local function installCrewHighlightHook()
                     matchedKey = personRefKeyNormalized
                 end
 
+                if (not taggedName or taggedName == "") and personentry and personentry.name and personentry.name ~= "" then
+                    local getNameMap = bridge and bridge.getGTNameMap
+                    local nameMap = getNameMap and getNameMap() or nil
+                    if nameMap then
+                        local uiName = tostring(personentry.name):gsub("\27%w?", "")
+                        uiName = uiName:gsub("^%(T:%d+%)%s*", "")
+                        uiName = uiName:gsub("^%s+", ""):gsub("%s+$", "")
+                        local norm = string.lower(uiName)
+                        local byName = nameMap[norm]
+                        if byName and byName ~= "" then
+                            taggedName = byName
+                            matchedKey = "name:" .. norm
+                        end
+                    end
+                end
+
                 if taggedName and taggedName ~= "" then
                     personentry.name = ColorText["text_positive"] .. taggedName .. "\27X"
                     matched = matched + 1

@@ -225,10 +225,40 @@ local function collectPilotIdAliasKeys(keyRaw)
     return out
 end
 
+-- Collapse stacked "(T:n) " prefixes MD may have baked into PilotIdMap values.
+local function sanitizeTaggedPilotName(taggedName)
+    if not taggedName or taggedName == "" then
+        return taggedName
+    end
+    local level, base = string.match(taggedName, "^%((T:%d+)%)(.*)$")
+    if not level then
+        return taggedName
+    end
+    base = base or ""
+    local changed = true
+    while changed do
+        changed = false
+        local stripped = string.gsub(base, "^%([Tt]%:%d+%)%s*", "")
+        if stripped ~= base then
+            base = stripped
+            changed = true
+        end
+    end
+    base = string.gsub(base, "^%s+", ""):gsub("%s+$", "")
+    if base == "" then
+        return taggedName
+    end
+    return "(" .. level .. ") " .. base
+end
+
 -- MapMenu crew rows use tostring(NPCSeed) as unsigned decimal; MD may send the same 64-bit value
 -- as signed (s:-…) or with s: prefix. Register all equivalent string keys so strict lookup succeeds.
 local function addPilotIdMapKeyWithInt64Aliases(idMap, taggedName, keyRaw)
     if not keyRaw or keyRaw == "" or not taggedName or taggedName == "" then
+        return 0
+    end
+    taggedName = sanitizeTaggedPilotName(taggedName)
+    if not taggedName or taggedName == "" then
         return 0
     end
     local added = 0
@@ -457,17 +487,27 @@ local function onReceivePilotIdMap(_, param)
                     local hi32, lo32 = string.match(pilotId, "^u64p:(%-?%d+):(%-?%d+)$")
                     local keyForAliases = pilotId
                     if hi32 and lo32 then
-                        u64WireCount = u64WireCount + 1
-                        local dec = u64DecimalStringFromHiLo(hi32, lo32)
-                        if dec then
-                            u64DecodedCount = u64DecodedCount + 1
-                            keyForAliases = dec
+                        local hiNum = tonumber(hi32)
+                        local loNum = tonumber(lo32)
+                        if hiNum == nil or loNum == nil or hiNum > 4294967295 or loNum > 4294967295 then
+                            malformedCount = malformedCount + 1
                         else
-                            u64DecodeFailed = u64DecodeFailed + 1
+                            u64WireCount = u64WireCount + 1
+                            local dec = u64DecimalStringFromHiLo(hi32, lo32)
+                            if dec then
+                                u64DecodedCount = u64DecodedCount + 1
+                                keyForAliases = dec
+                                idMap[pilotId] = sanitizeTaggedPilotName(taggedName)
+                                aliasKeyAdds = aliasKeyAdds + addPilotIdMapKeyWithInt64Aliases(idMap, taggedName, keyForAliases)
+                            else
+                                u64DecodeFailed = u64DecodeFailed + 1
+                                malformedCount = malformedCount + 1
+                            end
                         end
+                    else
+                        idMap[pilotId] = sanitizeTaggedPilotName(taggedName)
+                        aliasKeyAdds = aliasKeyAdds + addPilotIdMapKeyWithInt64Aliases(idMap, taggedName, keyForAliases)
                     end
-                    idMap[pilotId] = taggedName -- keep raw wire key for diagnostics
-                    aliasKeyAdds = aliasKeyAdds + addPilotIdMapKeyWithInt64Aliases(idMap, taggedName, keyForAliases)
                 else
                     malformedCount = malformedCount + 1
                 end

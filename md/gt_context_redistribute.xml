@@ -213,6 +213,164 @@
       </actions>
     </library>
 
+    <!-- True when this ship currently carries a DockAndPilotExchange order (default, current, or queued). -->
+    <library name="GT_PE_ShipHasPilotExchangeOrder" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+      </params>
+      <actions>
+        <set_value name="$hasOrder" exact="false"/>
+        <do_if value="$ship? and $ship.exists">
+          <do_if value="$ship.order? and @$ship.order.id == 'DockAndPilotExchange'">
+            <set_value name="$hasOrder" exact="true"/>
+          </do_if>
+          <do_if value="not $hasOrder and $ship.defaultorder? and @$ship.defaultorder.id == 'DockAndPilotExchange'">
+            <set_value name="$hasOrder" exact="true"/>
+          </do_if>
+          <do_if value="not $hasOrder and $ship.orders? and $ship.orders.count gt 0">
+            <do_all exact="$ship.orders.count" counter="$poi">
+              <do_if value="@$ship.orders.{$poi}.id == 'DockAndPilotExchange'">
+                <set_value name="$hasOrder" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_if>
+        <return value="$hasOrder"/>
+      </actions>
+    </library>
+
+    <!-- Remove one ship idcode from MD-published PE busy lists. -->
+    <library name="GT_RemoveShipIdFromPilotExchangeBusyLists" purpose="run_actions">
+      <params>
+        <param name="shipId"/>
+      </params>
+      <actions>
+        <set_value name="$removed" exact="false"/>
+        <do_if value="$shipId? and $shipId != ''">
+          <do_if value="player.entity.$GT_PilotExchange_BusyShipIds?">
+            <set_value name="$oldBusy" exact="player.entity.$GT_PilotExchange_BusyShipIds"/>
+            <create_list name="$newBusy"/>
+            <do_if value="$oldBusy.count? and $oldBusy.count gt 0">
+              <do_all exact="$oldBusy.count" counter="$bi">
+                <do_if value="$oldBusy.{$bi} == $shipId">
+                  <set_value name="$removed" exact="true"/>
+                </do_if>
+                <do_else>
+                  <append_to_list name="$newBusy" exact="$oldBusy.{$bi}"/>
+                </do_else>
+              </do_all>
+            </do_if>
+            <set_value name="player.entity.$GT_PilotExchange_BusyShipIds" exact="$newBusy"/>
+          </do_if>
+          <do_if value="player.entity.$GT_PilotExchange_DirectQueueBusyIds?">
+            <set_value name="$oldDirect" exact="player.entity.$GT_PilotExchange_DirectQueueBusyIds"/>
+            <create_list name="$newDirect"/>
+            <do_if value="$oldDirect.count? and $oldDirect.count gt 0">
+              <do_all exact="$oldDirect.count" counter="$di">
+                <do_if value="$oldDirect.{$di} == $shipId">
+                  <set_value name="$removed" exact="true"/>
+                </do_if>
+                <do_else>
+                  <append_to_list name="$newDirect" exact="$oldDirect.{$di}"/>
+                </do_else>
+              </do_all>
+            </do_if>
+            <set_value name="player.entity.$GT_PilotExchange_DirectQueueBusyIds" exact="$newDirect"/>
+          </do_if>
+        </do_if>
+        <return value="$removed"/>
+      </actions>
+    </library>
+
+    <!-- Close open PE sessions for this ship that are no longer actively engaged. -->
+    <library name="GT_CloseStalePilotExchangeSessionsForShip" purpose="run_actions">
+      <params>
+        <param name="shipId"/>
+        <param name="reason" default="''"/>
+      </params>
+      <actions>
+        <set_value name="$closed" exact="false"/>
+        <do_if value="$shipId? and $shipId != '' and global.$GT_PilotExchange_SessionKeys? and global.$GT_PilotExchange_SessionKeys.count gt 0">
+          <create_list name="$staleKeys"/>
+          <do_all exact="global.$GT_PilotExchange_SessionKeys.count" counter="$ski">
+            <set_value name="$scanKey" exact="global.$GT_PilotExchange_SessionKeys.{$ski}"/>
+            <do_if value="global.$GT_PilotExchangeSessions? and global.$GT_PilotExchangeSessions.{'$' + $scanKey}?">
+              <set_value name="$scanSess" exact="global.$GT_PilotExchangeSessions.{'$' + $scanKey}"/>
+              <do_if value="($scanSess.$left == $shipId or $scanSess.$right == $shipId) and not ($scanSess.$swapCompleted? and $scanSess.$swapCompleted)">
+                <run_actions ref="md.GT_Context_Redistribute.GT_PE_ShipSessionIsActivelyBusy" result="$scanActive">
+                  <param name="shipId" value="$shipId"/>
+                  <param name="session" value="$scanSess"/>
+                </run_actions>
+                <run_actions ref="md.GT_Context_Redistribute.GT_PE_ShipHasInFlightTransfer" result="$scanInFlight">
+                  <param name="shipId" value="$shipId"/>
+                  <param name="excludeSessionKey" value="''"/>
+                </run_actions>
+                <do_if value="not $scanActive and not $scanInFlight">
+                  <append_to_list name="$staleKeys" exact="$scanKey"/>
+                </do_if>
+              </do_if>
+            </do_if>
+          </do_all>
+          <do_all exact="$staleKeys.count" counter="$sti">
+            <set_value name="$staleKey" exact="$staleKeys.{$sti}"/>
+            <do_if value="global.$GT_PilotExchangeSessions? and global.$GT_PilotExchangeSessions.{'$' + $staleKey}?">
+              <set_value name="$staleSess" exact="global.$GT_PilotExchangeSessions.{'$' + $staleKey}"/>
+              <do_if value="$staleSess.$left? and $staleSess.$left != ''">
+                <raise_lua_event name="'gt.redistributeOrderCancelled'" param="$staleSess.$left"/>
+              </do_if>
+              <do_if value="$staleSess.$right? and $staleSess.$right != '' and $staleSess.$right != $staleSess.$left">
+                <raise_lua_event name="'gt.redistributeOrderCancelled'" param="$staleSess.$right"/>
+              </do_if>
+              <run_actions ref="md.GT_Context_Redistribute.GT_ClosePilotExchangeSession">
+                <param name="sessionKey" value="$staleKey"/>
+                <param name="reason" value="'stale_session:' + (if $reason != '' then $reason else 'none')"/>
+              </run_actions>
+              <set_value name="$closed" exact="true"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <return value="$closed"/>
+      </actions>
+    </library>
+
+    <!-- Purge stale queue/session markers for one ship (Lua queue + MD busy lists). -->
+    <library name="GT_ClearStalePilotExchangeMarkersForShip" purpose="run_actions">
+      <params>
+        <param name="shipId"/>
+        <param name="reason" default="''"/>
+      </params>
+      <actions>
+        <set_value name="$cleared" exact="false"/>
+        <do_if value="not $shipId? or $shipId == ''">
+          <return value="false"/>
+        </do_if>
+        <raise_lua_event name="'gt.redistributeOrderCancelled'" param="$shipId"/>
+        <run_actions ref="md.GT_Context_Redistribute.GT_CloseStalePilotExchangeSessionsForShip" result="$closedSessions">
+          <param name="shipId" value="$shipId"/>
+          <param name="reason" value="$reason"/>
+        </run_actions>
+        <do_if value="$closedSessions">
+          <set_value name="$cleared" exact="true"/>
+        </do_if>
+        <run_actions ref="md.GT_Context_Redistribute.GT_RemoveShipIdFromPilotExchangeBusyLists" result="$removedFromLists">
+          <param name="shipId" value="$shipId"/>
+        </run_actions>
+        <do_if value="$removedFromLists">
+          <set_value name="$cleared" exact="true"/>
+        </do_if>
+        <do_if value="global.$GT_RedistributePendingDockByShip? and global.$GT_RedistributePendingDockByShip.{'$' + $shipId}?">
+          <remove_value name="global.$GT_RedistributePendingDockByShip.{'$' + $shipId}"/>
+          <set_value name="$cleared" exact="true"/>
+        </do_if>
+        <run_actions ref="md.GT_Context_Redistribute.GT_RefreshPilotExchangeBusyShipIds"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT Redistribute] Cleared stale PE markers ship=' + $shipId + ' reason=' + (if $reason != '' then $reason else 'none') + ' closedSessions=' + $closedSessions + ' removedFromLists=' + $removedFromLists" chance="100"/>
+        </do_if>
+        <return value="$cleared"/>
+      </actions>
+    </library>
+
     <!-- Count GT ships in map/interact multi-selection for context-menu visibility (synchronous; do not rely on Lua blackboard). -->
     <library name="GT_CountPilotExchangeEligibleSelectedShips" purpose="run_actions">
       <params>
@@ -375,37 +533,57 @@
     </library>
 
     <!-- True when ship is still in the multiswap plan busy list (any incomplete leg). -->
+    <!-- True when a session still has live dock/swap activity (not merely stale awaitingSettlement). -->
+    <library name="GT_PE_SessionHasLiveExchangeActivity" purpose="run_actions">
+      <params>
+        <param name="session"/>
+      </params>
+      <actions>
+        <set_value name="$live" exact="false"/>
+        <do_if value="$session? and not ($session.$swapCompleted? and $session.$swapCompleted)">
+          <set_value name="$leftId" exact="if $session.$left? then $session.$left else ''"/>
+          <set_value name="$rightId" exact="if $session.$right? then $session.$right else ''"/>
+          <do_all exact="2" counter="$legIdx">
+            <set_value name="$legId" exact="if $legIdx == 1 then $leftId else $rightId"/>
+            <do_if value="not $live and $legId != ''">
+              <do_if value="global.$GT_RedistributePendingDockByShip? and global.$GT_RedistributePendingDockByShip.{'$' + $legId}?">
+                <set_value name="$live" exact="true"/>
+              </do_if>
+              <do_if value="not $live and global.$GT_ShipIDCodeMap? and global.$GT_ShipIDCodeMap.{'$' + $legId}?">
+                <set_value name="$legShip" exact="global.$GT_ShipIDCodeMap.{'$' + $legId}"/>
+                <do_if value="@$legShip.exists">
+                  <run_actions ref="md.GT_Context_Redistribute.GT_PE_ShipHasPilotExchangeOrder" result="$legPeOrder">
+                    <param name="ship" value="$legShip"/>
+                  </run_actions>
+                  <do_if value="$legPeOrder">
+                    <set_value name="$live" exact="true"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+        <return value="$live"/>
+      </actions>
+    </library>
+
+    <!-- True when this ship still has another open PE session leg (not stale busy-list membership). -->
     <library name="GT_PE_ShipStillInMultiswapPlan" purpose="run_actions">
       <params>
         <param name="shipId"/>
+        <param name="excludeSessionKey" default="''"/>
       </params>
       <actions>
         <set_value name="$stillIn" exact="false"/>
         <do_if value="$shipId? and $shipId != ''">
-          <do_if value="player.entity.$GT_PilotExchange_DirectQueueBusyIds?">
-            <set_value name="$planIds" exact="player.entity.$GT_PilotExchange_DirectQueueBusyIds"/>
-            <do_if value="$planIds.count? and $planIds.count gt 0">
-              <do_all exact="$planIds.count" counter="$pi">
-                <do_if value="$planIds.{$pi} == $shipId">
-                  <set_value name="$stillIn" exact="true"/>
-                  <break/>
-                </do_if>
-              </do_all>
-            </do_if>
-          </do_if>
-          <do_if value="not $stillIn and player.entity.$GT_PilotExchange_BusyShipIds?">
-            <set_value name="$busyIds" exact="player.entity.$GT_PilotExchange_BusyShipIds"/>
-            <do_if value="$busyIds.count? and $busyIds.count gt 0">
-              <do_all exact="$busyIds.count" counter="$bi">
-                <do_if value="$busyIds.{$bi} == $shipId">
-                  <set_value name="$stillIn" exact="true"/>
-                  <break/>
-                </do_if>
-              </do_all>
-            </do_if>
-          </do_if>
+          <run_actions ref="md.GT_Context_Redistribute.GT_PE_ShipHasOtherOpenSession" result="$stillIn">
+            <param name="shipId" value="$shipId"/>
+            <param name="excludeSessionKey" value="$excludeSessionKey"/>
+          </run_actions>
         </do_if>
-        <debug_text text="'[GT Redistribute] PE stillInPlan ship=' + $shipId + ' result=' + $stillIn + ' directCount=' + (if player.entity.$GT_PilotExchange_DirectQueueBusyIds? and player.entity.$GT_PilotExchange_DirectQueueBusyIds.count? then player.entity.$GT_PilotExchange_DirectQueueBusyIds.count else -1) + ' busyCount=' + (if player.entity.$GT_PilotExchange_BusyShipIds? and player.entity.$GT_PilotExchange_BusyShipIds.count? then player.entity.$GT_PilotExchange_BusyShipIds.count else -1)" chance="100"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT Redistribute] PE stillInPlan ship=' + $shipId + ' exclude=' + (if $excludeSessionKey != '' then $excludeSessionKey else 'none') + ' result=' + $stillIn" chance="100"/>
+        </do_if>
         <return value="$stillIn"/>
       </actions>
     </library>
@@ -426,32 +604,35 @@
           <do_elseif value="$session.$right == $shipId">
             <set_value name="$sessionPartnerId" exact="$session.$left"/>
           </do_elseif>
-          <do_if value="($session.$awaitingSettlement? and $session.$awaitingSettlement) or ($session.$swapAttempted? and $session.$swapAttempted)">
+          <do_if value="global.$GT_RedistributePendingDockByShip? and global.$GT_RedistributePendingDockByShip.{'$' + $shipId}?">
             <set_value name="$active" exact="true"/>
           </do_if>
-          <do_else>
-            <do_if value="global.$GT_RedistributePendingDockByShip? and global.$GT_RedistributePendingDockByShip.{'$' + $shipId}?">
-              <set_value name="$active" exact="true"/>
-            </do_if>
-            <do_if value="not $active and global.$GT_ShipIDCodeMap? and global.$GT_ShipIDCodeMap.{'$' + $shipId}?">
-              <set_value name="$busyShip" exact="global.$GT_ShipIDCodeMap.{'$' + $shipId}"/>
-              <do_if value="@$busyShip.exists">
-                <set_value name="$orderPartnerId" exact="''"/>
-                <do_if value="$busyShip.order? and @$busyShip.order.id == 'DockAndPilotExchange' and $busyShip.order.$partner? and @$busyShip.order.$partner.exists">
-                  <set_value name="$orderPartnerId" exact="$busyShip.order.$partner.idcode"/>
-                </do_if>
-                <do_elseif value="$busyShip.order? and @$busyShip.order.id == 'DockAndWait' and $busyShip.order.$callerid? and @$busyShip.order.$callerid.id == 'DockAndPilotExchange' and $busyShip.order.$callerid.$partner? and @$busyShip.order.$callerid.$partner.exists">
-                  <set_value name="$orderPartnerId" exact="$busyShip.order.$callerid.$partner.idcode"/>
-                </do_elseif>
-                <do_elseif value="$busyShip.defaultorder? and @$busyShip.defaultorder.id == 'DockAndPilotExchange' and $busyShip.defaultorder.$partner? and @$busyShip.defaultorder.$partner.exists">
-                  <set_value name="$orderPartnerId" exact="$busyShip.defaultorder.$partner.idcode"/>
-                </do_elseif>
-                <do_if value="$orderPartnerId != '' and ($sessionPartnerId == '' or $orderPartnerId == $sessionPartnerId)">
-                  <set_value name="$active" exact="true"/>
-                </do_if>
+          <do_if value="not $active and global.$GT_ShipIDCodeMap? and global.$GT_ShipIDCodeMap.{'$' + $shipId}?">
+            <set_value name="$busyShip" exact="global.$GT_ShipIDCodeMap.{'$' + $shipId}"/>
+            <do_if value="@$busyShip.exists">
+              <set_value name="$orderPartnerId" exact="''"/>
+              <do_if value="$busyShip.order? and @$busyShip.order.id == 'DockAndPilotExchange' and $busyShip.order.$partner? and @$busyShip.order.$partner.exists">
+                <set_value name="$orderPartnerId" exact="$busyShip.order.$partner.idcode"/>
+              </do_if>
+              <do_elseif value="$busyShip.order? and @$busyShip.order.id == 'DockAndWait' and $busyShip.order.$callerid? and @$busyShip.order.$callerid.id == 'DockAndPilotExchange' and $busyShip.order.$callerid.$partner? and @$busyShip.order.$callerid.$partner.exists">
+                <set_value name="$orderPartnerId" exact="$busyShip.order.$callerid.$partner.idcode"/>
+              </do_elseif>
+              <do_elseif value="$busyShip.defaultorder? and @$busyShip.defaultorder.id == 'DockAndPilotExchange' and $busyShip.defaultorder.$partner? and @$busyShip.defaultorder.$partner.exists">
+                <set_value name="$orderPartnerId" exact="$busyShip.defaultorder.$partner.idcode"/>
+              </do_elseif>
+              <do_if value="$orderPartnerId != '' and ($sessionPartnerId == '' or $orderPartnerId == $sessionPartnerId)">
+                <set_value name="$active" exact="true"/>
               </do_if>
             </do_if>
-          </do_else>
+          </do_if>
+          <do_if value="not $active and ($session.$awaitingSettlement? and $session.$awaitingSettlement)">
+            <run_actions ref="md.GT_Context_Redistribute.GT_PE_SessionHasLiveExchangeActivity" result="$sessLive">
+              <param name="session" value="$session"/>
+            </run_actions>
+            <do_if value="$sessLive">
+              <set_value name="$active" exact="true"/>
+            </do_if>
+          </do_if>
         </do_if>
         <return value="$active"/>
       </actions>
@@ -506,8 +687,13 @@
             <do_if value="$ifKey != $excludeSessionKey and global.$GT_PilotExchangeSessions? and global.$GT_PilotExchangeSessions.{'$' + $ifKey}?">
               <set_value name="$ifSess" exact="global.$GT_PilotExchangeSessions.{'$' + $ifKey}"/>
               <do_if value="($ifSess.$left == $shipId or $ifSess.$right == $shipId) and ($ifSess.$awaitingSettlement? and $ifSess.$awaitingSettlement) and not ($ifSess.$swapCompleted? and $ifSess.$swapCompleted)">
-                <set_value name="$inFlight" exact="true"/>
-                <break/>
+                <run_actions ref="md.GT_Context_Redistribute.GT_PE_SessionHasLiveExchangeActivity" result="$ifSessLive">
+                  <param name="session" value="$ifSess"/>
+                </run_actions>
+                <do_if value="$ifSessLive">
+                  <set_value name="$inFlight" exact="true"/>
+                  <break/>
+                </do_if>
               </do_if>
             </do_if>
           </do_all>
@@ -1063,11 +1249,13 @@
         <do_if value="$finishLeftId != ''">
           <run_actions ref="md.GT_Context_Redistribute.GT_PE_ShipStillInMultiswapPlan" result="$leftStillInMultiswap">
             <param name="shipId" value="$finishLeftId"/>
+            <param name="excludeSessionKey" value="$resolvedSessionKey"/>
           </run_actions>
         </do_if>
         <do_if value="$finishRightId != ''">
           <run_actions ref="md.GT_Context_Redistribute.GT_PE_ShipStillInMultiswapPlan" result="$rightStillInMultiswap">
             <param name="shipId" value="$finishRightId"/>
+            <param name="excludeSessionKey" value="$resolvedSessionKey"/>
           </run_actions>
         </do_if>
         <do_if value="not $leftStillInMultiswap">
@@ -1529,17 +1717,14 @@
           <set_value name="$skipPeTerminalTeardown" exact="false"/>
           <do_if value="($s.$State == 'aborted' or $s.$State == 'released') and $sessionKey != '' and global.$GT_PilotExchangeSessions? and global.$GT_PilotExchangeSessions.{'$' + $sessionKey}?">
             <set_value name="$terminalSess" exact="global.$GT_PilotExchangeSessions.{'$' + $sessionKey}"/>
-            <do_if value="$terminalSess.$awaitingSettlement? and $terminalSess.$awaitingSettlement and (not $terminalSess.$swapCompleted? or not $terminalSess.$swapCompleted)">
+            <run_actions ref="md.GT_Context_Redistribute.GT_PE_SessionHasLiveExchangeActivity" result="$terminalSessLive">
+              <param name="session" value="$terminalSess"/>
+            </run_actions>
+            <do_if value="$terminalSessLive">
               <set_value name="$skipPeTerminalTeardown" exact="true"/>
-              <debug_text text="'[GT Redistribute] PE order_state:' + $s.$State + ' ignored (swap/settlement in progress) ship=' + $s.$ShipID + ' session=' + $sessionKey" chance="100"/>
+              <debug_text text="'[GT Redistribute] PE order_state:' + $s.$State + ' ignored (live dock/swap activity) ship=' + $s.$ShipID + ' session=' + $sessionKey" chance="100"/>
             </do_if>
-            <do_elseif value="$terminalSess.$swapAttempted? and $terminalSess.$swapAttempted and (not $terminalSess.$swapCompleted? or not $terminalSess.$swapCompleted)">
-              <set_value name="$skipPeTerminalTeardown" exact="true"/>
-              <debug_text text="'[GT Redistribute] PE order_state:' + $s.$State + ' ignored (swap/settlement in progress) ship=' + $s.$ShipID + ' session=' + $sessionKey" chance="100"/>
-            </do_elseif>
             <do_elseif value="($s.$State == 'released' or $s.$State == 'aborted') and (not $terminalSess.$swapCompleted? or not $terminalSess.$swapCompleted)">
-              <set_value name="$skipPeTerminalTeardown" exact="true"/>
-              <debug_text text="'[GT Redistribute] PE order_state:' + $s.$State + ' ignored (swap not complete, partner may still be active) ship=' + $s.$ShipID + ' session=' + $sessionKey" chance="100"/>
               <do_if value="$s.$ShipID == $sessionLeftId">
                 <set_value name="global.$GT_PilotExchangeSessions.{'$' + $sessionKey}.$leftArrived" exact="false"/>
               </do_if>
@@ -1592,8 +1777,11 @@
             </do_if>
             <do_if value="$sessionKey != '' and global.$GT_PilotExchangeSessions? and global.$GT_PilotExchangeSessions.{'$' + $sessionKey}?">
               <set_value name="$cancelSess" exact="global.$GT_PilotExchangeSessions.{'$' + $sessionKey}"/>
-              <do_if value="($cancelSess.$awaitingSettlement? and $cancelSess.$awaitingSettlement) or ($cancelSess.$swapAttempted? and $cancelSess.$swapAttempted) or ($cancelSess.$swapCompleted? and $cancelSess.$swapCompleted)">
-                <debug_text text="'[GT Redistribute] PE cancelled ignored (swap in flight/complete) ship=' + $s.$ShipID + ' session=' + $sessionKey" chance="100"/>
+              <run_actions ref="md.GT_Context_Redistribute.GT_PE_SessionHasLiveExchangeActivity" result="$cancelSessLive">
+                <param name="session" value="$cancelSess"/>
+              </run_actions>
+              <do_if value="($cancelSess.$swapCompleted? and $cancelSess.$swapCompleted) or $cancelSessLive">
+                <debug_text text="'[GT Redistribute] PE cancelled ignored (live or completed swap) ship=' + $s.$ShipID + ' session=' + $sessionKey" chance="100"/>
               </do_if>
               <do_else>
                 <run_actions ref="md.GT_Context_Redistribute.GT_PE_ReleasePartnerAndCloseSession">
@@ -1822,18 +2010,61 @@
     <!-- After the direct queue drains, clear any stale [PE] flags left by busy-list races. -->
     <library name="GT_ReconcileAllStalePilotExchangeFlags" purpose="run_actions">
       <actions>
+        <do_if value="global.$GT_PE_ReconcileAllInProgress? and global.$GT_PE_ReconcileAllInProgress">
+          <return value="false"/>
+        </do_if>
+        <set_value name="global.$GT_PE_ReconcileAllInProgress" exact="true"/>
         <run_actions ref="md.GT_Context_Redistribute.GT_RefreshPilotExchangeBusyShipIds"/>
+        <create_list name="$reconcileIds"/>
+        <set_value name="$reconcileSeen" exact="table[]"/>
         <do_if value="global.$GT_Ships? and global.$GT_Ships.keys? and global.$GT_Ships.keys.count gt 0">
           <do_all exact="global.$GT_Ships.keys.count" counter="$ki">
             <set_value name="$ship" exact="global.$GT_Ships.keys.{$ki}"/>
-            <do_if value="$ship? and $ship.exists and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$PilotExchange? and global.$GT_Ships.{$ship}.$PilotExchange and md.GT_Ship_State_Utilities.GT_ReconcilePilotExchangeState?">
-              <run_actions ref="md.GT_Ship_State_Utilities.GT_ReconcilePilotExchangeState">
-                <param name="ship" value="$ship"/>
-                <param name="reason" value="'pe_queue_finished'"/>
-              </run_actions>
+            <do_if value="$ship? and $ship.exists and $ship.idcode? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$PilotExchange? and global.$GT_Ships.{$ship}.$PilotExchange and not $reconcileSeen.{'$' + $ship.idcode}?">
+              <set_value name="$reconcileSeen.{'$' + $ship.idcode}" exact="true"/>
+              <append_to_list name="$reconcileIds" exact="$ship.idcode"/>
             </do_if>
           </do_all>
         </do_if>
+        <do_if value="player.entity.$GT_PilotExchange_BusyShipIds? and player.entity.$GT_PilotExchange_BusyShipIds.count? and player.entity.$GT_PilotExchange_BusyShipIds.count gt 0">
+          <do_all exact="player.entity.$GT_PilotExchange_BusyShipIds.count" counter="$bi">
+            <set_value name="$busyId" exact="player.entity.$GT_PilotExchange_BusyShipIds.{$bi}"/>
+            <do_if value="$busyId? and $busyId != '' and not $reconcileSeen.{'$' + $busyId}?">
+              <set_value name="$reconcileSeen.{'$' + $busyId}" exact="true"/>
+              <append_to_list name="$reconcileIds" exact="$busyId"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <do_if value="player.entity.$GT_PilotExchange_DirectQueueBusyIds? and player.entity.$GT_PilotExchange_DirectQueueBusyIds.count? and player.entity.$GT_PilotExchange_DirectQueueBusyIds.count gt 0">
+          <do_all exact="player.entity.$GT_PilotExchange_DirectQueueBusyIds.count" counter="$di">
+            <set_value name="$directId" exact="player.entity.$GT_PilotExchange_DirectQueueBusyIds.{$di}"/>
+            <do_if value="$directId? and $directId != '' and not $reconcileSeen.{'$' + $directId}?">
+              <set_value name="$reconcileSeen.{'$' + $directId}" exact="true"/>
+              <append_to_list name="$reconcileIds" exact="$directId"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <do_if value="$reconcileIds.count gt 0">
+          <do_all exact="$reconcileIds.count" counter="$ri">
+            <set_value name="$reconcileId" exact="$reconcileIds.{$ri}"/>
+            <set_value name="$reconcileShip" exact="null"/>
+            <do_if value="global.$GT_ShipIDCodeMap? and global.$GT_ShipIDCodeMap.{'$' + $reconcileId}?">
+              <set_value name="$reconcileShip" exact="global.$GT_ShipIDCodeMap.{'$' + $reconcileId}"/>
+            </do_if>
+            <do_if value="$reconcileShip? and $reconcileShip.exists and md.GT_Ship_State_Utilities.GT_CheckPilotExchangeStatus? and md.GT_Ship_State_Utilities.GT_ReconcilePilotExchangeState?">
+              <run_actions ref="md.GT_Ship_State_Utilities.GT_CheckPilotExchangeStatus" result="$batchPeStatus">
+                <param name="ship" value="$reconcileShip"/>
+              </run_actions>
+              <do_if value="$batchPeStatus.$ShouldClearPE">
+                <run_actions ref="md.GT_Ship_State_Utilities.GT_ReconcilePilotExchangeState">
+                  <param name="ship" value="$reconcileShip"/>
+                  <param name="reason" value="'pe_queue_finished'"/>
+                </run_actions>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+        <remove_value name="global.$GT_PE_ReconcileAllInProgress"/>
       </actions>
     </library>
 
@@ -1895,11 +2126,16 @@
       </conditions>
       <actions>
         <set_value name="$ship" exact="event.object"/>
-        <do_if value="$ship? and $ship.exists and $ship.isclass.ship and $ship.owner == faction.player and md.GT_Ship_State_Utilities.GT_ReconcilePilotExchangeState? and global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$PilotExchange? and global.$GT_Ships.{$ship}.$PilotExchange">
-          <run_actions ref="md.GT_Ship_State_Utilities.GT_ReconcilePilotExchangeState">
+        <do_if value="$ship? and $ship.exists and $ship.isclass.ship and $ship.owner == faction.player and md.GT_Ship_State_Utilities.GT_ReconcilePilotExchangeState?">
+          <run_actions ref="md.GT_Ship_State_Utilities.GT_CheckPilotExchangeStatus" result="$peOrderReadyStatus">
             <param name="ship" value="$ship"/>
-            <param name="reason" value="'order_ready'"/>
           </run_actions>
+          <do_if value="$peOrderReadyStatus.$FlagSet or $peOrderReadyStatus.$IsInDirectQueue or $peOrderReadyStatus.$ShouldClearPE">
+            <run_actions ref="md.GT_Ship_State_Utilities.GT_ReconcilePilotExchangeState">
+              <param name="ship" value="$ship"/>
+              <param name="reason" value="'order_ready'"/>
+            </run_actions>
+          </do_if>
         </do_if>
       </actions>
     </cue>
@@ -1911,11 +2147,16 @@
       </conditions>
       <actions>
         <set_value name="$ship" exact="event.object"/>
-        <do_if value="$ship? and $ship.exists and $ship.isclass.ship and $ship.owner == faction.player and md.GT_Ship_State_Utilities.GT_ReconcilePilotExchangeState? and global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$PilotExchange? and global.$GT_Ships.{$ship}.$PilotExchange">
-          <run_actions ref="md.GT_Ship_State_Utilities.GT_ReconcilePilotExchangeState">
+        <do_if value="$ship? and $ship.exists and $ship.isclass.ship and $ship.owner == faction.player and md.GT_Ship_State_Utilities.GT_ReconcilePilotExchangeState?">
+          <run_actions ref="md.GT_Ship_State_Utilities.GT_CheckPilotExchangeStatus" result="$peOrderCancelledStatus">
             <param name="ship" value="$ship"/>
-            <param name="reason" value="'order_cancelled'"/>
           </run_actions>
+          <do_if value="$peOrderCancelledStatus.$FlagSet or $peOrderCancelledStatus.$IsInDirectQueue or $peOrderCancelledStatus.$ShouldClearPE">
+            <run_actions ref="md.GT_Ship_State_Utilities.GT_ReconcilePilotExchangeState">
+              <param name="ship" value="$ship"/>
+              <param name="reason" value="'order_cancelled'"/>
+            </run_actions>
+          </do_if>
         </do_if>
       </actions>
     </cue>

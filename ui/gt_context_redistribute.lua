@@ -789,6 +789,21 @@ local function shipIsInDirectSwapQueue(idcode)
     return false
 end
 
+-- MD busy-list entry with no corroborating live PE activity (stale session/queue marker).
+local function isStaleMdPilotExchangeBusyShip(ship, idcode)
+    local codeKey = tostring(idcode or (ship and GetComponentData(ship, "idcode")) or "")
+    if codeKey == "" then
+        return false
+    end
+    if shipIsInDirectSwapQueue(codeKey) or isShipInPendingRedistribution(ship, codeKey) then
+        return false
+    end
+    if ship and ship ~= 0 and shipHasActiveOrQueuedPilotExchangeOrder(ship) then
+        return false
+    end
+    return true
+end
+
 -- Planning exclusion only: already queued for exchange (not operational busy - those defer at execution).
 local function shipIsAlreadyQueuedForPilotExchange(ship, idcode)
     if shipHasActiveOrQueuedPilotExchangeOrder(ship) then
@@ -804,6 +819,10 @@ local function shipIsAlreadyQueuedForPilotExchange(ship, idcode)
     if codeKey ~= "" then
         local busySet = peBusyShipIdSet or getPilotExchangeBusyShipIdSet()
         if busySet[codeKey] then
+            if isStaleMdPilotExchangeBusyShip(ship, codeKey) then
+                requestPilotExchangeBusyShipRefresh()
+                return false
+            end
             return true
         end
     end

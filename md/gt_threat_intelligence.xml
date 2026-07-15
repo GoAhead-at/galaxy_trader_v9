@@ -47,9 +47,6 @@
         <do_if value="not global.$GT_PendingBlacklistMacroRemovals?">
           <set_value name="global.$GT_PendingBlacklistMacroRemovals" exact="[]"/>
         </do_if>
-        <do_if value="not global.$GT_BlacklistRespeakMacros?">
-          <set_value name="global.$GT_BlacklistRespeakMacros" exact="[]"/>
-        </do_if>
         <!-- MD group for reliable event_object_destroyed on tracked enemy ships (vanilla pattern) -->
         <do_if value="not global.$GT_TrackedEnemyShipsGroup?">
           <create_group groupname="global.$GT_TrackedEnemyShipsGroup"/>
@@ -168,7 +165,6 @@
             <param name="Sector" value="$sector"/>
             <param name="DebugChance" value="100"/>
           </run_actions>
-          <signal_cue_instantly cue="ApplyBlacklistToFleet"/>
           
           <show_notification text="'Threat cleared: Player defense station established in ' + $sector.knownname + ' - removing sector from GT blacklist'" timeout="8s"/>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -672,7 +668,6 @@
         </do_if>
         <set_value name="global.$GT_AutoBlacklistedMacroList" exact="[]"/>
         <set_value name="global.$GT_PendingBlacklistMacroRemovals" exact="[]"/>
-        <set_value name="global.$GT_BlacklistRespeakMacros" exact="[]"/>
         
         <do_if value="global.$GT_ThreatBlacklistSpeakQueue?">
           <set_value name="global.$GT_ThreatBlacklistSpeakQueue" exact="[]"/>
@@ -815,34 +810,51 @@
       </actions>
     </library>
     
-    <!-- Player removed GT-auto sector(s) from empire UI: re-check live threat before re-merge -->
-    <library name="GT_RevalidateRemovedAutoThreatMacros" purpose="run_actions">
+    <!-- Player removed a GT-auto sector from empire UI: wipe MD threat episode (no re-merge until new detection) -->
+    <library name="GT_ProcessPlayerRemovedAutoBlacklistMacro" purpose="run_actions">
       <params>
-        <param name="RemovedMacros"/>
+        <param name="SectorMacro"/>
         <param name="DebugChance" default="0"/>
       </params>
       <actions>
-        <set_value name="$stillThreatened" exact="[]"/>
-        <do_if value="$RemovedMacros? and $RemovedMacros.count gt 0 and global.$GT_ThreatIntelligence?">
-          <do_all exact="$RemovedMacros.count" counter="$rmIdx">
-            <set_value name="$rmMacro" exact="$RemovedMacros.{$rmIdx}"/>
-            <do_all exact="global.$GT_ThreatIntelligence.keys.count" counter="$tiIdx">
-              <set_value name="$tiSector" exact="global.$GT_ThreatIntelligence.keys.list.{$tiIdx}"/>
-              <set_value name="$tiMacro" exact="@$tiSector.macro.id"/>
-              <do_if value="$tiMacro == $rmMacro">
-                <run_actions ref="ClearSectorIfAllShipsGone" result="$clearResult">
-                  <param name="Sector" value="$tiSector"/>
-                  <param name="DebugChance" value="$DebugChance"/>
-                </run_actions>
-                <do_if value="global.$GT_ThreatIntelligence.{$tiSector}? and global.$GT_ThreatIntelligence.{$tiSector}.$ShouldBlacklist?">
-                  <append_to_list name="$stillThreatened" exact="$rmMacro"/>
-                </do_if>
-                <break/>
-              </do_if>
-            </do_all>
+        <set_value name="$processed" exact="false"/>
+        <run_actions ref="EnsureBlacklistRegistryGlobals"/>
+        <do_if value="not $SectorMacro? or $SectorMacro == ''">
+          <return value="table[$Processed = false]"/>
+        </do_if>
+        <set_value name="$wasGtAuto" exact="false"/>
+        <do_all exact="global.$GT_AutoBlacklistedMacroList.count" counter="$autoIdx">
+          <do_if value="global.$GT_AutoBlacklistedMacroList.{$autoIdx} == $SectorMacro">
+            <set_value name="$wasGtAuto" exact="true"/>
+            <break/>
+          </do_if>
+        </do_all>
+        <do_if value="not $wasGtAuto">
+          <return value="table[$Processed = false]"/>
+        </do_if>
+        <remove_from_list name="global.$GT_AutoBlacklistedMacroList" exact="$SectorMacro"/>
+        <set_value name="$threatSector" exact="null"/>
+        <do_if value="global.$GT_ThreatIntelligence?">
+          <do_all exact="global.$GT_ThreatIntelligence.keys.count" counter="$tiIdx">
+            <set_value name="$tiSector" exact="global.$GT_ThreatIntelligence.keys.list.{$tiIdx}"/>
+            <set_value name="$tiMacro" exact="@$tiSector.macro.id"/>
+            <do_if value="$tiMacro == $SectorMacro">
+              <set_value name="$threatSector" exact="$tiSector"/>
+              <break/>
+            </do_if>
           </do_all>
         </do_if>
-        <return value="table[$StillThreatenedMacros = $stillThreatened, $NeedsRemerge = $stillThreatened.count gt 0]"/>
+        <do_if value="$threatSector?">
+          <run_actions ref="GT_RemoveThreatEpisode">
+            <param name="Sector" value="$threatSector"/>
+            <param name="DebugChance" value="$DebugChance"/>
+          </run_actions>
+        </do_if>
+        <set_value name="$processed" exact="true"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Blacklist] Player removed GT-auto sector macro ' + $SectorMacro + ' - threat episode cleared (re-blacklist on next detection: gravidar, attack, missile, or destruction)'" chance="100"/>
+        </do_if>
+        <return value="table[$Processed = $processed]"/>
       </actions>
     </library>
     
@@ -2413,17 +2425,17 @@
     <!-- DYNAMIC BLACKLIST INTEGRATION                                            -->
     <!-- ========================================================================= -->
     
-    <!-- Shared bootstrap: raise Lua Initialize, push threat payload, optional fleet assign.
-         Called on session start (game_loaded / new game) AND on Lua Ready (UI loads before MD on menu). -->
+    <!-- Shared bootstrap: raise Lua Initialize, push threat payload.
+         Called on session start (game_loaded / new game) AND on Lua Ready (UI loads before MD on menu).
+         Fleet commander assignment is manual only (settings button). -->
     <library name="BootstrapBlacklistLuaIntegration" purpose="run_actions">
       <params>
         <param name="Reason" default="'unknown'"/>
-        <param name="ApplyToFleet" default="true"/>
         <param name="ReconcileThreats" default="false" comment="Session start only: silent batch threat reconcile on save load"/>
       </params>
       <actions>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-Blacklist] BootstrapBlacklistLuaIntegration reason=' + $Reason + ' applyToFleet=' + $ApplyToFleet" chance="100"/>
+          <debug_text text="'[GT-Blacklist] BootstrapBlacklistLuaIntegration reason=' + $Reason" chance="100"/>
         </do_if>
         
         <!-- Pass relation threshold AND existing blacklist ID (if any) to Lua -->
@@ -2456,11 +2468,6 @@
         <!-- Load existing threats into blacklist immediately after creation -->
         <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
         
-        <do_if value="$ApplyToFleet and @global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist">
-          <set_value name="global.$GT_ManualBlacklistAssignRequested" exact="true"/>
-          <signal_cue_instantly cue="ApplyBlacklistToFleet"/>
-        </do_if>
-        
         <do_if value="$ReconcileThreats">
           <signal_cue_instantly cue="CleanupExpiredThreats_Blacklist" param="table[$SuppressPlayerAlerts = true]"/>
         </do_if>
@@ -2480,7 +2487,6 @@
       <actions>
         <run_actions ref="BootstrapBlacklistLuaIntegration">
           <param name="Reason" value="event.name"/>
-          <param name="ApplyToFleet" value="true"/>
           <param name="ReconcileThreats" value="true"/>
         </run_actions>
       </actions>
@@ -2494,7 +2500,6 @@
       <actions>
         <run_actions ref="BootstrapBlacklistLuaIntegration">
           <param name="Reason" value="'lua_ready'"/>
-          <param name="ApplyToFleet" value="false"/>
         </run_actions>
       </actions>
     </cue>
@@ -2537,64 +2542,18 @@
       </actions>
     </cue>
     
-    <!-- Lua poll: one event per sector macro the player removed from the fleet blacklist -->
+    <!-- Lua read-merge-write: GT-auto macro missing from vanilla on blacklist update -->
     <cue name="OnVanillaSectorRemoved" instantiate="true">
       <conditions>
         <event_ui_triggered screen="'gt_blacklist_manager'" control="'VanillaSectorRemoved'"/>
       </conditions>
       <actions>
-        <do_if value="not global.$GT_BlacklistRespeakMacros?">
-          <set_value name="global.$GT_BlacklistRespeakMacros" exact="[]"/>
-        </do_if>
         <set_value name="$removedMacro" exact="if event.param3? then event.param3 else ''"/>
-        <do_if value="$removedMacro != ''">
-          <set_value name="$alreadyListed" exact="false"/>
-          <do_all exact="global.$GT_BlacklistRespeakMacros.count" counter="$rmIdx">
-            <do_if value="global.$GT_BlacklistRespeakMacros.{$rmIdx} == $removedMacro">
-              <set_value name="$alreadyListed" exact="true"/>
-              <break/>
-            </do_if>
-          </do_all>
-          <do_if value="not $alreadyListed">
-            <append_to_list name="global.$GT_BlacklistRespeakMacros" exact="$removedMacro"/>
-          </do_if>
-        </do_if>
-      </actions>
-    </cue>
-    
-    <!-- Poll detected external vanilla edit; bump epoch for route cache invalidation -->
-    <cue name="OnVanillaBlacklistChanged" instantiate="true">
-      <conditions>
-        <event_ui_triggered screen="'gt_blacklist_manager'" control="'VanillaChanged'"/>
-      </conditions>
-      <actions>
-        <do_if value="not global.$GT_BlacklistEpoch?">
-          <set_value name="global.$GT_BlacklistEpoch" exact="0"/>
-        </do_if>
-        <set_value name="$fingerprint" exact="if event.param3? then event.param3 else ''"/>
-        <do_if value="not global.$GT_LastVanillaBlacklistFingerprint?">
-          <set_value name="global.$GT_LastVanillaBlacklistFingerprint" exact="''"/>
-        </do_if>
-        <do_if value="$fingerprint != global.$GT_LastVanillaBlacklistFingerprint">
-          <set_value name="global.$GT_LastVanillaBlacklistFingerprint" exact="$fingerprint"/>
-          <set_value name="global.$GT_BlacklistEpoch" exact="global.$GT_BlacklistEpoch + 1"/>
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Blacklist] Epoch advanced to ' + global.$GT_BlacklistEpoch + ' (external vanilla edit)'" chance="100"/>
-          </do_if>
-          <!-- Re-merge only when player removed GT-auto sector(s) that still have live threat -->
-          <do_if value="@global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist">
-            <set_value name="$respeakMacros" exact="if global.$GT_BlacklistRespeakMacros? then global.$GT_BlacklistRespeakMacros else []"/>
-            <do_if value="$respeakMacros.count gt 0">
-              <run_actions ref="GT_RevalidateRemovedAutoThreatMacros" result="$revalidate">
-                <param name="RemovedMacros" value="$respeakMacros"/>
-                <param name="DebugChance" value="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
-              </run_actions>
-              <do_if value="$revalidate.$NeedsRemerge">
-                <signal_cue_instantly cue="UpdateBlacklistOnThreat" param="table[$RespeakRemovedMacros = $revalidate.$StillThreatenedMacros]"/>
-              </do_if>
-            </do_if>
-            <set_value name="global.$GT_BlacklistRespeakMacros" exact="[]"/>
-          </do_if>
+        <do_if value="$removedMacro != '' and @global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist">
+          <run_actions ref="GT_ProcessPlayerRemovedAutoBlacklistMacro">
+            <param name="SectorMacro" value="$removedMacro"/>
+            <param name="DebugChance" value="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+          </run_actions>
         </do_if>
       </actions>
     </cue>
@@ -2615,10 +2574,6 @@
         <!-- Only update if dynamic blacklist is enabled -->
         <do_if value="@global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist">
           <run_actions ref="EnsureBlacklistRegistryGlobals"/>
-          <set_value name="$respeakRemovedMacros" exact="[]"/>
-          <do_if value="event.param? and event.param.$RespeakRemovedMacros?">
-            <set_value name="$respeakRemovedMacros" exact="event.param.$RespeakRemovedMacros"/>
-          </do_if>
           <!-- Build GT auto-add payload (Lua read-merge-write preserves manual vanilla sectors) -->
           <set_value name="$threatDataString" exact="''"/>
           <set_value name="$threatCount" exact="0"/>
@@ -2671,18 +2626,6 @@
                   <run_actions ref="RegisterAutoBlacklistedMacro">
                     <param name="SectorMacro" value="$sectorMacro"/>
                   </run_actions>
-                  <set_value name="$shouldRespeak" exact="false"/>
-                  <do_all exact="$respeakRemovedMacros.count" counter="$rsIdx">
-                    <do_if value="$respeakRemovedMacros.{$rsIdx} == $sectorMacro">
-                      <set_value name="$shouldRespeak" exact="true"/>
-                      <break/>
-                    </do_if>
-                  </do_all>
-                  <do_if value="$shouldRespeak">
-                    <run_actions ref="GT_SpeakThreatBlacklistAlert">
-                      <param name="Sector" value="$sector"/>
-                    </run_actions>
-                  </do_if>
                   <set_value name="$entry" exact="$sectorMacro + ':' + $threatData.$ThreatLevel + ':' + $threatData.$Timestamp"/>
                   
                   <do_if value="$threatDataString == ''">
@@ -2726,8 +2669,7 @@
       </actions>
     </cue>
     
-    <!-- Apply blacklist to all GT ships automatically (EVENT-DRIVEN, NO PERIODIC POLLING) -->
-    <!-- Triggered by: threat detection, blacklist initialization, ship registration -->
+    <!-- Apply blacklist to GT fleet commanders (manual settings button only). -->
     <cue name="ApplyBlacklistToFleet" instantiate="true">
       <conditions>
         <event_cue_signalled/>
@@ -2811,10 +2753,10 @@
               </do_if>
             </do_all>
           </do_if>
-          </do_else>
+        </do_else>
 
-          <!-- Consume one-shot manual flag after processing -->
-          <set_value name="global.$GT_ManualBlacklistAssignRequested" exact="false"/>
+        <!-- Consume one-shot manual flag after processing -->
+        <set_value name="global.$GT_ManualBlacklistAssignRequested" exact="false"/>
         </do_if>
       </actions>
     </cue>

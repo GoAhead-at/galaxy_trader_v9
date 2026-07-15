@@ -73,7 +73,6 @@ local GT_Blacklist = {
         DEBUG_MODE = false,  -- true: init/update/FFI trace + per-macro verbose dumps
         BLACKLIST_NAME_PREFIX = "GT_ThreatAvoid_",
         THREAT_LEVEL_THRESHOLD = 3,  -- Default: Blacklist sectors with threat >= 3 (overridden by MD settings)
-        POLL_INTERVAL = 5.0,        -- Vanilla fingerprint poll (seconds); reconcile only on diff
     },
     
     -- State tracking
@@ -82,9 +81,8 @@ local GT_Blacklist = {
     fleet_blacklist_id = nil, -- Shared fleet-wide blacklist ID
     relation_value = "",      -- Stored relation value: "enemy" or ""
     last_written_fingerprint = "",
-    last_written_macros = {}, -- { [macro] = true } snapshot after last GT write
+    last_written_macros = {}, -- { [macro] = true } GT-auto macros after last write
     self_write_in_progress = false,
-    poll_next_time = 0,
     initialized = false,
 }
 
@@ -264,7 +262,7 @@ local function readFleetBlacklistMacros()
 end
 
 --- Merge vanilla base with GT auto adds/removes; preserve player manual sectors.
---- Player manual remove of an auto sector is temporary: next MD add while threat active re-applies it.
+--- Player manual remove of a GT-auto sector is permanent until MD detects a new threat episode.
 local function mergeFleetMacroList(vanilla_macros, add_macros, remove_macros)
     local final_set = macroListToSet(vanilla_macros)
     local remove_set = macroListToSet(remove_macros)
@@ -283,7 +281,17 @@ end
 local function rememberWrittenMacros(macros)
     GT_Blacklist.last_written_macros = macroListToSet(macros)
     GT_Blacklist.last_written_fingerprint = fingerprintMacroList(macros)
-    GT_Blacklist.last_notified_fingerprint = GT_Blacklist.last_written_fingerprint
+end
+
+--- Drop MD auto-add macros the player removed from vanilla since the last GT write.
+local function filterAddMacrosExcludingSet(add_macros, exclude_set)
+    local filtered = {}
+    for _, macro in ipairs(add_macros or {}) do
+        if macro and macro ~= "" and not exclude_set[macro] then
+            table.insert(filtered, macro)
+        end
+    end
+    return filtered
 end
 
 --- Macros present after last GT write but missing from live vanilla (player removed in empire UI).
@@ -466,14 +474,29 @@ local function writeFleetBlacklistMacros(final_macro_list, relation_value)
     return true
 end
 
---- Read vanilla, merge GT adds/removes, write result. Preserves player manual sectors.
+--- Read vanilla, detect player removals vs last GT write, merge, write. Preserves manual sectors.
 local function mergeAndWriteFleetBlacklist(add_macros, remove_macros, relation_value, clear_all)
     if clear_all then
         return writeFleetBlacklistMacros({}, relation_value)
     end
 
     local vanilla_macros = readFleetBlacklistMacros()
-    local final_macros = mergeFleetMacroList(vanilla_macros, add_macros, remove_macros)
+    local player_removed = macrosRemovedSinceLastWrite(vanilla_macros)
+    local player_removed_set = macroListToSet(player_removed)
+    local filtered_add_macros = add_macros
+
+    if #player_removed > 0 then
+        logTrace(string.format(
+            "mergeAndWriteFleetBlacklist: player removed %d GT-written macro(s) from vanilla: [%s]",
+            #player_removed, summarizeMacroList(player_removed)
+        ))
+        for _, macro in ipairs(player_removed) do
+            AddUITriggeredEvent("gt_blacklist_manager", "VanillaSectorRemoved", macro)
+        end
+        filtered_add_macros = filterAddMacrosExcludingSet(add_macros, player_removed_set)
+    end
+
+    local final_macros = mergeFleetMacroList(vanilla_macros, filtered_add_macros, remove_macros)
     return writeFleetBlacklistMacros(final_macros, relation_value)
 end
 
@@ -881,49 +904,6 @@ local function onRecreateBlacklist(_, event_data)
     return onInitialize(_, event_data)
 end
 
---- Lightweight poll: detect external (player) vanilla edits and notify MD for route epoch + auto-registry sync.
-local function pollVanillaBlacklistChanges()
-    if not GT_Blacklist.initialized or GT_Blacklist.self_write_in_progress then
-        return
-    end
-    if type(getElapsedTime) ~= "function" then
-        return
-    end
-
-    local now = getElapsedTime()
-    if GT_Blacklist.poll_next_time > now then
-        return
-    end
-    GT_Blacklist.poll_next_time = now + GT_Blacklist.CONFIG.POLL_INTERVAL
-
-    local macros = readFleetBlacklistMacros()
-    local fp = fingerprintMacroList(macros)
-    if fp == (GT_Blacklist.last_written_fingerprint or "") then
-        return
-    end
-    if fp == (GT_Blacklist.last_notified_fingerprint or "") then
-        return
-    end
-
-    GT_Blacklist.last_notified_fingerprint = fp
-    local removed = macrosRemovedSinceLastWrite(macros)
-    if #removed == 0 then
-        return
-    end
-    logTrace(string.format(
-        "Vanilla blacklist changed externally (poll): macros=%d removed=%d",
-        #macros, #removed
-    ))
-    for _, macro in ipairs(removed) do
-        AddUITriggeredEvent("gt_blacklist_manager", "VanillaSectorRemoved", macro)
-    end
-    AddUITriggeredEvent("gt_blacklist_manager", "VanillaChanged", fp)
-end
-
-local function onPollUpdate()
-    pollVanillaBlacklistChanges()
-end
-
 -- =============================================================================
 -- MODULE INITIALIZATION
 -- =============================================================================
@@ -958,13 +938,6 @@ local function init()
         end
     end
 
-    if type(SetScript) == "function" then
-        local ok = pcall(SetScript, "onUpdate", onPollUpdate)
-        if ok then
-            logLoad(string.format("Registered onUpdate poll (interval=%.1fs)", GT_Blacklist.CONFIG.POLL_INTERVAL))
-        end
-    end
-    
     logLoad("================================================================================")
     logLoad("Dynamic Blacklist Manager loaded successfully!")
     logLoad("Signalled MD: gt_blacklist_manager Ready")

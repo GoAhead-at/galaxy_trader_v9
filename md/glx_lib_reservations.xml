@@ -3,136 +3,103 @@
   <cues>
     <!-- Trade key, index, failure reasons, reservations, orphaned credits cleanup (split from gt_libraries_general). -->
 
-    <!-- Generate Trade Key (Option A: BuyOffer.id + SellOffer.id) -->
-    <!-- Simple approach: uses offer IDs which are unique per offer instance -->
-    <!-- Trade key format: "buyOfferId_sellOfferId" or "null_sellOfferId" for sell-only -->
+    <!-- Generate Trade Key (ORS R1): stable dest_<stationId>_<wareId>.
+         Offer object keys (old Method B) orphan after offer refresh; offer.id (Method A) is often unavailable.
+         Destination-collision semantics: one customer ware slot across the fleet. -->
     <library name="GLX_GenerateTradeKey" purpose="run_actions">
       <params>
-        <param name="buyOffer" default="null" comment="Buy offer object (may be null for sell-only trades)"/>
-        <param name="sellOffer" comment="Sell offer object (required)"/>
+        <param name="buyOffer" default="null" comment="Unused for key (kept for call-site compatibility)"/>
+        <param name="sellOffer" comment="Customer buy offer (GT SellOffer) — destination demand"/>
+        <param name="sellStation" default="null" comment="Optional delivery station override"/>
+        <param name="deliveryStationId" default="null" comment="Optional pre-stamped station idcode"/>
+        <param name="ware" default="null" comment="Optional ware override"/>
         <param name="traceId" default="''" comment="Trace ID for logging"/>
       </params>
       <actions>
         <set_value name="$tradeKey" exact="''"/>
         
-        <!-- Validate sell offer - ERROR if missing -->
         <do_if value="not $sellOffer? or not $sellOffer.exists">
-          <do_if value="$traceId != ''">
-            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
-              <param name="traceId" value="$traceId"/>
-              <param name="stage" value="'CacheIndex'"/>
-              <param name="action" value="'Error'"/>
-              <param name="details" value="'reason=missing_sellOffer'"/>
-              <param name="logLevel" value="0"/>
-            </run_actions>
-          </do_if>
-          <do_else>
-            <debug_text text="'[GT-ERROR] GLX_GenerateTradeKey: sellOffer is null or missing - cannot generate trade key'" chance="100"/>
-          </do_else>
-          <return value="''"/>
-        </do_if>
-        
-        <!-- Get offer IDs -->
-        <set_value name="$buyOfferId" exact="'null'"/>
-        <set_value name="$sellOfferId" exact="''"/>
-        
-        <do_if value="$buyOffer? and $buyOffer.exists">
-          <set_value name="$tempBuyId" exact="@$buyOffer.id"/>
-          <do_if value="$tempBuyId? and $tempBuyId != null">
-            <set_value name="$buyOfferId" exact="'' + $tempBuyId"/>
-          </do_if>
-        </do_if>
-        
-        <!-- Validate sellOffer has valid ID before generating key -->
-        <!-- CRITICAL: Check if sellOffer.id exists and is not null before converting to string -->
-        <set_value name="$tempSellId" exact="@$sellOffer.id"/>
-        <do_if value="$tempSellId? and $tempSellId != null and typeof $tempSellId != datatype.null">
-          <!-- Valid ID - convert to string -->
-          <set_value name="$sellOfferId" exact="'' + $tempSellId"/>
-          <!-- Double-check: ensure sellOfferId is not empty or 'null' string -->
-          <do_if value="$sellOfferId == '' or $sellOfferId == 'null'">
-            <!-- ID conversion failed - log error and return empty key -->
+          <do_if value="not $sellStation? or not @$sellStation.exists">
             <do_if value="$traceId != ''">
               <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
                 <param name="traceId" value="$traceId"/>
                 <param name="stage" value="'CacheIndex'"/>
                 <param name="action" value="'Error'"/>
-                <param name="details" value="'reason=invalid_sellOffer_id_conversion tempSellId=' + (if $tempSellId? then $tempSellId else 'null') + ' sellOfferId=' + $sellOfferId"/>
+                <param name="details" value="'reason=missing_sellOffer'"/>
                 <param name="logLevel" value="0"/>
               </run_actions>
             </do_if>
             <do_else>
-              <debug_text text="'[GT-ERROR] GLX_GenerateTradeKey: sellOffer.id conversion failed - tempSellId=' + (if $tempSellId? then $tempSellId else 'null') + ', sellOfferId=' + $sellOfferId" chance="100"/>
+              <debug_text text="'[GT-ERROR] GLX_GenerateTradeKey: sellOffer/sellStation missing - cannot generate trade key'" chance="100"/>
             </do_else>
             <return value="''"/>
           </do_if>
         </do_if>
-        <do_else>
-          <!-- Fallback (Method B): offer.id is not available in many X4 trade-offer objects.
-               Use the SELL offer object itself as the reservation key.
-               This restores reservation behavior under fleet load and prevents mass cache collisions. -->
-          <set_value name="$tradeKey" exact="$sellOffer"/>
-          <do_if value="$traceId != ''">
-            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
-              <param name="traceId" value="$traceId"/>
-              <param name="stage" value="'CacheIndex'"/>
-              <param name="action" value="'KeyGenerated'"/>
-              <param name="details" value="'trade=SellOfferObj method=B buyOffer=' + (if $buyOffer? then 'valid' else 'null') + ' sellOffer=valid'"/>
-              <param name="logLevel" value="2"/>
-            </run_actions>
+
+        <set_value name="$destId" exact="''"/>
+        <do_if value="$deliveryStationId? and $deliveryStationId != null and $deliveryStationId != ''">
+          <set_value name="$destId" exact="'' + $deliveryStationId"/>
+        </do_if>
+        <do_if value="$destId == '' and $sellStation? and @$sellStation.exists">
+          <do_if value="@$sellStation.isclass.buildstorage and $sellStation.base? and @$sellStation.base.exists and @$sellStation.base.idcode != null">
+            <set_value name="$destId" exact="'' + @$sellStation.base.idcode"/>
           </do_if>
-          <return value="$tradeKey"/>
-        </do_else>
-        
-        <!-- Generate key: "buyOfferId_sellOfferId" -->
-        <!-- CRITICAL: Validate sellOfferId is not empty before generating key -->
-        <do_if value="$sellOfferId == ''">
-          <!-- sellOfferId is empty - this should have been caught earlier, but double-check -->
+          <do_elseif value="@$sellStation.idcode != null">
+            <set_value name="$destId" exact="'' + @$sellStation.idcode"/>
+          </do_elseif>
+        </do_if>
+        <do_if value="$destId == '' and $sellOffer? and @$sellOffer.exists">
+          <set_value name="$offerBuyer" exact="null"/>
+          <do_if value="$sellOffer.buyer? and @$sellOffer.buyer.exists">
+            <set_value name="$offerBuyer" exact="@$sellOffer.buyer"/>
+          </do_if>
+          <do_elseif value="$sellOffer.owner? and @$sellOffer.owner.exists">
+            <set_value name="$offerBuyer" exact="@$sellOffer.owner"/>
+          </do_elseif>
+          <do_if value="$offerBuyer? and @$offerBuyer.exists">
+            <do_if value="@$offerBuyer.isclass.buildstorage and $offerBuyer.base? and @$offerBuyer.base.exists and @$offerBuyer.base.idcode != null">
+              <set_value name="$destId" exact="'' + @$offerBuyer.base.idcode"/>
+            </do_if>
+            <do_elseif value="@$offerBuyer.idcode != null">
+              <set_value name="$destId" exact="'' + @$offerBuyer.idcode"/>
+            </do_elseif>
+          </do_if>
+        </do_if>
+
+        <set_value name="$wareId" exact="''"/>
+        <do_if value="$ware? and $ware != null and $ware.id?">
+          <set_value name="$wareId" exact="'' + @$ware.id"/>
+        </do_if>
+        <do_if value="$wareId == '' and $sellOffer? and @$sellOffer.exists and $sellOffer.ware? and @$sellOffer.ware != null">
+          <set_value name="$wareId" exact="'' + @$sellOffer.ware.id"/>
+        </do_if>
+
+        <do_if value="$destId == '' or $wareId == ''">
           <do_if value="$traceId != ''">
             <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
               <param name="traceId" value="$traceId"/>
               <param name="stage" value="'CacheIndex'"/>
               <param name="action" value="'Error'"/>
-              <param name="details" value="'reason=empty_sellOfferId buyOfferId=' + $buyOfferId"/>
+              <param name="details" value="'reason=stable_key_incomplete destId=' + $destId + ' wareId=' + $wareId"/>
               <param name="logLevel" value="0"/>
             </run_actions>
           </do_if>
           <do_else>
-            <debug_text text="'[GT-ERROR] GLX_GenerateTradeKey: sellOfferId is empty - cannot generate trade key'" chance="100"/>
+            <debug_text text="'[GT-ERROR] GLX_GenerateTradeKey: cannot build dest_station_ware key (destId=' + $destId + ', wareId=' + $wareId + ')'" chance="100"/>
           </do_else>
           <return value="''"/>
         </do_if>
-        
-        <set_value name="$tradeKey" exact="$buyOfferId + '_' + $sellOfferId"/>
-        
-        <!-- Validate generated key is not null_null (indicates invalid offer IDs) -->
-        <do_if value="$tradeKey == 'null_null'">
-          <do_if value="$traceId != ''">
-            <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
-              <param name="traceId" value="$traceId"/>
-              <param name="stage" value="'CacheIndex'"/>
-              <param name="action" value="'Error'"/>
-              <param name="details" value="'reason=invalid_offer_ids buyOfferId=' + $buyOfferId + ' sellOfferId=' + $sellOfferId"/>
-              <param name="logLevel" value="0"/>
-            </run_actions>
-          </do_if>
-          <do_else>
-            <debug_text text="'[GT-ERROR] GLX_GenerateTradeKey: Generated invalid trade key null_null - buyOfferId=' + $buyOfferId + ', sellOfferId=' + $sellOfferId" chance="100"/>
-          </do_else>
-          <return value="''"/>
-        </do_if>
-        
-        <!-- Log key generation -->
+
+        <set_value name="$tradeKey" exact="'$dest_' + $destId + '_' + $wareId"/>
         <do_if value="$traceId != ''">
           <run_actions ref="md.GLX_Lib_TradingLog.GLX_LogTradeSearch">
             <param name="traceId" value="$traceId"/>
             <param name="stage" value="'CacheIndex'"/>
             <param name="action" value="'KeyGenerated'"/>
-            <param name="details" value="'trade=' + $tradeKey + ' method=A buyOffer=' + (if $buyOffer? then 'valid' else 'null') + ' sellOffer=valid'"/>
+            <param name="details" value="'trade=' + $tradeKey + ' method=stable_dest'"/>
             <param name="logLevel" value="3"/>
           </run_actions>
         </do_if>
-        
         <return value="$tradeKey"/>
       </actions>
     </library>

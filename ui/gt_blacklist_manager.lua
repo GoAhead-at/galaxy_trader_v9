@@ -659,25 +659,6 @@ local function parseThreatData(threat_data_string)
     return add_macros
 end
 
---- Clean up expired threats from tracking
-local function cleanupExpiredThreats(current_time, expiry_time)
-    local removed_count = 0
-    
-    for sector_name, threat_info in pairs(GT_Blacklist.blacklisted_sectors) do
-        local age = current_time - threat_info.timestamp
-        if age > expiry_time then
-            GT_Blacklist.blacklisted_sectors[sector_name] = nil
-            removed_count = removed_count + 1
-        end
-    end
-    
-    if removed_count > 0 then
-        debugLog(string.format("Cleaned up %d expired threat entries", removed_count))
-    end
-    
-    return removed_count
-end
-
 -- =============================================================================
 -- EVENT HANDLERS - MD SCRIPT INTERFACE
 -- =============================================================================
@@ -848,43 +829,6 @@ local function onApplyToFleet(_, event_data)
     return ok
 end
 
---- Clean up expired threats and update blacklist
-local function onCleanupExpired(_, event_data)
-    if not GT_Blacklist.initialized then
-        logTrace("EVENT CleanupExpired DROPPED: initialized=false", "WARNING")
-        return false
-    end
-    
-    logTrace(string.format("EVENT CleanupExpired received payload_len=%d", event_data and #event_data or 0))
-    
-    -- Check for nil/empty event_data before parsing (prevents crash)
-    if not event_data or event_data == "" then
-        debugLog("Invalid cleanup parameters: event_data is nil or empty", "ERROR")
-        return false
-    end
-    
-    -- Format: "current_time:expiry_time"
-    local parts = {}
-    for part in string.gmatch(event_data, "([^:]+)") do
-        table.insert(parts, part)
-    end
-    
-    if #parts < 2 then
-        debugLog("Invalid cleanup parameters", "ERROR")
-        return false
-    end
-    
-    local current_time = tonumber(parts[1]) or 0
-    local expiry_time = tonumber(parts[2]) or 3600
-    
-    debugLog(string.format("Cleaning up threats older than %d seconds", expiry_time))
-    
-    -- MD runs UpdateBlacklistOnThreat after cleanup; only prune local metadata here.
-    cleanupExpiredThreats(current_time, expiry_time)
-
-    return true
-end
-
 --- Remove blacklist from a specific ship
 local function onRemoveFromShip(_, event_data)
     if not GT_Blacklist.initialized then
@@ -927,7 +871,6 @@ local function init()
         { name = "GT_Blacklist.Initialize",      handler = onInitialize },
         { name = "GT_Blacklist.Update",          handler = onUpdateBlacklist },
         { name = "GT_Blacklist.ApplyToFleet",    handler = onApplyToFleet },
-        { name = "GT_Blacklist.CleanupExpired",  handler = onCleanupExpired },
         { name = "GT_Blacklist.RemoveFromShip",  handler = onRemoveFromShip },
         { name = "GT_Blacklist.Recreate",        handler = onRecreateBlacklist },
     }

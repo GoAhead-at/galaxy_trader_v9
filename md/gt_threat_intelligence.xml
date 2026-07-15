@@ -30,6 +30,15 @@
         <do_if value="not global.$GT_ThreatCleanupTime? or global.$GT_ThreatCleanupTime == 0">
           <set_value name="global.$GT_ThreatCleanupTime" exact="player.age"/>
         </do_if>
+        <do_if value="not global.$GT_LastBlacklistActivityTime?">
+          <set_value name="global.$GT_LastBlacklistActivityTime" exact="player.age"/>
+        </do_if>
+        <do_if value="not global.$GT_BlacklistReconcileBusy?">
+          <set_value name="global.$GT_BlacklistReconcileBusy" exact="false"/>
+        </do_if>
+        <do_if value="global.$GT_BlacklistReconcileState?">
+          <remove_value name="global.$GT_BlacklistReconcileState"/>
+        </do_if>
         <!-- Route-reroute integration: epoch bumps when dynamic blacklist payload changes -->
         <do_if value="not global.$GT_BlacklistEpoch?">
           <set_value name="global.$GT_BlacklistEpoch" exact="0"/>
@@ -704,6 +713,7 @@
         <set_value name="global.$GT_LastVanillaBlacklistFingerprint" exact="''"/>
         <set_value name="global.$GT_BlacklistEpoch" exact="global.$GT_BlacklistEpoch + 1"/>
         <set_value name="global.$GT_ThreatCleanupTime" exact="player.age"/>
+        <run_actions ref="GT_BumpBlacklistActivityTime"/>
         
         <!-- Per-ship threat report counters (attack path) -->
         <do_if value="global.$GT_Ships?">
@@ -1338,6 +1348,7 @@
           </do_if>
         </do_else>
         <set_value name="$processed" exact="true"/>
+        <run_actions ref="GT_BumpBlacklistActivityTime"/>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-Dismiss] PLAYER_REMOVE macro=' + $SectorMacro + ' processed=1 episodeCleared=' + (if $threatSector? then 1 else 0)" chance="$DebugChance"/>
         </do_if>
@@ -1681,6 +1692,7 @@
           <set_value name="global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShipIdcodes" exact="[]"/>
         </do_if>
         
+        <set_value name="$newShipsAdded" exact="0"/>
         <!-- Add new enemy ships to tracking (avoid duplicates) -->
         <!-- IMPORTANT: ? only checks whether a variable is defined, not whether its value is null -->
         <do_if value="$EnemyShips == null">
@@ -1744,39 +1756,38 @@
             <debug_text text="'[GT-Threat] Stored ' + $newShipsAdded + ' new enemy ships for tracking in sector ' + $Sector.knownname + ' (total tracked: ' + global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShips.count + '): ' + $shipListString" chance="$DebugChance"/>
           </do_if>
         </do_if>
+        <return value="table[$NewShipsAdded = $newShipsAdded]"/>
       </actions>
     </library>
     
     <!-- ========================================================================= -->
-    <!-- LIBRARY: Clear sector blacklist when the tracked threat episode is resolved -->
-    <!-- (tracked hostiles gone, player relief fleet outmatches tracked score, or defense station) -->
+    <!-- LIBRARY: Bump idle-reconcile activity clock (blacklist-driving events only) -->
     <!-- ========================================================================= -->
-    <library name="ClearSectorIfAllShipsGone" purpose="run_actions">
+    <library name="GT_BumpBlacklistActivityTime" purpose="run_actions">
+      <actions>
+        <set_value name="global.$GT_LastBlacklistActivityTime" exact="player.age"/>
+      </actions>
+    </library>
+    
+    <!-- ========================================================================= -->
+    <!-- LIBRARY: Prune destroyed, departed, or invalid tracked hostile refs -->
+    <!-- ========================================================================= -->
+    <library name="GT_PruneStaleTrackedHostiles" purpose="run_actions">
       <params>
         <param name="Sector"/>
-        <param name="ReliefShip" default="null" comment="Optional player combat ship that entered sector (relief re-eval)"/>
-        <param name="ClearVoiceReason" default="null" comment="Optional: departed | destroyed (inferred from prune when null)"/>
-        <param name="DestroyedShip" default="null" comment="Tracked hostile destroyed (Betty line 315 name)"/>
-        <param name="SuppressPlayerAlerts" default="false" comment="Save-load batch reconcile: update blacklist without voice/toast"/>
         <param name="DebugChance" default="0"/>
       </params>
       <actions>
-        <set_value name="$shouldClear" exact="false"/>
+        <set_value name="$prunedCount" exact="0"/>
         <set_value name="$pruneHadDestroyed" exact="false"/>
         <set_value name="$pruneHadDeparted" exact="false"/>
         <set_value name="$pruneLastDestroyedShip" exact="null"/>
-        
-        <do_if value="not global.$GT_ThreatIntelligence? or not global.$GT_ThreatIntelligence.{$Sector}?">
-          <return value="table[$SectorCleared = false]"/>
-        </do_if>
-        <do_else>
-          <!-- Drop orphan idcodes when parallel removals desynced the parallel lists -->
+        <do_if value="global.$GT_ThreatIntelligence? and global.$GT_ThreatIntelligence.{$Sector}?">
           <do_if value="global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShipIdcodes? and global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShips?">
             <do_while value="global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShipIdcodes.count gt global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShips.count">
               <remove_from_list name="global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShipIdcodes" exact="global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShipIdcodes.last"/>
             </do_while>
           </do_if>
-          <!-- Prune destroyed, invalid, or departed tracked ships -->
           <do_if value="global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShips?">
             <set_value name="$trackedShips" exact="global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShips"/>
             <do_all exact="$trackedShips.count" counter="$pruneIdx" reverse="true">
@@ -1795,6 +1806,7 @@
                 <set_value name="$shouldPrune" exact="true"/>
               </do_elseif>
               <do_if value="$shouldPrune">
+                <set_value name="$prunedCount" exact="$prunedCount + 1"/>
                 <do_if value="$pruneShip? and $pruneShip != null">
                   <do_if value="not @$pruneShip.exists or not @$pruneShip.isoperational">
                     <set_value name="$pruneHadDestroyed" exact="true"/>
@@ -1829,6 +1841,102 @@
               </do_if>
             </do_all>
           </do_if>
+          <do_if value="$prunedCount gt 0 and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Threat] Pruned ' + $prunedCount + ' stale tracked hostile(s) in ' + $Sector.knownname" chance="$DebugChance"/>
+          </do_if>
+        </do_if>
+        <return value="table[
+          $PrunedCount = $prunedCount,
+          $PruneHadDestroyed = $pruneHadDestroyed,
+          $PruneHadDeparted = $pruneHadDeparted,
+          $PruneLastDestroyedShip = $pruneLastDestroyedShip
+        ]"/>
+      </actions>
+    </library>
+    
+    <!-- ========================================================================= -->
+    <!-- LIBRARY: True when combat pool contains a ship not yet in tracked lists -->
+    <!-- ========================================================================= -->
+    <library name="GT_HasUntrackedCombatHostiles" purpose="run_actions">
+      <params>
+        <param name="Sector"/>
+        <param name="EnemyShips"/>
+      </params>
+      <actions>
+        <set_value name="$hasUntracked" exact="false"/>
+        <set_value name="$pool" exact="if $EnemyShips? and $EnemyShips != null then $EnemyShips else []"/>
+        <do_if value="$pool.count gt 0">
+          <set_value name="$trackedShips" exact="[]"/>
+          <set_value name="$trackedIdcodes" exact="[]"/>
+          <do_if value="global.$GT_ThreatIntelligence? and global.$GT_ThreatIntelligence.{$Sector}?">
+            <do_if value="global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShips?">
+              <set_value name="$trackedShips" exact="global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShips"/>
+            </do_if>
+            <do_if value="global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShipIdcodes?">
+              <set_value name="$trackedIdcodes" exact="global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShipIdcodes"/>
+            </do_if>
+          </do_if>
+          <do_all exact="$pool.count" counter="$ui">
+            <set_value name="$poolShip" exact="$pool.{$ui}"/>
+            <do_if value="$poolShip? and @$poolShip.exists and $poolShip.primarypurpose == purpose.fight">
+              <set_value name="$alreadyTracked" exact="false"/>
+              <do_all exact="$trackedShips.count" counter="$ti">
+                <set_value name="$trackedIdAtIdx" exact="null"/>
+                <do_if value="$trackedIdcodes.count gt 0 and $trackedIdcodes.{$ti}?">
+                  <set_value name="$trackedIdAtIdx" exact="$trackedIdcodes.{$ti}"/>
+                </do_if>
+                <run_actions ref="GT_ShipMatchesTracked" result="$alreadyTracked">
+                  <param name="TrackedShip" value="$trackedShips.{$ti}"/>
+                  <param name="TrackedIdcode" value="$trackedIdAtIdx"/>
+                  <param name="CandidateShip" value="$poolShip"/>
+                  <param name="CandidateIdcode" value="$poolShip.idcode"/>
+                </run_actions>
+                <do_if value="$alreadyTracked">
+                  <break/>
+                </do_if>
+              </do_all>
+              <do_if value="not $alreadyTracked">
+                <set_value name="$hasUntracked" exact="true"/>
+                <break/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+        <return value="table[$HasUntracked = $hasUntracked]"/>
+      </actions>
+    </library>
+    
+    <!-- ========================================================================= -->
+    <!-- LIBRARY: Clear sector blacklist when the tracked threat episode is resolved -->
+    <!-- (tracked hostiles gone, player relief fleet outmatches tracked score, or defense station) -->
+    <!-- ========================================================================= -->
+    <library name="ClearSectorIfAllShipsGone" purpose="run_actions">
+      <params>
+        <param name="Sector"/>
+        <param name="ReliefShip" default="null" comment="Optional player combat ship that entered sector (relief re-eval)"/>
+        <param name="ClearVoiceReason" default="null" comment="Optional: departed | destroyed (inferred from prune when null)"/>
+        <param name="DestroyedShip" default="null" comment="Tracked hostile destroyed (Betty line 315 name)"/>
+        <param name="SuppressPlayerAlerts" default="false" comment="Save-load batch reconcile: update blacklist without voice/toast"/>
+        <param name="SkipBlacklistSync" default="false" comment="Batch reconcile: defer UpdateBlacklistOnThreat to caller"/>
+        <param name="DebugChance" default="0"/>
+      </params>
+      <actions>
+        <set_value name="$shouldClear" exact="false"/>
+        <set_value name="$pruneHadDestroyed" exact="false"/>
+        <set_value name="$pruneHadDeparted" exact="false"/>
+        <set_value name="$pruneLastDestroyedShip" exact="null"/>
+        
+        <do_if value="not global.$GT_ThreatIntelligence? or not global.$GT_ThreatIntelligence.{$Sector}?">
+          <return value="table[$SectorCleared = false]"/>
+        </do_if>
+        <do_else>
+          <run_actions ref="GT_PruneStaleTrackedHostiles" result="$pruneResult">
+            <param name="Sector" value="$Sector"/>
+            <param name="DebugChance" value="$DebugChance"/>
+          </run_actions>
+          <set_value name="$pruneHadDestroyed" exact="$pruneResult.$PruneHadDestroyed"/>
+          <set_value name="$pruneHadDeparted" exact="$pruneResult.$PruneHadDeparted"/>
+          <set_value name="$pruneLastDestroyedShip" exact="$pruneResult.$PruneLastDestroyedShip"/>
           
           <!-- Tracked-hostile episode only: no sector-wide enemy scan, no gravidar-silence clear -->
           <set_value name="$activeTrackedCombat" exact="[]"/>
@@ -1884,7 +1992,8 @@
               </run_actions>
             </do_if>
             <remove_value name="global.$GT_ThreatIntelligence.{$Sector}"/>
-            <do_if value="$wasBlacklisted">
+            <do_if value="$wasBlacklisted and not $SkipBlacklistSync">
+              <run_actions ref="GT_BumpBlacklistActivityTime"/>
               <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
             </do_if>
             <set_value name="$voiceReason" exact="'departed'"/>
@@ -2028,6 +2137,12 @@
           </do_if>
 
           <do_if value="not $suppressDismissedDetection">
+          <do_if value="global.$GT_ThreatIntelligence? and global.$GT_ThreatIntelligence.{$currentSector}?">
+            <run_actions ref="GT_PruneStaleTrackedHostiles">
+              <param name="Sector" value="$currentSector"/>
+              <param name="DebugChance" value="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+            </run_actions>
+          </do_if>
           <do_if value="not global.$GT_ThreatIntelligence?">
             <set_value name="global.$GT_ThreatIntelligence" exact="table[]"/>
           </do_if>
@@ -2059,6 +2174,7 @@
             <param name="DebugChance" value="100"/>
           </run_actions>
           <do_if value="not $wasAlreadyBlacklisted">
+            <run_actions ref="GT_BumpBlacklistActivityTime"/>
             <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
           </do_if>
           <signal_cue_instantly cue="NotifyShipsOfThreat" param="$currentSector"/>
@@ -2168,6 +2284,12 @@
           </do_if>
 
           <do_if value="not $suppressDismissedDetection">
+          <do_if value="global.$GT_ThreatIntelligence? and global.$GT_ThreatIntelligence.{$currentSector}?">
+            <run_actions ref="GT_PruneStaleTrackedHostiles">
+              <param name="Sector" value="$currentSector"/>
+              <param name="DebugChance" value="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+            </run_actions>
+          </do_if>
           <do_if value="not global.$GT_ThreatIntelligence?">
             <set_value name="global.$GT_ThreatIntelligence" exact="table[]"/>
           </do_if>
@@ -2196,6 +2318,7 @@
             <param name="DebugChance" value="100"/>
           </run_actions>
           <do_if value="not $wasAlreadyBlacklisted">
+            <run_actions ref="GT_BumpBlacklistActivityTime"/>
             <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
           </do_if>
           <signal_cue_instantly cue="NotifyShipsOfThreat" param="$currentSector"/>
@@ -2315,6 +2438,15 @@
           </do_if>
 
           <do_if value="not $suppressDismissedDetection">
+          <do_if value="global.$GT_ThreatIntelligence? and global.$GT_ThreatIntelligence.{$currentSector}?">
+            <run_actions ref="GT_PruneStaleTrackedHostiles">
+              <param name="Sector" value="$currentSector"/>
+              <param name="DebugChance" value="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+            </run_actions>
+          </do_if>
+          <do_if value="not global.$GT_ThreatIntelligence?">
+            <set_value name="global.$GT_ThreatIntelligence" exact="table[]"/>
+          </do_if>
           <set_value name="global.$GT_ThreatIntelligence.{$currentSector}" exact="table[]"/>
           <set_value name="global.$GT_ThreatIntelligence.{$currentSector}.$Timestamp" exact="player.age"/>
           <set_value name="global.$GT_ThreatIntelligence.{$currentSector}.$ThreatLevel" exact="5"/>
@@ -2342,6 +2474,7 @@
             </run_actions>
           </do_if>
           <do_if value="not $wasAlreadyBlacklisted">
+            <run_actions ref="GT_BumpBlacklistActivityTime"/>
             <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
           </do_if>
           <signal_cue_instantly cue="NotifyShipsOfThreat" param="$currentSector"/>
@@ -2559,45 +2692,6 @@
             <remove_value name="global.$GT_ThreatNotifyState.{$sector}"/>
           </do_else>
         </do_else>
-      </actions>
-    </cue>
-    
-    <!-- Threat Database Cleanup - Remove old threats every 10 minutes -->
-    <cue name="CleanupOldThreats">
-      <conditions>
-        <event_cue_signalled/>
-      </conditions>
-      <delay exact="600s"/> <!-- 10 minutes -->
-      <actions>
-        <do_if value="global.$GT_ThreatIntelligence?">
-          <set_value name="$currentTime" exact="player.age"/>
-          <set_value name="$threatsRemoved" exact="0"/>
-          
-          <!-- Remove threats older than 1 hour -->
-          <do_all exact="global.$GT_ThreatIntelligence.keys.count" counter="$i" reverse="true">
-            <set_value name="$sector" exact="global.$GT_ThreatIntelligence.keys.list.{$i}"/>
-            <set_value name="$threatData" exact="global.$GT_ThreatIntelligence.{$sector}"/>
-            
-            <do_if value="$threatData.$Timestamp?">
-              <set_value name="$age" exact="$currentTime - $threatData.$Timestamp"/>
-              
-              <!-- Remove threats older than 1 hour -->
-              <do_if value="$age gt 3600s">
-                <remove_value name="global.$GT_ThreatIntelligence.{$sector}"/>
-                <set_value name="$threatsRemoved" exact="$threatsRemoved + 1"/>
-              </do_if>
-            </do_if>
-          </do_all>
-          
-          <do_if value="$threatsRemoved gt 0">
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GalaxyTrader MK3] Threat Intelligence cleanup: Removed ' + $threatsRemoved + ' old threat reports'" chance="100"/>
-            </do_if>
-          </do_if>
-        </do_if>
-        
-        <!-- Signal self to repeat -->
-        <signal_cue cue="CleanupOldThreats"/>
       </actions>
     </cue>
     
@@ -2845,6 +2939,16 @@
           <cancel_cue cue="this"/>
         </do_if>
         <do_else>
+        <run_actions ref="GT_HasUntrackedCombatHostiles" result="$untrackedCheck">
+          <param name="Sector" value="$sector"/>
+          <param name="EnemyShips" value="$enemyShips"/>
+        </run_actions>
+        <do_if value="$untrackedCheck.$HasUntracked">
+          <run_actions ref="GT_PruneStaleTrackedHostiles">
+            <param name="Sector" value="$sector"/>
+            <param name="DebugChance" value="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+          </run_actions>
+        </do_if>
         <set_value name="$threatLevel" exact="2"/>
         <do_if value="$capitalShips gt 0">
           <set_value name="$threatLevel" exact="4"/>
@@ -3053,6 +3157,12 @@
           <do_if value="not $deny and $dismissedEval.$Decision == 'NEW_HOSTILE' and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-Dismiss] RECEIVER ACCEPTED sector=' + $sector.knownname + ' reporter=' + $reporterIdcode + ' (new hostile idcode - new episode)'" chance="100"/>
           </do_if>
+          <do_if value="not $deny and ($dismissedEval.$Decision == 'NEW_HOSTILE' or $dismissedEval.$Decision == 'NO_DISMISSED_MEMORY')">
+            <run_actions ref="GT_PruneStaleTrackedHostiles">
+              <param name="Sector" value="$sector"/>
+              <param name="DebugChance" value="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+            </run_actions>
+          </do_if>
         </do_if>
 
         <do_if value="not $deny">
@@ -3109,6 +3219,7 @@
 
         <!-- Sync vanilla only on first blacklist; repeat warnings must not re-merge after player manual remove -->
         <do_if value="not $wasAlreadyBlacklisted">
+          <run_actions ref="GT_BumpBlacklistActivityTime"/>
           <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
         </do_if>
 
@@ -3182,7 +3293,11 @@
         <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
         
         <do_if value="$ReconcileThreats">
-          <signal_cue_instantly cue="CleanupExpiredThreats_Blacklist" param="table[$SuppressPlayerAlerts = true]"/>
+          <run_actions ref="GT_RunBlacklistIdleReconcile">
+            <param name="SuppressPlayerAlerts" value="true"/>
+            <param name="ForceReconcile" value="true"/>
+            <param name="DebugChance" value="0"/>
+          </run_actions>
         </do_if>
       </actions>
     </library>
@@ -3474,65 +3589,124 @@
       </actions>
     </cue>
     
-    <!-- Cleanup expired threats -->
-    <cue name="CleanupExpiredThreats_Blacklist" instantiate="true">
+    <!-- Idle blacklist reconcile: incremental prune + sync (yields between sectors) -->
+    <library name="GT_RunBlacklistIdleReconcile" purpose="run_actions">
+      <params>
+        <param name="SuppressPlayerAlerts" default="false"/>
+        <param name="ForceReconcile" default="false"/>
+        <param name="DebugChance" default="0"/>
+      </params>
+      <actions>
+        <set_value name="$ran" exact="false"/>
+        <set_value name="$busy" exact="false"/>
+        <do_if value="global.$GT_BlacklistReconcileBusy? and global.$GT_BlacklistReconcileBusy">
+          <set_value name="$busy" exact="true"/>
+          <return value="table[$Ran = false, $Busy = $busy]"/>
+        </do_if>
+        <set_value name="$shouldRun" exact="$ForceReconcile"/>
+        <do_if value="not $shouldRun and @global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist">
+          <set_value name="$idleInterval" exact="@global.$GT_GlobalSettings.$ThreatAvoidance.$BlacklistReconcileIdle"/>
+          <do_if value="not $idleInterval?">
+            <set_value name="$idleInterval" exact="300s"/>
+          </do_if>
+          <set_value name="$lastActivity" exact="@global.$GT_LastBlacklistActivityTime"/>
+          <do_if value="not $lastActivity?">
+            <set_value name="$lastActivity" exact="0"/>
+          </do_if>
+          <do_if value="player.age - $lastActivity ge $idleInterval">
+            <set_value name="$shouldRun" exact="true"/>
+          </do_if>
+        </do_if>
+        <do_if value="$shouldRun and @global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist">
+          <set_value name="$sectorKeys" exact="[]"/>
+          <do_if value="global.$GT_ThreatIntelligence?">
+            <set_value name="$sectorKeys" exact="global.$GT_ThreatIntelligence.keys.list"/>
+          </do_if>
+          <set_value name="global.$GT_BlacklistReconcileBusy" exact="true"/>
+          <set_value name="global.$GT_BlacklistReconcileState" exact="table[
+            $SectorKeys = $sectorKeys,
+            $NextIndex = 1,
+            $SuppressPlayerAlerts = $SuppressPlayerAlerts,
+            $SectorsCleared = 0,
+            $DebugChance = $DebugChance
+          ]"/>
+          <signal_cue_instantly cue="BlacklistIdleReconcile_Step"/>
+          <set_value name="$ran" exact="true"/>
+        </do_if>
+        <return value="table[$Ran = $ran, $Busy = $busy]"/>
+      </actions>
+    </library>
+    
+    <cue name="BlacklistIdleReconcile_Step" instantiate="true">
       <conditions>
         <event_cue_signalled/>
       </conditions>
+      <delay exact="1ms"/>
       <actions>
-        <set_value name="$suppressPlayerAlerts" exact="false"/>
-        <do_if value="event.param? and event.param.$SuppressPlayerAlerts?">
-          <set_value name="$suppressPlayerAlerts" exact="event.param.$SuppressPlayerAlerts"/>
+        <do_if value="not global.$GT_BlacklistReconcileState?">
+          <set_value name="global.$GT_BlacklistReconcileBusy" exact="false"/>
+          <cancel_cue cue="this"/>
         </do_if>
-        <!-- Only cleanup if dynamic blacklist is enabled -->
-        <do_if value="@global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist">
-          <set_value name="$currentTime" exact="player.age"/>
-          <set_value name="$expiryTime" exact="@global.$GT_GlobalSettings.$ThreatAvoidance.$ThreatExpiry"/>
-          
-          <do_if value="not $expiryTime?">
-            <set_value name="$expiryTime" exact="3600"/> <!-- Default 1 hour -->
-          </do_if>
-          
-          <!-- Re-evaluate all threatened sectors (prune dead hostiles, clear when safe) -->
-          <do_if value="global.$GT_ThreatIntelligence?">
-            <set_value name="$sectorsToProcess" exact="global.$GT_ThreatIntelligence.keys.list"/>
-            <set_value name="$sectorsCleared" exact="0"/>
-            
-            <do_all exact="$sectorsToProcess.count" counter="$i">
-              <set_value name="$sector" exact="$sectorsToProcess.{$i}"/>
-              <run_actions ref="ClearSectorIfAllShipsGone" result="$clearResult">
-                <param name="Sector" value="$sector"/>
-                <param name="SuppressPlayerAlerts" value="$suppressPlayerAlerts"/>
-                <param name="DebugChance" value="0"/>
-              </run_actions>
-              <do_if value="$clearResult.$SectorCleared">
-                <set_value name="$sectorsCleared" exact="$sectorsCleared + 1"/>
-              </do_if>
-            </do_all>
-            
-            <do_if value="$sectorsCleared gt 0">
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Threat] Cleanup: cleared ' + $sectorsCleared + ' sector(s) after threat re-evaluation'" chance="100"/>
-              </do_if>
+        <do_else>
+          <set_value name="$state" exact="global.$GT_BlacklistReconcileState"/>
+          <set_value name="$sectors" exact="$state.$SectorKeys"/>
+          <set_value name="$idx" exact="$state.$NextIndex"/>
+          <do_if value="$idx gt $sectors.count">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Threat] Idle reconcile complete: cleared ' + $state.$SectorsCleared + ' sector(s)'" chance="$state.$DebugChance"/>
             </do_if>
+            <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
+            <run_actions ref="GT_BumpBlacklistActivityTime"/>
+            <remove_value name="global.$GT_BlacklistReconcileState"/>
+            <set_value name="global.$GT_BlacklistReconcileBusy" exact="false"/>
           </do_if>
-          
-          <!-- Signal Lua to cleanup expired threats -->
-          <raise_lua_event name="'GT_Blacklist.CleanupExpired'" param="$currentTime + ':' + $expiryTime"/>
-          
-          <!-- Update blacklist after cleanup (event-driven: some threats may have expired or been cleared) -->
-          <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
-        </do_if>
+          <do_else>
+            <set_value name="$sector" exact="$sectors.{$idx}"/>
+            <run_actions ref="GT_PruneStaleTrackedHostiles">
+              <param name="Sector" value="$sector"/>
+              <param name="DebugChance" value="$state.$DebugChance"/>
+            </run_actions>
+            <run_actions ref="ClearSectorIfAllShipsGone" result="$clearResult">
+              <param name="Sector" value="$sector"/>
+              <param name="SuppressPlayerAlerts" value="$state.$SuppressPlayerAlerts"/>
+              <param name="SkipBlacklistSync" value="true"/>
+              <param name="DebugChance" value="$state.$DebugChance"/>
+            </run_actions>
+            <set_value name="$state.$NextIndex" exact="$idx + 1"/>
+            <do_if value="$clearResult.$SectorCleared">
+              <set_value name="$state.$SectorsCleared" exact="$state.$SectorsCleared + 1"/>
+            </do_if>
+            <set_value name="global.$GT_BlacklistReconcileState" exact="$state"/>
+            <signal_cue_instantly cue="BlacklistIdleReconcile_Step"/>
+          </do_else>
+        </do_else>
+      </actions>
+    </cue>
+    
+    <cue name="BlacklistIdleReconcileWatchdog" instantiate="true" version="1">
+      <conditions>
+        <check_any>
+          <event_game_loaded/>
+          <event_player_created/>
+          <event_game_started/>
+        </check_any>
+      </conditions>
+      <actions>
+        <signal_cue cue="BlacklistIdleReconcileWatchdog_Tick"/>
       </actions>
       <cues>
-        <cue name="CleanupExpiredThreats_Delay">
+        <cue name="BlacklistIdleReconcileWatchdog_Tick">
           <conditions>
             <event_cue_signalled/>
           </conditions>
-          <delay exact="600s"/>
+          <delay exact="60s"/>
           <actions>
-            <!-- Continue cleanup -->
-            <signal_cue_instantly cue="CleanupExpiredThreats_Blacklist"/>
+            <run_actions ref="GT_RunBlacklistIdleReconcile">
+              <param name="SuppressPlayerAlerts" value="true"/>
+              <param name="ForceReconcile" value="false"/>
+              <param name="DebugChance" value="if @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging then 100 else 0"/>
+            </run_actions>
+            <signal_cue cue="BlacklistIdleReconcileWatchdog_Tick"/>
           </actions>
         </cue>
       </cues>

@@ -477,6 +477,9 @@ end
 --- Read vanilla, detect player removals vs last GT write, merge, write. Preserves manual sectors.
 local function mergeAndWriteFleetBlacklist(add_macros, remove_macros, relation_value, clear_all)
     if clear_all then
+        GT_Blacklist.blacklisted_sectors = {}
+        GT_Blacklist.last_written_macros = {}
+        GT_Blacklist.last_written_fingerprint = ""
         return writeFleetBlacklistMacros({}, relation_value)
     end
 

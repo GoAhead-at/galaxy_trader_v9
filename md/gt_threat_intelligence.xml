@@ -47,6 +47,12 @@
         <do_if value="not global.$GT_PendingBlacklistMacroRemovals?">
           <set_value name="global.$GT_PendingBlacklistMacroRemovals" exact="[]"/>
         </do_if>
+        <do_if value="not global.$GT_PlayerDismissedHostileEntries?">
+          <set_value name="global.$GT_PlayerDismissedHostileEntries" exact="[]"/>
+        </do_if>
+        <do_if value="not global.$GT_LastVanillaBlacklistFingerprint?">
+          <set_value name="global.$GT_LastVanillaBlacklistFingerprint" exact="''"/>
+        </do_if>
         <!-- MD group for reliable event_object_destroyed on tracked enemy ships (vanilla pattern) -->
         <do_if value="not global.$GT_TrackedEnemyShipsGroup?">
           <create_group groupname="global.$GT_TrackedEnemyShipsGroup"/>
@@ -653,21 +659,35 @@
         <param name="DebugChance" default="0"/>
       </params>
       <actions>
+        <run_actions ref="EnsureBlacklistRegistryGlobals"/>
         <set_value name="$clearedCount" exact="0"/>
+        <set_value name="$dismissedCount" exact="global.$GT_PlayerDismissedHostileEntries.count"/>
+        
+        <!-- Tear down each threat episode (tracked ships + group membership) before dropping the table -->
         <do_if value="global.$GT_ThreatIntelligence?">
-          <set_value name="$clearedCount" exact="global.$GT_ThreatIntelligence.keys.count"/>
-          <remove_value name="global.$GT_ThreatIntelligence"/>
+          <set_value name="$sectorsToClear" exact="global.$GT_ThreatIntelligence.keys.list"/>
+          <set_value name="$clearedCount" exact="$sectorsToClear.count"/>
+          <do_all exact="$sectorsToClear.count" counter="$clearIdx" reverse="true">
+            <set_value name="$clearSector" exact="$sectorsToClear.{$clearIdx}"/>
+            <run_actions ref="GT_RemoveThreatEpisode">
+              <param name="Sector" value="$clearSector"/>
+              <param name="DebugChance" value="0"/>
+            </run_actions>
+          </do_all>
         </do_if>
         
         <do_if value="global.$GT_TrackedEnemyShipsGroup?">
           <clear_group group="global.$GT_TrackedEnemyShipsGroup"/>
         </do_if>
         
+        <set_value name="global.$GT_ThreatIntelligence" exact="table[]"/>
+        
         <do_if value="global.$GT_AutoBlacklistedMacros?">
           <remove_value name="global.$GT_AutoBlacklistedMacros"/>
         </do_if>
         <set_value name="global.$GT_AutoBlacklistedMacroList" exact="[]"/>
         <set_value name="global.$GT_PendingBlacklistMacroRemovals" exact="[]"/>
+        <set_value name="global.$GT_PlayerDismissedHostileEntries" exact="[]"/>
         
         <do_if value="global.$GT_ThreatBlacklistSpeakQueue?">
           <set_value name="global.$GT_ThreatBlacklistSpeakQueue" exact="[]"/>
@@ -680,11 +700,23 @@
         <do_if value="not global.$GT_LastThreatBlacklistData?">
           <set_value name="global.$GT_LastThreatBlacklistData" exact="''"/>
         </do_if>
+        <set_value name="global.$GT_LastThreatBlacklistData" exact="''"/>
+        <set_value name="global.$GT_LastVanillaBlacklistFingerprint" exact="''"/>
+        <set_value name="global.$GT_BlacklistEpoch" exact="global.$GT_BlacklistEpoch + 1"/>
+        <set_value name="global.$GT_ThreatCleanupTime" exact="player.age"/>
+        
+        <!-- Per-ship threat report counters (attack path) -->
+        <do_if value="global.$GT_Ships?">
+          <do_all exact="global.$GT_Ships.keys.count" counter="$shipIdx">
+            <set_value name="$gtShip" exact="global.$GT_Ships.keys.list.{$shipIdx}"/>
+            <do_if value="global.$GT_Ships.{$gtShip}?">
+              <set_value name="global.$GT_Ships.{$gtShip}.$ThreatReports" exact="0"/>
+              <set_value name="global.$GT_Ships.{$gtShip}.$LastThreatTime" exact="0"/>
+            </do_if>
+          </do_all>
+        </do_if>
         
         <!-- Force Lua + route-epoch sync even when threat table is already empty -->
-        <set_value name="global.$GT_LastThreatBlacklistData" exact="''"/>
-        <set_value name="global.$GT_BlacklistEpoch" exact="global.$GT_BlacklistEpoch + 1"/>
-        
         <raise_lua_event name="'GT_Blacklist.Update'" param="'!CLEAR!'"/>
         
         <do_if value="$RefreshFleetBlacklist">
@@ -693,10 +725,10 @@
         </do_if>
         
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-Threat] ClearAllThreatBlacklistData reason=' + $Reason + ' cleared=' + $clearedCount + ' epoch=' + global.$GT_BlacklistEpoch" chance="$DebugChance"/>
+          <debug_text text="'[GT-Threat] ClearAllThreatBlacklistData reason=' + $Reason + ' episodes=' + $clearedCount + ' dismissed=' + $dismissedCount + ' epoch=' + global.$GT_BlacklistEpoch" chance="$DebugChance"/>
         </do_if>
         
-        <return value="table[$ClearedCount = $clearedCount]"/>
+        <return value="table[$ClearedCount = $clearedCount, $DismissedEntriesCleared = $dismissedCount]"/>
       </actions>
     </library>
     
@@ -714,6 +746,291 @@
         <do_if value="not global.$GT_PendingBlacklistMacroRemovals?">
           <set_value name="global.$GT_PendingBlacklistMacroRemovals" exact="[]"/>
         </do_if>
+        <do_if value="not global.$GT_PlayerDismissedHostileEntries?">
+          <set_value name="global.$GT_PlayerDismissedHostileEntries" exact="[]"/>
+        </do_if>
+      </actions>
+    </library>
+    
+    <!-- Player removed GT-auto sector: remember tracked hostile idcodes until a new enemy appears -->
+    <library name="GT_GetPlayerDismissedHostileIdcodes" purpose="run_actions">
+      <params>
+        <param name="SectorMacro"/>
+      </params>
+      <actions>
+        <set_value name="$idcodes" exact="[]"/>
+        <run_actions ref="EnsureBlacklistRegistryGlobals"/>
+        <do_if value="$SectorMacro? and $SectorMacro != '' and global.$GT_PlayerDismissedHostileEntries.count gt 0">
+          <do_all exact="global.$GT_PlayerDismissedHostileEntries.count" counter="$eIdx">
+            <set_value name="$entry" exact="global.$GT_PlayerDismissedHostileEntries.{$eIdx}"/>
+            <do_if value="$entry.$SectorMacro? and $entry.$SectorMacro == $SectorMacro and $entry.$Idcodes?">
+              <set_value name="$idcodes" exact="$entry.$Idcodes"/>
+              <break/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <return value="$idcodes"/>
+      </actions>
+    </library>
+    
+    <library name="GT_ClearPlayerDismissedHostilesForMacro" purpose="run_actions">
+      <params>
+        <param name="SectorMacro"/>
+        <param name="DebugChance" default="0"/>
+      </params>
+      <actions>
+        <run_actions ref="EnsureBlacklistRegistryGlobals"/>
+        <set_value name="$removedCount" exact="0"/>
+        <do_if value="$SectorMacro? and $SectorMacro != '' and global.$GT_PlayerDismissedHostileEntries.count gt 0">
+          <do_all exact="global.$GT_PlayerDismissedHostileEntries.count" counter="$rmIdx" reverse="true">
+            <set_value name="$entry" exact="global.$GT_PlayerDismissedHostileEntries.{$rmIdx}"/>
+            <do_if value="$entry.$SectorMacro? and $entry.$SectorMacro == $SectorMacro">
+              <set_value name="$removedCount" exact="$removedCount + 1"/>
+              <remove_from_list name="global.$GT_PlayerDismissedHostileEntries" exact="$entry"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <do_if value="$removedCount gt 0 and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Dismiss] CLEARED dismissed memory macro=' + $SectorMacro + ' entriesRemoved=' + $removedCount" chance="$DebugChance"/>
+        </do_if>
+      </actions>
+    </library>
+    
+    <library name="GT_FormatIdcodeListForLog" purpose="run_actions">
+      <params>
+        <param name="Idcodes"/>
+      </params>
+      <actions>
+        <set_value name="$out" exact="'(none)'"/>
+        <do_if value="$Idcodes? and $Idcodes.count gt 0">
+          <set_value name="$out" exact="''"/>
+          <do_all exact="$Idcodes.count" counter="$fi">
+            <set_value name="$out" exact="$out + (if $out != '' then ', ' else '') + $Idcodes.{$fi}"/>
+          </do_all>
+        </do_if>
+        <return value="$out"/>
+      </actions>
+    </library>
+    
+    <!-- Per-ship combat pool vs dismissed snapshot (diagnostic logging) -->
+    <library name="GT_BuildDismissedEvalPoolLog" purpose="run_actions">
+      <params>
+        <param name="EnemyShips"/>
+        <param name="DismissedIdcodes"/>
+      </params>
+      <actions>
+        <set_value name="$rawCount" exact="0"/>
+        <set_value name="$combatCount" exact="0"/>
+        <set_value name="$newIdcode" exact="''"/>
+        <set_value name="$poolLog" exact="''"/>
+        <do_if value="$EnemyShips? and $EnemyShips != null">
+          <set_value name="$rawCount" exact="$EnemyShips.count"/>
+          <do_all exact="$EnemyShips.count" counter="$pi">
+            <set_value name="$poolShip" exact="$EnemyShips.{$pi}"/>
+            <set_value name="$entry" exact="'unknown'"/>
+            <do_if value="not ($poolShip? and @$poolShip.exists)">
+              <set_value name="$entry" exact="'invalid-ref'"/>
+            </do_if>
+            <do_elseif value="$poolShip.primarypurpose != purpose.fight">
+              <set_value name="$entry" exact="@$poolShip.idcode + ':non-combat'"/>
+            </do_elseif>
+            <do_else>
+              <set_value name="$combatCount" exact="$combatCount + 1"/>
+              <run_actions ref="GT_HostileIdcodeInDismissedList" result="$poolKnown">
+                <param name="Idcode" value="$poolShip.idcode"/>
+                <param name="DismissedIdcodes" value="$DismissedIdcodes"/>
+              </run_actions>
+              <do_if value="$poolKnown">
+                <set_value name="$entry" exact="$poolShip.idcode + ':known'"/>
+              </do_if>
+              <do_else>
+                <set_value name="$entry" exact="$poolShip.idcode + ':NEW'"/>
+                <do_if value="$newIdcode == ''">
+                  <set_value name="$newIdcode" exact="$poolShip.idcode"/>
+                </do_if>
+              </do_else>
+            </do_else>
+            <set_value name="$poolLog" exact="$poolLog + (if $poolLog != '' then ' | ' else '') + $entry"/>
+          </do_all>
+        </do_if>
+        <do_if value="$poolLog == ''">
+          <set_value name="$poolLog" exact="'(empty pool)'"/>
+        </do_if>
+        <return value="table[$RawCount = $rawCount, $CombatCount = $combatCount, $NewIdcode = $newIdcode, $PoolLog = $poolLog]"/>
+      </actions>
+    </library>
+    
+    <library name="GT_SnapshotPlayerDismissedHostiles" purpose="run_actions">
+      <params>
+        <param name="SectorMacro"/>
+        <param name="Sector"/>
+        <param name="DebugChance" default="0"/>
+      </params>
+      <actions>
+        <run_actions ref="EnsureBlacklistRegistryGlobals"/>
+        <do_if value="not $SectorMacro? or $SectorMacro == ''">
+          <return value="table[$SnapshotCount = 0]"/>
+        </do_if>
+        <set_value name="$idcodes" exact="[]"/>
+        <set_value name="$sourceTrackedCount" exact="0"/>
+        <do_if value="$Sector? and global.$GT_ThreatIntelligence? and global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShipIdcodes?">
+          <set_value name="$sourceTrackedCount" exact="global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShipIdcodes.count"/>
+          <do_all exact="global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShipIdcodes.count" counter="$idIdx">
+            <set_value name="$idcode" exact="global.$GT_ThreatIntelligence.{$Sector}.$TrackedEnemyShipIdcodes.{$idIdx}"/>
+            <do_if value="$idcode? and $idcode != ''">
+              <set_value name="$alreadySnap" exact="false"/>
+              <do_all exact="$idcodes.count" counter="$dupIdx">
+                <do_if value="$idcodes.{$dupIdx} == $idcode">
+                  <set_value name="$alreadySnap" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+              <do_if value="not $alreadySnap">
+                <append_to_list name="$idcodes" exact="$idcode"/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+        <run_actions ref="GT_ClearPlayerDismissedHostilesForMacro">
+          <param name="SectorMacro" value="$SectorMacro"/>
+        </run_actions>
+        <do_if value="$idcodes.count gt 0">
+          <append_to_list name="global.$GT_PlayerDismissedHostileEntries" exact="table[$SectorMacro = $SectorMacro, $Idcodes = $idcodes]"/>
+        </do_if>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <run_actions ref="GT_FormatIdcodeListForLog" result="$snapIdcodeLog">
+            <param name="Idcodes" value="$idcodes"/>
+          </run_actions>
+          <set_value name="$snapSectorName" exact="if $Sector? then @$Sector.knownname else 'NO_SECTOR'"/>
+          <debug_text text="'[GT-Dismiss] SNAPSHOT macro=' + $SectorMacro + ' sector=' + $snapSectorName + ' sourceTracked=' + $sourceTrackedCount + ' snapshotted=' + $idcodes.count + ' idcodes=[' + $snapIdcodeLog + ']'" chance="$DebugChance"/>
+          <do_if value="$idcodes.count == 0">
+            <debug_text text="'[GT-Dismiss] SNAPSHOT WARNING: no idcodes stored - post-remove detections will NOT be suppressed until a new hostile idcode appears'" chance="$DebugChance"/>
+          </do_if>
+        </do_if>
+        <return value="table[$SnapshotCount = $idcodes.count]"/>
+      </actions>
+    </library>
+    
+    <library name="GT_HostileIdcodeInDismissedList" purpose="run_actions">
+      <params>
+        <param name="Idcode"/>
+        <param name="DismissedIdcodes"/>
+      </params>
+      <actions>
+        <set_value name="$found" exact="false"/>
+        <do_if value="$Idcode? and $Idcode != '' and $DismissedIdcodes? and $DismissedIdcodes.count gt 0">
+          <do_all exact="$DismissedIdcodes.count" counter="$dIdx">
+            <do_if value="$DismissedIdcodes.{$dIdx} == $Idcode">
+              <set_value name="$found" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <return value="$found"/>
+      </actions>
+    </library>
+    
+    <library name="GT_CombatHostilesHaveNewThreat" purpose="run_actions">
+      <params>
+        <param name="DismissedIdcodes"/>
+        <param name="EnemyShips"/>
+      </params>
+      <actions>
+        <set_value name="$hasNew" exact="false"/>
+        <set_value name="$hasCombat" exact="false"/>
+        <set_value name="$newIdcode" exact="''"/>
+        <do_if value="$EnemyShips? and $EnemyShips != null and $EnemyShips.count gt 0">
+          <do_all exact="$EnemyShips.count" counter="$hIdx">
+            <set_value name="$hostileShip" exact="$EnemyShips.{$hIdx}"/>
+            <do_if value="$hostileShip? and @$hostileShip.exists and $hostileShip.primarypurpose == purpose.fight">
+              <set_value name="$hasCombat" exact="true"/>
+              <run_actions ref="GT_HostileIdcodeInDismissedList" result="$knownHostile">
+                <param name="Idcode" value="$hostileShip.idcode"/>
+                <param name="DismissedIdcodes" value="$DismissedIdcodes"/>
+              </run_actions>
+              <do_if value="not $knownHostile">
+                <set_value name="$hasNew" exact="true"/>
+                <set_value name="$newIdcode" exact="$hostileShip.idcode"/>
+                <break/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+        <return value="table[$HasNewThreat = $hasNew, $HasCombatHostiles = $hasCombat, $NewHostileIdcode = $newIdcode]"/>
+      </actions>
+    </library>
+    
+    <!-- After player manual sector remove: suppress repeat detections for known hostiles only -->
+    <library name="GT_EvaluatePlayerDismissedSectorDetection" purpose="run_actions">
+      <params>
+        <param name="SectorMacro"/>
+        <param name="EnemyShips"/>
+        <param name="EpisodeActive"/>
+        <param name="Source" default="'unknown'"/>
+        <param name="ReporterIdcode" default="''"/>
+        <param name="WarningHostileCount" default="0"/>
+        <param name="DebugChance" default="0"/>
+      </params>
+      <actions>
+        <set_value name="$suppress" exact="false"/>
+        <set_value name="$clearDismissed" exact="false"/>
+        <set_value name="$decision" exact="'SKIP'"/>
+        <set_value name="$dismissedIdcodes" exact="[]"/>
+        <set_value name="$poolDiag" exact="table[$RawCount = 0, $CombatCount = 0, $NewIdcode = '', $PoolLog = '(n/a)']"/>
+        <set_value name="$newCheck" exact="table[$HasNewThreat = false, $HasCombatHostiles = false, $NewHostileIdcode = '']"/>
+        <do_if value="$EpisodeActive">
+          <set_value name="$decision" exact="'EPISODE_ACTIVE'"/>
+        </do_if>
+        <do_elseif value="not $SectorMacro? or $SectorMacro == ''">
+          <set_value name="$decision" exact="'NO_MACRO'"/>
+        </do_elseif>
+        <do_else>
+          <run_actions ref="GT_GetPlayerDismissedHostileIdcodes" result="$dismissedIdcodes">
+            <param name="SectorMacro" value="$SectorMacro"/>
+          </run_actions>
+          <do_if value="not $dismissedIdcodes? or $dismissedIdcodes.count == 0">
+            <set_value name="$decision" exact="'NO_DISMISSED_MEMORY'"/>
+          </do_if>
+          <do_else>
+            <run_actions ref="GT_CombatHostilesHaveNewThreat" result="$newCheck">
+              <param name="DismissedIdcodes" value="$dismissedIdcodes"/>
+              <param name="EnemyShips" value="$EnemyShips"/>
+            </run_actions>
+            <do_if value="not $newCheck.$HasCombatHostiles">
+              <set_value name="$decision" exact="'NO_COMBAT_IN_EVAL_POOL'"/>
+            </do_if>
+            <do_elseif value="not $newCheck.$HasNewThreat">
+              <set_value name="$suppress" exact="true"/>
+              <set_value name="$decision" exact="'SUPPRESS_ALL_KNOWN'"/>
+            </do_elseif>
+            <do_else>
+              <set_value name="$clearDismissed" exact="true"/>
+              <set_value name="$decision" exact="'NEW_HOSTILE'"/>
+            </do_else>
+          </do_else>
+        </do_else>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <do_if value="$decision == 'NEW_HOSTILE' or $decision == 'SUPPRESS_ALL_KNOWN' or $decision == 'NO_COMBAT_IN_EVAL_POOL'">
+            <run_actions ref="GT_BuildDismissedEvalPoolLog" result="$poolDiag">
+              <param name="EnemyShips" value="$EnemyShips"/>
+              <param name="DismissedIdcodes" value="$dismissedIdcodes"/>
+            </run_actions>
+          </do_if>
+          <run_actions ref="GT_FormatIdcodeListForLog" result="$dismissedLog">
+            <param name="Idcodes" value="$dismissedIdcodes"/>
+          </run_actions>
+          <set_value name="$evalDetail" exact="'[GT-Dismiss] EVAL source=' + $Source + ' reporter=' + (if $ReporterIdcode != '' then $ReporterIdcode else '?') + ' macro=' + $SectorMacro + ' decision=' + $decision"/>
+          <set_value name="$evalDetail" exact="$evalDetail + ' warnHostiles=' + $WarningHostileCount + ' dismissed=[' + $dismissedLog + ']'"/>
+          <do_if value="$decision == 'NEW_HOSTILE' or $decision == 'SUPPRESS_ALL_KNOWN' or $decision == 'NO_COMBAT_IN_EVAL_POOL'">
+            <set_value name="$evalDetail" exact="$evalDetail + ' poolRaw=' + $poolDiag.$RawCount + ' poolCombat=' + $poolDiag.$CombatCount + ' pool=[' + $poolDiag.$PoolLog + ']'"/>
+          </do_if>
+          <do_if value="$decision == 'NEW_HOSTILE'">
+            <set_value name="$newHostileId" exact="if $newCheck.$NewHostileIdcode != '' then $newCheck.$NewHostileIdcode else $poolDiag.$NewIdcode"/>
+            <set_value name="$evalDetail" exact="$evalDetail + ' newIdcode=' + $newHostileId"/>
+          </do_if>
+          <debug_text text="$evalDetail" chance="$DebugChance"/>
+        </do_if>
+        <return value="table[$Suppress = $suppress, $ClearDismissed = $clearDismissed, $Decision = $decision]"/>
       </actions>
     </library>
     
@@ -790,6 +1107,166 @@
       </actions>
     </library>
 
+    <!-- Derive threat broadcast metrics from an operational combat-hostile ship list. -->
+    <library name="GT_ComputeThreatMetricsFromShips" purpose="run_actions">
+      <params>
+        <param name="EnemyShips" default="null"/>
+      </params>
+      <actions>
+        <set_value name="$hostileCount" exact="0"/>
+        <set_value name="$threatScore" exact="0"/>
+        <set_value name="$shipClass_XL" exact="0"/>
+        <set_value name="$shipClass_L" exact="0"/>
+        <set_value name="$shipClass_M" exact="0"/>
+        <set_value name="$shipClass_S" exact="0"/>
+        <set_value name="$factionCounts" exact="table[]"/>
+        <set_value name="$primaryFaction" exact="null"/>
+        <do_if value="$EnemyShips == null">
+          <set_value name="$EnemyShips" exact="[]"/>
+        </do_if>
+        <do_all exact="$EnemyShips.count" counter="$mi">
+          <set_value name="$ship" exact="$EnemyShips.{$mi}"/>
+          <do_if value="not ($ship? and @$ship.exists and @$ship.isoperational and $ship.primarypurpose == purpose.fight)">
+            <continue/>
+          </do_if>
+          <do_if value="$ship.isclass.ship_xl">
+            <set_value name="$threatScore" exact="$threatScore + 5"/>
+            <set_value name="$shipClass_XL" operation="add"/>
+          </do_if>
+          <do_elseif value="$ship.isclass.ship_l">
+            <set_value name="$threatScore" exact="$threatScore + 3"/>
+            <set_value name="$shipClass_L" operation="add"/>
+          </do_elseif>
+          <do_elseif value="$ship.isclass.ship_m">
+            <set_value name="$threatScore" exact="$threatScore + 2"/>
+            <set_value name="$shipClass_M" operation="add"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$threatScore" exact="$threatScore + 1"/>
+            <set_value name="$shipClass_S" operation="add"/>
+          </do_else>
+          <do_if value="@$ship.owner != null">
+            <set_value name="$mf" exact="$ship.owner"/>
+            <set_value name="$factionCounts.{$mf}" exact="@$factionCounts.{$mf} + 1"/>
+          </do_if>
+        </do_all>
+        <set_value name="$hostileCount" exact="$shipClass_XL + $shipClass_L + $shipClass_M + $shipClass_S"/>
+        <set_value name="$maxFactionCount" exact="0"/>
+        <do_all exact="$factionCounts.keys.count" counter="$fi">
+          <set_value name="$mf" exact="$factionCounts.keys.{$fi}"/>
+          <do_if value="$factionCounts.{$mf} gt $maxFactionCount">
+            <set_value name="$primaryFaction" exact="$mf"/>
+            <set_value name="$maxFactionCount" exact="$factionCounts.{$mf}"/>
+          </do_if>
+        </do_all>
+        <return value="table[
+          $HostileCount = $hostileCount,
+          $ThreatScore = $threatScore,
+          $ShipClass_XL = $shipClass_XL,
+          $ShipClass_L = $shipClass_L,
+          $ShipClass_M = $shipClass_M,
+          $ShipClass_S = $shipClass_S,
+          $PrimaryFaction = $primaryFaction
+        ]"/>
+      </actions>
+    </library>
+
+    <!-- On first detect: union gravidar anchors with combat hostiles within ClusterRadius of each anchor. -->
+    <library name="GT_ExpandHostileCluster" purpose="run_actions">
+      <params>
+        <param name="Sector"/>
+        <param name="AnchorShips" default="null"/>
+        <param name="RelationObject"/>
+        <param name="ClusterRadius" default="10km"/>
+        <param name="DebugChance" default="0"/>
+      </params>
+      <actions>
+        <set_value name="$expanded" exact="[]"/>
+        <set_value name="$expandedIdcodes" exact="[]"/>
+        <set_value name="$gravidarCount" exact="0"/>
+        <set_value name="$clusterAdded" exact="0"/>
+        <do_if value="$AnchorShips == null">
+          <set_value name="$AnchorShips" exact="[]"/>
+        </do_if>
+        <do_if value="not $RelationObject? or not @$RelationObject.exists">
+          <set_value name="$RelationObject" exact="player.entity"/>
+        </do_if>
+
+        <do_all exact="$AnchorShips.count" counter="$ai">
+          <set_value name="$anchorShip" exact="$AnchorShips.{$ai}"/>
+          <do_if value="not ($anchorShip? and @$anchorShip.exists and @$anchorShip.isoperational and $anchorShip.primarypurpose == purpose.fight and $anchorShip.sector? and $anchorShip.sector == $Sector)">
+            <continue/>
+          </do_if>
+          <set_value name="$anchorIdcode" exact="$anchorShip.idcode"/>
+          <set_value name="$alreadyListed" exact="false"/>
+          <do_all exact="$expanded.count" counter="$dupA">
+            <set_value name="$dupIdAt" exact="null"/>
+            <do_if value="$expandedIdcodes.{$dupA}?">
+              <set_value name="$dupIdAt" exact="$expandedIdcodes.{$dupA}"/>
+            </do_if>
+            <run_actions ref="GT_ShipMatchesTracked" result="$alreadyListed">
+              <param name="TrackedShip" value="$expanded.{$dupA}"/>
+              <param name="TrackedIdcode" value="$dupIdAt"/>
+              <param name="CandidateShip" value="$anchorShip"/>
+              <param name="CandidateIdcode" value="$anchorIdcode"/>
+            </run_actions>
+            <do_if value="$alreadyListed">
+              <break/>
+            </do_if>
+          </do_all>
+          <do_if value="not $alreadyListed">
+            <append_to_list name="$expanded" exact="$anchorShip"/>
+            <append_to_list name="$expandedIdcodes" exact="$anchorIdcode"/>
+            <set_value name="$gravidarCount" exact="$gravidarCount + 1"/>
+          </do_if>
+
+          <find_ship name="$clusterShips" space="$Sector" primarypurpose="purpose.fight" multiple="true">
+            <match_distance object="$anchorShip" max="$ClusterRadius"/>
+            <match_relation_to object="$RelationObject" relation="enemy" comparison="le"/>
+          </find_ship>
+          <do_if value="$clusterShips != null and $clusterShips.count gt 0">
+            <do_all exact="$clusterShips.count" counter="$ci">
+              <set_value name="$clusterShip" exact="$clusterShips.{$ci}"/>
+              <do_if value="not ($clusterShip? and @$clusterShip.exists and @$clusterShip.isoperational and $clusterShip.primarypurpose == purpose.fight)">
+                <continue/>
+              </do_if>
+              <set_value name="$clusterIdcode" exact="$clusterShip.idcode"/>
+              <set_value name="$alreadyCluster" exact="false"/>
+              <do_all exact="$expanded.count" counter="$dupC">
+                <set_value name="$dupIdC" exact="null"/>
+                <do_if value="$expandedIdcodes.{$dupC}?">
+                  <set_value name="$dupIdC" exact="$expandedIdcodes.{$dupC}"/>
+                </do_if>
+                <run_actions ref="GT_ShipMatchesTracked" result="$alreadyCluster">
+                  <param name="TrackedShip" value="$expanded.{$dupC}"/>
+                  <param name="TrackedIdcode" value="$dupIdC"/>
+                  <param name="CandidateShip" value="$clusterShip"/>
+                  <param name="CandidateIdcode" value="$clusterIdcode"/>
+                </run_actions>
+                <do_if value="$alreadyCluster">
+                  <break/>
+                </do_if>
+              </do_all>
+              <do_if value="not $alreadyCluster">
+                <append_to_list name="$expanded" exact="$clusterShip"/>
+                <append_to_list name="$expandedIdcodes" exact="$clusterIdcode"/>
+                <set_value name="$clusterAdded" exact="$clusterAdded + 1"/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_all>
+
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT-Threat] Cluster expand sector=' + $Sector.knownname + ' anchors=' + $AnchorShips.count + ' gravidar=' + $gravidarCount + ' clusterAdded=' + $clusterAdded + ' total=' + $expanded.count + ' radius=' + $ClusterRadius" chance="$DebugChance"/>
+        </do_if>
+        <return value="table[
+          $Ships = $expanded,
+          $GravidarCount = $gravidarCount,
+          $ClusterAdded = $clusterAdded
+        ]"/>
+      </actions>
+    </library>
+
     <!-- Player combat relief visible within arriving ship radar (no sector-wide omniscience). -->
     <library name="GT_ComputeReliefFightingScore" purpose="run_actions">
       <params>
@@ -845,14 +1322,24 @@
           </do_all>
         </do_if>
         <do_if value="$threatSector?">
+          <run_actions ref="GT_SnapshotPlayerDismissedHostiles">
+            <param name="SectorMacro" value="$SectorMacro"/>
+            <param name="Sector" value="$threatSector"/>
+            <param name="DebugChance" value="$DebugChance"/>
+          </run_actions>
           <run_actions ref="GT_RemoveThreatEpisode">
             <param name="Sector" value="$threatSector"/>
             <param name="DebugChance" value="$DebugChance"/>
           </run_actions>
         </do_if>
+        <do_else>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Dismiss] PLAYER_REMOVE macro=' + $SectorMacro + ' - no active threat episode found; dismissed snapshot NOT stored'" chance="$DebugChance"/>
+          </do_if>
+        </do_else>
         <set_value name="$processed" exact="true"/>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-Blacklist] Player removed GT-auto sector macro ' + $SectorMacro + ' - threat episode cleared (re-blacklist on next detection: gravidar, attack, missile, or destruction)'" chance="100"/>
+          <debug_text text="'[GT-Dismiss] PLAYER_REMOVE macro=' + $SectorMacro + ' processed=1 episodeCleared=' + (if $threatSector? then 1 else 0)" chance="$DebugChance"/>
         </do_if>
         <return value="table[$Processed = $processed]"/>
       </actions>
@@ -1513,6 +2000,34 @@
             <set_value name="$wasAlreadyBlacklisted" exact="true"/>
           </do_if>
 
+          <set_value name="$shipsToTrack" exact="if $enemyShips != null then $enemyShips else []"/>
+          <do_if value="($shipsToTrack == null or $shipsToTrack.count == 0) and $attacker? and @$attacker.exists and $attacker.primarypurpose == purpose.fight">
+            <set_value name="$shipsToTrack" exact="[]"/>
+            <append_to_list name="$shipsToTrack" exact="$attacker"/>
+          </do_if>
+          <set_value name="$suppressDismissedDetection" exact="false"/>
+          <do_if value="not $wasAlreadyBlacklisted">
+            <set_value name="$sectorMacro" exact="@$currentSector.macro.id"/>
+            <run_actions ref="GT_EvaluatePlayerDismissedSectorDetection" result="$dismissedEval">
+              <param name="SectorMacro" value="$sectorMacro"/>
+              <param name="EnemyShips" value="$shipsToTrack"/>
+              <param name="EpisodeActive" value="$wasAlreadyBlacklisted"/>
+              <param name="Source" value="'attack'"/>
+              <param name="ReporterIdcode" value="$victim.idcode"/>
+              <param name="DebugChance" value="100"/>
+            </run_actions>
+            <do_if value="$dismissedEval.$Suppress">
+              <set_value name="$suppressDismissedDetection" exact="true"/>
+            </do_if>
+            <do_if value="$dismissedEval.$ClearDismissed and $sectorMacro?">
+              <run_actions ref="GT_ClearPlayerDismissedHostilesForMacro">
+                <param name="SectorMacro" value="$sectorMacro"/>
+                <param name="DebugChance" value="100"/>
+              </run_actions>
+            </do_if>
+          </do_if>
+
+          <do_if value="not $suppressDismissedDetection">
           <do_if value="not global.$GT_ThreatIntelligence?">
             <set_value name="global.$GT_ThreatIntelligence" exact="table[]"/>
           </do_if>
@@ -1538,18 +2053,16 @@
               <param name="Sector" value="$currentSector"/>
             </run_actions>
           </do_if>
-          <set_value name="$shipsToTrack" exact="if $enemyShips != null then $enemyShips else []"/>
-          <do_if value="($shipsToTrack == null or $shipsToTrack.count == 0) and $attacker? and @$attacker.exists and $attacker.primarypurpose == purpose.fight">
-            <set_value name="$shipsToTrack" exact="[]"/>
-            <append_to_list name="$shipsToTrack" exact="$attacker"/>
-          </do_if>
           <run_actions ref="StoreTrackedEnemyShips">
             <param name="Sector" value="$currentSector"/>
             <param name="EnemyShips" value="$shipsToTrack"/>
             <param name="DebugChance" value="100"/>
           </run_actions>
-          <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
+          <do_if value="not $wasAlreadyBlacklisted">
+            <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
+          </do_if>
           <signal_cue_instantly cue="NotifyShipsOfThreat" param="$currentSector"/>
+          </do_if>
           </do_if>
         </do_if>
         </do_else>
@@ -1627,6 +2140,34 @@
             <set_value name="$wasAlreadyBlacklisted" exact="true"/>
           </do_if>
 
+          <set_value name="$shipsToTrack" exact="if $enemyShips != null then $enemyShips else []"/>
+          <do_if value="($shipsToTrack == null or $shipsToTrack.count == 0) and $launcher? and @$launcher.exists and $launcher.primarypurpose == purpose.fight">
+            <set_value name="$shipsToTrack" exact="[]"/>
+            <append_to_list name="$shipsToTrack" exact="$launcher"/>
+          </do_if>
+          <set_value name="$suppressDismissedDetection" exact="false"/>
+          <do_if value="not $wasAlreadyBlacklisted">
+            <set_value name="$sectorMacro" exact="@$currentSector.macro.id"/>
+            <run_actions ref="GT_EvaluatePlayerDismissedSectorDetection" result="$dismissedEval">
+              <param name="SectorMacro" value="$sectorMacro"/>
+              <param name="EnemyShips" value="$shipsToTrack"/>
+              <param name="EpisodeActive" value="$wasAlreadyBlacklisted"/>
+              <param name="Source" value="'missile'"/>
+              <param name="ReporterIdcode" value="$target.idcode"/>
+              <param name="DebugChance" value="100"/>
+            </run_actions>
+            <do_if value="$dismissedEval.$Suppress">
+              <set_value name="$suppressDismissedDetection" exact="true"/>
+            </do_if>
+            <do_if value="$dismissedEval.$ClearDismissed and $sectorMacro?">
+              <run_actions ref="GT_ClearPlayerDismissedHostilesForMacro">
+                <param name="SectorMacro" value="$sectorMacro"/>
+                <param name="DebugChance" value="100"/>
+              </run_actions>
+            </do_if>
+          </do_if>
+
+          <do_if value="not $suppressDismissedDetection">
           <do_if value="not global.$GT_ThreatIntelligence?">
             <set_value name="global.$GT_ThreatIntelligence" exact="table[]"/>
           </do_if>
@@ -1649,18 +2190,16 @@
               <param name="Sector" value="$currentSector"/>
             </run_actions>
           </do_if>
-          <set_value name="$shipsToTrack" exact="if $enemyShips != null then $enemyShips else []"/>
-          <do_if value="($shipsToTrack == null or $shipsToTrack.count == 0) and $launcher? and @$launcher.exists and $launcher.primarypurpose == purpose.fight">
-            <set_value name="$shipsToTrack" exact="[]"/>
-            <append_to_list name="$shipsToTrack" exact="$launcher"/>
-          </do_if>
           <run_actions ref="StoreTrackedEnemyShips">
             <param name="Sector" value="$currentSector"/>
             <param name="EnemyShips" value="$shipsToTrack"/>
             <param name="DebugChance" value="100"/>
           </run_actions>
-          <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
+          <do_if value="not $wasAlreadyBlacklisted">
+            <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
+          </do_if>
           <signal_cue_instantly cue="NotifyShipsOfThreat" param="$currentSector"/>
+          </do_if>
           </do_if>
         </do_if>
         </do_else>
@@ -1748,6 +2287,34 @@
             <set_value name="$wasAlreadyBlacklisted" exact="true"/>
           </do_if>
 
+          <set_value name="$shipsToTrack" exact="if $enemyShips != null then $enemyShips else []"/>
+          <do_if value="($shipsToTrack == null or $shipsToTrack.count == 0) and $killer? and @$killer.exists and $killer.primarypurpose == purpose.fight">
+            <set_value name="$shipsToTrack" exact="[]"/>
+            <append_to_list name="$shipsToTrack" exact="$killer"/>
+          </do_if>
+          <set_value name="$suppressDismissedDetection" exact="false"/>
+          <do_if value="not $wasAlreadyBlacklisted">
+            <set_value name="$sectorMacro" exact="@$currentSector.macro.id"/>
+            <run_actions ref="GT_EvaluatePlayerDismissedSectorDetection" result="$dismissedEval">
+              <param name="SectorMacro" value="$sectorMacro"/>
+              <param name="EnemyShips" value="$shipsToTrack"/>
+              <param name="EpisodeActive" value="$wasAlreadyBlacklisted"/>
+              <param name="Source" value="'destroyed'"/>
+              <param name="ReporterIdcode" value="$destroyedObject.idcode"/>
+              <param name="DebugChance" value="100"/>
+            </run_actions>
+            <do_if value="$dismissedEval.$Suppress">
+              <set_value name="$suppressDismissedDetection" exact="true"/>
+            </do_if>
+            <do_if value="$dismissedEval.$ClearDismissed and $sectorMacro?">
+              <run_actions ref="GT_ClearPlayerDismissedHostilesForMacro">
+                <param name="SectorMacro" value="$sectorMacro"/>
+                <param name="DebugChance" value="100"/>
+              </run_actions>
+            </do_if>
+          </do_if>
+
+          <do_if value="not $suppressDismissedDetection">
           <set_value name="global.$GT_ThreatIntelligence.{$currentSector}" exact="table[]"/>
           <set_value name="global.$GT_ThreatIntelligence.{$currentSector}.$Timestamp" exact="player.age"/>
           <set_value name="global.$GT_ThreatIntelligence.{$currentSector}.$ThreatLevel" exact="5"/>
@@ -1767,15 +2334,18 @@
               <param name="Sector" value="$currentSector"/>
             </run_actions>
           </do_if>
-          <do_if value="$enemyShips? and $enemyShips != null and $enemyShips.count gt 0">
+          <do_if value="$shipsToTrack? and $shipsToTrack.count gt 0">
             <run_actions ref="StoreTrackedEnemyShips">
               <param name="Sector" value="$currentSector"/>
-              <param name="EnemyShips" value="$enemyShips"/>
+              <param name="EnemyShips" value="$shipsToTrack"/>
               <param name="DebugChance" value="100"/>
             </run_actions>
           </do_if>
-          <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
+          <do_if value="not $wasAlreadyBlacklisted">
+            <signal_cue_instantly cue="UpdateBlacklistOnThreat"/>
+          </do_if>
           <signal_cue_instantly cue="NotifyShipsOfThreat" param="$currentSector"/>
+          </do_if>
           </do_if>
         </do_if>
         <do_else>
@@ -2241,6 +2811,79 @@
       </actions>
     </cue>
     
+    <!-- Gravidar tracking update (no player alerts): append combat hostiles to active episode -->
+    <cue name="ReceiveThreatTrackingUpdate" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_Threat_TrackingUpdate'"/>
+      </conditions>
+      <actions>
+        <do_if value="not global.$GT_GlobalSettings.$ThreatAvoidance? or not global.$GT_GlobalSettings.$ThreatAvoidance.$Enabled or (global.$GT_GlobalSettings.$XP? and global.$GT_GlobalSettings.$XP.$UseVanillaXPOnly? and global.$GT_GlobalSettings.$XP.$UseVanillaXPOnly)">
+          <cancel_cue cue="this"/>
+        </do_if>
+        <do_else>
+        <set_value name="$update" exact="event.param2"/>
+        <set_value name="$sector" exact="$update.$Sector"/>
+        <set_value name="$detectedBy" exact="$update.$DetectedBy"/>
+        <set_value name="$hostileCount" exact="$update.$HostileCount"/>
+        <set_value name="$threatScore" exact="$update.$ThreatScore"/>
+        <set_value name="$shipClass_XL" exact="$update.$ShipClass_XL"/>
+        <set_value name="$shipClass_L" exact="$update.$ShipClass_L"/>
+        <set_value name="$shipClass_M" exact="$update.$ShipClass_M"/>
+        <set_value name="$shipClass_S" exact="$update.$ShipClass_S"/>
+        <set_value name="$capitalShips" exact="$shipClass_XL + $shipClass_L"/>
+        <set_value name="$primaryFaction" exact="$update.$PrimaryFaction"/>
+
+        <do_if value="not $sector? or not global.$GT_ThreatIntelligence? or not global.$GT_ThreatIntelligence.{$sector}? or not @global.$GT_ThreatIntelligence.{$sector}.$ShouldBlacklist">
+          <cancel_cue cue="this"/>
+        </do_if>
+        <do_else>
+        <set_value name="$enemyShips" exact="[]"/>
+        <do_if value="$update.$CombatHostiles? and $update.$CombatHostiles.count gt 0">
+          <set_value name="$enemyShips" exact="$update.$CombatHostiles"/>
+        </do_if>
+        <do_if value="$enemyShips.count le 0">
+          <cancel_cue cue="this"/>
+        </do_if>
+        <do_else>
+        <set_value name="$threatLevel" exact="2"/>
+        <do_if value="$capitalShips gt 0">
+          <set_value name="$threatLevel" exact="4"/>
+        </do_if>
+        <do_elseif value="$threatScore ge 6">
+          <set_value name="$threatLevel" exact="3"/>
+        </do_elseif>
+
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ThreatLevel" exact="$threatLevel"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$HostileCount" exact="$hostileCount"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ThreatScore" exact="$threatScore"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$Timestamp" exact="player.age"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ShipClass_XL" exact="$shipClass_XL"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ShipClass_L" exact="$shipClass_L"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ShipClass_M" exact="$shipClass_M"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ShipClass_S" exact="$shipClass_S"/>
+        <do_if value="$primaryFaction?">
+          <set_value name="global.$GT_ThreatIntelligence.{$sector}.$PrimaryFaction" exact="$primaryFaction.knownname"/>
+        </do_if>
+        <do_if value="$detectedBy? and @$detectedBy.exists">
+          <set_value name="global.$GT_ThreatIntelligence.{$sector}.$DetectedBy" exact="$detectedBy.knownname"/>
+        </do_if>
+
+        <run_actions ref="StoreTrackedEnemyShips">
+          <param name="Sector" value="$sector"/>
+          <param name="EnemyShips" value="$enemyShips"/>
+          <param name="DebugChance" value="100"/>
+        </run_actions>
+
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <set_value name="$reporterIdcode" exact="if $detectedBy? then $detectedBy.idcode else ''"/>
+          <debug_text text="'[GT-Threat] Tracking update sector=' + $sector.knownname + ' reporter=' + $reporterIdcode + ' pool=' + $enemyShips.count + ' tracked=' + global.$GT_ThreatIntelligence.{$sector}.$TrackedEnemyShips.count + ' hostileCount=' + $hostileCount + ' threatScore=' + $threatScore" chance="100"/>
+        </do_if>
+        </do_else>
+        </do_else>
+        </do_else>
+      </actions>
+    </cue>
+    
     <!-- Fleet Threat Warning Receiver -->
     <cue name="ReceiveThreatWarning" instantiate="true">
       <conditions>
@@ -2299,35 +2942,7 @@
           <set_value name="$wasAlreadyBlacklisted" exact="true"/>
         </do_if>
         
-        <!-- Calculate threat level (1-5) -->
-        <set_value name="$threatLevel" exact="2"/> <!-- Base: hostiles present -->
-        <do_if value="$capitalShips gt 0">
-          <set_value name="$threatLevel" exact="4"/> <!-- High: capital ships -->
-        </do_if>
-        <do_elseif value="$threatScore ge 6">
-          <set_value name="$threatLevel" exact="3"/> <!-- Medium-High: multiple hostiles -->
-        </do_elseif>
-        
-        <set_value name="global.$GT_ThreatIntelligence.{$sector}" exact="table[]"/>
-        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ThreatLevel" exact="$threatLevel"/>
-        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$HostileCount" exact="$hostileCount"/>
-        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ThreatScore" exact="$threatScore"/>
-        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$Timestamp" exact="player.age"/>
-        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$DetectedBy" exact="$detectedBy.knownname"/>
-        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ThreatType" exact="'Real-Time Detection'"/>
-        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$PrimaryFaction" exact="if $primaryFaction then $primaryFaction.knownname else 'Unknown'"/>
-        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ShipClass_XL" exact="$shipClass_XL"/>
-        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ShipClass_L" exact="$shipClass_L"/>
-        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ShipClass_M" exact="$shipClass_M"/>
-        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ShipClass_S" exact="$shipClass_S"/>
-        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ShouldBlacklist" exact="true"/>
-
-        <do_if value="not $wasAlreadyBlacklisted">
-          <run_actions ref="GT_SpeakThreatBlacklistAlert">
-            <param name="Sector" value="$sector"/>
-          </run_actions>
-        </do_if>
-        <!-- Tracking: gravidar snapshot from broadcast, else find_ship from detecting ship -->
+        <!-- Build combat pool before episode write (needed for player-dismiss hostile gate) -->
         <set_value name="$enemyShips" exact="[]"/>
         <do_if value="$warning.$CombatHostiles? and $warning.$CombatHostiles.count gt 0">
           <set_value name="$enemyShips" exact="$warning.$CombatHostiles"/>
@@ -2372,6 +2987,103 @@
         <do_if value="$enemyShips == null">
           <set_value name="$enemyShips" exact="[]"/>
         </do_if>
+        <set_value name="$enemyPoolSource" exact="if ($warning.$CombatHostiles? and $warning.$CombatHostiles.count gt 0) then 'broadcast' else 'find_ship'"/>
+
+        <!-- First episode only: expand tight fleet packet around each gravidar anchor (10km). -->
+        <do_if value="not $wasAlreadyBlacklisted and $enemyShips.count gt 0">
+          <set_value name="$gravidarPoolCount" exact="$enemyShips.count"/>
+          <set_value name="$relationObj" exact="if $detectedBy? and @$detectedBy.exists then $detectedBy else player.entity"/>
+          <run_actions ref="GT_ExpandHostileCluster" result="$clusterResult">
+            <param name="Sector" value="$sector"/>
+            <param name="AnchorShips" value="$enemyShips"/>
+            <param name="RelationObject" value="$relationObj"/>
+            <param name="DebugChance" value="100"/>
+          </run_actions>
+          <set_value name="$enemyShips" exact="$clusterResult.$Ships"/>
+          <run_actions ref="GT_ComputeThreatMetricsFromShips" result="$threatMetrics">
+            <param name="EnemyShips" value="$enemyShips"/>
+          </run_actions>
+          <set_value name="$hostileCount" exact="$threatMetrics.$HostileCount"/>
+          <set_value name="$threatScore" exact="$threatMetrics.$ThreatScore"/>
+          <set_value name="$shipClass_XL" exact="$threatMetrics.$ShipClass_XL"/>
+          <set_value name="$shipClass_L" exact="$threatMetrics.$ShipClass_L"/>
+          <set_value name="$shipClass_M" exact="$threatMetrics.$ShipClass_M"/>
+          <set_value name="$shipClass_S" exact="$threatMetrics.$ShipClass_S"/>
+          <set_value name="$primaryFaction" exact="$threatMetrics.$PrimaryFaction"/>
+          <set_value name="$capitalShips" exact="$shipClass_XL + $shipClass_L"/>
+          <set_value name="$enemyPoolSource" exact="'cluster'"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Threat] Cluster pool sector=' + $sector.knownname + ' gravidarPool=' + $gravidarPoolCount + ' clusterAdded=' + $clusterResult.$ClusterAdded + ' evalPool=' + $enemyShips.count + ' threatScore=' + $threatScore" chance="100"/>
+          </do_if>
+        </do_if>
+
+        <do_if value="not $wasAlreadyBlacklisted">
+          <set_value name="$sectorMacro" exact="@$sector.macro.id"/>
+          <set_value name="$reporterIdcode" exact="if $detectedBy? then $detectedBy.idcode else ''"/>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Dismiss] RECEIVER sector=' + $sector.knownname + ' reporter=' + $reporterIdcode + ' wasBlacklisted=0 warnHostiles=' + $hostileCount + ' evalPool=' + $enemyShips.count + ' poolSource=' + $enemyPoolSource" chance="100"/>
+          </do_if>
+          <run_actions ref="GT_EvaluatePlayerDismissedSectorDetection" result="$dismissedEval">
+            <param name="SectorMacro" value="$sectorMacro"/>
+            <param name="EnemyShips" value="$enemyShips"/>
+            <param name="EpisodeActive" value="$wasAlreadyBlacklisted"/>
+            <param name="Source" value="'gravidar'"/>
+            <param name="ReporterIdcode" value="$reporterIdcode"/>
+            <param name="WarningHostileCount" value="$hostileCount"/>
+            <param name="DebugChance" value="100"/>
+          </run_actions>
+          <do_if value="$dismissedEval.$Suppress">
+            <set_value name="$deny" exact="true"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Dismiss] RECEIVER DENIED sector=' + $sector.knownname + ' reporter=' + $reporterIdcode + ' decision=' + $dismissedEval.$Decision" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_if value="$dismissedEval.$ClearDismissed and $sectorMacro?">
+            <run_actions ref="GT_ClearPlayerDismissedHostilesForMacro">
+              <param name="SectorMacro" value="$sectorMacro"/>
+              <param name="DebugChance" value="100"/>
+            </run_actions>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT-Dismiss] RECEIVER CLEARED dismissed memory for macro=' + $sectorMacro + ' (new hostile - starting fresh episode)'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_if value="not $deny and $dismissedEval.$Decision == 'NO_DISMISSED_MEMORY' and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Dismiss] RECEIVER ACCEPTED sector=' + $sector.knownname + ' reporter=' + $reporterIdcode + ' (no dismissed memory - new episode)'" chance="100"/>
+          </do_if>
+          <do_if value="not $deny and $dismissedEval.$Decision == 'NEW_HOSTILE' and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Dismiss] RECEIVER ACCEPTED sector=' + $sector.knownname + ' reporter=' + $reporterIdcode + ' (new hostile idcode - new episode)'" chance="100"/>
+          </do_if>
+        </do_if>
+
+        <do_if value="not $deny">
+        <!-- Calculate threat level (1-5) -->
+        <set_value name="$threatLevel" exact="2"/> <!-- Base: hostiles present -->
+        <do_if value="$capitalShips gt 0">
+          <set_value name="$threatLevel" exact="4"/> <!-- High: capital ships -->
+        </do_if>
+        <do_elseif value="$threatScore ge 6">
+          <set_value name="$threatLevel" exact="3"/> <!-- Medium-High: multiple hostiles -->
+        </do_elseif>
+        
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}" exact="table[]"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ThreatLevel" exact="$threatLevel"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$HostileCount" exact="$hostileCount"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ThreatScore" exact="$threatScore"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$Timestamp" exact="player.age"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$DetectedBy" exact="$detectedBy.knownname"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ThreatType" exact="'Real-Time Detection'"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$PrimaryFaction" exact="if $primaryFaction then $primaryFaction.knownname else 'Unknown'"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ShipClass_XL" exact="$shipClass_XL"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ShipClass_L" exact="$shipClass_L"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ShipClass_M" exact="$shipClass_M"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ShipClass_S" exact="$shipClass_S"/>
+        <set_value name="global.$GT_ThreatIntelligence.{$sector}.$ShouldBlacklist" exact="true"/>
+
+        <do_if value="not $wasAlreadyBlacklisted">
+          <run_actions ref="GT_SpeakThreatBlacklistAlert">
+            <param name="Sector" value="$sector"/>
+          </run_actions>
+        </do_if>
 
         <run_actions ref="StoreTrackedEnemyShips">
           <param name="Sector" value="$sector"/>
@@ -2415,6 +3127,7 @@
             <set_value name="$classBreakdown" exact="$classBreakdown + (if $classBreakdown != '' then ', ' else '') + $shipClass_S + ' S'"/>
           </do_if>
           <debug_text text="'[GT-Threat] Fleet warning received: ' + $hostileCount + ' hostile(s) in ' + $sector.knownname + ' (' + $classBreakdown + ') - Faction: ' + (if $primaryFaction then $primaryFaction.knownname else 'Unknown') + ' - Level ' + $threatLevel + ', detected by ' + $detectedBy.knownname" chance="100"/>
+        </do_if>
         </do_if>
         </do_if>
         </do_else>

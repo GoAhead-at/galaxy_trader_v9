@@ -271,28 +271,25 @@ local function resolveWareExchangeLeg(shipId, leg)
     local wantPickup = (direction == "pickup")
     local offerCount = 0
     local wareHits = 0
-    local bestId = nil
+    local directionHits = 0
 
     for _, tradeData in pairs(offers) do
         offerCount = offerCount + 1
         if legsMatchWare(tradeData, reqWare) then
             wareHits = wareHits + 1
-            if offerMatchesDirection(tradeData, wantPickup) and canQueueOffer(tradeData, shipId, amount) then
-                return tradeData.id, nil
-            end
-            if bestId == nil and canQueueOffer(tradeData, shipId, amount) then
-                bestId = tradeData.id
+            if offerMatchesDirection(tradeData, wantPickup) then
+                directionHits = directionHits + 1
+                if canQueueOffer(tradeData, shipId, amount) then
+                    return tradeData.id, nil
+                end
             end
         end
     end
 
-    if bestId ~= nil then
-        debugLog("direction fallback used for " .. tostring(wareKey(reqWare)) .. " at station " .. tostring(stationId))
-        return bestId, nil
-    end
-
-    return nil, "no ware exchange match for " .. tostring(wareKey(reqWare))
-        .. " (offers=" .. tostring(offerCount) .. ", wareHits=" .. tostring(wareHits) .. ")"
+    local wantDir = wantPickup and "pickup" or "deliver"
+    return nil, "no ware exchange " .. wantDir .. " match for " .. tostring(wareKey(reqWare))
+        .. " (offers=" .. tostring(offerCount) .. ", wareHits=" .. tostring(wareHits)
+        .. ", directionHits=" .. tostring(directionHits) .. ")"
 end
 
 local function queueResolvedLeg(shipId, offerId, amount)

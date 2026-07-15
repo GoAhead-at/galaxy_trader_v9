@@ -380,10 +380,12 @@ local function GT_ReconcileSlots(_, params)
     end
 
     hasShip, shipWare, hasEngine, engineWare = ReadInstalledSlotWares(shipId)
-    logDebug(string.format(
-        "Reconcile ship=%s reason=%s desiredShip=%s desiredEngine=%s observedShip=%s observedEngine=%s",
-        shipIdCode, reason, desiredShip, desiredEngine, shipWare, engineWare
-    ), "WARNING")
+    if isDebugLoggingEnabled() then
+        logDebug(string.format(
+            "Reconcile ship=%s reason=%s desiredShip=%s desiredEngine=%s observedShip=%s observedEngine=%s",
+            shipIdCode, reason, desiredShip, desiredEngine, shipWare, engineWare
+        ), "INFO")
+    end
 end
 
 local function GT_ProbeSlots(_, params)

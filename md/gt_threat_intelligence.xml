@@ -67,7 +67,7 @@
         </do_if>
         <!-- Re-sync group membership from persisted threat data after save load -->
         <do_if value="global.$GT_ThreatIntelligence?">
-          <!-- R2/R10: migrate sector-object keys to '$'+idcode before any key walk -->
+          <!-- R2/R10: migrate sector-object keys to '$'+macro.id before any key walk -->
           <run_actions ref="GT_MigrateThreatIntelligenceKeys"/>
           <!-- Drop orphan rows that were never blacklisted (legacy protected-sector telemetry) -->
           <set_value name="$purgeSectorKeys" exact="global.$GT_ThreatIntelligence.keys.list"/>
@@ -1627,13 +1627,15 @@
       </actions>
     </library>
 
-    <!-- One-pass load migrate: sector-object keys -> '$'+macro.id (sectors have no .idcode). -->
+    <!-- One-pass load migrate: sector-object keys -> '$'+macro.id (sectors have no .idcode).
+         Hardened for 0.15.13 saves: no row stamps; merge on collision; salvage macro from live tracked ships. -->
     <library name="GT_MigrateThreatIntelligenceKeys" purpose="run_actions">
       <actions>
         <set_value name="$migrated" exact="0"/>
+        <set_value name="$merged" exact="0"/>
         <set_value name="$dropped" exact="0"/>
         <do_if value="not global.$GT_ThreatIntelligence?">
-          <return value="table[$Migrated = 0, $Dropped = 0]"/>
+          <return value="table[$Migrated = 0, $Merged = 0, $Dropped = 0]"/>
         </do_if>
         <set_value name="$oldKeys" exact="global.$GT_ThreatIntelligence.keys.list"/>
         <do_all exact="$oldKeys.count" counter="$mi" reverse="true">
@@ -1641,6 +1643,8 @@
           <do_if value="global.$GT_ThreatIntelligence.{$oldKey}?">
             <set_value name="$row" exact="global.$GT_ThreatIntelligence.{$oldKey}"/>
             <set_value name="$macro" exact="''"/>
+            <set_value name="$liveSector" exact="null"/>
+
             <do_if value="$row.$SectorMacro? and $row.$SectorMacro != null and $row.$SectorMacro != ''">
               <set_value name="$macro" exact="'' + $row.$SectorMacro"/>
             </do_if>
@@ -1660,6 +1664,27 @@
                 <set_value name="$macro" exact="'' + $rowMacro"/>
               </do_if>
             </do_if>
+            <!-- 0.15.13 rows had no stamps: recover sector from any still-live tracked hostile. -->
+            <do_if value="$macro == '' and $row.$TrackedEnemyShips?">
+              <do_all exact="$row.$TrackedEnemyShips.count" counter="$salvIdx">
+                <do_if value="$macro == ''">
+                  <set_value name="$salvShip" exact="null"/>
+                  <do_if value="$row.$TrackedEnemyShips.{$salvIdx}?">
+                    <set_value name="$salvShip" exact="$row.$TrackedEnemyShips.{$salvIdx}"/>
+                  </do_if>
+                  <do_if value="$salvShip? and @$salvShip.exists">
+                    <set_value name="$salvSector" exact="@$salvShip.sector"/>
+                    <do_if value="$salvSector? and @$salvSector.exists">
+                      <set_value name="$salvMacro" exact="@$salvSector.macro.id"/>
+                      <do_if value="$salvMacro? and $salvMacro != null and $salvMacro != ''">
+                        <set_value name="$macro" exact="'' + $salvMacro"/>
+                        <set_value name="$liveSector" exact="$salvSector"/>
+                      </do_if>
+                    </do_if>
+                  </do_if>
+                </do_if>
+              </do_all>
+            </do_if>
 
             <do_if value="$macro == ''">
               <remove_value name="global.$GT_ThreatIntelligence.{$oldKey}"/>
@@ -1667,16 +1692,15 @@
             </do_if>
             <do_else>
               <set_value name="$newKey" exact="'$' + $macro"/>
-              <set_value name="$liveSector" exact="null"/>
-              <do_if value="$row.$Sector? and @$row.$Sector.exists">
+              <do_if value="$liveSector == null and $row.$Sector? and @$row.$Sector.exists">
                 <set_value name="$liveSector" exact="$row.$Sector"/>
               </do_if>
-              <do_elseif value="$oldKey? and @$oldKey.exists and @$oldKey.isclass.sector">
+              <do_if value="$liveSector == null and $oldKey? and @$oldKey.exists and @$oldKey.isclass.sector">
                 <set_value name="$liveSector" exact="$oldKey"/>
-              </do_elseif>
-              <do_elseif value="global.$GT_ThreatIntelligence.{$newKey}? and global.$GT_ThreatIntelligence.{$newKey}.$Sector? and @global.$GT_ThreatIntelligence.{$newKey}.$Sector.exists">
+              </do_if>
+              <do_if value="$liveSector == null and global.$GT_ThreatIntelligence.{$newKey}? and global.$GT_ThreatIntelligence.{$newKey}.$Sector? and @global.$GT_ThreatIntelligence.{$newKey}.$Sector.exists">
                 <set_value name="$liveSector" exact="global.$GT_ThreatIntelligence.{$newKey}.$Sector"/>
-              </do_elseif>
+              </do_if>
 
               <do_if value="$oldKey == $newKey">
                 <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$SectorMacro" exact="$macro"/>
@@ -1685,29 +1709,129 @@
                   <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$Sector" exact="$liveSector"/>
                 </do_if>
               </do_if>
-              <do_else>
-                <do_if value="global.$GT_ThreatIntelligence.{$newKey}?">
-                  <remove_value name="global.$GT_ThreatIntelligence.{$oldKey}"/>
-                  <set_value name="$dropped" exact="$dropped + 1"/>
+              <do_elseif value="global.$GT_ThreatIntelligence.{$newKey}?">
+                <!-- Collision: merge tracked lists into existing macro key; do not drop old tracking. -->
+                <set_value name="$dest" exact="global.$GT_ThreatIntelligence.{$newKey}"/>
+                <do_if value="not $dest.$TrackedEnemyShips?">
+                  <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$TrackedEnemyShips" exact="[]"/>
                 </do_if>
-                <do_else>
-                  <set_value name="global.$GT_ThreatIntelligence.{$newKey}" exact="$row"/>
-                  <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$SectorMacro" exact="$macro"/>
-                  <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$SectorIdcode" exact="$macro"/>
-                  <do_if value="$liveSector != null">
-                    <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$Sector" exact="$liveSector"/>
+                <do_if value="not $dest.$TrackedEnemyShipIdcodes?">
+                  <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$TrackedEnemyShipIdcodes" exact="[]"/>
+                </do_if>
+                <do_if value="$row.$TrackedEnemyShips?">
+                  <do_all exact="$row.$TrackedEnemyShips.count" counter="$mgIdx">
+                    <set_value name="$mgShip" exact="null"/>
+                    <do_if value="$row.$TrackedEnemyShips.{$mgIdx}?">
+                      <set_value name="$mgShip" exact="$row.$TrackedEnemyShips.{$mgIdx}"/>
+                    </do_if>
+                    <set_value name="$mgIdcode" exact="null"/>
+                    <do_if value="$row.$TrackedEnemyShipIdcodes? and $row.$TrackedEnemyShipIdcodes.{$mgIdx}?">
+                      <set_value name="$mgIdcode" exact="$row.$TrackedEnemyShipIdcodes.{$mgIdx}"/>
+                    </do_if>
+                    <do_if value="not $mgIdcode? or $mgIdcode == null or $mgIdcode == ''">
+                      <do_if value="$mgShip?">
+                        <set_value name="$mgIdcode" exact="@$mgShip.idcode"/>
+                      </do_if>
+                    </do_if>
+                    <set_value name="$alreadyTracked" exact="false"/>
+                    <set_value name="$destShips" exact="global.$GT_ThreatIntelligence.{$newKey}.$TrackedEnemyShips"/>
+                    <set_value name="$destIds" exact="global.$GT_ThreatIntelligence.{$newKey}.$TrackedEnemyShipIdcodes"/>
+                    <do_all exact="$destShips.count" counter="$dj">
+                      <do_if value="not $alreadyTracked">
+                        <set_value name="$destIdAt" exact="null"/>
+                        <do_if value="$destIds.{$dj}?">
+                          <set_value name="$destIdAt" exact="$destIds.{$dj}"/>
+                        </do_if>
+                        <run_actions ref="GT_ShipMatchesTracked" result="$alreadyTracked">
+                          <param name="TrackedShip" value="$destShips.{$dj}"/>
+                          <param name="TrackedIdcode" value="$destIdAt"/>
+                          <param name="CandidateShip" value="$mgShip"/>
+                          <param name="CandidateIdcode" value="$mgIdcode"/>
+                        </run_actions>
+                      </do_if>
+                    </do_all>
+                    <do_if value="not $alreadyTracked">
+                      <!-- Keep ship/idcode lists parallel (null ship + idcode survives handle drift). -->
+                      <do_if value="($mgShip? and @$mgShip.exists) or ($mgIdcode? and $mgIdcode != null and $mgIdcode != '')">
+                        <do_if value="$mgShip? and @$mgShip.exists">
+                          <append_to_list name="global.$GT_ThreatIntelligence.{$newKey}.$TrackedEnemyShips" exact="$mgShip"/>
+                        </do_if>
+                        <do_else>
+                          <append_to_list name="global.$GT_ThreatIntelligence.{$newKey}.$TrackedEnemyShips" exact="null"/>
+                        </do_else>
+                        <append_to_list name="global.$GT_ThreatIntelligence.{$newKey}.$TrackedEnemyShipIdcodes" exact="if $mgIdcode? and $mgIdcode != null and $mgIdcode != '' then $mgIdcode else 'UNKNOWN'"/>
+                      </do_if>
+                    </do_if>
+                  </do_all>
+                </do_if>
+                <!-- Prefer stronger / newer episode metadata from the colliding row. -->
+                <do_if value="$row.$ShouldBlacklist? and $row.$ShouldBlacklist">
+                  <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$ShouldBlacklist" exact="true"/>
+                </do_if>
+                <do_if value="$row.$ThreatScore?">
+                  <do_if value="not $dest.$ThreatScore? or $row.$ThreatScore gt $dest.$ThreatScore">
+                    <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$ThreatScore" exact="$row.$ThreatScore"/>
                   </do_if>
-                  <remove_value name="global.$GT_ThreatIntelligence.{$oldKey}"/>
-                  <set_value name="$migrated" exact="$migrated + 1"/>
-                </do_else>
+                </do_if>
+                <do_if value="$row.$ThreatLevel?">
+                  <do_if value="not $dest.$ThreatLevel? or $row.$ThreatLevel gt $dest.$ThreatLevel">
+                    <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$ThreatLevel" exact="$row.$ThreatLevel"/>
+                  </do_if>
+                </do_if>
+                <do_if value="$row.$Timestamp?">
+                  <do_if value="not $dest.$Timestamp? or $row.$Timestamp gt $dest.$Timestamp">
+                    <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$Timestamp" exact="$row.$Timestamp"/>
+                    <do_if value="$row.$DetectedBy?">
+                      <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$DetectedBy" exact="$row.$DetectedBy"/>
+                    </do_if>
+                    <do_if value="$row.$ThreatType?">
+                      <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$ThreatType" exact="$row.$ThreatType"/>
+                    </do_if>
+                    <do_if value="$row.$PrimaryFaction?">
+                      <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$PrimaryFaction" exact="$row.$PrimaryFaction"/>
+                    </do_if>
+                    <do_if value="$row.$HostileCount?">
+                      <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$HostileCount" exact="$row.$HostileCount"/>
+                    </do_if>
+                    <do_if value="$row.$ShipClass_XL?">
+                      <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$ShipClass_XL" exact="$row.$ShipClass_XL"/>
+                    </do_if>
+                    <do_if value="$row.$ShipClass_L?">
+                      <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$ShipClass_L" exact="$row.$ShipClass_L"/>
+                    </do_if>
+                    <do_if value="$row.$ShipClass_M?">
+                      <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$ShipClass_M" exact="$row.$ShipClass_M"/>
+                    </do_if>
+                    <do_if value="$row.$ShipClass_S?">
+                      <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$ShipClass_S" exact="$row.$ShipClass_S"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+                <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$SectorMacro" exact="$macro"/>
+                <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$SectorIdcode" exact="$macro"/>
+                <do_if value="$liveSector != null">
+                  <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$Sector" exact="$liveSector"/>
+                </do_if>
+                <remove_value name="global.$GT_ThreatIntelligence.{$oldKey}"/>
+                <set_value name="$merged" exact="$merged + 1"/>
+              </do_elseif>
+              <do_else>
+                <set_value name="global.$GT_ThreatIntelligence.{$newKey}" exact="$row"/>
+                <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$SectorMacro" exact="$macro"/>
+                <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$SectorIdcode" exact="$macro"/>
+                <do_if value="$liveSector != null">
+                  <set_value name="global.$GT_ThreatIntelligence.{$newKey}.$Sector" exact="$liveSector"/>
+                </do_if>
+                <remove_value name="global.$GT_ThreatIntelligence.{$oldKey}"/>
+                <set_value name="$migrated" exact="$migrated + 1"/>
               </do_else>
             </do_else>
           </do_if>
         </do_all>
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and ($migrated gt 0 or $dropped gt 0)">
-          <debug_text text="'[GT-Threat] Migrated threat keys: moved=' + $migrated + ' dropped=' + $dropped" chance="100"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and ($migrated gt 0 or $merged gt 0 or $dropped gt 0)">
+          <debug_text text="'[GT-Threat] Migrated threat keys: moved=' + $migrated + ' merged=' + $merged + ' dropped=' + $dropped" chance="100"/>
         </do_if>
-        <return value="table[$Migrated = $migrated, $Dropped = $dropped]"/>
+        <return value="table[$Migrated = $migrated, $Merged = $merged, $Dropped = $dropped]"/>
       </actions>
     </library>
 

@@ -1934,11 +1934,10 @@
           <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Destination Stations', $Status = if $mk2DestCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $mk2DestCount + ' stations']"/>
 
           <!-- Read bidirectional + ignoreoffersettings and build the supplier/customer role
-               lists exactly like the runtime does (order.trade.galaxytraderMK2.xml lines
-               1212-1227). In bidirectional mode every participating station can both supply
-               and receive, so suppliers == customers == dedup union of source + dest lists.
-               Otherwise suppliers = source list, customers = destination list. These lists
-               are reused by the MK2 reserve eval below AND the pair-evaluation section. -->
+               lists for pair evaluation. Bidirectional keeps Source and Dest lists distinct
+               and evaluates both Source→Dest and Dest→Source (no peer trades within a list).
+               Pair eval iterates suppliers=sources∪dests × customers=sources∪dests with a
+               bipartite gate matching runtime. -->
           <set_value name="$mk2OrderBidirectional" exact="if $gtOrder.$bidirectional? then $gtOrder.$bidirectional else false"/>
           <set_value name="$mk2OrderIgnoreOffers" exact="if $gtOrder.$ignoreoffersettings? then $gtOrder.$ignoreoffersettings else false"/>
           <do_if value="$mk2OrderBidirectional">
@@ -1975,11 +1974,15 @@
             </do_if>
             <set_value name="$mk2SupplierList" exact="$mk2Union"/>
             <set_value name="$mk2CustomerList" exact="$mk2Union"/>
-            <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Direction', $Status = 'INFO', $Detail = 'BIDIRECTIONAL - every station can supply or receive (' + $mk2Union.count + ' participating stations, both directions evaluated)']"/>
+            <set_value name="$mk2SourceRoleList" exact="if $gtOrder.$sourceList? then $gtOrder.$sourceList else []"/>
+            <set_value name="$mk2DestRoleList" exact="if $gtOrder.$destList? then $gtOrder.$destList else []"/>
+            <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Direction', $Status = 'INFO', $Detail = 'BIDIRECTIONAL - Source to Dest and Dest to Source (' + $mk2SourceRoleList.count + ' sources, ' + $mk2DestRoleList.count + ' destinations; no peer trades within a list)']"/>
           </do_if>
           <do_else>
             <set_value name="$mk2SupplierList" exact="if $gtOrder.$sourceList? then $gtOrder.$sourceList else []"/>
             <set_value name="$mk2CustomerList" exact="if $gtOrder.$destList? then $gtOrder.$destList else []"/>
+            <set_value name="$mk2SourceRoleList" exact="$mk2SupplierList"/>
+            <set_value name="$mk2DestRoleList" exact="$mk2CustomerList"/>
           </do_else>
           <do_if value="$mk2OrderIgnoreOffers">
             <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Ware Exchange', $Status = 'INFO', $Detail = 'ON (ignoreoffersettings) - player-owned stations trade via storage discovery; a formal sell/buy offer is NOT required']"/>
@@ -7312,13 +7315,13 @@
                between the explicit $sourceList and $destList, so the only meaningful pair
                table is one that iterates supplier x customer x ware and walks the same
                gates the runtime applies in order.trade.galaxytraderMK2.xml lines 1212-1956.
-               When bidirectional is on, suppliers/customers are the participating-station
-               union so both trade directions are evaluated (runtime lines 1212-1227).
+               When bidirectional is on, pair eval still iterates the assigned-station union
+               but only Source→Dest and Dest→Source pairs pass (runtime bipartite gate).
                When ignoreoffersettings (ware exchange) is on, player-owned stations trade
                via storage discovery without a formal offer (runtime lines 1313 / 1459).
                We mirror those gates 1:1 here so each row carries a verdict + reasoning
                line that maps directly to a runtime skip counter (illegal/cargo, noSrcOffer,
-               srcNoTarget, srcBelowStatic, self, distance, noDstOffer, noNeed, minTrade).
+               srcNoTarget, srcBelowStatic, self, peerRole, distance, noDstOffer, noNeed, minTrade).
                Reservations (skipReserved) are intentionally NOT modelled - they require
                get_ware_reservation which can mutate engine state in unpredictable ways
                from an MD diagnostic context, and the player-actionable signal is already
@@ -7332,6 +7335,7 @@
           <set_value name="$mk2PairSkipSrcNoTarget" exact="0"/>
           <set_value name="$mk2PairSkipBelowStatic" exact="0"/>
           <set_value name="$mk2PairSkipSelf" exact="0"/>
+          <set_value name="$mk2PairSkipPeerRole" exact="0"/>
           <set_value name="$mk2PairSkipDistance" exact="0"/>
           <set_value name="$mk2PairSkipNoDst" exact="0"/>
           <set_value name="$mk2PairSkipNoNeed" exact="0"/>
@@ -7515,9 +7519,8 @@
                   <continue/>
                 </do_if>
 
-                <!-- Per-destination evaluation. In bidirectional mode the customer list is
-                     the participating-station union, so this also covers reverse-direction
-                     (former destination selling back to a former source) pairs. -->
+                <!-- Per-destination evaluation. Bidirectional evaluates Source→Dest and
+                     Dest→Source only; peer pairs within a list are blocked below. -->
                 <do_all exact="$mk2CustomerList.count" counter="$pmdi">
                   <set_value name="$pmDst" exact="$mk2CustomerList.{$pmdi}"/>
                   <do_if value="not $pmDst? or not $pmDst.exists">
@@ -7533,6 +7536,42 @@
                     <set_value name="$pmStatus2" exact="'BLOCK'"/>
                     <set_value name="$pmReason2" exact="'self: source and destination are the same station'"/>
                     <set_value name="$mk2PairSkipSelf" operation="add"/>
+                  </do_if>
+
+                  <!-- Gate 5b: bipartite role gate (skipPeerRole). Bidirectional allows only
+                       Source→Dest or Dest→Source; never source↔source or dest↔dest. -->
+                  <do_if value="$pmStatus2 == 'PASS' and $mk2OrderBidirectional">
+                    <set_value name="$pmPairForward" exact="false"/>
+                    <set_value name="$pmPairReverse" exact="false"/>
+                    <do_all exact="$mk2SourceRoleList.count" counter="$pmfwsi">
+                      <do_if value="$mk2SourceRoleList.{$pmfwsi} == $pmSrc">
+                        <do_all exact="$mk2DestRoleList.count" counter="$pmfwdi">
+                          <do_if value="$mk2DestRoleList.{$pmfwdi} == $pmDst">
+                            <set_value name="$pmPairForward" exact="true"/>
+                            <break/>
+                          </do_if>
+                        </do_all>
+                        <break/>
+                      </do_if>
+                    </do_all>
+                    <do_if value="not $pmPairForward">
+                      <do_all exact="$mk2DestRoleList.count" counter="$pmrvsi">
+                        <do_if value="$mk2DestRoleList.{$pmrvsi} == $pmSrc">
+                          <do_all exact="$mk2SourceRoleList.count" counter="$pmrvdi">
+                            <do_if value="$mk2SourceRoleList.{$pmrvdi} == $pmDst">
+                              <set_value name="$pmPairReverse" exact="true"/>
+                              <break/>
+                            </do_if>
+                          </do_all>
+                          <break/>
+                        </do_if>
+                      </do_all>
+                    </do_if>
+                    <do_if value="not $pmPairForward and not $pmPairReverse">
+                      <set_value name="$pmStatus2" exact="'BLOCK'"/>
+                      <set_value name="$pmReason2" exact="'peerRole: bidirectional allows only Source to Dest or Dest to Source (not peer trades within a list)'"/>
+                      <set_value name="$mk2PairSkipPeerRole" operation="add"/>
+                    </do_if>
                   </do_if>
 
                   <!-- Gate 6: distance (skipDistance, runtime line 1437-1439) -->
@@ -7714,7 +7753,7 @@
             <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'No Pairs', $Status = 'WARN', $Detail = if $mk2AutoSourceMode then 'Auto-source active - classic pair mesh not applicable' else 'No source/destination stations configured (see MK2 Specific section)']"/>
           </do_if>
           <do_if value="$mk2PairCount gt 0">
-            <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Skip Breakdown', $Status = 'INFO', $Detail = 'illegal/cargo=' + $mk2PairSkipIllegal + ', routeIllegal=' + $mk2PairSkipRouteIllegal + ', noSrcOffer=' + $mk2PairSkipNoSrc + ', srcNoTarget=' + $mk2PairSkipSrcNoTarget + ', srcBelowStatic=' + $mk2PairSkipBelowStatic + ', self=' + $mk2PairSkipSelf + ', distance=' + $mk2PairSkipDistance + ', noDstOffer=' + $mk2PairSkipNoDst + ', noNeed=' + $mk2PairSkipNoNeed + ', minTrade=' + $mk2PairSkipMinTrade]"/>
+            <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Skip Breakdown', $Status = 'INFO', $Detail = 'illegal/cargo=' + $mk2PairSkipIllegal + ', routeIllegal=' + $mk2PairSkipRouteIllegal + ', noSrcOffer=' + $mk2PairSkipNoSrc + ', srcNoTarget=' + $mk2PairSkipSrcNoTarget + ', srcBelowStatic=' + $mk2PairSkipBelowStatic + ', self=' + $mk2PairSkipSelf + ', peerRole=' + $mk2PairSkipPeerRole + ', distance=' + $mk2PairSkipDistance + ', noDstOffer=' + $mk2PairSkipNoDst + ', noNeed=' + $mk2PairSkipNoNeed + ', minTrade=' + $mk2PairSkipMinTrade]"/>
           </do_if>
           <do_all exact="$mk2PairRows.count" counter="$pmri">
             <append_to_list name="$sec8b.$Rows" exact="$mk2PairRows.{$pmri}"/>
@@ -8405,7 +8444,7 @@
              require at least one ware was actually evaluated - if none were, the source has
              no allocated storage and a separate diagnosis is more appropriate. -->
         <do_elseif value="$orderId == 'GalaxyTraderMK2' and $mk2SourceWaresEvaluated gt 0 and $mk2SourceWaresBelowStatic == $mk2SourceWaresEvaluated">
-          <set_value name="$verdict" exact="'MK2 IDLE (source below static reserve): every sellable ware on the configured ' + (if $mk2OrderBidirectional then 'participating station(s) [bidirectional]' else 'source station(s)') + ' is at or below the static-storage reserve of ' + $mk2StaticStorage + '%. The runtime refuses to drain a source until it climbs ABOVE this threshold. Worst case: ' + $mk2WorstSourceDetail + ' . Highest fill seen: ' + $mk2BestSourceDetail + ' .'"/>
+          <set_value name="$verdict" exact="'MK2 IDLE (source below static reserve): every sellable ware on the configured ' + (if $mk2OrderBidirectional then 'source/destination stations [bidirectional Source to Dest / Dest to Source]' else 'source station(s)') + ' is at or below the static-storage reserve of ' + $mk2StaticStorage + '%. The runtime refuses to drain a source until it climbs ABOVE this threshold. Worst case: ' + $mk2WorstSourceDetail + ' . Highest fill seen: ' + $mk2BestSourceDetail + ' .'"/>
           <append_to_list name="$suggestions" exact="'Wait for the source station to produce more stock (the static reserve is intentional - it prevents the trader from emptying a production line below operating margins).'"/>
           <append_to_list name="$suggestions" exact="'OR lower the trader Static Storage % in its order params (current ' + $mk2StaticStorage + '%) so it ships earlier - e.g. set it to a value below the highest source fill (' + $mk2BestSourceRatio + '%).'"/>
         </do_elseif>

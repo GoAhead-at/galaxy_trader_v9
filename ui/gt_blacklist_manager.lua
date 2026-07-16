@@ -851,6 +851,47 @@ local function onRecreateBlacklist(_, event_data)
     return onInitialize(_, event_data)
 end
 
+--- Sector diagnose: query GT fleet blacklist macros directly (no ship isblacklisted probe).
+--- MD raises with sector macro id; Lua writes membership onto player blackboard for immediate MD read.
+local function onQuerySectorMacro(_, event_data)
+    -- Match ship-diagnose / MK2 ware-exchange: MD player.entity.$X <-> SetNPCBlackboard(64-bit player id)
+    local playerId = ConvertStringTo64Bit(tostring(C.GetPlayerID()))
+    local macro = tostring(event_data or "")
+    if macro == "" or macro == "nil" then
+        macro = tostring(GetNPCBlackboard(playerId, "$GT_SectorBL_QueryMacro") or "")
+    end
+
+    local onVanilla = false
+    local lastWritten = false
+    local macros = {}
+    local fleetId = GT_Blacklist.fleet_blacklist_id or 0
+    local initialized = GT_Blacklist.initialized and true or false
+
+    if macro ~= "" and macro ~= "nil" then
+        macros = readFleetBlacklistMacros()
+        local macro_set = macroListToSet(macros)
+        onVanilla = macro_set[macro] == true
+        if GT_Blacklist.last_written_macros and GT_Blacklist.last_written_macros[macro] then
+            lastWritten = true
+        end
+    end
+
+    SetNPCBlackboard(playerId, "$GT_SectorBL_VanillaOnGT", onVanilla and 1 or 0)
+    SetNPCBlackboard(playerId, "$GT_SectorBL_LastWrittenHas", lastWritten and 1 or 0)
+    SetNPCBlackboard(playerId, "$GT_SectorBL_VanillaFleetId", tonumber(fleetId) or 0)
+    SetNPCBlackboard(playerId, "$GT_SectorBL_VanillaMacroCount", #macros)
+    SetNPCBlackboard(playerId, "$GT_SectorBL_VanillaQueryReady", 1)
+    SetNPCBlackboard(playerId, "$GT_SectorBL_VanillaInitialized", initialized and 1 or 0)
+
+    -- Always visible in log.log (not gated by DEBUG_MODE)
+    DebugError(string.format(
+        "[GT-Blacklist] QuerySectorMacro macro=%s onVanilla=%s lastWritten=%s fleetId=%s macros=%d initialized=%s",
+        tostring(macro), tostring(onVanilla), tostring(lastWritten),
+        tostring(fleetId), #macros, tostring(initialized)
+    ))
+    return onVanilla
+end
+
 -- =============================================================================
 -- MODULE INITIALIZATION
 -- =============================================================================
@@ -873,6 +914,7 @@ local function init()
         { name = "GT_Blacklist.ApplyToFleet",    handler = onApplyToFleet },
         { name = "GT_Blacklist.RemoveFromShip",  handler = onRemoveFromShip },
         { name = "GT_Blacklist.Recreate",        handler = onRecreateBlacklist },
+        { name = "GT_Blacklist.QuerySectorMacro", handler = onQuerySectorMacro },
     }
     
     for _, event in ipairs(events) do

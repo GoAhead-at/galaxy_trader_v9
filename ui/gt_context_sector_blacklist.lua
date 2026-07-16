@@ -1,5 +1,6 @@
 -- GalaxyTrader MK3 Sector Blacklist Diagnose
 -- Light single-panel report for sector right-click GT Diagnose.
+-- Scrollable content table (pilot-exchange / vanilla playerinfo pattern). No pagination.
 -- Data: player.entity.$GT_SectorBL_Report (@@ / ;; / || same as ship diagnose)
 
 local ffi = require("ffi")
@@ -21,12 +22,13 @@ if not GT_UI then
     return
 end
 
+local CONTEXT_LAYER = 2
+
 local gtSectorBL = {
     sections    = {},
     sectorId    = "",
     sectorName  = "",
     timestamp   = 0,
-    currentPage = 1,
     frameWidth  = 0,
     frameHeight = 0,
     flatRows    = {},
@@ -125,8 +127,6 @@ function gtSectorBL.openReport(component)
         return
     end
 
-    gtSectorBL.currentPage = 1
-
     local frameWidth  = math.min(Helper.viewWidth * 0.75, Helper.scaleX(1100))
     local frameHeight = math.min(Helper.viewHeight * 0.8, Helper.scaleY(800))
     gtSectorBL.frameWidth  = frameWidth
@@ -141,21 +141,21 @@ function gtSectorBL.openReport(component)
         xoffset   = xpos,
         yoffset   = ypos,
         width     = frameWidth,
+        frameHeight = frameHeight,
     }
 
     gtSectorBL.createAndDisplayFrame()
 end
 
 function gtSectorBL.createAndDisplayFrame()
-    local contextLayer = 2
-    Helper.removeAllWidgetScripts(menu, contextLayer)
+    Helper.removeAllWidgetScripts(menu, CONTEXT_LAYER)
 
     menu.contextFrame = Helper.createFrameHandle(menu, {
         x                     = menu.contextMenuData.xoffset,
         y                     = menu.contextMenuData.yoffset,
         width                 = gtSectorBL.frameWidth,
         height                = gtSectorBL.frameHeight,
-        layer                 = contextLayer,
+        layer                 = CONTEXT_LAYER,
         standardButtons       = { close = true },
         closeOnUnhandledClick = false,
     })
@@ -167,20 +167,21 @@ end
 
 function gtSectorBL.populateFrame(frame)
     local width = gtSectorBL.frameWidth - 2 * Helper.borderSize
+    local maxFrameHeight = gtSectorBL.frameHeight
 
+    -- Title (separate table - not part of scroll min-height)
     local titleTable = frame:addTable(1, {
-        tabOrder         = 0,
+        tabOrder         = 1,
         x                = Helper.borderSize,
         y                = Helper.borderSize,
         width            = width,
         highlightMode    = "off",
         reserveScrollBar = false,
     })
-    local titleRow = titleTable:addRow(nil, {
+    titleTable:addRow(true, {
         fixed   = true,
         bgColor = GT_UI.COLORS.headerBg,
-    })
-    titleRow[1]:createText(
+    })[1]:createText(
         string.format("GT Sector Blacklist: %s (%s)",
             tostring(gtSectorBL.sectorName), tostring(gtSectorBL.sectorId)),
         {
@@ -189,72 +190,12 @@ function gtSectorBL.populateFrame(frame)
             fontsize = Helper.headerRow1FontSize,
         }
     )
-    local titleHeight = Helper.headerRow1FontSize + 10
-    local contentY = titleHeight + Helper.borderSize + 8
 
-    -- Action/footer table sits below content. Keep it out of the scroll table:
-    -- X4 computes full table min-height even with maxVisibleHeight, and an extra
-    -- button row already overflowed by ~37px (empty window) at 60 flat rows.
-    local rowH = GT_UI.DEFAULTS.rowHeight or Helper.standardTextHeight
-    local actionHeight = (rowH + 6) * 3 + Helper.borderSize
-    local contentBottomPad = actionHeight + Helper.borderSize + 8
-
-    local allRows = gtSectorBL.flatRows or {}
-    local totalRows = #allRows
-    -- Leave headroom vs ship diagnose (38): pagination chrome + dense tracked lists.
-    local pageInfo = GT_UI.paginate(totalRows, gtSectorBL.currentPage, 28)
-    gtSectorBL.currentPage = pageInfo.currentPage
-
-    local detailFontSize = pageInfo.isPaginated
-        and (GT_UI.DEFAULTS.fontSize * 0.75)
-        or (GT_UI.DEFAULTS.fontSize * 0.85)
-
-    local contentTable = GT_UI.createScrollTable(frame, 3, {
-        tabOrder         = 2,
-        x                = Helper.borderSize,
-        y                = contentY,
-        width            = width,
-        maxVisibleHeight = gtSectorBL.frameHeight - contentY - contentBottomPad,
-    })
-    GT_UI.setColPercents(contentTable, { 22, 8 })
-
-    GT_UI.addHeaderRow(contentTable, { "Check", "Status", "Detail" })
-    GT_UI.addPaginationHeader(contentTable, pageInfo, 3)
-
-    if totalRows == 0 then
-        GT_UI.addEmptyRow(contentTable, "No data.", 3)
-    else
-        for i = pageInfo.startIdx, pageInfo.endIdx do
-            local row = allRows[i]
-            if not row then break end
-
-            local checkName = row.check or "?"
-            local status    = row.status or "INFO"
-            local detail    = row.detail or ""
-            local statusColor = GT_UI.getStatusColor(status)
-            local isSeparator = row.isHeader or (string.sub(checkName, 1, 3) == "---")
-            local rowBg = isSeparator and GT_UI.COLORS.headerBg or nil
-
-            -- Never wordwrap here: wrapped detail rows inflate min-height and blank the frame.
-            GT_UI.addDataRow(contentTable, {
-                { text = checkName, fontsize = detailFontSize, wordwrap = false },
-                { text = isSeparator and "" or status, halign = "center", fontsize = GT_UI.DEFAULTS.fontSize * 0.85, color = statusColor },
-                { text = detail, fontsize = detailFontSize, wordwrap = false,
-                  color = (status == "FAIL") and GT_UI.COLORS.textNegative or nil },
-            }, { bgColor = rowBg })
-        end
-    end
-
-    GT_UI.addPaginationNav(contentTable, pageInfo, function(newPage)
-        gtSectorBL.currentPage = newPage
-        gtSectorBL.createAndDisplayFrame()
-    end)
-
-    local actionY = gtSectorBL.frameHeight - actionHeight
+    -- Action/footer pinned to bottom first so scroll budget can fill the middle
     local actionTable = frame:addTable(1, {
         tabOrder         = 3,
         x                = Helper.borderSize,
-        y                = actionY,
+        y                = 0,
         width            = width,
         highlightMode    = "off",
         reserveScrollBar = false,
@@ -276,12 +217,79 @@ function gtSectorBL.populateFrame(frame)
         end,
     })
 
-    local footerRow = actionTable:addRow(nil, { fixed = true, bgColor = GT_UI.COLORS.headerBg })
+    local allRows = gtSectorBL.flatRows or {}
+    local totalRows = #allRows
+    local footerRow = actionTable:addRow(true, { fixed = true, bgColor = GT_UI.COLORS.headerBg })
     footerRow[1]:createText(
         string.format("Game time %.0fs  |  %d rows  |  %d sections",
             gtSectorBL.timestamp or 0, totalRows, #gtSectorBL.sections),
         { halign = "center", fontsize = GT_UI.DEFAULTS.fontSize * 0.8 }
     )
+
+    actionTable.properties.y = maxFrameHeight - actionTable:getFullHeight() - Helper.borderSize
+
+    local scrollTableY = titleTable.properties.y + titleTable:getFullHeight() + Helper.borderSize
+    local scrollBudget = actionTable.properties.y - scrollTableY - Helper.borderSize
+    if scrollBudget < Helper.scaleY(Helper.standardTextHeight) * 4 then
+        scrollBudget = Helper.scaleY(Helper.standardTextHeight) * 4
+    end
+
+    -- Interactive rows (addRow(true)) make mintableheight use the scroll viewport,
+    -- not full content height - same pattern as pilot exchange planner.
+    local contentTable = GT_UI.createScrollTable(frame, 3, {
+        tabOrder         = 2,
+        x                = Helper.borderSize,
+        y                = scrollTableY,
+        width            = width,
+        maxVisibleHeight = scrollBudget,
+        reserveScrollBar = false,
+        highlightMode    = "off",
+    })
+    GT_UI.setColPercents(contentTable, { 22, 8 })
+
+    GT_UI.addHeaderRow(contentTable, { "Check", "Status", "Detail" })
+
+    local detailFontSize = GT_UI.DEFAULTS.fontSize * 0.85
+    if totalRows == 0 then
+        -- Must stay interactive so scroll min-height still uses the viewport.
+        GT_UI.addDataRow(contentTable, {
+            { text = "No data.", colSpan = 3, fontsize = detailFontSize, wordwrap = false },
+        })
+    else
+        for _, row in ipairs(allRows) do
+            local checkName = row.check or "?"
+            local status    = row.status or "INFO"
+            local detail    = row.detail or ""
+            local statusColor = GT_UI.getStatusColor(status)
+            local isSeparator = row.isHeader or (string.sub(checkName, 1, 3) == "---")
+            local rowBg = isSeparator and GT_UI.COLORS.headerBg or nil
+
+            GT_UI.addDataRow(contentTable, {
+                { text = checkName, fontsize = detailFontSize, wordwrap = false },
+                { text = isSeparator and "" or status, halign = "center",
+                  fontsize = GT_UI.DEFAULTS.fontSize * 0.85, color = statusColor },
+                { text = detail, fontsize = detailFontSize, wordwrap = false,
+                  color = (status == "FAIL") and GT_UI.COLORS.textNegative or nil },
+            }, { bgColor = rowBg })
+        end
+    end
+
+    contentTable.properties.maxVisibleHeight = scrollBudget
+
+    titleTable:addConnection(1, 2, true)
+    contentTable:addConnection(2, 2)
+    actionTable:addConnection(3, 2)
+
+    frame.properties.height = maxFrameHeight
+
+    if frame.properties.y + frame.properties.height + Helper.frameBorder > Helper.viewHeight then
+        menu.contextMenuData.yoffset = Helper.viewHeight - frame.properties.height - Helper.frameBorder
+        frame.properties.y = menu.contextMenuData.yoffset
+    end
+
+    DebugError(string.format(
+        "[GT SectorBL] populate rows=%d scrollBudget=%d frameHeight=%d contentHeight=%d",
+        totalRows, scrollBudget, maxFrameHeight, contentTable:getFullHeight()))
 end
 
 function gtSectorBL.requestClearOrphans()
@@ -322,4 +330,4 @@ RegisterEvent("gt.openSectorBlacklistReport", function(_, component)
     gtSectorBL.openReport(component)
 end)
 
-DebugError("[GT SectorBL] Sector blacklist diagnose UI loaded")
+DebugError("[GT SectorBL] Sector blacklist diagnose UI loaded (scrollable)")

@@ -1181,26 +1181,26 @@
             </do_if>
           </do_if>
 
-          <!-- Shared amount semantics:
-               Prefer per-ship effective offer amounts (offeramount.{ship}) to match vanilla
-               trade resolution, especially for internal/no-money flows. Fallback to raw amount
-               when offeramount is unavailable. -->
+          <!-- Ship-agnostic amount for shared MK4-2 fleet cache (MK3 universalCacheBasis parity):
+               Prefer bare offeramount / amount / cargo deficit — NOT offeramount.{writer}.
+               Writer-sized offeramount.{ship} + clamp buyer=ship baked S-hold volumes into $Amount
+               so XL readers queued 322 instead of ~15k. Per-ship offeramount is applied at trade_found. -->
           <set_value name="$sellOfferAmount" exact="0"/>
-          <do_if value="$sellOffer.offeramount.{$ship}?">
-            <set_value name="$sellOfferAmount" exact="$sellOffer.offeramount.{$ship}"/>
+          <do_if value="$sellOffer.offeramount? and $sellOffer.offeramount gt 0">
+            <set_value name="$sellOfferAmount" exact="$sellOffer.offeramount"/>
           </do_if>
-          <do_elseif value="$sellOffer.amount?">
+          <do_elseif value="$sellOffer.amount? and $sellOffer.amount gt 0">
             <set_value name="$sellOfferAmount" exact="$sellOffer.amount"/>
           </do_elseif>
-          <!-- Diagnose parity: offeramount.{ship} may exist but be 0 (build storage / internal flows). -->
-          <do_if value="$sellOfferAmount le 0 and $sellOffer.amount? and $sellOffer.amount gt 0">
-            <set_value name="$sellOfferAmount" exact="$sellOffer.amount"/>
+          <!-- Last resort: writer offeramount only to detect a tradable pair when bare amounts are 0. -->
+          <do_if value="$sellOfferAmount le 0 and $sellOffer.offeramount.{$ship}? and $sellOffer.offeramount.{$ship} gt 0">
+            <set_value name="$sellOfferAmount" exact="$sellOffer.offeramount.{$ship}"/>
           </do_if>
           <set_value name="$buyOfferAmount" exact="0"/>
-          <do_if value="$buyOffer.offeramount.{$ship}?">
-            <set_value name="$buyOfferAmount" exact="$buyOffer.offeramount.{$ship}"/>
+          <do_if value="$buyOffer.offeramount? and $buyOffer.offeramount gt 0">
+            <set_value name="$buyOfferAmount" exact="$buyOffer.offeramount"/>
           </do_if>
-          <do_elseif value="$buyOffer.amount?">
+          <do_elseif value="$buyOffer.amount? and $buyOffer.amount gt 0">
             <set_value name="$buyOfferAmount" exact="$buyOffer.amount"/>
           </do_elseif>
           <set_value name="$mk42DestIsBuildStorage" exact="false"/>
@@ -1210,7 +1210,7 @@
           <do_elseif value="$sellStation? and $sellStation.base? and @$sellStation.base.exists and $sellStation.base.buildstorage? and @$sellStation.base.buildstorage.exists">
             <set_value name="$mk42DestIsBuildStorage" exact="true"/>
           </do_elseif>
-          <!-- Build-storage / no-money construction only: raw amount + cargo deficit when offeramount is zero. -->
+          <!-- Build-storage / no-money construction: cargo deficit when bare offeramount is zero. -->
           <do_if value="$mk42DestIsBuildStorage">
             <do_if value="$buyOfferAmount le 0 and $buyOffer.amount? and $buyOffer.amount gt 0">
               <set_value name="$buyOfferAmount" exact="$buyOffer.amount"/>
@@ -1222,9 +1222,13 @@
               </do_if>
             </do_if>
           </do_if>
+          <do_if value="$buyOfferAmount le 0 and $buyOffer.offeramount.{$ship}? and $buyOffer.offeramount.{$ship} gt 0">
+            <set_value name="$buyOfferAmount" exact="$buyOffer.offeramount.{$ship}"/>
+          </do_if>
 
           <!-- Destination demand gate:
-               Normal stations: offeramount.{ship} is vanilla-authoritative (reservations included).
+               Normal stations: bare offeramount/amount (ship-agnostic cache). Readers re-cap via
+               offeramount.{ship} at trade_found (reservations netted per ship).
                Build storage: max(offer slice, cargo deficit) minus vanilla + GT pre-order locks. -->
           <do_if value="$sellStation? and $sellStation.exists and $ware?">
             <do_if value="not $mk42DestIsBuildStorage">
@@ -1317,8 +1321,8 @@
 
           <!-- UNIVERSAL CACHE BASIS:
                Do not bind cached trade amount/score to the writer ship's free cargo.
-               Cache entries should represent station-side opportunity; per-ship execution
-               amount is resolved later via clamp_trade_amount in order.trade.galaxytrader. -->
+               Cache entries represent station-side opportunity; per-ship execution amount is
+               resolved at trade_found via offeramount.{reader} + clamp_trade_amount. -->
           <set_value name="$tradeAmount" exact="[$sellOfferAmount, $buyOfferAmount].min"/>
           <set_value name="$stationDemandMax" exact="$tradeAmount"/>
           <do_if value="$tradeAmount le 0">
@@ -1326,55 +1330,46 @@
             <continue/>
           </do_if>
 
-          <!-- clamp_trade_amount preview (mirrors order.trade.galaxytrader trade_found).
-               Rejects broker/warehouse offers that list amount/offeramount but have no
-               exportable seller stock at execution time.
-               Seller/buyer resolution MUST match trade_found validation: prefer offer.seller
-               when seller? is set — do NOT gate on .exists or fall back to owner while seller?
-               is set (trading-station brokers clamp to seller_cargo=0 at validation). -->
-          <set_value name="$tmClampBuySeller" exact="null"/>
+          <!-- Station-side clamp only (MK3 universalCacheBasis): seller storage then destination
+               buyer capacity. Writer ship is NOT buyer — that was baking S-hold sizes into $Amount. -->
+          <set_value name="$tmCacheClampSeller" exact="null"/>
           <do_if value="$sellOffer?">
             <do_if value="$sellOffer.seller?">
-              <set_value name="$tmClampBuySeller" exact="@$sellOffer.seller"/>
+              <set_value name="$tmCacheClampSeller" exact="@$sellOffer.seller"/>
             </do_if>
-            <do_if value="$tmClampBuySeller == null and $sellOffer.owner?">
-              <set_value name="$tmClampBuySeller" exact="@$sellOffer.owner"/>
+            <do_if value="$tmCacheClampSeller == null and $sellOffer.owner?">
+              <set_value name="$tmCacheClampSeller" exact="@$sellOffer.owner"/>
             </do_if>
           </do_if>
-          <do_if value="$tmClampBuySeller != null">
-            <set_value name="$tmClampPreview" exact="$tradeAmount"/>
-            <set_value name="$tmClampReason" exact="null"/>
-            <set_value name="$tmTradePartner" exact="if this.assignedcontrolled? then this.assignedcontrolled else $ship"/>
-            <clamp_trade_amount trade="$sellOffer" amount="$tmClampPreview" buyer="$tmTradePartner" seller="$tmClampBuySeller" result="$tmClampPreview" reason="$tmClampReason"/>
-            <do_if value="not $tmClampPreview? or $tmClampPreview le 0">
+          <do_if value="$tmCacheClampSeller != null">
+            <set_value name="$tmCacheClampReason" exact="null"/>
+            <clamp_trade_amount trade="$sellOffer" amount="$tradeAmount" seller="$tmCacheClampSeller" result="$tradeAmount" reason="$tmCacheClampReason"/>
+            <do_if value="not $tradeAmount? or $tradeAmount le 0">
               <set_value name="this.$tm_tradesRejected" operation="add"/>
               <continue/>
             </do_if>
-            <set_value name="$tradeAmount" exact="$tmClampPreview"/>
             <set_value name="$sellOfferAmount" exact="[$sellOfferAmount, $tradeAmount].min"/>
           </do_if>
           <do_else>
             <set_value name="this.$tm_tradesRejected" operation="add"/>
             <continue/>
           </do_else>
-          <set_value name="$tmClampSellBuyer" exact="null"/>
+          <set_value name="$tmCacheClampBuyer" exact="null"/>
           <do_if value="$buyOffer?">
             <do_if value="$buyOffer.buyer?">
-              <set_value name="$tmClampSellBuyer" exact="@$buyOffer.buyer"/>
+              <set_value name="$tmCacheClampBuyer" exact="@$buyOffer.buyer"/>
             </do_if>
-            <do_if value="$tmClampSellBuyer == null and $buyOffer.owner?">
-              <set_value name="$tmClampSellBuyer" exact="@$buyOffer.owner"/>
+            <do_if value="$tmCacheClampBuyer == null and $buyOffer.owner?">
+              <set_value name="$tmCacheClampBuyer" exact="@$buyOffer.owner"/>
             </do_if>
           </do_if>
-          <do_if value="$tmClampSellBuyer != null">
-            <set_value name="$tmSellClampPreview" exact="$tradeAmount"/>
-            <set_value name="$tmSellClampReason" exact="null"/>
-            <clamp_trade_amount trade="$buyOffer" amount="$tmSellClampPreview" buyer="$tmClampSellBuyer" result="$tmSellClampPreview" reason="$tmSellClampReason"/>
-            <do_if value="not $tmSellClampPreview? or $tmSellClampPreview le 0">
+          <do_if value="$tmCacheClampBuyer != null">
+            <set_value name="$tmCacheSellClampReason" exact="null"/>
+            <clamp_trade_amount trade="$buyOffer" amount="$tradeAmount" buyer="$tmCacheClampBuyer" result="$tradeAmount" reason="$tmCacheSellClampReason"/>
+            <do_if value="not $tradeAmount? or $tradeAmount le 0">
               <set_value name="this.$tm_tradesRejected" operation="add"/>
               <continue/>
             </do_if>
-            <set_value name="$tradeAmount" exact="[$tradeAmount, $tmSellClampPreview].min"/>
             <set_value name="$buyOfferAmount" exact="[$buyOfferAmount, $tradeAmount].min"/>
           </do_if>
           <do_else>
@@ -1385,6 +1380,7 @@
             <set_value name="this.$tm_tradesRejected" operation="add"/>
             <continue/>
           </do_if>
+          <set_value name="$stationDemandMax" exact="$tradeAmount"/>
 
           <set_value name="$unitProfit" exact="$buyOffer.unitprice - $sellOffer.unitprice"/>
           <!-- Default sell-mode behavior requires positive unit profit.

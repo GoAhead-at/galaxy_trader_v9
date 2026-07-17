@@ -602,7 +602,10 @@
       </params>
       <actions>
         <set_value name="$didRegister" exact="false"/>
-        <do_if value="md.GT_Ship_Management.Register_Pilot?">
+        <run_actions ref="md.GT_CoreSystem.DeterminePilotAssignmentHasGTOrder" result="$allowRegister">
+          <param name="ship" value="$ship"/>
+        </run_actions>
+        <do_if value="$allowRegister and md.GT_Ship_Management.Register_Pilot?">
           <run_actions ref="md.GT_Ship_Management.Register_Pilot">
             <param name="pilot" value="$pilot"/>
             <param name="ship" value="$ship"/>
@@ -1366,9 +1369,11 @@
           <param name="ship" value="$ship"/>
           <param name="source" value="$source"/>
         </run_actions>
-        <run_actions ref="md.GT_InfoMenu_Loader.Raise_PilotIdMap_For_Live_Pilot">
-          <param name="pilot" value="$pilot"/>
-          <param name="extraTemplateId" value="$sarTplForMap"/>
+        <run_actions ref="md.GT_Pilot_Ecosystem.GT_Pilot_On_Rescued">
+          <param name="ship" value="$ship"/>
+          <param name="entity" value="$pilot"/>
+          <param name="forceRegistryKey" value="if $registryKey? then $registryKey else null"/>
+          <param name="forceStableKey" value="if $stableKey? then ('' + $stableKey) else ''"/>
         </run_actions>
         <signal_cue_instantly cue="md.GT_InfoMenu_Loader.SendPilotData"/>
 
@@ -1628,32 +1633,7 @@
                   <set_value name="$matched" exact="true"/>
                 </do_if>
               </do_if>
-              <do_if value="not $matched and $originalName != ''">
-                <do_if value="$crewEntity and $crewEntity.exists and $crewEntity.name?">
-                  <run_actions ref="md.GT_Ship_Management.Pilot_Display_Name_Matches" result="$matched">
-                    <param name="displayName" value="$crewEntity.name"/>
-                    <param name="originalName" value="$originalName"/>
-                    <param name="taggedPilotName" value="$taggedPilotName"/>
-                    <param name="pilotLevel" value="$pilotLevel"/>
-                  </run_actions>
-                </do_if>
-                <do_if value="not $matched and $root.people? and $root.people.{$crew}? and $root.people.{$crew}.name?">
-                  <run_actions ref="md.GT_Ship_Management.Pilot_Display_Name_Matches" result="$matched">
-                    <param name="displayName" value="$root.people.{$crew}.name"/>
-                    <param name="originalName" value="$originalName"/>
-                    <param name="taggedPilotName" value="$taggedPilotName"/>
-                    <param name="pilotLevel" value="$pilotLevel"/>
-                  </run_actions>
-                </do_if>
-                <do_if value="not $matched and $root.availablepeople? and $root.availablepeople.{$crew}? and $root.availablepeople.{$crew}.name?">
-                  <run_actions ref="md.GT_Ship_Management.Pilot_Display_Name_Matches" result="$matched">
-                    <param name="displayName" value="$root.availablepeople.{$crew}.name"/>
-                    <param name="originalName" value="$originalName"/>
-                    <param name="taggedPilotName" value="$taggedPilotName"/>
-                    <param name="pilotLevel" value="$pilotLevel"/>
-                  </run_actions>
-                </do_if>
-              </do_if>
+              <!-- name match removed: seed/template only -->
               <do_if value="$matched and $crewEntity and $crewEntity.exists">
                 <set_value name="$matchPilot" exact="$crewEntity"/>
                 <set_value name="$matchCount" exact="$matchCount + 1"/>
@@ -2387,6 +2367,10 @@
         <run_actions ref="md.GT_Ship_Management.Sync_Stable_Identity_Index">
           <param name="pilot" value="$pilot"/>
         </run_actions>
+        <run_actions ref="md.GT_Pilot_Ecosystem.GT_Pilot_On_Ejected">
+          <param name="entity" value="$pilot"/>
+          <param name="seedKey" value="$stableKey"/>
+        </run_actions>
 
         <run_actions ref="md.GT_CoreSystem.QueueBoundedPilotTagRefresh">
           <param name="pilot" value="$pilot"/>
@@ -2913,8 +2897,8 @@
           </do_if>
           
           <!-- Handle incoming pilot identity:
-               - If already registered, keep their GT record linked to this ship.
-               - If unregistered (e.g. object id changed), recover from paused/ejected record. -->
+               - Existing GT pilots: keep ship link; tag only on GT ships.
+               - Seed rebind / tag apply only when this ship is GT-controlled. -->
           <do_if value="$newPilot and $newPilot.exists? and $newPilot.exists">
             <run_actions ref="md.GT_CoreSystem.HandleRescueRebindForEjectedPilot" result="$rescuedEjected">
               <param name="livePilot" value="$newPilot"/>
@@ -2930,72 +2914,27 @@
                 <param name="hasGTOrder" value="$hasGTOrder"/>
                 <param name="clearPausedFields" value="false"/>
               </run_actions>
-              <!-- Ensure pilot tag is refreshed when vanilla reassignment changes actor identity/state. -->
-              <run_actions ref="md.GT_CoreSystem.TryUpdatePilotNameTag">
-                <param name="pilot" value="$newPilot"/>
-              </run_actions>
-            </do_if>
-            <do_elseif value="global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
-              <set_value name="$incomingName" exact="$newPilotName"/>
-              <set_value name="$incomingPilotID" exact="if $newPilot.idcode? then $newPilot.idcode else ''"/>
-              <set_value name="$incomingStable" exact="''"/>
-              <do_if value="md.GT_Ship_Management.Compute_Pilot_Stable_Key?">
-                <run_actions ref="md.GT_Ship_Management.Compute_Pilot_Stable_Key" result="$incomingStable">
+              <do_if value="$hasGTOrder">
+                <run_actions ref="md.GT_CoreSystem.TryUpdatePilotNameTag">
                   <param name="pilot" value="$newPilot"/>
                 </run_actions>
               </do_if>
-              <set_value name="$keys" exact="global.$GT_Pilots.keys.list"/>
-              <set_value name="$bestCandidate" exact="null"/>
-              <set_value name="$bestScore" exact="0"/>
-              <set_value name="$bestScoreCount" exact="0"/>
-              
-              <do_all exact="$keys.count" counter="$i">
-                <set_value name="$candidate" exact="$keys.{$i}"/>
-                <do_if value="$candidate and $candidate != $newPilot and global.$GT_Pilots.{$candidate}? and global.$GT_Pilots.{$candidate}.$Status? and (global.$GT_Pilots.{$candidate}.$Status == 'paused' or global.$GT_Pilots.{$candidate}.$Status == 'ejected')">
-                  <set_value name="$score" exact="0"/>
-                  
-                  <do_if value="$incomingStable != '' and global.$GT_Pilots.{$candidate}.$StableIdentity? and global.$GT_Pilots.{$candidate}.$StableIdentity == $incomingStable">
-                    <set_value name="$score" exact="$score + 50"/>
-                  </do_if>
-                  
-                  <do_if value="$incomingPilotID != '' and global.$GT_Pilots.{$candidate}.$PilotID? and global.$GT_Pilots.{$candidate}.$PilotID == $incomingPilotID">
-                    <set_value name="$score" exact="$score + 20"/>
-                  </do_if>
-                  
-                  <do_if value="global.$GT_Pilots.{$candidate}.$ShipID? and global.$GT_Pilots.{$candidate}.$ShipID == $ship.idcode">
-                    <set_value name="$score" exact="$score + 4"/>
-                  </do_if>
-                  <do_if value="$incomingPilotID == '' or not global.$GT_Pilots.{$candidate}.$PilotID?">
-                    <do_if value="global.$GT_Pilots.{$candidate}.$OriginalPilotName? and global.$GT_Pilots.{$candidate}.$OriginalPilotName == $incomingName">
-                      <set_value name="$score" exact="$score + 5"/>
-                    </do_if>
-                    <do_elseif value="global.$GT_Pilots.{$candidate}.$PilotName? and global.$GT_Pilots.{$candidate}.$PilotName == $incomingName">
-                      <set_value name="$score" exact="$score + 4"/>
-                    </do_elseif>
-                  </do_if>
-                  
-                  <do_if value="$score gt $bestScore">
-                    <set_value name="$bestScore" exact="$score"/>
-                    <set_value name="$bestCandidate" exact="$candidate"/>
-                    <set_value name="$bestScoreCount" exact="1"/>
-                  </do_if>
-                  <do_elseif value="$score gt 0 and $score == $bestScore">
-                    <set_value name="$bestScoreCount" exact="$bestScoreCount + 1"/>
-                  </do_elseif>
-                </do_if>
-              </do_all>
-              
-              <do_if value="$bestCandidate and $bestScoreCount == 1 and $bestScore ge 8">
-                <set_value name="global.$GT_Pilots.{$newPilot}" exact="global.$GT_Pilots.{$bestCandidate}"/>
-                <remove_value name="global.$GT_Pilots.{$bestCandidate}"/>
+            </do_if>
+            <do_elseif value="$hasGTOrder and global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
+              <!-- Seed-only rebind via ecosystem (no name / PilotID scoring). GT ships only. -->
+              <run_actions ref="md.GT_Pilot_Ecosystem.GT_Pilot_Bind_Live" result="$ecoBind">
+                <param name="entity" value="$newPilot"/>
+                <param name="ship" value="$ship"/>
+                <param name="status" value="'active'"/>
+                <param name="role" value="'captain'"/>
+              </run_actions>
+              <do_if value="$ecoBind.$Success and $ecoBind.$Rebound">
                 <run_actions ref="md.GT_CoreSystem.SyncPilotShipLinkState">
                   <param name="pilot" value="$newPilot"/>
                   <param name="ship" value="$ship"/>
                   <param name="hasGTOrder" value="$hasGTOrder"/>
                   <param name="clearPausedFields" value="true"/>
                 </run_actions>
-                
-                <!-- Keep vanilla skill aligned with recovered GT XP so stars are not lost. -->
                 <set_value name="$xp" exact="if global.$GT_Pilots.{$newPilot}.$XP? then global.$GT_Pilots.{$newPilot}.$XP else 0"/>
                 <set_value name="$level" exact="1"/>
                 <do_if value="md.GT_Ship_Management.Calculate_Skill_Level_From_XP?">
@@ -3009,17 +2948,12 @@
                   <set_skill entity="$newPilot" type="skilltype.management" exact="$level"/>
                 </do_if>
                 <set_value name="global.$GT_Pilots.{$newPilot}.$Level" exact="$level"/>
-                <run_actions ref="md.GT_CoreSystem.TryUpdatePilotNameTag">
-                  <param name="pilot" value="$newPilot"/>
-                  <param name="level" value="$level"/>
+                <run_actions ref="md.GT_Pilot_Ecosystem.GT_Pilot_On_Rescued">
+                  <param name="ship" value="$ship"/>
+                  <param name="entity" value="$newPilot"/>
                 </run_actions>
-                <run_actions ref="md.GT_CoreSystem.QueueDeferredPilotTagRefresh">
-                  <param name="pilot" value="$newPilot"/>
-                  <param name="source" value="'vanilla_reassignment_recovered'"/>
-                </run_actions>
-                
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                  <debug_text text="'[GT-Core] Reattached GT pilot after vanilla reassignment: new=' + $newPilot.name + (if $newPilot.idcode? then ' [' + $newPilot.idcode + ']' else '') + ', recoveredFrom=' + $bestCandidate.name + (if $bestCandidate.idcode? then ' [' + $bestCandidate.idcode + ']' else '') + ', XP=' + $xp + ', level=' + $level + ', hasGTOrder=' + $hasGTOrder" chance="100"/>
+                  <debug_text text="'[GT-Core] Reattached GT pilot by seed: new=' + $newPilot.name + ', seed=' + $ecoBind.$SeedKey + ', XP=' + $xp + ', level=' + $level" chance="100"/>
                 </do_if>
               </do_if>
             </do_elseif>
@@ -3215,8 +3149,7 @@
             </do_else>
           </do_if>
           <do_else>
-            <!-- No GT order yet: still reconcile pilot identity after delayed vanilla binding so
-                 transferred GT pilots are ready for a fresh GT order assignment. -->
+            <!-- No GT order: keep existing GT pilot ship link only. Do not register or tag. -->
             <do_if value="$pilot and $pilot.exists? and $pilot.exists and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}?">
               <run_actions ref="md.GT_CoreSystem.SyncPilotShipLinkState">
                 <param name="pilot" value="$pilot"/>
@@ -3225,16 +3158,12 @@
                 <param name="clearPausedFields" value="false"/>
               </run_actions>
 
-              <run_actions ref="md.GT_CoreSystem.QueueDeferredPilotTagRefresh">
-                <param name="pilot" value="$pilot"/>
-                <param name="source" value="'finalize_vanilla_assignment_no_gt'"/>
-              </run_actions>
-
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Core] FinalizeVanillaPilotAssignmentForGT: synchronized GT pilot without active GT order: ship=' + $ship.idcode + ', pilot=' + (if $pilot.name? then $pilot.name else 'NONE') + ', source=' + $source + ', attempt=' + $attempt" chance="100"/>
+                <debug_text text="'[GT-Core] FinalizeVanillaPilotAssignmentForGT: synchronized GT pilot without active GT order (no tag/register): ship=' + $ship.idcode + ', pilot=' + (if $pilot.name? then $pilot.name else 'NONE') + ', source=' + $source + ', attempt=' + $attempt" chance="100"/>
               </do_if>
             </do_if>
-            <do_elseif value="$newPilotTemplate? and $newPilotTemplate != null">
+            <do_elseif value="$newPilotTemplate? and $newPilotTemplate != null and global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
+              <!-- Rebind existing GT identity only; Register_Pilot remains gated to GT ships. -->
               <run_actions ref="md.GT_CoreSystem.QueueResolvePilotIdentityByStable">
                 <param name="ship" value="$ship"/>
                 <param name="stable" value="'s:' + $newPilotTemplate"/>
@@ -3368,30 +3297,23 @@
               </do_if>
               <do_if value="not $skipCrew">
                 <set_value name="$matched" exact="false"/>
-                <do_if value="$baseName? and $baseName != ''">
-                  <do_if value="$crewEntity and $crewEntity.exists and $crewEntity.name?">
-                    <run_actions ref="md.GT_Ship_Management.Pilot_Display_Name_Matches" result="$matched">
-                      <param name="displayName" value="$crewEntity.name"/>
-                      <param name="originalName" value="$baseName"/>
-                      <param name="taggedPilotName" value="$taggedPilotName"/>
-                      <param name="pilotLevel" value="$pilotLevel"/>
+                <do_if value="$oldStable != ''">
+                  <do_if value="$crewEntity and $crewEntity.exists">
+                    <run_actions ref="md.GT_Ship_Management.Compute_Pilot_Stable_Key" result="$crewStableEnt">
+                      <param name="pilot" value="$crewEntity"/>
                     </run_actions>
+                    <do_if value="$crewStableEnt == $oldStable">
+                      <set_value name="$matched" exact="true"/>
+                    </do_if>
                   </do_if>
-                  <do_if value="not $matched and $ship.people? and $ship.people.{$crew}? and $ship.people.{$crew}.name?">
-                    <run_actions ref="md.GT_Ship_Management.Pilot_Display_Name_Matches" result="$matched">
-                      <param name="displayName" value="$ship.people.{$crew}.name"/>
-                      <param name="originalName" value="$baseName"/>
-                      <param name="taggedPilotName" value="$taggedPilotName"/>
-                      <param name="pilotLevel" value="$pilotLevel"/>
+                  <do_if value="not $matched">
+                    <run_actions ref="md.GT_Ship_Management.Template_Stable_Key_From_Crew" result="$crewTplStable">
+                      <param name="ship" value="$ship"/>
+                      <param name="crewTemplate" value="$crew"/>
                     </run_actions>
-                  </do_if>
-                  <do_if value="not $matched and $ship.availablepeople? and $ship.availablepeople.{$crew}? and $ship.availablepeople.{$crew}.name?">
-                    <run_actions ref="md.GT_Ship_Management.Pilot_Display_Name_Matches" result="$matched">
-                      <param name="displayName" value="$ship.availablepeople.{$crew}.name"/>
-                      <param name="originalName" value="$baseName"/>
-                      <param name="taggedPilotName" value="$taggedPilotName"/>
-                      <param name="pilotLevel" value="$pilotLevel"/>
-                    </run_actions>
+                    <do_if value="$crewTplStable == $oldStable">
+                      <set_value name="$matched" exact="true"/>
+                    </do_if>
                   </do_if>
                 </do_if>
                 <do_if value="$matched and not ($crewEntity and $crewEntity.exists) and $crew and $ship.roleentity? and $ship.roleentity.{$crew}? and $ship.roleentity.{$crew}.exists">
@@ -3476,6 +3398,12 @@
               <param name="template" value="$oldTemplate"/>
             </run_actions>
             <set_value name="$candidate" exact="if $demotedRebind.$Pilot? then $demotedRebind.$Pilot else $candidate"/>
+            <do_if value="$candidate? and $candidate.exists">
+              <run_actions ref="md.GT_Pilot_Ecosystem.GT_Pilot_On_Demoted_To_Crew">
+                <param name="ship" value="$ship"/>
+                <param name="entity" value="$candidate"/>
+              </run_actions>
+            </do_if>
             <run_actions ref="md.GT_CoreSystem.SyncPilotShipLinkState">
               <param name="pilot" value="$candidate"/>
               <param name="ship" value="$ship"/>
@@ -3495,7 +3423,7 @@
               <param name="crewTemplateHint" value="$oldTemplate"/>
             </run_actions>
             <do_if value="$resolvedMenuSeeds.count gt 0">
-              <set_value name="global.$GT_Pilots.{$candidate}.$LastDemotedPeopleSeed" exact="$resolvedMenuSeeds.1"/>
+              <set_value name="global.$GT_Pilots.{$candidate}.$LastDemotedPeopleSeed" exact="$resolvedMenuSeeds.{1}"/>
             </do_if>
             <run_actions ref="md.GT_InfoMenu_Loader.Raise_PilotIdMap_For_Live_Pilot">
               <param name="pilot" value="$candidate"/>
@@ -3716,12 +3644,17 @@
               <param name="clearPausedFields" value="false"/>
             </run_actions>
             <do_if value="$source != 'vanilla_reassignment_oldpilot_stable'">
-            <run_actions ref="md.GT_CoreSystem.QueueBoundedPilotTagRefresh">
-              <param name="pilot" value="$crewCandidate"/>
-              <param name="stableKey" value="$stable"/>
-              <param name="ship" value="$ship"/>
-              <param name="source" value="'resolve_stable_' + $source"/>
-            </run_actions>
+              <run_actions ref="md.GT_CoreSystem.DeterminePilotAssignmentHasGTOrder" result="$stableHasGT">
+                <param name="ship" value="$ship"/>
+              </run_actions>
+              <do_if value="$stableHasGT">
+                <run_actions ref="md.GT_CoreSystem.QueueBoundedPilotTagRefresh">
+                  <param name="pilot" value="$crewCandidate"/>
+                  <param name="stableKey" value="$stable"/>
+                  <param name="ship" value="$ship"/>
+                  <param name="source" value="'resolve_stable_' + $source"/>
+                </run_actions>
+              </do_if>
             </do_if>
             <do_if value="$rebindStableResult.$Rebound?">
               <run_actions ref="md.GT_Ship_Management.Clear_Eject_Scratch_State">

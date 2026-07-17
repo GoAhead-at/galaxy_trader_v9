@@ -1,0 +1,811 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_Pilot_Ecosystem" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/md.xsd">
+  <!--
+    Authoritative GT pilot identity / XP / UI seed map.
+    Contract: DOCS/Spec/improvements/FEATURE_GT_PILOT_ECOSYSTEM_REWRITE.md
+    Vanilla identity: DOCS/TECHNICAL/VANILLA_PILOT_AND_CREW_HANDLING.md
+    Identity = people/entity seed only. No name / idcode / npctemplate matching.
+  -->
+  <cues>
+
+    <library name="GT_Pilot_Ensure_Tables" purpose="run_actions">
+      <actions>
+        <do_if value="not global.$GT_PilotBySeed?">
+          <set_value name="global.$GT_PilotBySeed" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_PilotLiveIndex?">
+          <set_value name="global.$GT_PilotLiveIndex" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_Pilots?">
+          <set_value name="global.$GT_Pilots" exact="table[]"/>
+        </do_if>
+        <!-- One-shot: wipe BySeed if it was keyed with invalid 's:N' strings (X4 requires $ prefix or largeint). -->
+        <do_if value="not global.$GT_PilotBySeedKeyFixV1?">
+          <set_value name="global.$GT_PilotBySeed" exact="table[]"/>
+          <set_value name="global.$GT_PilotLiveIndex" exact="table[]"/>
+          <set_value name="global.$GT_PilotBySeedKeyFixV1" exact="true"/>
+          <remove_value name="global.$GT_PilotEcosystemMigratedV1"/>
+        </do_if>
+      </actions>
+    </library>
+
+    <!-- StableIdentity string form (comparisons / legacy). NOT a table key. -->
+    <library name="GT_Pilot_Compute_Seed_Key" purpose="run_actions">
+      <params>
+        <param name="entity" default="null"/>
+        <param name="ship" default="null"/>
+        <param name="peopleTemplate" default="null"/>
+        <param name="seedRaw" default="null"/>
+      </params>
+      <actions>
+        <set_value name="$result" exact="''"/>
+        <run_actions ref="GT_Pilot_Compute_Seed_Raw" result="$raw">
+          <param name="entity" value="$entity"/>
+          <param name="ship" value="$ship"/>
+          <param name="peopleTemplate" value="$peopleTemplate"/>
+          <param name="seedRaw" value="$seedRaw"/>
+        </run_actions>
+        <do_if value="$raw? and $raw != null">
+          <set_value name="$result" exact="'s:' + $raw"/>
+        </do_if>
+        <return value="$result"/>
+      </actions>
+    </library>
+
+    <!-- Largeint people/entity seed for $GT_PilotBySeed table keys (X4 string keys must start with $; 's:N' is invalid). -->
+    <library name="GT_Pilot_Compute_Seed_Raw" purpose="run_actions">
+      <params>
+        <param name="entity" default="null"/>
+        <param name="ship" default="null"/>
+        <param name="peopleTemplate" default="null"/>
+        <param name="seedRaw" default="null"/>
+      </params>
+      <actions>
+        <set_value name="$raw" exact="null"/>
+        <do_if value="$seedRaw? and $seedRaw != null">
+          <set_value name="$raw" exact="$seedRaw"/>
+        </do_if>
+        <do_elseif value="$ship and $ship.exists and $peopleTemplate? and $peopleTemplate != null">
+          <do_if value="$ship.people? and $ship.people.{$peopleTemplate}? and $ship.people.{$peopleTemplate}.seed?">
+            <set_value name="$raw" exact="$ship.people.{$peopleTemplate}.seed"/>
+          </do_if>
+          <do_elseif value="$ship.availablepeople? and $ship.availablepeople.{$peopleTemplate}? and $ship.availablepeople.{$peopleTemplate}.seed?">
+            <set_value name="$raw" exact="$ship.availablepeople.{$peopleTemplate}.seed"/>
+          </do_elseif>
+        </do_elseif>
+        <do_elseif value="$entity? and $entity.exists and $entity.seed?">
+          <set_value name="$raw" exact="$entity.seed"/>
+        </do_elseif>
+        <return value="$raw"/>
+      </actions>
+    </library>
+
+    <!-- Resolve BySeed table key (largeint). Accepts raw seed or StableIdentity 's:N' via row scan. -->
+    <library name="GT_Pilot_Resolve_BySeed_Key" purpose="run_actions">
+      <params>
+        <param name="seedRaw" default="null"/>
+        <param name="seedKey" default="''"/>
+        <param name="entity" default="null"/>
+      </params>
+      <actions>
+        <run_actions ref="GT_Pilot_Ensure_Tables"/>
+        <do_if value="$seedRaw? and $seedRaw != null">
+          <return value="$seedRaw"/>
+        </do_if>
+        <do_if value="$entity? and $entity.exists and $entity.seed?">
+          <return value="$entity.seed"/>
+        </do_if>
+        <do_if value="$seedKey != '' and global.$GT_PilotBySeed? and global.$GT_PilotBySeed.keys.count gt 0">
+          <do_all exact="global.$GT_PilotBySeed.keys.count" counter="$i">
+            <set_value name="$k" exact="global.$GT_PilotBySeed.keys.{$i}"/>
+            <do_if value="global.$GT_PilotBySeed.{$k}? and global.$GT_PilotBySeed.{$k}.$SeedKey? and global.$GT_PilotBySeed.{$k}.$SeedKey == $seedKey">
+              <return value="$k"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <return value="null"/>
+      </actions>
+    </library>
+
+    <library name="GT_Pilot_LargeInt_U64Wire" purpose="run_actions">
+      <params>
+        <param name="value" default="null"/>
+      </params>
+      <actions>
+        <set_value name="$result" exact="''"/>
+        <do_if value="$value? and $value != null and typeof $value != datatype.npctemplate">
+          <set_value name="$lo32" exact="$value % 4294967296L"/>
+          <do_if value="$lo32 lt 0">
+            <set_value name="$lo32" exact="$lo32 + 4294967296L"/>
+          </do_if>
+          <set_value name="$hi32" exact="(($value - $lo32) / 4294967296L)i"/>
+          <do_if value="$hi32 lt 0">
+            <set_value name="$hi32" exact="$hi32 + 4294967296L"/>
+          </do_if>
+          <do_if value="$hi32 ge 0 and $hi32 lt 4294967296L and $lo32 ge 0 and $lo32 lt 4294967296L">
+            <set_value name="$result" exact="'u64p:' + $hi32 + ':' + $lo32"/>
+          </do_if>
+        </do_if>
+        <return value="$result"/>
+      </actions>
+    </library>
+
+    <!-- Copy / refresh BySeed row from a live $GT_Pilots.{entity} entry. Table key = seed largeint. -->
+    <library name="GT_Pilot_Sync_Entity_Into_BySeed" purpose="run_actions">
+      <params>
+        <param name="entity"/>
+        <param name="ship" default="null"/>
+        <param name="status" default="''"/>
+        <param name="role" default="''"/>
+      </params>
+      <actions>
+        <run_actions ref="GT_Pilot_Ensure_Tables"/>
+        <do_if value="not $entity? or not global.$GT_Pilots? or not global.$GT_Pilots.{$entity}?">
+          <return value="''"/>
+        </do_if>
+        <run_actions ref="GT_Pilot_Compute_Seed_Raw" result="$tableKey">
+          <param name="entity" value="$entity"/>
+        </run_actions>
+        <do_if value="not $tableKey? or $tableKey == null">
+          <return value="''"/>
+        </do_if>
+        <set_value name="$seedKey" exact="'s:' + $tableKey"/>
+        <set_value name="$src" exact="global.$GT_Pilots.{$entity}"/>
+        <do_if value="not global.$GT_PilotBySeed.{$tableKey}?">
+          <set_value name="global.$GT_PilotBySeed.{$tableKey}" exact="table[]"/>
+        </do_if>
+        <set_value name="global.$GT_PilotBySeed.{$tableKey}.$SeedKey" exact="$seedKey"/>
+        <set_value name="global.$GT_PilotBySeed.{$tableKey}.$SeedRaw" exact="$tableKey"/>
+        <set_value name="global.$GT_PilotBySeed.{$tableKey}.$XP" exact="if $src.$XP? then $src.$XP else 0"/>
+        <set_value name="global.$GT_PilotBySeed.{$tableKey}.$Level" exact="if $src.$Level? then $src.$Level else 1"/>
+        <set_value name="global.$GT_PilotBySeed.{$tableKey}.$OriginalPilotName" exact="if $src.$OriginalPilotName? then $src.$OriginalPilotName else (if $src.$PilotName? then $src.$PilotName else '')"/>
+        <set_value name="global.$GT_PilotBySeed.{$tableKey}.$TotalTrades" exact="if $src.$TotalTrades? then $src.$TotalTrades else 0"/>
+        <set_value name="global.$GT_PilotBySeed.{$tableKey}.$TotalProfit" exact="if $src.$TotalProfit? then $src.$TotalProfit else 0Cr"/>
+        <do_if value="$src.$TrainingCompleted?">
+          <set_value name="global.$GT_PilotBySeed.{$tableKey}.$TrainingCompleted" exact="$src.$TrainingCompleted"/>
+        </do_if>
+        <do_if value="$entity.exists">
+          <set_value name="global.$GT_PilotBySeed.{$tableKey}.$LiveEntity" exact="$entity"/>
+          <set_value name="global.$GT_PilotLiveIndex.{$entity}" exact="$tableKey"/>
+        </do_if>
+        <do_if value="$ship? and $ship.exists">
+          <set_value name="global.$GT_PilotBySeed.{$tableKey}.$Ship" exact="$ship"/>
+          <set_value name="global.$GT_PilotBySeed.{$tableKey}.$ShipID" exact="$ship.idcode"/>
+          <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}?">
+            <set_value name="global.$GT_Ships.{$ship}.$PilotSeedKey" exact="$seedKey"/>
+          </do_if>
+        </do_if>
+        <do_elseif value="$src.$Ship?">
+          <set_value name="global.$GT_PilotBySeed.{$tableKey}.$Ship" exact="$src.$Ship"/>
+          <do_if value="$src.$ShipID?">
+            <set_value name="global.$GT_PilotBySeed.{$tableKey}.$ShipID" exact="$src.$ShipID"/>
+          </do_if>
+        </do_elseif>
+        <do_if value="$status != ''">
+          <set_value name="global.$GT_PilotBySeed.{$tableKey}.$Status" exact="$status"/>
+        </do_if>
+        <do_elseif value="$src.$Status?">
+          <set_value name="global.$GT_PilotBySeed.{$tableKey}.$Status" exact="$src.$Status"/>
+        </do_elseif>
+        <do_else>
+          <set_value name="global.$GT_PilotBySeed.{$tableKey}.$Status" exact="'active'"/>
+        </do_else>
+        <do_if value="$role != ''">
+          <set_value name="global.$GT_PilotBySeed.{$tableKey}.$Role" exact="$role"/>
+        </do_if>
+        <do_if value="$src.$LastDemotedPeopleSeed?">
+          <set_value name="global.$GT_PilotBySeed.{$tableKey}.$LastDemotedPeopleSeed" exact="$src.$LastDemotedPeopleSeed"/>
+        </do_if>
+        <do_if value="$src.$LastDemotedTemplate?">
+          <set_value name="global.$GT_PilotBySeed.{$tableKey}.$LastDemotedTemplate" exact="$src.$LastDemotedTemplate"/>
+        </do_if>
+        <set_value name="global.$GT_Pilots.{$entity}.$StableIdentity" exact="$seedKey"/>
+        <run_actions ref="GT_Pilot_Refresh_Tagged_Name_On_Row">
+          <param name="tableKey" value="$tableKey"/>
+        </run_actions>
+        <return value="$seedKey"/>
+      </actions>
+    </library>
+
+    <library name="GT_Pilot_Refresh_Tagged_Name_On_Row" purpose="run_actions">
+      <params>
+        <param name="tableKey" default="null"/>
+        <param name="seedKey" default="''" comment="legacy alias: StableIdentity string or raw"/>
+      </params>
+      <actions>
+        <do_if value="not $tableKey? or $tableKey == null">
+          <run_actions ref="GT_Pilot_Resolve_BySeed_Key" result="$tableKey">
+            <param name="seedKey" value="$seedKey"/>
+          </run_actions>
+        </do_if>
+        <do_if value="$tableKey? and $tableKey != null and global.$GT_PilotBySeed? and global.$GT_PilotBySeed.{$tableKey}?">
+          <set_value name="$row" exact="global.$GT_PilotBySeed.{$tableKey}"/>
+          <set_value name="$base" exact="if $row.$OriginalPilotName? then $row.$OriginalPilotName else ''"/>
+          <set_value name="$level" exact="if $row.$Level? then $row.$Level else 1"/>
+          <do_if value="$base != ''">
+            <run_actions ref="md.GT_Ship_Management.Normalize_GT_Pilot_Base_Name" result="$base">
+              <param name="displayName" value="$base"/>
+            </run_actions>
+            <set_value name="global.$GT_PilotBySeed.{$tableKey}.$TaggedName" exact="'(T:' + $level + ') ' + $base"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </library>
+
+    <library name="GT_Pilot_Sync_All_From_Legacy" purpose="run_actions">
+      <actions>
+        <run_actions ref="GT_Pilot_Ensure_Tables"/>
+        <do_if value="global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
+          <do_all exact="global.$GT_Pilots.keys.count" counter="$i">
+            <set_value name="$ent" exact="global.$GT_Pilots.keys.{$i}"/>
+            <do_if value="global.$GT_Pilots.{$ent}?">
+              <set_value name="$shipHint" exact="null"/>
+              <do_if value="global.$GT_Pilots.{$ent}.$Ship? and global.$GT_Pilots.{$ent}.$Ship.exists">
+                <set_value name="$shipHint" exact="global.$GT_Pilots.{$ent}.$Ship"/>
+              </do_if>
+              <do_elseif value="global.$GT_Pilots.{$ent}.$AssociatedShip? and global.$GT_Pilots.{$ent}.$AssociatedShip.exists">
+                <set_value name="$shipHint" exact="global.$GT_Pilots.{$ent}.$AssociatedShip"/>
+              </do_elseif>
+              <run_actions ref="GT_Pilot_Sync_Entity_Into_BySeed">
+                <param name="entity" value="$ent"/>
+                <param name="ship" value="$shipHint"/>
+              </run_actions>
+            </do_if>
+          </do_all>
+        </do_if>
+      </actions>
+    </library>
+
+    <!-- Find legacy $GT_Pilots key whose StableIdentity / seed matches. Seed only. -->
+    <library name="GT_Pilot_Find_Legacy_Key_By_Seed" purpose="run_actions">
+      <params>
+        <param name="seedKey" default="''"/>
+        <param name="excludeEntity" default="null"/>
+      </params>
+      <actions>
+        <set_value name="$found" exact="null"/>
+        <set_value name="$matchCount" exact="0"/>
+        <do_if value="$seedKey != '' and global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
+          <do_all exact="global.$GT_Pilots.keys.count" counter="$i">
+            <set_value name="$cand" exact="global.$GT_Pilots.keys.{$i}"/>
+            <do_if value="$cand != $excludeEntity and global.$GT_Pilots.{$cand}?">
+              <set_value name="$candStable" exact="if global.$GT_Pilots.{$cand}.$StableIdentity? then global.$GT_Pilots.{$cand}.$StableIdentity else ''"/>
+              <do_if value="$candStable == $seedKey">
+                <set_value name="$found" exact="$cand"/>
+                <set_value name="$matchCount" operation="add"/>
+              </do_if>
+              <do_elseif value="$candStable == '' and $cand.exists and $cand.seed?">
+                <run_actions ref="GT_Pilot_Compute_Seed_Key" result="$candKey">
+                  <param name="entity" value="$cand"/>
+                </run_actions>
+                <do_if value="$candKey == $seedKey">
+                  <set_value name="$found" exact="$cand"/>
+                  <set_value name="$matchCount" operation="add"/>
+                </do_if>
+              </do_elseif>
+            </do_if>
+          </do_all>
+        </do_if>
+        <do_if value="$matchCount != 1">
+          <set_value name="$found" exact="null"/>
+        </do_if>
+        <return value="$found"/>
+      </actions>
+    </library>
+
+    <!-- Move $GT_Pilots row onto live entity. Seed match by default; forceRegistryKey for SAR rekey. -->
+    <library name="GT_Pilot_Bind_Live" purpose="run_actions">
+      <params>
+        <param name="entity"/>
+        <param name="ship" default="null"/>
+        <param name="status" default="'active'"/>
+        <param name="role" default="'captain'"/>
+        <param name="forceRegistryKey" default="null" comment="Trusted entity key when live seed differs (SAR)"/>
+        <param name="forceStableKey" default="''" comment="Prior StableIdentity for BySeed rekey"/>
+      </params>
+      <actions>
+        <run_actions ref="GT_Pilot_Ensure_Tables"/>
+        <do_if value="not $entity? or not $entity.exists">
+          <return value="table[$Success = false, $Rebound = false, $SeedKey = '', $Pilot = null]"/>
+        </do_if>
+        <run_actions ref="GT_Pilot_Compute_Seed_Raw" result="$seedRaw">
+          <param name="entity" value="$entity"/>
+        </run_actions>
+        <do_if value="not $seedRaw? or $seedRaw == null">
+          <return value="table[$Success = false, $Rebound = false, $SeedKey = '', $Pilot = null]"/>
+        </do_if>
+        <set_value name="$seedKey" exact="'s:' + $seedRaw"/>
+        <set_value name="$rebound" exact="false"/>
+        <do_if value="not global.$GT_Pilots.{$entity}?">
+          <set_value name="$legacyKey" exact="null"/>
+          <do_if value="$forceRegistryKey? and $forceRegistryKey != null and global.$GT_Pilots.{$forceRegistryKey}?">
+            <set_value name="$legacyKey" exact="$forceRegistryKey"/>
+          </do_if>
+          <do_if value="not $legacyKey? or $legacyKey == null">
+            <run_actions ref="GT_Pilot_Find_Legacy_Key_By_Seed" result="$legacyKey">
+              <param name="seedKey" value="$seedKey"/>
+              <param name="excludeEntity" value="$entity"/>
+            </run_actions>
+          </do_if>
+          <do_if value="(not $legacyKey? or $legacyKey == null) and $forceStableKey != ''">
+            <run_actions ref="GT_Pilot_Find_Legacy_Key_By_Seed" result="$legacyKey">
+              <param name="seedKey" value="$forceStableKey"/>
+              <param name="excludeEntity" value="$entity"/>
+            </run_actions>
+          </do_if>
+          <do_if value="$legacyKey? and $legacyKey != null and global.$GT_Pilots.{$legacyKey}?">
+            <set_value name="$oldStable" exact="''"/>
+            <set_value name="$oldRaw" exact="null"/>
+            <do_if value="global.$GT_Pilots.{$legacyKey}.$StableIdentity?">
+              <set_value name="$oldStable" exact="'' + global.$GT_Pilots.{$legacyKey}.$StableIdentity"/>
+            </do_if>
+            <do_if value="$legacyKey.exists and $legacyKey.seed?">
+              <set_value name="$oldRaw" exact="$legacyKey.seed"/>
+            </do_if>
+            <set_value name="global.$GT_Pilots.{$entity}" exact="global.$GT_Pilots.{$legacyKey}"/>
+            <remove_value name="global.$GT_Pilots.{$legacyKey}"/>
+            <do_if value="$oldRaw? and $oldRaw != null and $oldRaw != $seedRaw and global.$GT_PilotBySeed.{$oldRaw}?">
+              <remove_value name="global.$GT_PilotBySeed.{$oldRaw}"/>
+            </do_if>
+            <do_elseif value="$oldStable != '' and $oldStable != $seedKey">
+              <run_actions ref="GT_Pilot_Resolve_BySeed_Key" result="$oldRawResolved">
+                <param name="seedKey" value="$oldStable"/>
+              </run_actions>
+              <do_if value="$oldRawResolved? and $oldRawResolved != null and $oldRawResolved != $seedRaw and global.$GT_PilotBySeed.{$oldRawResolved}?">
+                <remove_value name="global.$GT_PilotBySeed.{$oldRawResolved}"/>
+              </do_if>
+            </do_elseif>
+            <set_value name="$rebound" exact="true"/>
+          </do_if>
+        </do_if>
+        <do_if value="global.$GT_Pilots.{$entity}?">
+          <set_value name="global.$GT_Pilots.{$entity}.$StableIdentity" exact="$seedKey"/>
+          <set_value name="global.$GT_Pilots.{$entity}.$Status" exact="$status"/>
+          <do_if value="$ship? and $ship.exists">
+            <set_value name="global.$GT_Pilots.{$entity}.$Ship" exact="$ship"/>
+            <set_value name="global.$GT_Pilots.{$entity}.$AssociatedShip" exact="$ship"/>
+            <set_value name="global.$GT_Pilots.{$entity}.$ShipID" exact="$ship.idcode"/>
+          </do_if>
+          <run_actions ref="GT_Pilot_Sync_Entity_Into_BySeed" result="$seedKey">
+            <param name="entity" value="$entity"/>
+            <param name="ship" value="$ship"/>
+            <param name="status" value="$status"/>
+            <param name="role" value="$role"/>
+          </run_actions>
+          <return value="table[$Success = true, $Rebound = $rebound, $SeedKey = $seedKey, $Pilot = $entity]"/>
+        </do_if>
+        <return value="table[$Success = false, $Rebound = false, $SeedKey = $seedKey, $Pilot = null]"/>
+      </actions>
+    </library>
+
+    <library name="GT_Pilot_Get_By_Seed" purpose="run_actions">
+      <params>
+        <param name="seedKey" default="''"/>
+        <param name="seedRaw" default="null"/>
+      </params>
+      <actions>
+        <run_actions ref="GT_Pilot_Ensure_Tables"/>
+        <run_actions ref="GT_Pilot_Resolve_BySeed_Key" result="$tableKey">
+          <param name="seedKey" value="$seedKey"/>
+          <param name="seedRaw" value="$seedRaw"/>
+        </run_actions>
+        <do_if value="$tableKey? and $tableKey != null and global.$GT_PilotBySeed.{$tableKey}?">
+          <return value="global.$GT_PilotBySeed.{$tableKey}"/>
+        </do_if>
+        <return value="null"/>
+      </actions>
+    </library>
+
+    <library name="GT_Pilot_Get_By_Entity" purpose="run_actions">
+      <params>
+        <param name="entity"/>
+      </params>
+      <actions>
+        <run_actions ref="GT_Pilot_Ensure_Tables"/>
+        <do_if value="not $entity?">
+          <return value="null"/>
+        </do_if>
+        <do_if value="global.$GT_PilotLiveIndex.{$entity}?">
+          <set_value name="$tk" exact="global.$GT_PilotLiveIndex.{$entity}"/>
+          <do_if value="global.$GT_PilotBySeed.{$tk}?">
+            <return value="global.$GT_PilotBySeed.{$tk}"/>
+          </do_if>
+        </do_if>
+        <run_actions ref="GT_Pilot_Compute_Seed_Raw" result="$raw">
+          <param name="entity" value="$entity"/>
+        </run_actions>
+        <do_if value="$raw? and $raw != null and global.$GT_PilotBySeed.{$raw}?">
+          <return value="global.$GT_PilotBySeed.{$raw}"/>
+        </do_if>
+        <return value="null"/>
+      </actions>
+    </library>
+
+    <library name="GT_Pilot_Apply_Tag" purpose="run_actions">
+      <params>
+        <param name="entity"/>
+        <param name="level" default="null"/>
+      </params>
+      <actions>
+        <do_if value="md.GT_Ship_Management.Update_Pilot_Name_Tag?">
+          <run_actions ref="md.GT_Ship_Management.Update_Pilot_Name_Tag" result="$ok">
+            <param name="pilot" value="$entity"/>
+            <param name="level" value="$level"/>
+          </run_actions>
+          <run_actions ref="GT_Pilot_Sync_Entity_Into_BySeed">
+            <param name="entity" value="$entity"/>
+          </run_actions>
+          <return value="$ok"/>
+        </do_if>
+        <return value="false"/>
+      </actions>
+    </library>
+
+    <library name="GT_Pilot_Add_XP" purpose="run_actions">
+      <params>
+        <param name="entity" default="null"/>
+        <param name="seedKey" default="''"/>
+        <param name="amount" default="0"/>
+      </params>
+      <actions>
+        <do_if value="$amount le 0">
+          <return value="false"/>
+        </do_if>
+        <do_if value="$entity? and $entity.exists and global.$GT_Pilots? and global.$GT_Pilots.{$entity}?">
+          <set_value name="global.$GT_Pilots.{$entity}.$XP" exact="(if global.$GT_Pilots.{$entity}.$XP? then global.$GT_Pilots.{$entity}.$XP else 0) + $amount"/>
+          <run_actions ref="GT_Pilot_Sync_Entity_Into_BySeed">
+            <param name="entity" value="$entity"/>
+          </run_actions>
+          <return value="true"/>
+        </do_if>
+        <do_if value="$seedKey != '' and global.$GT_PilotBySeed?">
+          <run_actions ref="GT_Pilot_Resolve_BySeed_Key" result="$tableKey">
+            <param name="seedKey" value="$seedKey"/>
+          </run_actions>
+          <do_if value="$tableKey? and $tableKey != null and global.$GT_PilotBySeed.{$tableKey}?">
+            <set_value name="global.$GT_PilotBySeed.{$tableKey}.$XP" exact="(if global.$GT_PilotBySeed.{$tableKey}.$XP? then global.$GT_PilotBySeed.{$tableKey}.$XP else 0) + $amount"/>
+            <do_if value="global.$GT_PilotBySeed.{$tableKey}.$LiveEntity? and global.$GT_PilotBySeed.{$tableKey}.$LiveEntity.exists">
+              <set_value name="$le" exact="global.$GT_PilotBySeed.{$tableKey}.$LiveEntity"/>
+              <do_if value="global.$GT_Pilots.{$le}?">
+                <set_value name="global.$GT_Pilots.{$le}.$XP" exact="global.$GT_PilotBySeed.{$tableKey}.$XP"/>
+              </do_if>
+            </do_if>
+            <return value="true"/>
+          </do_if>
+        </do_if>
+        <return value="false"/>
+      </actions>
+    </library>
+
+    <library name="GT_Pilot_On_Assigned_Captain" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="entity"/>
+      </params>
+      <actions>
+        <do_if value="not $ship? or not $ship.exists or not $entity? or not $entity.exists">
+          <return value="false"/>
+        </do_if>
+        <set_value name="$allowAssign" exact="false"/>
+        <do_if value="md.GT_CoreSystem.DeterminePilotAssignmentHasGTOrder?">
+          <run_actions ref="md.GT_CoreSystem.DeterminePilotAssignmentHasGTOrder" result="$allowAssign">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+        </do_if>
+        <do_if value="not $allowAssign">
+          <return value="false"/>
+        </do_if>
+        <do_if value="md.GT_Ship_Management.Register_Pilot?">
+          <run_actions ref="md.GT_Ship_Management.Register_Pilot">
+            <param name="pilot" value="$entity"/>
+            <param name="ship" value="$ship"/>
+          </run_actions>
+        </do_if>
+        <run_actions ref="GT_Pilot_Bind_Live" result="$bind">
+          <param name="entity" value="$entity"/>
+          <param name="ship" value="$ship"/>
+          <param name="status" value="'active'"/>
+          <param name="role" value="'captain'"/>
+        </run_actions>
+        <run_actions ref="GT_Pilot_Publish_UI_Maps"/>
+        <return value="$bind.$Success"/>
+      </actions>
+    </library>
+
+    <library name="GT_Pilot_On_Demoted_To_Crew" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="entity"/>
+      </params>
+      <actions>
+        <do_if value="not $entity? or not $entity.exists">
+          <return value="false"/>
+        </do_if>
+        <run_actions ref="GT_Pilot_Bind_Live" result="$bind">
+          <param name="entity" value="$entity"/>
+          <param name="ship" value="$ship"/>
+          <param name="status" value="'crew'"/>
+          <param name="role" value="'crew'"/>
+        </run_actions>
+        <do_if value="$bind.$Success and global.$GT_Pilots.{$entity}?">
+          <set_value name="global.$GT_Pilots.{$entity}.$Status" exact="'crew'"/>
+          <run_actions ref="GT_Pilot_Apply_Tag">
+            <param name="entity" value="$entity"/>
+          </run_actions>
+        </do_if>
+        <run_actions ref="GT_Pilot_Publish_UI_Maps"/>
+        <return value="$bind.$Success"/>
+      </actions>
+    </library>
+
+    <library name="GT_Pilot_On_Ejected" purpose="run_actions">
+      <params>
+        <param name="entity" default="null"/>
+        <param name="seedKey" default="''"/>
+      </params>
+      <actions>
+        <run_actions ref="GT_Pilot_Ensure_Tables"/>
+        <do_if value="$seedKey == '' and $entity?">
+          <run_actions ref="GT_Pilot_Compute_Seed_Key" result="$seedKey">
+            <param name="entity" value="$entity"/>
+          </run_actions>
+          <do_if value="$seedKey == '' and global.$GT_Pilots? and global.$GT_Pilots.{$entity}? and global.$GT_Pilots.{$entity}.$StableIdentity?">
+            <set_value name="$seedKey" exact="global.$GT_Pilots.{$entity}.$StableIdentity"/>
+          </do_if>
+        </do_if>
+        <do_if value="$entity? and global.$GT_Pilots? and global.$GT_Pilots.{$entity}?">
+          <set_value name="global.$GT_Pilots.{$entity}.$Status" exact="'ejected'"/>
+          <run_actions ref="GT_Pilot_Sync_Entity_Into_BySeed">
+            <param name="entity" value="$entity"/>
+            <param name="status" value="'ejected'"/>
+            <param name="role" value="'adrift'"/>
+          </run_actions>
+        </do_if>
+        <do_elseif value="$seedKey != ''">
+          <run_actions ref="GT_Pilot_Resolve_BySeed_Key" result="$tableKey">
+            <param name="seedKey" value="$seedKey"/>
+          </run_actions>
+          <do_if value="$tableKey? and $tableKey != null and global.$GT_PilotBySeed.{$tableKey}?">
+            <set_value name="global.$GT_PilotBySeed.{$tableKey}.$Status" exact="'ejected'"/>
+            <set_value name="global.$GT_PilotBySeed.{$tableKey}.$Role" exact="'adrift'"/>
+          </do_if>
+        </do_elseif>
+        <run_actions ref="GT_Pilot_Publish_UI_Maps"/>
+        <return value="true"/>
+      </actions>
+    </library>
+
+    <library name="GT_Pilot_On_Rescued" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="entity"/>
+        <param name="forceRegistryKey" default="null"/>
+        <param name="forceStableKey" default="''"/>
+      </params>
+      <actions>
+        <run_actions ref="GT_Pilot_Bind_Live" result="$bind">
+          <param name="entity" value="$entity"/>
+          <param name="ship" value="$ship"/>
+          <param name="status" value="'active'"/>
+          <param name="role" value="'captain'"/>
+          <param name="forceRegistryKey" value="$forceRegistryKey"/>
+          <param name="forceStableKey" value="$forceStableKey"/>
+        </run_actions>
+        <do_if value="$bind.$Success">
+          <run_actions ref="GT_Pilot_Apply_Tag">
+            <param name="entity" value="$entity"/>
+          </run_actions>
+          <run_actions ref="GT_Pilot_Publish_UI_Maps"/>
+        </do_if>
+        <return value="$bind.$Success"/>
+      </actions>
+    </library>
+
+    <library name="GT_Pilot_On_Exchange_Commit" purpose="run_actions">
+      <params>
+        <param name="leftShip" default="null"/>
+        <param name="rightShip" default="null"/>
+        <param name="leftPilot" default="null"/>
+        <param name="rightPilot" default="null"/>
+      </params>
+      <actions>
+        <do_if value="$leftPilot? and $leftPilot.exists and $leftShip? and $leftShip.exists">
+          <run_actions ref="GT_Pilot_Bind_Live">
+            <param name="entity" value="$leftPilot"/>
+            <param name="ship" value="$leftShip"/>
+            <param name="status" value="'active'"/>
+            <param name="role" value="'captain'"/>
+          </run_actions>
+        </do_if>
+        <do_if value="$rightPilot? and $rightPilot.exists and $rightShip? and $rightShip.exists">
+          <run_actions ref="GT_Pilot_Bind_Live">
+            <param name="entity" value="$rightPilot"/>
+            <param name="ship" value="$rightShip"/>
+            <param name="status" value="'active'"/>
+            <param name="role" value="'captain'"/>
+          </run_actions>
+        </do_if>
+        <run_actions ref="GT_Pilot_Publish_UI_Maps"/>
+        <return value="true"/>
+      </actions>
+    </library>
+
+    <library name="GT_Pilot_List_On_Ship" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+      </params>
+      <actions>
+        <set_value name="$out" exact="[]"/>
+        <run_actions ref="GT_Pilot_Ensure_Tables"/>
+        <do_if value="$ship and $ship.exists and $ship.people? and $ship.people.list?">
+          <do_all exact="$ship.people.list.count" counter="$pi">
+            <set_value name="$tpl" exact="$ship.people.list.{$pi}"/>
+            <do_if value="$ship.people.{$tpl}? and $ship.people.{$tpl}.seed?">
+              <set_value name="$raw" exact="$ship.people.{$tpl}.seed"/>
+              <do_if value="global.$GT_PilotBySeed.{$raw}?">
+                <append_to_list name="$out" exact="global.$GT_PilotBySeed.{$raw}"/>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+        <return value="$out"/>
+      </actions>
+    </library>
+
+    <!-- Append one seed wire if not already seen. -->
+    <library name="GT_Pilot_Publish_Append_Seed_Wire" purpose="run_actions">
+      <params>
+        <param name="mapData"/>
+        <param name="mapCount"/>
+        <param name="seenSeeds"/>
+        <param name="seedRaw" default="null"/>
+        <param name="tagged" default="''"/>
+      </params>
+      <actions>
+        <do_if value="$tagged != '' and $seedRaw? and $seedRaw != null">
+          <run_actions ref="GT_Pilot_LargeInt_U64Wire" result="$wire">
+            <param name="value" value="$seedRaw"/>
+          </run_actions>
+          <do_if value="$wire != ''">
+            <set_value name="$seenKey" exact="'$' + $wire"/>
+            <do_if value="not $seenSeeds.{$seenKey}?">
+              <set_value name="$seenSeeds.{$seenKey}" exact="true"/>
+              <do_if value="$mapCount gt 0">
+                <set_value name="$mapData" exact="$mapData + '||'"/>
+              </do_if>
+              <set_value name="$mapData" exact="$mapData + $wire + '|' + $tagged"/>
+              <set_value name="$mapCount" operation="add"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        <return value="table[$MapData = $mapData, $MapCount = $mapCount, $SeenSeeds = $seenSeeds]"/>
+      </actions>
+    </library>
+
+    <!-- Full-replace PilotIdMap: people/entity seed wires only (no idcode / name / template). -->
+    <library name="GT_Pilot_Publish_UI_Maps" purpose="run_actions">
+      <actions>
+        <run_actions ref="GT_Pilot_Sync_All_From_Legacy"/>
+        <set_value name="$mapData" exact="''"/>
+        <set_value name="$mapCount" exact="0"/>
+        <set_value name="$seenSeeds" exact="table[]"/>
+        <do_if value="global.$GT_PilotBySeed? and global.$GT_PilotBySeed.keys.count gt 0">
+          <do_all exact="global.$GT_PilotBySeed.keys.count" counter="$si">
+            <set_value name="$tableKey" exact="global.$GT_PilotBySeed.keys.{$si}"/>
+            <do_if value="global.$GT_PilotBySeed.{$tableKey}?">
+              <set_value name="$row" exact="global.$GT_PilotBySeed.{$tableKey}"/>
+              <run_actions ref="GT_Pilot_Refresh_Tagged_Name_On_Row">
+                <param name="tableKey" value="$tableKey"/>
+              </run_actions>
+              <set_value name="$tagged" exact="if $row.$TaggedName? and $row.$TaggedName != '' then $row.$TaggedName else ''"/>
+              <do_if value="$tagged == '' and $row.$OriginalPilotName? and $row.$OriginalPilotName != ''">
+                <set_value name="$tagged" exact="'(T:' + (if $row.$Level? then $row.$Level else 1) + ') ' + $row.$OriginalPilotName"/>
+              </do_if>
+              <set_value name="$raw" exact="null"/>
+              <do_if value="$row.$SeedRaw?">
+                <set_value name="$raw" exact="$row.$SeedRaw"/>
+              </do_if>
+              <do_elseif value="$row.$LiveEntity? and $row.$LiveEntity.exists and $row.$LiveEntity.seed?">
+                <set_value name="$raw" exact="$row.$LiveEntity.seed"/>
+              </do_elseif>
+              <run_actions ref="GT_Pilot_Publish_Append_Seed_Wire" result="$appendRes">
+                <param name="mapData" value="$mapData"/>
+                <param name="mapCount" value="$mapCount"/>
+                <param name="seenSeeds" value="$seenSeeds"/>
+                <param name="seedRaw" value="$raw"/>
+                <param name="tagged" value="$tagged"/>
+              </run_actions>
+              <set_value name="$mapData" exact="$appendRes.$MapData"/>
+              <set_value name="$mapCount" exact="$appendRes.$MapCount"/>
+              <set_value name="$seenSeeds" exact="$appendRes.$SeenSeeds"/>
+              <!-- MapMenu crew rows use people.{tpl}.seed; emit when live entity is aboard. -->
+              <do_if value="$tagged != '' and $row.$LiveEntity? and $row.$LiveEntity.exists and $row.$Ship? and $row.$Ship.exists">
+                <run_actions ref="md.GT_Ship_Management.Collect_MapMenu_People_Seeds_For_Entity_On_Ship" result="$menuSeeds">
+                  <param name="ship" value="$row.$Ship"/>
+                  <param name="entity" value="$row.$LiveEntity"/>
+                  <param name="crewTemplateHint" value="if $row.$LastDemotedTemplate? then $row.$LastDemotedTemplate else null"/>
+                </run_actions>
+                <do_all exact="$menuSeeds.count" counter="$msi">
+                  <run_actions ref="GT_Pilot_Publish_Append_Seed_Wire" result="$appendRes">
+                    <param name="mapData" value="$mapData"/>
+                    <param name="mapCount" value="$mapCount"/>
+                    <param name="seenSeeds" value="$seenSeeds"/>
+                    <param name="seedRaw" value="$menuSeeds.{$msi}"/>
+                    <param name="tagged" value="$tagged"/>
+                  </run_actions>
+                  <set_value name="$mapData" exact="$appendRes.$MapData"/>
+                  <set_value name="$mapCount" exact="$appendRes.$MapCount"/>
+                  <set_value name="$seenSeeds" exact="$appendRes.$SeenSeeds"/>
+                </do_all>
+              </do_if>
+              <!-- Stamped demotion people seed (entity handle may lag). -->
+              <do_if value="$tagged != '' and $row.$LastDemotedPeopleSeed? and $row.$LastDemotedPeopleSeed != null">
+                <run_actions ref="GT_Pilot_Publish_Append_Seed_Wire" result="$appendRes">
+                  <param name="mapData" value="$mapData"/>
+                  <param name="mapCount" value="$mapCount"/>
+                  <param name="seenSeeds" value="$seenSeeds"/>
+                  <param name="seedRaw" value="$row.$LastDemotedPeopleSeed"/>
+                  <param name="tagged" value="$tagged"/>
+                </run_actions>
+                <set_value name="$mapData" exact="$appendRes.$MapData"/>
+                <set_value name="$mapCount" exact="$appendRes.$MapCount"/>
+                <set_value name="$seenSeeds" exact="$appendRes.$SeenSeeds"/>
+              </do_if>
+              <do_elseif value="$tagged != '' and $row.$LiveEntity?">
+                <set_value name="$liveEnt" exact="$row.$LiveEntity"/>
+                <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{$liveEnt}? and global.$GT_Pilots.{$liveEnt}.$LastDemotedPeopleSeed?">
+                  <run_actions ref="GT_Pilot_Publish_Append_Seed_Wire" result="$appendRes">
+                    <param name="mapData" value="$mapData"/>
+                    <param name="mapCount" value="$mapCount"/>
+                    <param name="seenSeeds" value="$seenSeeds"/>
+                    <param name="seedRaw" value="global.$GT_Pilots.{$liveEnt}.$LastDemotedPeopleSeed"/>
+                    <param name="tagged" value="$tagged"/>
+                  </run_actions>
+                  <set_value name="$mapData" exact="$appendRes.$MapData"/>
+                  <set_value name="$mapCount" exact="$appendRes.$MapCount"/>
+                  <set_value name="$seenSeeds" exact="$appendRes.$SeenSeeds"/>
+                </do_if>
+              </do_elseif>
+            </do_if>
+          </do_all>
+        </do_if>
+        <!-- Always raise: empty clears Lua map (replace semantics). -->
+        <do_if value="$mapCount gt 0">
+          <raise_lua_event name="'GT_PilotIdMap.Update'" param="$mapData"/>
+        </do_if>
+        <do_else>
+          <raise_lua_event name="'GT_PilotIdMap.Update'" param="'__CLEAR__|cleared'"/>
+        </do_else>
+        <debug_text text="'[GT-PilotEco] Publish_UI_Maps seedEntries=' + $mapCount" chance="100"/>
+      </actions>
+    </library>
+
+    <cue name="GT_Pilot_Migrate_On_Load" instantiate="true" version="1">
+      <conditions>
+        <event_game_loaded/>
+      </conditions>
+      <actions>
+        <do_if value="not global.$GT_PilotEcosystemMigratedV1?">
+          <run_actions ref="GT_Pilot_Sync_All_From_Legacy"/>
+          <set_value name="global.$GT_PilotEcosystemMigratedV1" exact="true"/>
+          <run_actions ref="GT_Pilot_Publish_UI_Maps"/>
+          <debug_text text="'[GT-PilotEco] Migrated legacy $GT_Pilots into $GT_PilotBySeed'" chance="100"/>
+        </do_if>
+      </actions>
+    </cue>
+
+    <cue name="GT_Pilot_Migrate_On_Start" instantiate="true" version="1">
+      <conditions>
+        <event_game_started/>
+      </conditions>
+      <actions>
+        <run_actions ref="GT_Pilot_Ensure_Tables"/>
+        <do_if value="not global.$GT_PilotEcosystemMigratedV1?">
+          <run_actions ref="GT_Pilot_Sync_All_From_Legacy"/>
+          <set_value name="global.$GT_PilotEcosystemMigratedV1" exact="true"/>
+        </do_if>
+      </actions>
+    </cue>
+
+  </cues>
+</mdscript>

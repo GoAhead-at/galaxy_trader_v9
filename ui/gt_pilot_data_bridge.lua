@@ -469,21 +469,10 @@ local function onReceivePilotNameMap(_, param)
 end
 
 -- Receive GT pilot-id -> tagged-name map from MD
--- Expected format: "PILOTID1|Tagged Name1||PILOTID2|Tagged Name2"
--- Merges into the existing Lua map: MD snapshots can be partial after vanilla crew
--- swaps / reassignment; a full replace dropped seeds still shown in MapMenu crew rows.
+-- Expected format: "u64p:hi:lo|Tagged Name||..." or "__CLEAR__|" to wipe.
+-- Full replace (no merge): stale seeds must not survive unregister / demotion cleanup.
 local function onReceivePilotIdMap(_, param)
-    local prev = GT_PilotData.gtPilotIdMap or {}
-    local prevKeyCount = 0
-    for _ in pairs(prev) do
-        prevKeyCount = prevKeyCount + 1
-    end
-
     local idMap = {}
-    for k, v in pairs(prev) do
-        idMap[k] = v
-    end
-
     local entryCount = 0
     local malformedCount = 0
     local u64WireCount = 0
@@ -496,12 +485,16 @@ local function onReceivePilotIdMap(_, param)
         for mapStr in string.gmatch(param .. "||", "(.-)||") do
             if mapStr ~= "" then
                 local pilotId, taggedName = string.match(mapStr, "^(.-)|(.*)$")
-                if pilotId and taggedName and pilotId ~= "" and taggedName ~= "" then
+                if pilotId == "__CLEAR__" then
+                    -- Explicit clear sentinel from MD.
+                    entryCount = 0
+                    idMap = {}
+                    break
+                elseif pilotId and taggedName and pilotId ~= "" and taggedName ~= "" then
                     entryCount = entryCount + 1
                     if #sampleKeys < 5 then
                         table.insert(sampleKeys, tostring(pilotId))
                     end
-                    -- MD wire may send signed 32-bit halves (e.g. negative hi/lo); accept both signs.
                     local hi32, lo32 = string.match(pilotId, "^u64p:(%-?%d+):(%-?%d+)$")
                     local keyForAliases = pilotId
                     if hi32 and lo32 then
@@ -523,6 +516,7 @@ local function onReceivePilotIdMap(_, param)
                             end
                         end
                     else
+                        -- Accept s:<signed> or decimal seed forms only (no idcode / name keys).
                         idMap[pilotId] = sanitizeTaggedPilotName(taggedName)
                         aliasKeyAdds = aliasKeyAdds + addPilotIdMapKeyWithInt64Aliases(idMap, taggedName, keyForAliases)
                     end
@@ -538,25 +532,12 @@ local function onReceivePilotIdMap(_, param)
         totalKeys = totalKeys + 1
     end
 
-    -- Never replace a good map with an empty snapshot: MD can raise this during
-    -- SendPilotData "early" branch or transient registry races (crew UI refresh).
-    if entryCount == 0 then
-        if prevKeyCount > 0 then
-            DebugError(string.format(
-                "[GT Pilot Bridge] PilotIdMap skipped empty update (keeping %d keys; raw_len=%d)",
-                prevKeyCount,
-                string.len(tostring(param or ""))
-            ))
-        end
-        return
-    end
-
     GT_PilotData.gtPilotIdMap = idMap
+    GT_PilotData.gtNameMap = {}
     DebugError(string.format(
-        "[GT Pilot Bridge] PilotIdMap merged: incomingLogical=%d totalKeys=%d prevKeys=%d malformed=%d wireU64=%d decodedU64=%d decodeFail=%d aliasAdds=%d raw_len=%d sampleKeys=[%s]",
+        "[GT Pilot Bridge] PilotIdMap replaced: incomingLogical=%d totalKeys=%d malformed=%d wireU64=%d decodedU64=%d decodeFail=%d aliasAdds=%d raw_len=%d sampleKeys=[%s]",
         entryCount,
         totalKeys,
-        prevKeyCount,
         malformedCount,
         u64WireCount,
         u64DecodedCount,
@@ -565,7 +546,6 @@ local function onReceivePilotIdMap(_, param)
         string.len(tostring(param or "")),
         table.concat(sampleKeys, ", ")
     ))
-    debugLog(string.format("Updated GT pilot id map: %d logical entries, %d lookup keys (malformed=%d, wire=%d, decoded=%d, decodeFail=%d, aliasAdds=%d)", entryCount, totalKeys, malformedCount, u64WireCount, u64DecodedCount, u64DecodeFailed, aliasKeyAdds))
     if malformedCount > 0 then
         DebugError(string.format("[GT Pilot Bridge] WARNING: Received malformed PilotIdMap entries: %d", malformedCount))
     end

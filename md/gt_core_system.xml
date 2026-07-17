@@ -1102,13 +1102,43 @@
           </run_actions>
           <do_if value="$tierRes.$Pilot? and $tierRes.$Pilot.exists">
             <set_value name="$livePilot" exact="$tierRes.$Pilot"/>
-            <run_actions ref="md.GT_Ship_Management.Rebind_Pilot_Registry" result="$rb">
-              <param name="livePilot" value="$livePilot"/>
-              <param name="registryPilotHint" value="$pilotHint"/>
-              <param name="stableKey" value="$stableKey"/>
-              <param name="sector" value="$sector"/>
-            </run_actions>
-            <set_value name="$livePilot" exact="if $rb.$Pilot? then $rb.$Pilot else $livePilot"/>
+            <do_if value="$ejectMode">
+              <!-- Eject logbook requires Status=ejected. Write before any registry migrate. -->
+              <run_actions ref="md.GT_CoreSystem.TryWriteTestPilotEjectLogbook">
+                <param name="registryPilotHint" value="$pilotHint"/>
+                <param name="livePilot" value="$livePilot"/>
+                <param name="stableKey" value="$stableKey"/>
+                <param name="sector" value="$sector"/>
+              </run_actions>
+              <!-- Migrate row onto spacesuit actor without clearing eject (Rebind_Pilot_Registry forces active). -->
+              <run_actions ref="md.GT_Pilot_Ecosystem.GT_Pilot_Bind_Live" result="$rb">
+                <param name="entity" value="$livePilot"/>
+                <param name="ship" value="null"/>
+                <param name="status" value="'ejected'"/>
+                <param name="role" value="'adrift'"/>
+                <param name="forceRegistryKey" value="$pilotHint"/>
+                <param name="forceStableKey" value="if $stableKey? then ('' + $stableKey) else ''"/>
+              </run_actions>
+              <set_value name="$livePilot" exact="if $rb.$Pilot? then $rb.$Pilot else $livePilot"/>
+              <do_if value="$livePilot and global.$GT_Pilots? and global.$GT_Pilots.{$livePilot}?">
+                <set_value name="global.$GT_Pilots.{$livePilot}.$Status" exact="'ejected'"/>
+                <run_actions ref="md.GT_Ship_Management.Ensure_Pilot_Fields">
+                  <param name="pilot" value="$livePilot"/>
+                </run_actions>
+                <run_actions ref="md.GT_Ship_Management.Sync_Stable_Identity_Index">
+                  <param name="pilot" value="$livePilot"/>
+                </run_actions>
+              </do_if>
+            </do_if>
+            <do_else>
+              <run_actions ref="md.GT_Ship_Management.Rebind_Pilot_Registry" result="$rb">
+                <param name="livePilot" value="$livePilot"/>
+                <param name="registryPilotHint" value="$pilotHint"/>
+                <param name="stableKey" value="$stableKey"/>
+                <param name="sector" value="$sector"/>
+              </run_actions>
+              <set_value name="$livePilot" exact="if $rb.$Pilot? then $rb.$Pilot else $livePilot"/>
+            </do_else>
           </do_if>
         </do_if>
 
@@ -1122,10 +1152,10 @@
           </do_if>
         </do_if>
 
-        <!-- Eject logbook is independent of tag refresh — registry key may differ from live spacesuit pilot entity. -->
+        <!-- Idempotent: covers attempts where spacesuit was not resolved on the first pass. -->
         <do_if value="$ejectMode">
           <run_actions ref="md.GT_CoreSystem.TryWriteTestPilotEjectLogbook">
-            <param name="registryPilotHint" value="$pilotHint"/>
+            <param name="registryPilotHint" value="if $livePilot and global.$GT_Pilots? and global.$GT_Pilots.{$livePilot}? then $livePilot else $pilotHint"/>
             <param name="livePilot" value="$livePilot"/>
             <param name="stableKey" value="$stableKey"/>
             <param name="sector" value="$sector"/>
@@ -1157,9 +1187,7 @@
       <actions>
         <set_value name="$result" exact="false"/>
         <do_if value="not $ship or not $ship.exists">
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Core] HandleRescueRebindForEjectedPilot: rescue ship missing, source=' + $source" chance="100"/>
-          </do_if>
+          <debug_text text="'[GT-RescueLB] HandleRescue FAIL ship_missing source=' + $source" chance="100"/>
           <return value="false"/>
         </do_if>
 
@@ -1205,9 +1233,7 @@
         </do_if>
 
         <do_if value="not $wasEjected">
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Core] HandleRescueRebindForEjectedPilot: no ejected registry row (live=' + (if $livePilot and $livePilot.exists and $livePilot.name? then $livePilot.name else 'NONE') + ', stable=' + $stableKey + ', source=' + $source + ')'" chance="100"/>
-          </do_if>
+          <debug_text text="'[GT-RescueLB] HandleRescue FAIL no_ejected_row live=' + (if $livePilot and $livePilot.exists and $livePilot.name? then $livePilot.name else 'NONE') + ' stable=' + $stableKey + ' source=' + $source + ' hint=' + (if $registryPilotHint? then 'yes' else 'no') + ' trusted=' + $trustedRegistryHint" chance="100"/>
           <return value="false"/>
         </do_if>
 
@@ -1220,9 +1246,7 @@
             <param name="pilot" value="$livePilot"/>
           </run_actions>
           <do_if value="$liveStableKey != '' and $liveStableKey != $stableKey">
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Core] HandleRescueRebindForEjectedPilot: stable mismatch — live=' + $liveStableKey + ', registry=' + $stableKey + ', liveName=' + (if $livePilot.name? then $livePilot.name else 'NONE') + ', source=' + $source" chance="100"/>
-            </do_if>
+            <debug_text text="'[GT-RescueLB] HandleRescue FAIL stable_mismatch live=' + $liveStableKey + ' registry=' + $stableKey + ' source=' + $source" chance="100"/>
             <return value="false"/>
           </do_if>
           <set_value name="$pilotStillInSpacesuit" exact="$livePilot.ship? and $livePilot.ship.exists and $livePilot.ship.isclass.spacesuit"/>
@@ -1232,9 +1256,7 @@
               <param name="ship" value="$ship"/>
             </run_actions>
             <do_if value="not $liveOnShip">
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Core] HandleRescueRebindForEjectedPilot: live pilot not on ship=' + $ship.idcode + ', source=' + $source" chance="100"/>
-              </do_if>
+              <debug_text text="'[GT-RescueLB] HandleRescue FAIL live_not_on_ship ship=' + $ship.idcode + ' source=' + $source" chance="100"/>
               <return value="false"/>
             </do_if>
           </do_if>
@@ -1284,18 +1306,14 @@
         </do_if>
 
         <do_if value="not ($resolvedPilot and $resolvedPilot.exists)">
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Core] HandleRescueRebindForEjectedPilot: live crew actor not resolved yet on ship=' + $ship.idcode + ' (stable=' + $stableKey + ', source=' + $source + ') - keeping eject state for delayed rescan'" chance="100"/>
-          </do_if>
+          <debug_text text="'[GT-RescueLB] HandleRescue FAIL crew_unresolved ship=' + $ship.idcode + ' stable=' + $stableKey + ' source=' + $source" chance="100"/>
           <return value="false"/>
         </do_if>
 
         <!-- Final gate: never complete the rebind onto an entity that is still sitting in a
              spacesuit or is not verifiably aboard the rescue ship. -->
         <do_if value="$resolvedPilot.ship? and $resolvedPilot.ship.exists and $resolvedPilot.ship.isclass.spacesuit">
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Core] HandleRescueRebindForEjectedPilot: resolved pilot still in spacesuit, ship=' + $ship.idcode + ', source=' + $source + ' - keeping eject state'" chance="100"/>
-          </do_if>
+          <debug_text text="'[GT-RescueLB] HandleRescue FAIL still_spacesuit ship=' + $ship.idcode + ' source=' + $source" chance="100"/>
           <return value="false"/>
         </do_if>
         <run_actions ref="md.GT_Ship_Management.Pilot_Is_On_Ship" result="$resolvedOnShip">
@@ -1303,9 +1321,7 @@
           <param name="ship" value="$ship"/>
         </run_actions>
         <do_if value="not $resolvedOnShip">
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Core] HandleRescueRebindForEjectedPilot: resolved pilot not aboard ship=' + $ship.idcode + ' (pilot=' + (if $resolvedPilot.name? then $resolvedPilot.name else 'NONE') + ', source=' + $source + ') - keeping eject state'" chance="100"/>
-          </do_if>
+          <debug_text text="'[GT-RescueLB] HandleRescue FAIL resolved_not_aboard ship=' + $ship.idcode + ' pilot=' + (if $resolvedPilot.name? then $resolvedPilot.name else 'NONE') + ' source=' + $source" chance="100"/>
           <return value="false"/>
         </do_if>
 
@@ -1316,6 +1332,14 @@
           <param name="ship" value="$ship"/>
         </run_actions>
         <set_value name="$pilot" exact="if $rebindResult.$Pilot? then $rebindResult.$Pilot else $resolvedPilot"/>
+
+        <!-- Write rescue logbook before tag/publish side-effects (same upkeep channel as eject). -->
+        <run_actions ref="md.GT_CoreSystem.TryWriteTestPilotRescueLogbook" result="$rescueLbWrote">
+          <param name="pilot" value="$pilot"/>
+          <param name="ship" value="$ship"/>
+          <param name="registryPilotHint" value="$pilot"/>
+        </run_actions>
+        <debug_text text="'[GT-RescueLB] HandleRescue OK rebind pilot=' + (if $pilot.name? then $pilot.name else 'NONE') + ' ship=' + $ship.idcode + ' source=' + $source + ' logbookWrote=' + $rescueLbWrote + ' rebindSuccess=' + (if $rebindResult.$Success? then $rebindResult.$Success else 'NONE')" chance="100"/>
 
         <run_actions ref="md.GT_CoreSystem.SyncPilotShipLinkState">
           <param name="pilot" value="$pilot"/>
@@ -1355,12 +1379,6 @@
           <param name="forceStableKey" value="if $stableKey? then ('' + $stableKey) else ''"/>
         </run_actions>
         <signal_cue_instantly cue="md.GT_InfoMenu_Loader.SendPilotData"/>
-
-        <run_actions ref="md.GT_CoreSystem.TryWriteTestPilotRescueLogbook">
-          <param name="pilot" value="$pilot"/>
-          <param name="ship" value="$ship"/>
-          <param name="registryPilotHint" value="$registryKey"/>
-        </run_actions>
 
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-Core] HandleRescueRebindForEjectedPilot: pilot=' + (if $pilot.name? then $pilot.name else 'NONE') + ', ship=' + $ship.idcode + ', hasGTOrder=' + $hasGTOrder + ', source=' + $source" chance="100"/>
@@ -1866,9 +1884,7 @@
       <delay exact="1ms"/>
       <actions>
         <set_value name="$payload" exact="event.param2"/>
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-Core] HandleVanillaSarPilotTransferred: signal received, stranded=' + (if $payload.$StrandedPilot? and $payload.$StrandedPilot.name? then $payload.$StrandedPilot.name else 'NONE') + ', ship=' + (if $payload.$RescueShip? and $payload.$RescueShip.idcode? then $payload.$RescueShip.idcode else 'NONE') + ', crewTemplate=' + (if $payload.$CrewTemplate? then $payload.$CrewTemplate else 'NONE') + ', stable=' + (if $payload.$StableIdentity? then $payload.$StableIdentity else 'NONE')" chance="100"/>
-        </do_if>
+        <debug_text text="'[GT-RescueLB] SAR signal: stranded=' + (if $payload.$StrandedPilot? and $payload.$StrandedPilot.name? then $payload.$StrandedPilot.name else 'NONE') + ' ship=' + (if $payload.$RescueShip? and $payload.$RescueShip.idcode? then $payload.$RescueShip.idcode else 'NONE') + ' tpl=' + (if $payload.$CrewTemplate? then $payload.$CrewTemplate else 'NONE') + ' stable=' + (if $payload.$StableIdentity? then $payload.$StableIdentity else 'NONE') + ' regHint=' + (if $payload.$RegistryKeyHint? then 'yes' else 'no')" chance="100"/>
         <set_value name="$strandedPilot" exact="if $payload.$StrandedPilot? then $payload.$StrandedPilot else null"/>
         <set_value name="$rescueShip" exact="if $payload.$RescueShip? then $payload.$RescueShip else null"/>
         <set_value name="$spacesuit" exact="if $payload.$Spacesuit? then $payload.$Spacesuit else null"/>
@@ -1888,6 +1904,7 @@
           <param name="liveCrewPilot" value="$liveCrewPilot"/>
           <param name="attempt" value="1"/>
         </run_actions>
+        <debug_text text="'[GT-RescueLB] SAR process attempt=1 rescued=' + $rescued + ' ship=' + (if $rescueShip and $rescueShip.idcode? then $rescueShip.idcode else 'NONE')" chance="100"/>
       </actions>
     </cue>
 
@@ -1909,6 +1926,7 @@
           <param name="liveCrewPilot" value="if $payload.$LiveCrewPilot? then $payload.$LiveCrewPilot else null"/>
           <param name="attempt" value="$attempt"/>
         </run_actions>
+        <debug_text text="'[GT-RescueLB] SAR retry attempt=' + $attempt + ' rescued=' + $rescued" chance="100"/>
       </actions>
     </cue>
 
@@ -2150,9 +2168,11 @@
           </do_if>
         </do_if>
         <do_if value="$alreadyWritten">
+          <debug_text text="'[GT-RescueLB] TryWrite SKIP already_written pilot=' + (if $pilot and $pilot.name? then $pilot.name else 'NONE') + ' ship=' + (if $ship and $ship.idcode? then $ship.idcode else 'NONE')" chance="100"/>
           <return value="false"/>
         </do_if>
         <do_if value="not $ship or not $ship.exists">
+          <debug_text text="'[GT-RescueLB] TryWrite SKIP ship_missing pilot=' + (if $pilot and $pilot.name? then $pilot.name else 'NONE')" chance="100"/>
           <return value="false"/>
         </do_if>
         <set_value name="$pilotName" exact="if $pilot and $pilot.exists and $pilot.name? then $pilot.name else (if $regKey and $regKey.name? then $regKey.name else 'Unknown Pilot')"/>
@@ -2161,7 +2181,7 @@
         <set_value name="$rescueLogbookMessage" exact="'\033#text_positive#' + {77000,3230}.[player.name, $pilotName, $shipName, $shipID] + '\033X'"/>
         <run_actions ref="md.GT_Libraries_General.WriteLogbookMessage">
           <param name="Message" value="$rescueLogbookMessage"/>
-          <param name="Category" value="'news'"/>
+          <param name="Category" value="'upkeep'"/>
           <param name="Title" value="'\033#text_positive#' + {77000,3229} + '\033X'"/>
           <param name="Object" value="$ship"/>
           <param name="Interaction" value="'showonmap'"/>
@@ -2170,9 +2190,7 @@
         <do_if value="$regKey and global.$GT_Pilots? and global.$GT_Pilots.{$regKey}?">
           <set_value name="global.$GT_Pilots.{$regKey}.$RescueLogbookWritten" exact="true"/>
         </do_if>
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-Core] TryWriteTestPilotRescueLogbook: pilot=' + (if $pilot and $pilot.name? then $pilot.name else 'NONE') + ', ship=' + (if $ship and $ship.idcode? then $ship.idcode else 'NONE')" chance="100"/>
-        </do_if>
+        <debug_text text="'[GT-RescueLB] TryWrite WROTE pilot=' + $pilotName + ' ship=' + $shipID + ' regKeyExists=' + (if $regKey and global.$GT_Pilots? and global.$GT_Pilots.{$regKey}? then 'yes' else 'no')" chance="100"/>
         <return value="true"/>
       </actions>
     </library>
@@ -2472,7 +2490,7 @@
         <param name="attempt" default="1"/>
       </params>
       <actions>
-        <signal_cue_instantly cue="ResolvePilotIdentityByStable" param="table[
+        <signal_cue_instantly cue="md.GT_CoreSystem.ResolvePilotIdentityByStable" param="table[
           $Ship = $ship,
           $stable = $stable,
           $template = $template,
@@ -3336,6 +3354,7 @@
         <set_value name="$peopleSeed" exact="if $data.$PeopleSeed? then $data.$PeopleSeed else null"/>
         <set_value name="$source" exact="if $data.$source? then $data.$source else 'unknown'"/>
         <set_value name="$attempt" exact="if $data.$attempt? then $data.$attempt else 1"/>
+        <debug_text text="'[GT-RescueLB] ResolveStable START source=' + $source + ' attempt=' + $attempt + ' ship=' + (if $ship and $ship.idcode? then $ship.idcode else 'NONE') + ' stable=' + $stable + ' tpl=' + (if $template? then $template else 'NONE')" chance="100"/>
 
         <do_if value="$ship and $ship.exists and $stable != '' and global.$GT_Pilots?">
           <set_value name="$registryPilot" exact="null"/>
@@ -3466,7 +3485,7 @@
                 </run_actions>
               </do_if>
             </do_if>
-            <do_if value="$rebindStableResult.$Rebound?">
+            <do_if value="$rebindStableResult.$Success">
               <run_actions ref="md.GT_Ship_Management.Clear_Eject_Scratch_State">
                 <param name="pilot" value="$crewCandidate"/>
               </run_actions>
@@ -3481,6 +3500,12 @@
                 <remove_value name="global.$GT_Pilots.{$crewCandidate}.$LastSarPeopleSeed"/>
               </do_if>
               <do_if value="$source == 'vanilla_sar_transfer'">
+                <run_actions ref="md.GT_CoreSystem.TryWriteTestPilotRescueLogbook" result="$stableLbWrote">
+                  <param name="pilot" value="$crewCandidate"/>
+                  <param name="ship" value="$ship"/>
+                  <param name="registryPilotHint" value="$crewCandidate"/>
+                </run_actions>
+                <debug_text text="'[GT-RescueLB] ResolveStable SAR Success logbookWrote=' + $stableLbWrote + ' ship=' + $ship.idcode + ' pilot=' + (if $crewCandidate.name? then $crewCandidate.name else 'NONE') + ' rebound=' + (if $rebindStableResult.$Rebound? then $rebindStableResult.$Rebound else 'NONE')" chance="100"/>
                 <run_actions ref="md.GT_CoreSystem.TryUpdatePilotNameTag">
                   <param name="pilot" value="$crewCandidate"/>
                 </run_actions>
@@ -3488,14 +3513,9 @@
                   <param name="pilot" value="$crewCandidate"/>
                 </run_actions>
                 <signal_cue_instantly cue="md.GT_InfoMenu_Loader.SendPilotData"/>
-                <run_actions ref="md.GT_CoreSystem.TryWriteTestPilotRescueLogbook">
-                  <param name="pilot" value="$crewCandidate"/>
-                  <param name="ship" value="$ship"/>
-                  <param name="registryPilotHint" value="$registryPilot"/>
-                </run_actions>
               </do_if>
             </do_if>
-            <do_if value="$rebindStableResult.$Rebound? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <do_if value="$rebindStableResult.$Success and $rebindStableResult.$Rebound and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <set_value name="$registryPilotNameDbg" exact="if $registryPilot and $registryPilot.exists and $registryPilot.name? then $registryPilot.name else 'NONE'"/>
               <debug_text text="'[GT-Core] ResolvePilotIdentityByStable: rebound pilot stable=' + $stable + ' source=' + $source + ' ship=' + $ship.idcode + ', new=' + $crewCandidate.name + ', old=' + $registryPilotNameDbg" chance="100"/>
             </do_if>

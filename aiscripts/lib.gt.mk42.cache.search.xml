@@ -1011,8 +1011,11 @@
           <do_if value="$preCheckBuyAmt? and $preCheckBuyAmt lt $minUtilAmountLimit">
             <set_value name="$minUtilAmountLimit" exact="$preCheckBuyAmt"/>
           </do_if>
-          <do_if value="$entry.$Amount? and $entry.$Amount gt 0 and $entry.$Amount lt $minUtilAmountLimit">
-            <set_value name="$minUtilAmountLimit" exact="$entry.$Amount"/>
+          <!-- Prefer ship-agnostic OfferMaxAmount: live writers share refs with cache, and validation
+               can overwrite $Amount with a peer ship's cargo clamp before other ships read the row. -->
+          <set_value name="$minUtilCachedAmount" exact="if $entry.$OfferMaxAmount? and $entry.$OfferMaxAmount gt 0 then $entry.$OfferMaxAmount else (if $entry.$Amount? then $entry.$Amount else 0)"/>
+          <do_if value="$minUtilCachedAmount gt 0 and $minUtilCachedAmount lt $minUtilAmountLimit">
+            <set_value name="$minUtilAmountLimit" exact="$minUtilCachedAmount"/>
           </do_if>
           <set_value name="$minUtilTradeVolume" exact="$minUtilAmountLimit * $minUtilVolumePerUnit"/>
           <set_value name="$minUtilRequiredVolume" exact="($ship.cargo.capacity.all * $cargoUtilThresholdPct) / 100.0"/>
@@ -1123,8 +1126,54 @@
           </do_if>
         </do_if>
 
-        <!-- Entry passed all filters -->
-        <append_to_list name="$tradeList" exact="$entry"/>
+        <!-- Entry passed all filters. Hand out a PRIVATE wrapper copy — never the cache-resident
+             table. Validation/queue write $Amount / $FinalBuyAmount / $Queued* onto the working
+             row; sharing the cache object lets a Prometheus clamp overwrite a Heron's amount
+             mid-flight (same pair, concurrent fleet). Offers/stations stay shared game refs.
+             Ephemeral clamp fields are omitted; $Amount prefers ship-agnostic $OfferMaxAmount. -->
+        <set_value name="$privateAmount" exact="if $entry.$OfferMaxAmount? and $entry.$OfferMaxAmount gt 0 then $entry.$OfferMaxAmount else (if $entry.$Amount? then $entry.$Amount else 0)"/>
+        <set_value name="$privateEntry" exact="table[
+          $Ware = if $entry.$Ware? then $entry.$Ware else null,
+          $CargoWareTransport = if $entry.$CargoWareTransport? then $entry.$CargoWareTransport else null,
+          $BuyOffer = if $entry.$BuyOffer? then $entry.$BuyOffer else null,
+          $SellOffer = if $entry.$SellOffer? then $entry.$SellOffer else null,
+          $Amount = $privateAmount,
+          $OfferMaxAmount = if $entry.$OfferMaxAmount? and $entry.$OfferMaxAmount gt 0 then $entry.$OfferMaxAmount else $privateAmount,
+          $BuyOfferAmount = if $entry.$BuyOfferAmount? then $entry.$BuyOfferAmount else null,
+          $SellOfferAmount = if $entry.$SellOfferAmount? then $entry.$SellOfferAmount else null,
+          $Score = if $entry.$Score? then $entry.$Score else 0,
+          $baseSupplyScore = if $entry.$baseSupplyScore? then $entry.$baseSupplyScore else (if $entry.$Score? then $entry.$Score else 0),
+          $urgencyScore = if $entry.$urgencyScore? then $entry.$urgencyScore else 0,
+          $StationDemandMax = if $entry.$StationDemandMax? then $entry.$StationDemandMax else $privateAmount,
+          $CustomerClass = if $entry.$CustomerClass? then $entry.$CustomerClass else 'None',
+          $SupplierSource = if $entry.$SupplierSource? then $entry.$SupplierSource else 'Any',
+          $ClassMultiplier = if $entry.$ClassMultiplier? then $entry.$ClassMultiplier else 1,
+          $BuyStation = if $entry.$BuyStation? then $entry.$BuyStation else null,
+          $SellStation = if $entry.$SellStation? then $entry.$SellStation else null,
+          $SellStationBase = if $entry.$SellStationBase? then $entry.$SellStationBase else null,
+          $BuySector = if $entry.$BuySector? then $entry.$BuySector else null,
+          $SellSector = if $entry.$SellSector? then $entry.$SellSector else null,
+          $SellSectorId = if $entry.$SellSectorId? then $entry.$SellSectorId else null,
+          $Distance = if $entry.$Distance? then $entry.$Distance else 0,
+          $HomeToBuyDistance = if $entry.$HomeToBuyDistance? then $entry.$HomeToBuyDistance else 0,
+          $HomeToSellDistance = if $entry.$HomeToSellDistance? then $entry.$HomeToSellDistance else 0,
+          $RouteDistance = if $entry.$RouteDistance? then $entry.$RouteDistance else 0,
+          $UnitProfit = if $entry.$UnitProfit? then $entry.$UnitProfit else 0,
+          $BuyPrice = if $entry.$BuyPrice? then $entry.$BuyPrice else 0,
+          $SellPrice = if $entry.$SellPrice? then $entry.$SellPrice else 0,
+          $ProfitPerUnit = if $entry.$ProfitPerUnit? then $entry.$ProfitPerUnit else (if $entry.$UnitProfit? then $entry.$UnitProfit else 0),
+          $VolumePerUnit = if $entry.$VolumePerUnit? then $entry.$VolumePerUnit else 0,
+          $Profit = if $entry.$Profit? then $entry.$Profit else 0,
+          $PlayerFreeSupplier = if $entry.$PlayerFreeSupplier? then $entry.$PlayerFreeSupplier else false,
+          $IsSellOnly = if $entry.$IsSellOnly? then $entry.$IsSellOnly else false,
+          $TradeRuleBlocked = if $entry.$TradeRuleBlocked? then $entry.$TradeRuleBlocked else false,
+          $CachedAt = if $entry.$CachedAt? then $entry.$CachedAt else null,
+          $Timestamp = if $entry.$Timestamp? then $entry.$Timestamp else null,
+          $DeliveryStationId = if $entry.$DeliveryStationId? then $entry.$DeliveryStationId else null,
+          $DeliveryStationName = if $entry.$DeliveryStationName? then $entry.$DeliveryStationName else null,
+          $SupplierStationId = if $entry.$SupplierStationId? then $entry.$SupplierStationId else null
+        ]"/>
+        <append_to_list name="$tradeList" exact="$privateEntry"/>
         <set_value name="$foundCount" operation="add"/>
         <do_if value="$quotaWare? and ($quotaDeliveryClass == 'Buildstorage' or $quotaDeliveryClass == 'Stations' or $quotaDeliveryClass == 'Aux')">
           <do_if value="not $foundPerWare.{$quotaWare}?">
@@ -1140,9 +1189,9 @@
             <set_value name="$foundPerWare.{$quotaWare}.$Aux" exact="if $foundPerWare.{$quotaWare}.$Aux? then ($foundPerWare.{$quotaWare}.$Aux + 1) else 1"/>
           </do_elseif>
         </do_if>
-        <do_if value="$entry.$Score gt $bestScore">
-          <set_value name="$bestScore" exact="$entry.$Score"/>
-          <set_value name="$bestTrade" exact="$entry"/>
+        <do_if value="$privateEntry.$Score gt $bestScore">
+          <set_value name="$bestScore" exact="$privateEntry.$Score"/>
+          <set_value name="$bestTrade" exact="$privateEntry"/>
         </do_if>
         <!-- Scan the full MK4-2 pool; per-ship class re-score + searchDepth cap happen in the order script. -->
         <do_if value="($i % 10) == 0">

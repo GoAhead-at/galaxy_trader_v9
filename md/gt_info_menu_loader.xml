@@ -13,11 +13,16 @@
         <set_value name="$result" exact="''"/>
         <!-- MD cannot do modulo/arithmetic on npctemplate; such ids must be pre-split AI-side. Bail gracefully. -->
         <do_if value="$value? and $value != null and typeof $value != datatype.npctemplate">
+          <!-- Treat $value as a raw 64-bit pattern (NPC seeds are often negative when
+               MD prints signed int64). Split to unsigned hi/lo for Lua MapMenu match. -->
           <set_value name="$lo32" exact="$value % 4294967296L"/>
           <do_if value="$lo32 lt 0">
             <set_value name="$lo32" exact="$lo32 + 4294967296L"/>
           </do_if>
           <set_value name="$hi32" exact="(($value - $lo32) / 4294967296L)i"/>
+          <do_if value="$hi32 lt 0">
+            <set_value name="$hi32" exact="$hi32 + 4294967296L"/>
+          </do_if>
           <do_if value="$hi32 ge 0 and $hi32 lt 4294967296L and $lo32 ge 0 and $lo32 lt 4294967296L">
             <set_value name="$result" exact="'u64p:' + $hi32 + ':' + $lo32"/>
           </do_if>
@@ -71,6 +76,41 @@
               <set_value name="$mapCount" operation="add"/>
             </do_if>
           </do_elseif>
+        </do_if>
+        <return value="table[$MapData = $mapData, $MapCount = $mapCount]"/>
+      </actions>
+    </library>
+
+    <!-- Append MapMenu people.{template}.seed wires for a crew entity (demoted GT pilots). -->
+    <library name="Append_PilotIdMap_MapMenu_Seeds_For_Entity_On_Ship" purpose="run_actions">
+      <params>
+        <param name="mapData"/>
+        <param name="mapCount"/>
+        <param name="taggedName"/>
+        <param name="ship" default="null"/>
+        <param name="entity" default="null"/>
+        <param name="crewTemplateHint" default="null"/>
+      </params>
+      <actions>
+        <do_if value="$taggedName != '' and $ship and $ship.exists and $entity and $entity.exists">
+          <run_actions ref="md.GT_Ship_Management.Collect_MapMenu_People_Seeds_For_Entity_On_Ship" result="$menuSeeds">
+            <param name="ship" value="$ship"/>
+            <param name="entity" value="$entity"/>
+            <param name="crewTemplateHint" value="$crewTemplateHint"/>
+          </run_actions>
+          <do_all exact="$menuSeeds.count" counter="$msi">
+            <run_actions ref="LargeInt_U64Wire_ForPilotIdMap" result="$menuSeedWire">
+              <param name="value" value="$menuSeeds.{$msi}"/>
+            </run_actions>
+            <run_actions ref="Append_PilotIdMap_Template_Keys" result="$menuSeedAppend">
+              <param name="mapData" value="$mapData"/>
+              <param name="mapCount" value="$mapCount"/>
+              <param name="taggedName" value="$taggedName"/>
+              <param name="templateWire" value="$menuSeedWire"/>
+            </run_actions>
+            <set_value name="$mapData" exact="$menuSeedAppend.$MapData"/>
+            <set_value name="$mapCount" exact="$menuSeedAppend.$MapCount"/>
+          </do_all>
         </do_if>
         <return value="table[$MapData = $mapData, $MapCount = $mapCount]"/>
       </actions>
@@ -146,6 +186,38 @@
               <set_value name="$mapData" exact="$demotedAppend.$MapData"/>
               <set_value name="$mapCount" exact="$demotedAppend.$MapCount"/>
             </do_if>
+            <do_if value="$pilotRow.$LastDemotedPeopleSeed? and $pilotRow.$LastDemotedPeopleSeed != null">
+              <run_actions ref="LargeInt_U64Wire_ForPilotIdMap" result="$demotedPeopleWire">
+                <param name="value" value="$pilotRow.$LastDemotedPeopleSeed"/>
+              </run_actions>
+              <run_actions ref="Append_PilotIdMap_Template_Keys" result="$demotedPeopleAppend">
+                <param name="mapData" value="$mapData"/>
+                <param name="mapCount" value="$mapCount"/>
+                <param name="taggedName" value="$taggedName"/>
+                <param name="templateWire" value="$demotedPeopleWire"/>
+              </run_actions>
+              <set_value name="$mapData" exact="$demotedPeopleAppend.$MapData"/>
+              <set_value name="$mapCount" exact="$demotedPeopleAppend.$MapCount"/>
+            </do_if>
+            <set_value name="$regShip" exact="null"/>
+            <do_if value="$registryKey.exists? and $registryKey.exists">
+              <do_if value="$pilotRow.$Ship? and $pilotRow.$Ship.exists">
+                <set_value name="$regShip" exact="$pilotRow.$Ship"/>
+              </do_if>
+              <do_elseif value="$pilotRow.$AssociatedShip? and $pilotRow.$AssociatedShip.exists">
+                <set_value name="$regShip" exact="$pilotRow.$AssociatedShip"/>
+              </do_elseif>
+              <run_actions ref="Append_PilotIdMap_MapMenu_Seeds_For_Entity_On_Ship" result="$regMenuAppend">
+                <param name="mapData" value="$mapData"/>
+                <param name="mapCount" value="$mapCount"/>
+                <param name="taggedName" value="$taggedName"/>
+                <param name="ship" value="$regShip"/>
+                <param name="entity" value="$registryKey"/>
+                <param name="crewTemplateHint" value="if $pilotRow.$LastDemotedTemplate? then $pilotRow.$LastDemotedTemplate else $extraTemplateId"/>
+              </run_actions>
+              <set_value name="$mapData" exact="$regMenuAppend.$MapData"/>
+              <set_value name="$mapCount" exact="$regMenuAppend.$MapCount"/>
+            </do_if>
             <do_if value="$mapCount gt 0">
               <raise_lua_event name="'GT_PilotIdMap.Update'" param="$mapData"/>
             </do_if>
@@ -159,10 +231,27 @@
       <params>
         <param name="pilot"/>
         <param name="extraTemplateId" default="null"/>
+        <param name="ship" default="null"/>
+        <param name="crewTemplateHint" default="null"/>
       </params>
       <actions>
         <do_if value="$pilot and $pilot.exists and global.$GT_Pilots? and global.$GT_Pilots.{$pilot}?">
           <set_value name="$pilotRow" exact="global.$GT_Pilots.{$pilot}"/>
+          <set_value name="$assocShip" exact="$ship"/>
+          <do_if value="not $assocShip? or $assocShip == null">
+            <do_if value="$pilotRow.$Ship? and $pilotRow.$Ship.exists">
+              <set_value name="$assocShip" exact="$pilotRow.$Ship"/>
+            </do_if>
+            <do_elseif value="$pilotRow.$AssociatedShip? and $pilotRow.$AssociatedShip.exists">
+              <set_value name="$assocShip" exact="$pilotRow.$AssociatedShip"/>
+            </do_elseif>
+          </do_if>
+          <set_value name="$templateHint" exact="$crewTemplateHint"/>
+          <do_if value="not $templateHint? or $templateHint == null">
+            <do_if value="$pilotRow.$LastDemotedTemplate? and $pilotRow.$LastDemotedTemplate != null">
+              <set_value name="$templateHint" exact="$pilotRow.$LastDemotedTemplate"/>
+            </do_if>
+          </do_if>
           <run_actions ref="md.GT_Ship_Management.Build_PilotIdMap_Tagged_Name" result="$taggedName">
             <param name="registryRow" value="$pilotRow"/>
             <param name="pilotEntity" value="$pilot"/>
@@ -204,6 +293,29 @@
               <set_value name="$mapData" exact="$liveDemotedAppend.$MapData"/>
               <set_value name="$mapCount" exact="$liveDemotedAppend.$MapCount"/>
             </do_if>
+            <do_if value="$pilotRow.$LastDemotedPeopleSeed? and $pilotRow.$LastDemotedPeopleSeed != null">
+              <run_actions ref="LargeInt_U64Wire_ForPilotIdMap" result="$demotedPeopleWire">
+                <param name="value" value="$pilotRow.$LastDemotedPeopleSeed"/>
+              </run_actions>
+              <run_actions ref="Append_PilotIdMap_Template_Keys" result="$demotedPeopleAppend">
+                <param name="mapData" value="$mapData"/>
+                <param name="mapCount" value="$mapCount"/>
+                <param name="taggedName" value="$taggedName"/>
+                <param name="templateWire" value="$demotedPeopleWire"/>
+              </run_actions>
+              <set_value name="$mapData" exact="$demotedPeopleAppend.$MapData"/>
+              <set_value name="$mapCount" exact="$demotedPeopleAppend.$MapCount"/>
+            </do_if>
+            <run_actions ref="Append_PilotIdMap_MapMenu_Seeds_For_Entity_On_Ship" result="$menuSeedAppend">
+              <param name="mapData" value="$mapData"/>
+              <param name="mapCount" value="$mapCount"/>
+              <param name="taggedName" value="$taggedName"/>
+              <param name="ship" value="$assocShip"/>
+              <param name="entity" value="$pilot"/>
+              <param name="crewTemplateHint" value="$templateHint"/>
+            </run_actions>
+            <set_value name="$mapData" exact="$menuSeedAppend.$MapData"/>
+            <set_value name="$mapCount" exact="$menuSeedAppend.$MapCount"/>
             <do_if value="$mapCount gt 0">
               <raise_lua_event name="'GT_PilotIdMap.Update'" param="$mapData"/>
             </do_if>
@@ -271,6 +383,8 @@
       <actions>
         <set_value name="$pilotDataString" exact="''"/>
         <set_value name="$pilotCount" exact="0"/>
+        <!-- Captains already emitted into overview rows (skip when appending paused crew). -->
+        <set_value name="$listedOverviewPilots" exact="table[]"/>
         <!-- Build ID-based map for UI crew highlighting (strict unique pilot id). -->
         <set_value name="$gtPilotIdMapData" exact="''"/>
         <set_value name="$gtPilotIdMapCount" exact="0"/>
@@ -363,12 +477,49 @@
                   <set_value name="$gtPilotIdMapFromPilotIdcode" operation="add"/>
                 </do_if>
                 <do_if value="global.$GT_Pilots.{$pilotObj}.$LastDemotedTemplate? and global.$GT_Pilots.{$pilotObj}.$LastDemotedTemplate != null">
-                  <do_if value="$gtPilotIdMapCount gt 0">
-                    <set_value name="$gtPilotIdMapData" exact="$gtPilotIdMapData + '||'"/>
+                  <run_actions ref="LargeInt_U64Wire_ForPilotIdMap" result="$demotedTplWire0">
+                    <param name="value" value="global.$GT_Pilots.{$pilotObj}.$LastDemotedTemplate"/>
+                  </run_actions>
+                  <do_if value="$demotedTplWire0 != ''">
+                    <do_if value="$gtPilotIdMapCount gt 0">
+                      <set_value name="$gtPilotIdMapData" exact="$gtPilotIdMapData + '||'"/>
+                    </do_if>
+                    <set_value name="$gtPilotIdMapData" exact="$gtPilotIdMapData + $demotedTplWire0 + '|' + $taggedNameToAdd"/>
+                    <set_value name="$gtPilotIdMapCount" operation="add"/>
+                    <set_value name="$gtPilotIdMapFromTemplate" operation="add"/>
                   </do_if>
-                  <set_value name="$gtPilotIdMapData" exact="$gtPilotIdMapData + 's:' + global.$GT_Pilots.{$pilotObj}.$LastDemotedTemplate + '|' + $taggedNameToAdd"/>
-                  <set_value name="$gtPilotIdMapCount" operation="add"/>
-                  <set_value name="$gtPilotIdMapFromTemplate" operation="add"/>
+                </do_if>
+                <do_if value="$pOD0.$LastDemotedPeopleSeed? and $pOD0.$LastDemotedPeopleSeed != null">
+                  <run_actions ref="LargeInt_U64Wire_ForPilotIdMap" result="$demotedPeopleWire0">
+                    <param name="value" value="$pOD0.$LastDemotedPeopleSeed"/>
+                  </run_actions>
+                  <do_if value="$demotedPeopleWire0 != ''">
+                    <do_if value="$gtPilotIdMapCount gt 0">
+                      <set_value name="$gtPilotIdMapData" exact="$gtPilotIdMapData + '||'"/>
+                    </do_if>
+                    <set_value name="$gtPilotIdMapData" exact="$gtPilotIdMapData + $demotedPeopleWire0 + '|' + $taggedNameToAdd"/>
+                    <set_value name="$gtPilotIdMapCount" operation="add"/>
+                    <set_value name="$gtPilotIdMapFromTemplate" operation="add"/>
+                  </do_if>
+                </do_if>
+                <set_value name="$pausedShip0" exact="null"/>
+                <do_if value="$pilotObj.exists? and $pilotObj.exists">
+                  <do_if value="$pOD0.$Ship? and $pOD0.$Ship.exists">
+                    <set_value name="$pausedShip0" exact="$pOD0.$Ship"/>
+                  </do_if>
+                  <do_elseif value="$pOD0.$AssociatedShip? and $pOD0.$AssociatedShip.exists">
+                    <set_value name="$pausedShip0" exact="$pOD0.$AssociatedShip"/>
+                  </do_elseif>
+                  <run_actions ref="Append_PilotIdMap_MapMenu_Seeds_For_Entity_On_Ship" result="$pausedMenuAppend0">
+                    <param name="mapData" value="$gtPilotIdMapData"/>
+                    <param name="mapCount" value="$gtPilotIdMapCount"/>
+                    <param name="taggedName" value="$taggedNameToAdd"/>
+                    <param name="ship" value="$pausedShip0"/>
+                    <param name="entity" value="$pilotObj"/>
+                    <param name="crewTemplateHint" value="if $pOD0.$LastDemotedTemplate? then $pOD0.$LastDemotedTemplate else null"/>
+                  </run_actions>
+                  <set_value name="$gtPilotIdMapData" exact="$pausedMenuAppend0.$MapData"/>
+                  <set_value name="$gtPilotIdMapCount" exact="$pausedMenuAppend0.$MapCount"/>
                 </do_if>
                 <!-- npctemplate is NOT unique across pilots — do not add to PilotIdMap (collisions overwrote per-seed keys). -->
               </do_if>
@@ -447,10 +598,14 @@
                   <param name="registryRow" value="$pilotData"/>
                   <param name="pilotEntity" value="$pilot"/>
                 </run_actions>
-                <set_value name="$pilotName" exact="if $pilot.name? then $pilot.name else 'NONE'"/>
-                <run_actions ref="md.GT_Ship_Management.Normalize_GT_Pilot_Base_Name" result="$pilotName">
-                  <param name="displayName" value="$pilotName"/>
-                </run_actions>
+                <!-- Overview Pilot column: keep (T:Level) tag when renaming is enabled path built it. -->
+                <set_value name="$pilotName" exact="$taggedNameToAdd"/>
+                <do_if value="$pilotName == ''">
+                  <set_value name="$pilotName" exact="if $pilot.name? then $pilot.name else 'NONE'"/>
+                  <run_actions ref="md.GT_Ship_Management.Normalize_GT_Pilot_Base_Name" result="$pilotName">
+                    <param name="displayName" value="$pilotName"/>
+                  </run_actions>
+                </do_if>
 
                 <!-- PilotIdMap: multiple keys per pilot — StableIdentity + raw seed + idcode + template (names are not unique). -->
                 <do_if value="$taggedNameToAdd != ''">
@@ -590,9 +745,129 @@
                 </do_if>
                 <set_value name="$pilotDataString" exact="$pilotDataString + $pilotRecord"/>
                 <set_value name="$pilotCount" operation="add"/>
+                <set_value name="$listedOverviewPilots.{$pilot}" exact="true"/>
               </do_if>
             </do_if>
           </do_all>
+
+          <!-- Demoted / paused / ejected GT pilots are not GT_Ships.$Pilot, so the captain
+               loop above skips them. Append them so personnel overview still shows XP/rank. -->
+          <do_if value="global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
+            <set_value name="$overviewPilotKeys" exact="global.$GT_Pilots.keys.list"/>
+            <do_all exact="$overviewPilotKeys.count" counter="$opi">
+              <set_value name="$ovPilot" exact="$overviewPilotKeys.{$opi}"/>
+              <do_if value="$ovPilot and global.$GT_Pilots.{$ovPilot}? and not $listedOverviewPilots.{$ovPilot}?">
+                <set_value name="$ovRow" exact="global.$GT_Pilots.{$ovPilot}"/>
+                <set_value name="$ovStatus" exact="if $ovRow.$Status? then $ovRow.$Status else ''"/>
+                <do_if value="$ovStatus == 'paused' or $ovStatus == 'ejected'">
+                  <set_value name="$ovShip" exact="null"/>
+                  <do_if value="$ovRow.$Ship? and $ovRow.$Ship.exists">
+                    <set_value name="$ovShip" exact="$ovRow.$Ship"/>
+                  </do_if>
+                  <do_elseif value="$ovRow.$AssociatedShip? and $ovRow.$AssociatedShip.exists">
+                    <set_value name="$ovShip" exact="$ovRow.$AssociatedShip"/>
+                  </do_elseif>
+                  <do_elseif value="$ovRow.$ShipID? and $ovRow.$ShipID != '' and global.$GT_Ships? and global.$GT_Ships.keys.count gt 0">
+                    <do_all exact="global.$GT_Ships.keys.count" counter="$osi">
+                      <set_value name="$ovShipCand" exact="global.$GT_Ships.keys.{$osi}"/>
+                      <do_if value="not $ovShip and $ovShipCand and $ovShipCand.exists and $ovShipCand.idcode? and $ovShipCand.idcode == $ovRow.$ShipID">
+                        <set_value name="$ovShip" exact="$ovShipCand"/>
+                      </do_if>
+                    </do_all>
+                  </do_elseif>
+
+                  <set_value name="$ovPilotName" exact="''"/>
+                  <run_actions ref="md.GT_Ship_Management.Build_PilotIdMap_Tagged_Name" result="$ovPilotName">
+                    <param name="registryRow" value="$ovRow"/>
+                    <param name="pilotEntity" value="$ovPilot"/>
+                  </run_actions>
+                  <do_if value="$ovPilotName == ''">
+                    <do_if value="$ovRow.$OriginalPilotName? and $ovRow.$OriginalPilotName != ''">
+                      <set_value name="$ovPilotName" exact="$ovRow.$OriginalPilotName"/>
+                    </do_if>
+                    <do_elseif value="$ovRow.$PilotName? and $ovRow.$PilotName != ''">
+                      <set_value name="$ovPilotName" exact="$ovRow.$PilotName"/>
+                    </do_elseif>
+                    <do_elseif value="$ovPilot.exists? and $ovPilot.exists and $ovPilot.name?">
+                      <set_value name="$ovPilotName" exact="$ovPilot.name"/>
+                    </do_elseif>
+                    <run_actions ref="md.GT_Ship_Management.Normalize_GT_Pilot_Base_Name" result="$ovPilotName">
+                      <param name="displayName" value="$ovPilotName"/>
+                    </run_actions>
+                  </do_if>
+
+                  <do_if value="$ovPilotName != ''">
+                    <set_value name="$ovLevel" exact="if $ovRow.$Level? and $ovRow.$Level != null then $ovRow.$Level else 1"/>
+                    <set_value name="$ovXP" exact="if $ovRow.$XP? and $ovRow.$XP != null then $ovRow.$XP else 0"/>
+                    <set_value name="$ovRankIndex" exact="($ovLevel / 3)i + 1"/>
+                    <do_if value="global.$GT_Config? and global.$GT_Config.$XP? and global.$GT_Config.$XP.$TraderTitles?">
+                      <do_if value="$ovRankIndex gt global.$GT_Config.$XP.$TraderTitles.keys.count">
+                        <set_value name="$ovRankIndex" exact="global.$GT_Config.$XP.$TraderTitles.keys.count"/>
+                      </do_if>
+                      <set_value name="$ovRankTitle" exact="global.$GT_Config.$XP.$TraderTitles.{$ovRankIndex}"/>
+                    </do_if>
+                    <do_else>
+                      <set_value name="$ovRankTitle" exact="'Lehrling'"/>
+                    </do_else>
+                    <set_value name="$ovXpToNext" exact="1000"/>
+                    <do_if value="global.$GT_Config? and global.$GT_Config.$XP? and global.$GT_Config.$XP.$SkillThresholds?">
+                      <do_if value="$ovLevel lt 15 and global.$GT_Config.$XP.$SkillThresholds.{$ovLevel + 1}?">
+                        <set_value name="$ovXpToNext" exact="global.$GT_Config.$XP.$SkillThresholds.{$ovLevel + 1}"/>
+                      </do_if>
+                    </do_if>
+                    <set_value name="$ovPilotProfit" exact="if $ovRow.$TotalProfit? then $ovRow.$TotalProfit else 0"/>
+                    <set_value name="$ovTradeCount" exact="if $ovRow.$TotalTrades? then $ovRow.$TotalTrades else 0"/>
+                    <set_value name="$ovBlockedLevel" exact="if $ovRow.$BlockedLevel? then $ovRow.$BlockedLevel else 0"/>
+                    <set_value name="$ovShipProfit" exact="0"/>
+                    <set_value name="$ovShipId" exact="if $ovRow.$ShipID? and $ovRow.$ShipID != '' then $ovRow.$ShipID else '---'"/>
+                    <set_value name="$ovShipName" exact="'Off ship'"/>
+                    <set_value name="$ovSectorName" exact="'Unknown'"/>
+                    <do_if value="$ovShip and $ovShip.exists">
+                      <set_value name="$ovShipId" exact="$ovShip.idcode"/>
+                      <set_value name="$ovShipName" exact="if $ovShip.knownname? then $ovShip.knownname else $ovShipId"/>
+                      <do_if value="$ovShip.sector? and $ovShip.sector.knownname?">
+                        <set_value name="$ovSectorName" exact="$ovShip.sector.knownname"/>
+                      </do_if>
+                      <do_if value="global.$GT_Ships.{$ovShip}? and global.$GT_Ships.{$ovShip}.$TotalProfit?">
+                        <set_value name="$ovShipProfit" exact="global.$GT_Ships.{$ovShip}.$TotalProfit"/>
+                      </do_if>
+                    </do_if>
+                    <!-- Status only: role on ship. Pilot name already carries (T:Level). -->
+                    <set_value name="$ovStatusString" exact="'[CREW]'"/>
+                    <do_if value="$ovStatus == 'ejected'">
+                      <set_value name="$ovStatusString" exact="'[EJECTED]'"/>
+                    </do_if>
+                    <do_elseif value="not $ovShip or not $ovShip.exists">
+                      <set_value name="$ovStatusString" exact="'[PAUSED]'"/>
+                    </do_elseif>
+
+                    <set_value name="$ovPilotRecord" exact="
+                      $ovShipId + '|' +
+                      $ovPilotName + '|' +
+                      $ovShipName + '|' +
+                      $ovStatusString + '|' +
+                      $ovRankTitle + '|' +
+                      $ovRankIndex + '|' +
+                      $ovLevel + '|' +
+                      $ovXP + '|' +
+                      $ovXpToNext + '|' +
+                      $ovPilotProfit + '|' +
+                      $ovShipProfit + '|' +
+                      $ovSectorName + '|' +
+                      $ovTradeCount + '|' +
+                      $ovBlockedLevel
+                    "/>
+                    <do_if value="$pilotCount gt 0">
+                      <set_value name="$pilotDataString" exact="$pilotDataString + '||'"/>
+                    </do_if>
+                    <set_value name="$pilotDataString" exact="$pilotDataString + $ovPilotRecord"/>
+                    <set_value name="$pilotCount" operation="add"/>
+                    <set_value name="$listedOverviewPilots.{$ovPilot}" exact="true"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_if>
         
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT Info Menu] Sending data for ' + $pilotCount + ' pilots to Lua UI'" chance="100"/>
@@ -682,6 +957,38 @@
                   <set_value name="$gtPilotIdMapCount" operation="add"/>
                   <set_value name="$gtPilotIdMapFromTemplate" operation="add"/>
                 </do_if>
+              </do_if>
+              <do_if value="$pOD.$LastDemotedPeopleSeed? and $pOD.$LastDemotedPeopleSeed != null">
+                <run_actions ref="LargeInt_U64Wire_ForPilotIdMap" result="$demotedPeopleWire">
+                  <param name="value" value="$pOD.$LastDemotedPeopleSeed"/>
+                </run_actions>
+                <do_if value="$demotedPeopleWire != ''">
+                  <do_if value="$gtPilotIdMapCount gt 0">
+                    <set_value name="$gtPilotIdMapData" exact="$gtPilotIdMapData + '||'"/>
+                  </do_if>
+                  <set_value name="$gtPilotIdMapData" exact="$gtPilotIdMapData + $demotedPeopleWire + '|' + $taggedNameToAdd"/>
+                  <set_value name="$gtPilotIdMapCount" operation="add"/>
+                  <set_value name="$gtPilotIdMapFromTemplate" operation="add"/>
+                </do_if>
+              </do_if>
+              <set_value name="$pausedShip" exact="null"/>
+              <do_if value="$pilotObj.exists? and $pilotObj.exists">
+                <do_if value="$pOD.$Ship? and $pOD.$Ship.exists">
+                  <set_value name="$pausedShip" exact="$pOD.$Ship"/>
+                </do_if>
+                <do_elseif value="$pOD.$AssociatedShip? and $pOD.$AssociatedShip.exists">
+                  <set_value name="$pausedShip" exact="$pOD.$AssociatedShip"/>
+                </do_elseif>
+                <run_actions ref="Append_PilotIdMap_MapMenu_Seeds_For_Entity_On_Ship" result="$pausedMenuAppend">
+                  <param name="mapData" value="$gtPilotIdMapData"/>
+                  <param name="mapCount" value="$gtPilotIdMapCount"/>
+                  <param name="taggedName" value="$taggedNameToAdd"/>
+                  <param name="ship" value="$pausedShip"/>
+                  <param name="entity" value="$pilotObj"/>
+                  <param name="crewTemplateHint" value="if $pOD.$LastDemotedTemplate? then $pOD.$LastDemotedTemplate else null"/>
+                </run_actions>
+                <set_value name="$gtPilotIdMapData" exact="$pausedMenuAppend.$MapData"/>
+                <set_value name="$gtPilotIdMapCount" exact="$pausedMenuAppend.$MapCount"/>
               </do_if>
               <do_if value="$pOD.$LastSarCrewTemplate? and $pOD.$LastSarCrewTemplate != null">
                 <set_value name="$sarTplWire" exact="if $pOD.$LastSarCrewTemplateWire? and $pOD.$LastSarCrewTemplateWire != '' then $pOD.$LastSarCrewTemplateWire else ''"/>

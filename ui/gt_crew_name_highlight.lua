@@ -2,6 +2,7 @@
 --
 -- Colors crew list names in MapMenu when the person belongs to GT pilot registry.
 -- Matching: PilotIdMap keys only — seed / StableIdentity / idcode, plus int64 aliases from gt_pilot_data_bridge (NPCSeed uint64).
+-- No gtNameMap / display-name fallback (pilot names are not unique across the universe).
 -- This is UI-only and does not modify vanilla/MD name fields.
 
 local DEBUG_RECOLOR = false
@@ -184,22 +185,6 @@ local function installCrewHighlightHook()
                 elseif personRefKeyNormalized and gtPilotIdMap[personRefKeyNormalized] and gtPilotIdMap[personRefKeyNormalized] ~= "" then
                     taggedName = gtPilotIdMap[personRefKeyNormalized]
                     matchedKey = personRefKeyNormalized
-                end
-
-                if (not taggedName or taggedName == "") and personentry and personentry.name and personentry.name ~= "" then
-                    local getNameMap = bridge and bridge.getGTNameMap
-                    local nameMap = getNameMap and getNameMap() or nil
-                    if nameMap then
-                        local uiName = tostring(personentry.name):gsub("\27%w?", "")
-                        uiName = uiName:gsub("^%(T:%d+%)%s*", "")
-                        uiName = uiName:gsub("^%s+", ""):gsub("%s+$", "")
-                        local norm = string.lower(uiName)
-                        local byName = nameMap[norm]
-                        if byName and byName ~= "" then
-                            taggedName = byName
-                            matchedKey = "name:" .. norm
-                        end
-                    end
                 end
 
                 if taggedName and taggedName ~= "" then

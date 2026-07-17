@@ -28,6 +28,8 @@ ffi.cdef[[
     const char* GetComponentName(uint64_t componentid);
     uint64_t ConvertStringTo64Bit(const char* idcode);
     const char* ConvertIDToString(uint64_t componentid);
+    long long strtoll(const char* nptr, char** endptr, int base);
+    unsigned long long strtoull(const char* nptr, char** endptr, int base);
 ]]
 
 -- =============================================================================
@@ -141,6 +143,31 @@ local function u64DecimalStringFromHiLo(hiStr, loStr)
     return tostring(u)
 end
 
+-- Parse a decimal int64/uint64 string without going through Lua double ( >2^53 safe).
+-- ffi.new("int64_t", string) fails / corrupts for high-bit seeds such as Ganatos's
+-- MapMenu key 14524711178825386684ULL <-> MD StableIdentity s:-3922032894884164932.
+local function parseDecimalToInt64Pair(body)
+    if not body or body == "" or not body:match("^%-?%d+$") then
+        return nil, nil
+    end
+    local ok, u64, i64 = pcall(function()
+        if body:sub(1, 1) == "-" then
+            local i = ffi.C.strtoll(body, nil, 10)
+            local ic = ffi.typeof("int64_t")(i)
+            local uc = ffi.cast("uint64_t", ic)
+            return uc, ic
+        end
+        local u = ffi.C.strtoull(body, nil, 10)
+        local uc = ffi.typeof("uint64_t")(u)
+        local ic = ffi.cast("int64_t", uc)
+        return uc, ic
+    end)
+    if not ok or u64 == nil or i64 == nil then
+        return nil, nil
+    end
+    return u64, i64
+end
+
 -- Prefer engine uint64 (cdata); tostring(NPCSeed) alone can disagree with map keys for some builds.
 local function npcSeedToCanonicalDecimalString(person)
     if person == nil then
@@ -160,10 +187,11 @@ local function npcSeedToCanonicalDecimalString(person)
         return nil
     end
     local ok2, dec = pcall(function()
-        if s:sub(1, 1) == "-" then
-            return tostring(ffi.cast("uint64_t", ffi.new("int64_t", s)))
+        local u64 = select(1, parseDecimalToInt64Pair(s))
+        if u64 then
+            return tostring(u64)
         end
-        return tostring(ffi.new("uint64_t", s))
+        return nil
     end)
     if ok2 then
         return normalizeUniquePilotKey(dec)
@@ -194,18 +222,8 @@ local function collectPilotIdAliasKeys(keyRaw)
         return out
     end
 
-    local ok, u64, i64 = pcall(function()
-        if body:sub(1, 1) == "-" then
-            local i = ffi.new("int64_t", body)
-            local u = ffi.cast("uint64_t", i)
-            return u, i
-        else
-            local u = ffi.new("uint64_t", body)
-            local i = ffi.cast("int64_t", u)
-            return u, i
-        end
-    end)
-    if not ok or not u64 or not i64 then
+    local u64, i64 = parseDecimalToInt64Pair(body)
+    if not u64 or not i64 then
         return out
     end
 

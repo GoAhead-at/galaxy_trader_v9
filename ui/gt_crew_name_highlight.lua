@@ -1,8 +1,8 @@
 -- GalaxyTrader - Crew Name Highlight Override
 --
 -- Colors crew list names in MapMenu when the person belongs to GT pilot registry.
--- Matching: PilotIdMap keys only — seed / StableIdentity / idcode, plus int64 aliases from gt_pilot_data_bridge (NPCSeed uint64).
--- No gtNameMap / display-name fallback (pilot names are not unique across the universe).
+-- Matching: PilotIdMap keys only - seed / StableIdentity, plus int64 aliases from gt_pilot_data_bridge (NPCSeed uint64).
+-- No display-name fallback (pilot names are not unique across the universe).
 -- This is UI-only and does not modify vanilla/MD name fields.
 
 local DEBUG_RECOLOR = false
@@ -47,11 +47,6 @@ local function isCrewHighlightEnabledBySettings()
     return bridge.settings.pilotRenamingEnabled == true
 end
 
-local function getPersonIdCode(person)
-    -- personentry.person in MapMenu is an NPCSeed, not a component.
-    -- Calling GetComponentData(person, "idcode") causes runtime errors.
-    return nil
-end
 
 local function getPersonRefKey(person)
     if not person then
@@ -167,16 +162,12 @@ local function installCrewHighlightHook()
                 missingPersonRef = missingPersonRef + 1
                 logRecolor("pass=" .. tostring(passId) .. " row=" .. tostring(checked) .. " missing person reference; uiName='" .. tostring(personentry and personentry.name) .. "'")
             else
-                local pilotId = getPersonIdCode(personRef)
                 local personRefKey = getPersonRefKey(personRef)
                 local personRefKeyNormalized = normalizeUniquePilotKey(personRefKey)
                 local taggedName = nil
                 local matchedKey = nil
 
-                if pilotId and gtPilotIdMap[pilotId] and gtPilotIdMap[pilotId] ~= "" then
-                    taggedName = gtPilotIdMap[pilotId]
-                    matchedKey = pilotId
-                elseif lookupTagged then
+                if lookupTagged then
                     taggedName, matchedKey = lookupTagged(gtPilotIdMap, personRef)
                 elseif personRefKey and gtPilotIdMap[personRefKey] and gtPilotIdMap[personRefKey] ~= "" then
                     -- Legacy fallback path if bridge helper is unavailable.
@@ -194,19 +185,15 @@ local function installCrewHighlightHook()
                         "pass=" .. tostring(passId) ..
                         " row=" .. tostring(checked) ..
                         " match key=" .. tostring(matchedKey) ..
-                        " idcode=" .. tostring(pilotId) ..
                         " personRef=" .. tostring(personRefKey) ..
                         " personRefNormalized=" .. tostring(personRefKeyNormalized) ..
                         " tagged='" .. tostring(taggedName) .. "'"
                     )
-                elseif (not pilotId) and (not personRefKey) then
+                elseif not personRefKey then
                     missingPilotId = missingPilotId + 1
-                    logRecolor("pass=" .. tostring(passId) .. " row=" .. tostring(checked) .. " no idcode for person=" .. tostring(personRef) .. " uiName='" .. tostring(personentry and personentry.name) .. "'")
+                    logRecolor("pass=" .. tostring(passId) .. " row=" .. tostring(checked) .. " no person ref for uiName='" .. tostring(personentry and personentry.name) .. "'")
                 else
-                    if pilotId and gtPilotIdMap[pilotId] ~= nil and gtPilotIdMap[pilotId] == "" then
-                        missingTaggedName = missingTaggedName + 1
-                        DebugError("[GT Crew Highlight] pass=" .. tostring(passId) .. " row=" .. tostring(checked) .. " idcode key in map but tagged name empty: " .. tostring(pilotId))
-                    elseif personRefKey and gtPilotIdMap[personRefKey] ~= nil and gtPilotIdMap[personRefKey] == "" then
+                    if personRefKey and gtPilotIdMap[personRefKey] ~= nil and gtPilotIdMap[personRefKey] == "" then
                         missingTaggedName = missingTaggedName + 1
                         DebugError("[GT Crew Highlight] pass=" .. tostring(passId) .. " row=" .. tostring(checked) .. " personRef key in map but tagged name empty: " .. tostring(personRefKey))
                     elseif personRefKeyNormalized and gtPilotIdMap[personRefKeyNormalized] ~= nil and gtPilotIdMap[personRefKeyNormalized] == "" then
@@ -217,8 +204,7 @@ local function installCrewHighlightHook()
                         logRecolor(
                             "pass=" .. tostring(passId) ..
                             " row=" .. tostring(checked) ..
-                            " no map entry idcode=" .. tostring(pilotId) ..
-                            " personRef=" .. tostring(personRefKey) ..
+                            " no map entry personRef=" .. tostring(personRefKey) ..
                             " personRefNormalized=" .. tostring(personRefKeyNormalized) ..
                             " uiName='" .. tostring(personentry and personentry.name) .. "'"
                         )

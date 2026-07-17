@@ -52,9 +52,7 @@ local GT_PilotData = {
     
     -- Pilot data storage (received from MD)
     pilots = {},  -- Array of pilot info tables
-    gtNameIndex = {},  -- Set of normalized GT pilot names (includes paused pilots)
-    gtNameMap = {},  -- normalized base name -> tagged display name
-    gtPilotIdMap = {},  -- pilot idcode -> tagged display name
+    gtPilotIdMap = {},  -- seed / StableIdentity -> tagged display name
     lastUpdate = 0,
     initialized = false,
 }
@@ -89,19 +87,6 @@ local function formatMoney(amount)
     end
 end
 
-local function normalizePilotName(name)
-    if not name then
-        return ""
-    end
-
-    local normalized = tostring(name)
-    -- Strip GT training prefix for matching against vanilla UI names.
-    normalized = normalized:gsub("^%(T:%d+%)%s*", "")
-    -- Trim whitespace.
-    normalized = normalized:gsub("^%s+", ""):gsub("%s+$", "")
-    normalized = string.lower(normalized)
-    return normalized
-end
 
 local function normalizeUniquePilotKey(key)
     if key == nil then
@@ -417,56 +402,7 @@ local function onReceivePilotData(_, param)
     end
 end
 
--- Receive GT name index from MD
--- Expected format: "Name1||Name2||Name3"
-local function onReceivePilotNameIndex(_, param)
-    local index = {}
-    local entryCount = 0
 
-    if param and param ~= "" then
-        for nameStr in string.gmatch(param .. "||", "(.-)||") do
-            if nameStr ~= "" then
-                local normalized = normalizePilotName(nameStr)
-                if normalized ~= "" then
-                    if not index[normalized] then
-                        entryCount = entryCount + 1
-                    end
-                    index[normalized] = true
-                end
-            end
-        end
-    end
-
-    GT_PilotData.gtNameIndex = index
-    debugLog(string.format("Updated GT name index with %d entries", entryCount))
-end
-
--- Receive GT name -> tagged-name map from MD
--- Expected format: "Base Name|Tagged Name||Base2|Tagged2"
-local function onReceivePilotNameMap(_, param)
-    local nameMap = {}
-    local entryCount = 0
-
-    if param and param ~= "" then
-        for mapStr in string.gmatch(param .. "||", "(.-)||") do
-            if mapStr ~= "" then
-                local baseName, taggedName = string.match(mapStr, "^(.-)|(.*)$")
-                if baseName and taggedName and baseName ~= "" and taggedName ~= "" then
-                    local normalized = normalizePilotName(baseName)
-                    if normalized ~= "" then
-                        if not nameMap[normalized] then
-                            entryCount = entryCount + 1
-                        end
-                        nameMap[normalized] = taggedName
-                    end
-                end
-            end
-        end
-    end
-
-    GT_PilotData.gtNameMap = nameMap
-    debugLog(string.format("Updated GT name map with %d entries", entryCount))
-end
 
 -- Receive GT pilot-id -> tagged-name map from MD
 -- Expected format: "u64p:hi:lo|Tagged Name||..." or "__CLEAR__|" to wipe.
@@ -533,7 +469,6 @@ local function onReceivePilotIdMap(_, param)
     end
 
     GT_PilotData.gtPilotIdMap = idMap
-    GT_PilotData.gtNameMap = {}
     DebugError(string.format(
         "[GT Pilot Bridge] PilotIdMap replaced: incomingLogical=%d totalKeys=%d malformed=%d wireU64=%d decodedU64=%d decodeFail=%d aliasAdds=%d raw_len=%d sampleKeys=[%s]",
         entryCount,
@@ -685,13 +620,6 @@ function GT_PilotData.requestRefresh()
     AddUITriggeredEvent("gt_pilot_data_bridge", "RequestPilotData", 1)
 end
 
-function GT_PilotData.getGTNameIndex()
-    return GT_PilotData.gtNameIndex or {}
-end
-
-function GT_PilotData.getGTNameMap()
-    return GT_PilotData.gtNameMap or {}
-end
 
 function GT_PilotData.getGTPilotIdMap()
     return GT_PilotData.gtPilotIdMap or {}
@@ -706,12 +634,10 @@ local function init()
     
     -- Register event listener for pilot data from MD
     RegisterEvent("GT_PilotData.Update", onReceivePilotData)
-    RegisterEvent("GT_PilotNameIndex.Update", onReceivePilotNameIndex)
-    RegisterEvent("GT_PilotNameMap.Update", onReceivePilotNameMap)
     RegisterEvent("GT_PilotIdMap.Update", onReceivePilotIdMap)
     
     debugLog("GT Pilot Data Bridge initialized - waiting for data from MD")
-    -- Prime data once so MapMenu hooks have index data immediately.
+    -- Prime data once so MapMenu hooks have PilotIdMap immediately.
     GT_PilotData.requestRefresh()
 end
 

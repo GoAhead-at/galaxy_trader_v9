@@ -26,8 +26,18 @@ local function resolveMapMenu()
     return nil
 end
 
-local function logRecolor(message)
+local function isPilotDebugLoggingEnabled()
     if DEBUG_RECOLOR then
+        return true
+    end
+    if _G.GT_PlayerBridge and GT_PlayerBridge.IsDebugLoggingEnabled then
+        return GT_PlayerBridge.IsDebugLoggingEnabled()
+    end
+    return false
+end
+
+local function logRecolor(message)
+    if isPilotDebugLoggingEnabled() then
         DebugError("[GT Crew Highlight] " .. tostring(message))
     end
 end
@@ -93,7 +103,7 @@ local function installCrewHighlightHook()
     if not menu then
         if not missingMenuLogged then
             missingMenuLogged = true
-            DebugError("[GT Crew Highlight] MapMenu not found - deferring crew highlight hook")
+            logRecolor("MapMenu not found - deferring crew highlight hook")
         end
         return
     end
@@ -105,7 +115,7 @@ local function installCrewHighlightHook()
         -- Another script / reload replaced the function after we hooked it.
         menu.__gtCrewHighlightHookInstalled = nil
         menu.__gtCrewHighlightWrappedCombine = nil
-        DebugError("[GT Crew Highlight] Detected combine hook replacement - reinstalling")
+        logRecolor("Detected combine hook replacement - reinstalling")
     end
 
     if menu.__gtCrewHighlightHookInstalled then
@@ -114,7 +124,7 @@ local function installCrewHighlightHook()
 
     local orig_infoSubmenuCombineCrewTables = menu.infoSubmenuCombineCrewTables
     if type(orig_infoSubmenuCombineCrewTables) ~= "function" then
-        DebugError("[GT Crew Highlight] infoSubmenuCombineCrewTables not found - deferring crew highlight hook")
+        logRecolor("infoSubmenuCombineCrewTables not found - deferring crew highlight hook")
         return
     end
 
@@ -137,7 +147,7 @@ local function installCrewHighlightHook()
         local passId = recolorPassCounter
 
         if not next(gtPilotIdMap) then
-            DebugError("[GT Crew Highlight] pass=" .. tostring(passId) .. " skip: GT pilot-id map empty")
+            logRecolor("pass=" .. tostring(passId) .. " skip: GT pilot-id map empty")
             requestGTRefreshIfNeeded("empty_pilot_id_map")
             return result
         end
@@ -195,10 +205,10 @@ local function installCrewHighlightHook()
                 else
                     if personRefKey and gtPilotIdMap[personRefKey] ~= nil and gtPilotIdMap[personRefKey] == "" then
                         missingTaggedName = missingTaggedName + 1
-                        DebugError("[GT Crew Highlight] pass=" .. tostring(passId) .. " row=" .. tostring(checked) .. " personRef key in map but tagged name empty: " .. tostring(personRefKey))
+                        logRecolor("pass=" .. tostring(passId) .. " row=" .. tostring(checked) .. " personRef key in map but tagged name empty: " .. tostring(personRefKey))
                     elseif personRefKeyNormalized and gtPilotIdMap[personRefKeyNormalized] ~= nil and gtPilotIdMap[personRefKeyNormalized] == "" then
                         missingTaggedName = missingTaggedName + 1
-                        DebugError("[GT Crew Highlight] pass=" .. tostring(passId) .. " row=" .. tostring(checked) .. " normalized personRef key in map but tagged name empty: " .. tostring(personRefKeyNormalized))
+                        logRecolor("pass=" .. tostring(passId) .. " row=" .. tostring(checked) .. " normalized personRef key in map but tagged name empty: " .. tostring(personRefKeyNormalized))
                     else
                         noMapEntry = noMapEntry + 1
                         logRecolor(
@@ -223,8 +233,8 @@ local function installCrewHighlightHook()
             end
         end
 
-        DebugError(
-            "[GT Crew Highlight] pass=" .. tostring(passId) ..
+        logRecolor(
+            "pass=" .. tostring(passId) ..
             " complete checked=" .. tostring(checked) ..
             " matched=" .. tostring(matched) ..
             " missingPersonRef=" .. tostring(missingPersonRef) ..
@@ -235,7 +245,7 @@ local function installCrewHighlightHook()
         )
 
         if matched == 0 and checked > 0 then
-            DebugError("[GT Crew Highlight] pass=" .. tostring(passId) .. " WARNING: zero matches in crew table; requesting refresh for diagnostics")
+            logRecolor("pass=" .. tostring(passId) .. " WARNING: zero matches in crew table; requesting refresh for diagnostics")
             requestGTRefreshIfNeeded("zero_matches")
         end
 
@@ -245,7 +255,7 @@ local function installCrewHighlightHook()
 
     menu.__gtCrewHighlightHookInstalled = true
     menu.__gtCrewHighlightWrappedCombine = wrappedCombine
-    DebugError("[GT Crew Highlight] MapMenu crew name highlight hook installed (strict pilot-id mode)")
+    logRecolor("MapMenu crew name highlight hook installed (strict pilot-id mode)")
 end
 
 local function installCrewHighlightUpdateGuard()
@@ -266,7 +276,7 @@ local function installCrewHighlightUpdateGuard()
         return originalUpdate(...)
     end
     menu.__gtCrewHighlightUpdateGuardInstalled = true
-    DebugError("[GT Crew Highlight] MapMenu update guard installed")
+    logRecolor("MapMenu update guard installed")
 end
 
 installCrewHighlightHook()

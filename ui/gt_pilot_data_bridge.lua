@@ -62,7 +62,11 @@ local GT_PilotData = {
 -- =============================================================================
 
 local function debugLog(message)
-    if GT_PilotData.CONFIG.DEBUG_MODE then
+    local enabled = GT_PilotData.CONFIG.DEBUG_MODE
+    if not enabled and _G.GT_PlayerBridge and GT_PlayerBridge.IsDebugLoggingEnabled then
+        enabled = GT_PlayerBridge.IsDebugLoggingEnabled()
+    end
+    if enabled then
         DebugError("[GT Pilot Bridge] " .. tostring(message))
     end
 end
@@ -469,8 +473,8 @@ local function onReceivePilotIdMap(_, param)
     end
 
     GT_PilotData.gtPilotIdMap = idMap
-    DebugError(string.format(
-        "[GT Pilot Bridge] PilotIdMap replaced: incomingLogical=%d totalKeys=%d malformed=%d wireU64=%d decodedU64=%d decodeFail=%d aliasAdds=%d raw_len=%d sampleKeys=[%s]",
+    debugLog(string.format(
+        "PilotIdMap replaced: incomingLogical=%d totalKeys=%d malformed=%d wireU64=%d decodedU64=%d decodeFail=%d aliasAdds=%d raw_len=%d sampleKeys=[%s]",
         entryCount,
         totalKeys,
         malformedCount,
@@ -482,10 +486,10 @@ local function onReceivePilotIdMap(_, param)
         table.concat(sampleKeys, ", ")
     ))
     if malformedCount > 0 then
-        DebugError(string.format("[GT Pilot Bridge] WARNING: Received malformed PilotIdMap entries: %d", malformedCount))
+        debugLog(string.format("WARNING: Received malformed PilotIdMap entries: %d", malformedCount))
     end
     if u64DecodeFailed > 0 then
-        DebugError(string.format("[GT Pilot Bridge] WARNING: u64p decode failed for %d entries (wire=%d decoded=%d)", u64DecodeFailed, u64WireCount, u64DecodedCount))
+        debugLog(string.format("WARNING: u64p decode failed for %d entries (wire=%d decoded=%d)", u64DecodeFailed, u64WireCount, u64DecodedCount))
     end
 end
 
@@ -587,8 +591,8 @@ function GT_PilotData.diagnosePilotIdMapMiss(idMap, person, label)
             table.insert(samples, tostring(key) .. "=>" .. vs)
         end
     end
-    DebugError(string.format(
-        "[GT Pilot Bridge] lookup miss %s type=%s tostring=%s canonicalFFI=%s sampleKeys=[%s]",
+    debugLog(string.format(
+        "lookup miss %s type=%s tostring=%s canonicalFFI=%s sampleKeys=[%s]",
         tostring(label or ""),
         type(person),
         tostring(person),

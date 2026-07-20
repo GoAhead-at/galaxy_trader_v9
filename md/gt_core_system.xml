@@ -332,100 +332,175 @@
     </cue>
     
     <!-- Delayed commander GT reactivation:
-         re-registers subordinates and restarts Assist inheritance when commander gains GT. -->
+         re-registers subordinates and restarts Assist inheritance when commander gains GT.
+         First/settle entry uses 1s delay; CPU yield chunks use ProcessCommanderGTReactivationYield (10ms). -->
     <cue name="ProcessCommanderGTReactivation" instantiate="true">
       <conditions>
         <event_cue_signalled cue="md.GT_CoreSystem.ProcessCommanderGTReactivation"/>
       </conditions>
       <delay exact="1s"/>
       <actions>
-        <set_value name="$commander" exact="event.param.$Commander"/>
-        <set_value name="$attempt" exact="1"/>
+        <set_value name="$reactCommander" exact="event.param.$Commander"/>
+        <set_value name="$reactAttempt" exact="1"/>
         <do_if value="event.param.$Attempt?">
-          <set_value name="$attempt" exact="event.param.$Attempt"/>
+          <set_value name="$reactAttempt" exact="event.param.$Attempt"/>
         </do_if>
-        
+        <set_value name="$reactPending" exact="null"/>
+        <do_if value="event.param.$PendingSubs?">
+          <set_value name="$reactPending" exact="event.param.$PendingSubs"/>
+        </do_if>
+        <set_value name="$reactUnresolved" exact="null"/>
+        <do_if value="event.param.$UnresolvedAccum?">
+          <set_value name="$reactUnresolved" exact="event.param.$UnresolvedAccum"/>
+        </do_if>
+        <run_actions ref="md.GT_CoreSystem.RunCommanderGTReactivationPass">
+          <param name="commander" value="$reactCommander"/>
+          <param name="attempt" value="$reactAttempt"/>
+          <param name="pendingSubs" value="$reactPending"/>
+          <param name="unresolvedAccum" value="$reactUnresolved"/>
+        </run_actions>
+      </actions>
+    </cue>
+
+    <!-- 10ms CPU yield between subordinate reactivation chunks (Assist restart is expensive). -->
+    <cue name="ProcessCommanderGTReactivationYield" instantiate="true">
+      <conditions>
+        <event_cue_signalled cue="md.GT_CoreSystem.ProcessCommanderGTReactivationYield"/>
+      </conditions>
+      <delay exact="10ms"/>
+      <actions>
+        <set_value name="$reactCommander" exact="event.param.$Commander"/>
+        <set_value name="$reactAttempt" exact="1"/>
+        <do_if value="event.param.$Attempt?">
+          <set_value name="$reactAttempt" exact="event.param.$Attempt"/>
+        </do_if>
+        <set_value name="$reactPending" exact="null"/>
+        <do_if value="event.param.$PendingSubs?">
+          <set_value name="$reactPending" exact="event.param.$PendingSubs"/>
+        </do_if>
+        <set_value name="$reactUnresolved" exact="null"/>
+        <do_if value="event.param.$UnresolvedAccum?">
+          <set_value name="$reactUnresolved" exact="event.param.$UnresolvedAccum"/>
+        </do_if>
+        <run_actions ref="md.GT_CoreSystem.RunCommanderGTReactivationPass">
+          <param name="commander" value="$reactCommander"/>
+          <param name="attempt" value="$reactAttempt"/>
+          <param name="pendingSubs" value="$reactPending"/>
+          <param name="unresolvedAccum" value="$reactUnresolved"/>
+        </run_actions>
+      </actions>
+    </cue>
+
+    <!-- One subordinate per pass, then 10ms yield-continue until the work list is empty.
+         Settle retries (attempt+1) still use the 1s cue. Explicit stop: empty work + attempt ge 5. -->
+    <library name="RunCommanderGTReactivationPass" purpose="run_actions">
+      <params>
+        <param name="commander"/>
+        <param name="attempt" default="1"/>
+        <param name="pendingSubs" default="null"/>
+        <param name="unresolvedAccum" default="null"/>
+      </params>
+      <actions>
         <do_if value="$commander? and $commander.exists and $commander.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$commander.defaultorder.id})">
           <set_value name="$reactivatedSubs" exact="0"/>
           <set_value name="$lightRefreshedSubs" exact="0"/>
           <set_value name="$fullRefreshedSubs" exact="0"/>
           <set_value name="$assistNudgedSubs" exact="0"/>
+          <set_value name="$assistSkippedSubs" exact="0"/>
           <set_value name="$unresolvedSubs" exact="[]"/>
           <set_value name="$sourceMode" exact="'all'"/>
           <set_value name="$subordinates" exact="[]"/>
           <set_value name="$retryAll" exact="false"/>
-          
-          <!-- Prefer unresolved subset on retries to avoid fleet-wide full reprocessing. -->
-          <do_if value="event.param.$PendingSubs? and typeof event.param.$PendingSubs == datatype.list and event.param.$PendingSubs.count gt 0">
+          <set_value name="$remainingSubs" exact="[]"/>
+
+          <!-- Carry unresolved from prior yield chunks in this attempt. -->
+          <do_if value="$unresolvedAccum? and typeof $unresolvedAccum == datatype.list and $unresolvedAccum.count gt 0">
+            <do_all exact="$unresolvedAccum.count" counter="$uai">
+              <append_to_list name="$unresolvedSubs" exact="$unresolvedAccum.{$uai}"/>
+            </do_all>
+          </do_if>
+
+          <!-- Prefer pending/yield subset to avoid fleet-wide full reprocessing in one frame. -->
+          <do_if value="$pendingSubs? and typeof $pendingSubs == datatype.list and $pendingSubs.count gt 0">
             <set_value name="$sourceMode" exact="'pending'"/>
-            <set_value name="$subordinates" exact="event.param.$PendingSubs"/>
+            <set_value name="$subordinates" exact="$pendingSubs"/>
           </do_if>
           <do_elseif value="$commander.allsubordinates? and @$commander.allsubordinates.count gt 0">
-            <!-- First pass source: commander's subordinate tree -->
             <set_value name="$subordinates" exact="@$commander.allsubordinates"/>
           </do_elseif>
           <do_else>
             <!-- Keep existing settle behavior: hierarchy can be empty briefly on startup. -->
             <set_value name="$retryAll" exact="true"/>
           </do_else>
-          
+
+          <!-- Process exactly one subordinate this frame; remainder is yield-continued. -->
           <do_if value="$subordinates.count gt 0">
-            <do_all exact="$subordinates.count" counter="$si">
-              <set_value name="$sub" exact="$subordinates.{$si}"/>
-              <set_value name="$isCandidate" exact="false"/>
-              <set_value name="$needsRetry" exact="false"/>
-              
-              <do_if value="$sub? and $sub.exists and $sub.isplayerowned and not ($sub.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$sub.defaultorder.id}))">
-                <do_if value="$sub.commander? and $sub.commander == $commander or ($sub.toplevelcommander? and $sub.toplevelcommander == $commander)">
-                  <set_value name="$isCandidate" exact="true"/>
-                </do_if>
-                <do_else>
-                  <!-- Hierarchy may still be settling; retry this subordinate only. -->
-                  <set_value name="$needsRetry" exact="true"/>
-                </do_else>
+            <set_value name="$sub" exact="$subordinates.{1}"/>
+            <do_all exact="$subordinates.count" counter="$ri">
+              <do_if value="$ri gt 1">
+                <append_to_list name="$remainingSubs" exact="$subordinates.{$ri}"/>
               </do_if>
-              
-              <do_if value="$isCandidate">
-                <do_if value="not $sub.pilot?">
-                  <!-- Pilot binding can lag one tick after AI restart. -->
-                  <set_value name="$needsRetry" exact="true"/>
+            </do_all>
+
+            <set_value name="$isCandidate" exact="false"/>
+            <set_value name="$needsRetry" exact="false"/>
+
+            <do_if value="$sub? and $sub.exists and $sub.isplayerowned and not ($sub.defaultorder? and (global.$GT_ProtectedOrderIDs? and global.$GT_ProtectedOrderIDs.indexof.{@$sub.defaultorder.id}))">
+              <do_if value="$sub.commander? and $sub.commander == $commander or ($sub.toplevelcommander? and $sub.toplevelcommander == $commander)">
+                <set_value name="$isCandidate" exact="true"/>
+              </do_if>
+              <do_else>
+                <!-- Hierarchy may still be settling; retry this subordinate only. -->
+                <set_value name="$needsRetry" exact="true"/>
+              </do_else>
+            </do_if>
+
+            <do_if value="$isCandidate">
+              <do_if value="not $sub.pilot?">
+                <!-- Pilot binding can lag one tick after AI restart. -->
+                <set_value name="$needsRetry" exact="true"/>
+              </do_if>
+              <do_else>
+                <set_value name="$isUnchanged" exact="false"/>
+                <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{$sub.pilot}? and global.$GT_Pilots.{$sub.pilot}.$AssociatedShip? and global.$GT_Pilots.{$sub.pilot}.$AssociatedShip == $sub and global.$GT_Ships? and global.$GT_Ships.{$sub}? and global.$GT_Ships.{$sub}.$Pilot? and global.$GT_Ships.{$sub}.$Pilot == $sub.pilot">
+                  <set_value name="$isUnchanged" exact="true"/>
+                </do_if>
+
+                <!-- Light path: unchanged mapping only needs a name/status sync. -->
+                <do_if value="$isUnchanged and md.GT_Ship_Management.Update_Pilot_Ship_Name?">
+                  <run_actions ref="md.GT_Ship_Management.Update_Pilot_Ship_Name">
+                    <param name="pilot" value="$sub.pilot"/>
+                    <param name="ship" value="$sub"/>
+                    <param name="forceUpdate" value="false"/>
+                  </run_actions>
+                  <set_value name="$lightRefreshedSubs" operation="add"/>
+                  <set_value name="$reactivatedSubs" operation="add"/>
                 </do_if>
                 <do_else>
-                  <set_value name="$isUnchanged" exact="false"/>
-                  <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{$sub.pilot}? and global.$GT_Pilots.{$sub.pilot}.$AssociatedShip? and global.$GT_Pilots.{$sub.pilot}.$AssociatedShip == $sub and global.$GT_Ships? and global.$GT_Ships.{$sub}? and global.$GT_Ships.{$sub}.$Pilot? and global.$GT_Ships.{$sub}.$Pilot == $sub.pilot">
-                    <set_value name="$isUnchanged" exact="true"/>
-                  </do_if>
-                  
-                  <!-- Light path: unchanged mapping only needs a name/status sync. -->
-                  <do_if value="$isUnchanged and md.GT_Ship_Management.Update_Pilot_Ship_Name?">
-                    <run_actions ref="md.GT_Ship_Management.Update_Pilot_Ship_Name">
-                      <param name="pilot" value="$sub.pilot"/>
+                  <!-- Full path: changed/missing mapping requires full registration + assignment sync. -->
+                  <run_actions ref="md.GT_Ship_Management.Register_Pilot">
+                    <param name="pilot" value="$sub.pilot"/>
+                    <param name="ship" value="$sub"/>
+                  </run_actions>
+                  <do_if value="md.GT_Ship_Management.Handle_Pilot_Ship_Assignment?">
+                    <run_actions ref="md.GT_Ship_Management.Handle_Pilot_Ship_Assignment">
                       <param name="ship" value="$sub"/>
-                      <param name="forceUpdate" value="false"/>
+                      <param name="new_pilot" value="$sub.pilot"/>
+                      <param name="old_pilot" value="$sub.pilot"/>
                     </run_actions>
-                    <set_value name="$lightRefreshedSubs" operation="add"/>
-                    <set_value name="$reactivatedSubs" operation="add"/>
                   </do_if>
-                  <do_else>
-                    <!-- Full path: changed/missing mapping requires full registration + assignment sync. -->
-                    <run_actions ref="md.GT_Ship_Management.Register_Pilot">
-                      <param name="pilot" value="$sub.pilot"/>
-                      <param name="ship" value="$sub"/>
-                    </run_actions>
-                    <do_if value="md.GT_Ship_Management.Handle_Pilot_Ship_Assignment?">
-                      <run_actions ref="md.GT_Ship_Management.Handle_Pilot_Ship_Assignment">
-                        <param name="ship" value="$sub"/>
-                        <param name="new_pilot" value="$sub.pilot"/>
-                        <param name="old_pilot" value="$sub.pilot"/>
-                      </run_actions>
-                    </do_if>
-                    <set_value name="$fullRefreshedSubs" operation="add"/>
-                    <set_value name="$reactivatedSubs" operation="add"/>
-                  </do_else>
-                  <!-- Existing Assist subordinates may still mimic a prior commander order (e.g. Hold Position).
-                       MD signals do not reach Assist while a nested mimic script is active; restart Assist
-                       with commander baseorder like a fresh subordinate assignment. -->
-                  <do_if value="$sub.defaultorder? and @$sub.defaultorder.id == 'Assist' and $commander.defaultorder?">
+                  <set_value name="$fullRefreshedSubs" operation="add"/>
+                  <set_value name="$reactivatedSubs" operation="add"/>
+                </do_else>
+
+                <!-- Restart Assist only when not already inheriting this commander's current GT order.
+                     Avoids N× AI cold-starts when fleet Assist is already correct. -->
+                <do_if value="$sub.defaultorder? and @$sub.defaultorder.id == 'Assist' and $commander.defaultorder?">
+                  <set_value name="$assistAlreadyOk" exact="false"/>
+                  <do_if value="$sub.defaultorder.$baseorder? and $sub.defaultorder.$baseorder == $commander.defaultorder and $sub.defaultorder.$orderobject? and $sub.defaultorder.$orderobject == $commander">
+                    <set_value name="$assistAlreadyOk" exact="true"/>
+                  </do_if>
+                  <do_if value="not $assistAlreadyOk">
                     <cancel_order order="$sub.defaultorder"/>
                     <create_order id="'Assist'" object="$sub" default="true">
                       <param name="baseorder" value="$commander.defaultorder"/>
@@ -436,36 +511,51 @@
                       <debug_text text="'[GT-Core] Restarted Assist inheritance for ' + $sub.idcode + ' under commander ' + $commander.idcode + ' (order=' + @$commander.defaultorder.id + ')'" chance="100"/>
                     </do_if>
                   </do_if>
-                </do_else>
-              </do_if>
-              
-              <do_if value="$needsRetry and $sub? and $sub.exists">
-                <append_to_list name="$unresolvedSubs" exact="$sub"/>
-              </do_if>
-            </do_all>
+                  <do_else>
+                    <set_value name="$assistSkippedSubs" operation="add"/>
+                  </do_else>
+                </do_if>
+              </do_else>
+            </do_if>
+
+            <do_if value="$needsRetry and $sub? and $sub.exists">
+              <append_to_list name="$unresolvedSubs" exact="$sub"/>
+            </do_if>
           </do_if>
-          
+
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Core] Commander GT reactivation delayed pass #' + $attempt + ': processed ' + $reactivatedSubs + ' subordinate(s) for commander ' + $commander.idcode + ' (source=' + $sourceMode + ', light=' + $lightRefreshedSubs + ', full=' + $fullRefreshedSubs + ', assistRestarted=' + $assistNudgedSubs + ', unresolved=' + $unresolvedSubs.count + ')'" chance="100"/>
+            <debug_text text="'[GT-Core] Commander GT reactivation pass #' + $attempt + ': processed ' + $reactivatedSubs + ' subordinate(s) for commander ' + $commander.idcode + ' (source=' + $sourceMode + ', light=' + $lightRefreshedSubs + ', full=' + $fullRefreshedSubs + ', assistRestarted=' + $assistNudgedSubs + ', assistSkipped=' + $assistSkippedSubs + ', remaining=' + $remainingSubs.count + ', unresolved=' + $unresolvedSubs.count + ')'" chance="100"/>
           </do_if>
-          
-          <!-- Retry a few times while relationships/pilot bindings settle. -->
-          <do_if value="$unresolvedSubs.count gt 0 and $attempt lt 5">
+
+          <!-- Yield: more ships left in this wave → 10ms continue (same attempt). -->
+          <do_if value="$remainingSubs.count gt 0">
+            <run_actions ref="md.GT_CoreSystem.QueueProcessCommanderGTReactivation">
+              <param name="commander" value="$commander"/>
+              <param name="attempt" value="$attempt"/>
+              <param name="pendingSubs" value="$remainingSubs"/>
+              <param name="unresolvedAccum" value="$unresolvedSubs"/>
+              <param name="yieldContinue" value="true"/>
+            </run_actions>
+          </do_if>
+          <!-- Wave done: settle-retry unresolved (1s cue), bounded by attempt lt 5. -->
+          <do_elseif value="$unresolvedSubs.count gt 0 and $attempt lt 5">
             <run_actions ref="md.GT_CoreSystem.QueueProcessCommanderGTReactivation">
               <param name="commander" value="$commander"/>
               <param name="attempt" value="$attempt + 1"/>
               <param name="pendingSubs" value="$unresolvedSubs"/>
+              <param name="yieldContinue" value="false"/>
             </run_actions>
-          </do_if>
+          </do_elseif>
           <do_elseif value="$retryAll and $attempt lt 5">
             <run_actions ref="md.GT_CoreSystem.QueueProcessCommanderGTReactivation">
               <param name="commander" value="$commander"/>
               <param name="attempt" value="$attempt + 1"/>
+              <param name="yieldContinue" value="false"/>
             </run_actions>
           </do_elseif>
         </do_if>
       </actions>
-    </cue>
+    </library>
     
     <!-- Authoritative commander GT state transition handler.
          Driven by commander AI default-order tracking, not fragile engine order payload timing. -->
@@ -543,19 +633,33 @@
       </actions>
     </cue>
 
-    <!-- Shared scheduler for commander GT reactivation processing. -->
+    <!-- Shared scheduler for commander GT reactivation processing.
+         yieldContinue=true → 10ms yield cue; false → 1s settle/first-entry cue. -->
     <library name="QueueProcessCommanderGTReactivation" purpose="run_actions">
       <params>
         <param name="commander"/>
         <param name="attempt" default="1"/>
         <param name="pendingSubs" default="null"/>
+        <param name="unresolvedAccum" default="null"/>
+        <param name="yieldContinue" default="false"/>
       </params>
       <actions>
-        <signal_cue_instantly cue="md.GT_CoreSystem.ProcessCommanderGTReactivation" param="table[
-          $Commander = $commander,
-          $Attempt = $attempt,
-          $PendingSubs = $pendingSubs
-        ]"/>
+        <do_if value="$yieldContinue">
+          <signal_cue_instantly cue="md.GT_CoreSystem.ProcessCommanderGTReactivationYield" param="table[
+            $Commander = $commander,
+            $Attempt = $attempt,
+            $PendingSubs = $pendingSubs,
+            $UnresolvedAccum = $unresolvedAccum
+          ]"/>
+        </do_if>
+        <do_else>
+          <signal_cue_instantly cue="md.GT_CoreSystem.ProcessCommanderGTReactivation" param="table[
+            $Commander = $commander,
+            $Attempt = $attempt,
+            $PendingSubs = $pendingSubs,
+            $UnresolvedAccum = $unresolvedAccum
+          ]"/>
+        </do_else>
       </actions>
     </library>
 

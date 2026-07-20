@@ -2119,7 +2119,7 @@
           <do_if value="$gtOrder? and $gtOrder.$checkDemandFirst?">
             <set_value name="$diagMinerCheckDemandFirst" exact="$gtOrder.$checkDemandFirst"/>
           </do_if>
-          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Check Demand First', $Status = if $diagMinerCheckDemandFirst then 'INFO' else 'WARN', $Detail = if $diagMinerCheckDemandFirst then 'true (demand-first) - checks station demand before starting to mine' else 'false (demand-off / stockpile) - mines proactively; selling still uses primary stations below overflow threshold or Overflow sell']"/>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Check Demand First', $Status = if $diagMinerCheckDemandFirst then 'INFO' else 'WARN', $Detail = if $diagMinerCheckDemandFirst then 'true (demand-first) - mines only when a station posts a live buy offer; storage target scales priority among offered wares' else 'false (demand-off / stockpile) - mines proactively; selling still uses primary stations below overflow threshold or Overflow sell']"/>
           <do_if value="not $diagMinerCheckDemandFirst">
             <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Demand-off Note', $Status = 'INFO', $Detail = 'Toggle OFF bypasses the mining demand gate only. Full bay with no willing buyer enters standby until capacity opens or overflow sell is enabled.']"/>
           </do_if>
@@ -3420,26 +3420,52 @@
               <set_value name="$selWUrgency" exact="0"/>
               <set_value name="$selWHasCap" exact="false"/>
               <set_value name="$selWStorageMax" exact="0"/>
+              <set_value name="$selWStorageMinCap" exact="100"/>
+              <set_value name="$selWHasAnyOffer" exact="false"/>
               <do_if value="$selWWare != null">
                 <do_all exact="$diagMinerPrimaryStations.count" counter="$selWk">
                   <set_value name="$selWStation" exact="$diagMinerPrimaryStations.{$selWk}"/>
                   <do_if value="$selWStation? and $selWStation.exists">
-                    <set_value name="$selWTarget" exact="@$selWStation.cargo.{$selWWare}.target"/>
-                    <do_if value="$selWTarget? and $selWTarget gt 0">
-                      <set_value name="$selWCurrent" exact="@$selWStation.cargo.{$selWWare}.count"/>
-                      <set_value name="$selWDeficit" exact="[0, $selWTarget - $selWCurrent].max"/>
-                      <set_value name="$selWUrgency" exact="$selWUrgency + (($selWDeficit * 100) / [$selWTarget, 1].max)"/>
-                      <set_value name="$selWStoragePct" exact="($selWCurrent * 100) / [$selWTarget, 1].max"/>
-                      <do_if value="$selWStoragePct gt $selWStorageMax">
-                        <set_value name="$selWStorageMax" exact="$selWStoragePct"/>
+                    <!-- Demand-first: buy offer is the manager demand signal (mirrors GalaxyMiner). -->
+                    <find_buy_offer buyer="$selWStation" wares="$selWWare" tradepartner="$ship" result="$selWOffer"/>
+                    <do_if value="$selWOffer">
+                      <set_value name="$selWOfferAmount" exact="$selWOffer.offeramount.{$ship}"/>
+                      <do_if value="$selWOfferAmount gt 0">
+                        <set_value name="$selWHasAnyOffer" exact="true"/>
+                        <get_ware_reservation object="$selWStation" ware="$selWWare" type="sell" virtual="true" result="$selWReserved"/>
+                        <set_value name="$selWNeeded" exact="[$selWOfferAmount - $selWReserved, 0].max"/>
+                        <do_if value="$selWNeeded gt 0">
+                          <set_value name="$selWTarget" exact="[@$selWStation.cargo.{$selWWare}.target, 1].max"/>
+                          <set_value name="$selWUrgency" exact="$selWUrgency + (($selWNeeded * 100) / $selWTarget)"/>
+                          <set_value name="$selWCurrent" exact="@$selWStation.cargo.{$selWWare}.count"/>
+                          <do_if value="not $selWCurrent?"><set_value name="$selWCurrent" exact="0"/></do_if>
+                          <set_value name="$selWStoragePct" exact="($selWCurrent * 100) / $selWTarget"/>
+                          <do_if value="$selWStoragePct gt $selWStorageMax">
+                            <set_value name="$selWStorageMax" exact="$selWStoragePct"/>
+                          </do_if>
+                          <do_if value="$selWStoragePct lt $diagMinerOverflowThreshold">
+                            <set_value name="$selWHasCap" exact="true"/>
+                            <do_if value="$selWStoragePct lt $selWStorageMinCap">
+                              <set_value name="$selWStorageMinCap" exact="$selWStoragePct"/>
+                            </do_if>
+                          </do_if>
+                        </do_if>
+                        <remove_value name="$selWNeeded"/>
+                        <remove_value name="$selWReserved"/>
                       </do_if>
-                      <do_if value="$selWStoragePct lt $diagMinerOverflowThreshold">
-                        <set_value name="$selWHasCap" exact="true"/>
-                      </do_if>
+                      <remove_value name="$selWOfferAmount"/>
                     </do_if>
+                    <remove_value name="$selWOffer"/>
                   </do_if>
                 </do_all>
               </do_if>
+              <!-- For SELECTABLE messaging use the best (lowest) fill among stations that still have capacity. -->
+              <do_if value="$selWHasCap">
+                <set_value name="$selWStorageReport" exact="$selWStorageMinCap"/>
+              </do_if>
+              <do_else>
+                <set_value name="$selWStorageReport" exact="$selWStorageMax"/>
+              </do_else>
               <!-- Categorise this ware against the miner's decision tree:
                      mineable + has primary capacity -> would actually be selected (best urgency wins)
                      mineable + capped               -> stall candidate (urgency exists but no sink)
@@ -3448,12 +3474,12 @@
                 <set_value name="$selWBest" exact="$selWWareName"/>
                 <set_value name="$selWBestUrgency" exact="$selWUrgency"/>
                 <set_value name="$selWBestCap" exact="true"/>
-                <set_value name="$selWBestStorageMax" exact="$selWStorageMax"/>
+                <set_value name="$selWBestStorageMax" exact="$selWStorageReport"/>
               </do_if>
               <do_if value="$selWRow.$Mineable and not $selWHasCap and $selWUrgency gt $selWStallUrgency">
                 <set_value name="$selWStallCandidate" exact="$selWWareName"/>
                 <set_value name="$selWStallUrgency" exact="$selWUrgency"/>
-                <set_value name="$selWStallStorageMax" exact="$selWStorageMax"/>
+                <set_value name="$selWStallStorageMax" exact="$selWStorageReport"/>
               </do_if>
               <do_if value="$selWRow.$DiscState == 'undiscovered' and $selWUrgency gt 0">
                 <!-- Carry the parallel-probe results forward so the verdict suggestion can
@@ -3486,16 +3512,16 @@
                 <do_elseif value="$selWRow.$Mineable and not $selWHasCap">
                   <do_if value="not $diagMinerAllowOverflowSellToOthers">
                     <set_value name="$selWBlockerStatus" exact="'FAIL'"/>
-                    <set_value name="$selWBlockerDetail" exact="'primary stations at ' + $selWStorageMax + '% ge ' + $diagMinerOverflowThreshold + '% overflow threshold AND overflow sell to other stations is DISABLED - miner stuck waiting at galaxyminer.xml:1309'"/>
+                    <set_value name="$selWBlockerDetail" exact="'primary stations at ' + $selWStorageReport + '% ge ' + $diagMinerOverflowThreshold + '% overflow threshold AND overflow sell to other stations is DISABLED - miner stuck waiting at galaxyminer.xml:1309'"/>
                   </do_if>
                   <do_else>
                     <set_value name="$selWBlockerStatus" exact="'WARN'"/>
-                    <set_value name="$selWBlockerDetail" exact="'primary stations at ' + $selWStorageMax + '% ge ' + $diagMinerOverflowThreshold + '% overflow threshold; overflow sell to other stations is enabled, so the miner will deliver to a non-primary buyer'"/>
+                    <set_value name="$selWBlockerDetail" exact="'primary stations at ' + $selWStorageReport + '% ge ' + $diagMinerOverflowThreshold + '% overflow threshold; overflow sell to other stations is enabled, so the miner will deliver to a non-primary buyer'"/>
                   </do_else>
                 </do_elseif>
                 <do_elseif value="$selWRow.$Mineable and $selWHasCap">
                   <set_value name="$selWBlockerStatus" exact="if @$selWRow.$IsActive then 'PASS' else 'INFO'"/>
-                  <set_value name="$selWBlockerDetail" exact="'SELECTABLE - primary fill ' + $selWStorageMax + '% lt ' + $diagMinerOverflowThreshold + '% threshold' + (if @$selWRow.$IsActive then ' (currently the active mining target)' else '')"/>
+                  <set_value name="$selWBlockerDetail" exact="'SELECTABLE - primary fill ' + $selWStorageReport + '% lt ' + $diagMinerOverflowThreshold + '% threshold' + (if @$selWRow.$IsActive then ' (currently the active mining target)' else '')"/>
                 </do_elseif>
                 <do_else>
                   <!-- Defensive: shouldn't happen because the four arms above are exhaustive
@@ -3511,6 +3537,14 @@
                   $Detail = $selWBlockerDetail
                 ]"/>
               </do_if>
+              <do_elseif value="$diagMinerCheckDemandFirst and $selWWare != null and not $selWHasAnyOffer">
+                <append_to_list name="$selWAllScored" exact="table[
+                  $Name = $selWWareName,
+                  $Urgency = 0,
+                  $Status = 'WARN',
+                  $Detail = 'no live buy offer on primary stations - storage target alone is not demand'
+                ]"/>
+              </do_elseif>
             </do_all>
           </do_if>
           <!-- Stall is real iff:
@@ -3523,7 +3557,7 @@
                `set_value name="$selWBest" exact="null"`. Use explicit `!= null` here. -->
           <set_value name="$selWStalled" exact="$diagMinerCheckDemandFirst and $selWBest == null and $selWStallCandidate != null and (not $diagMinerAllowOverflowSellToOthers)"/>
           <do_if value="$selWHasStations and $rscWareRows.count gt 0">
-            <append_to_list name="$sec3b.$Rows" exact="table[$Check = '--- Selectability (what the miner would pick now) ---', $Status = 'INFO', $Detail = if $diagMinerCheckDemandFirst then 'Demand-first mode: urgency scoring over primary stations' else 'Demand-off mode: fixed Resource Basket / slice-committed pick (urgency scoring skipped for mining gate)']"/>
+            <append_to_list name="$sec3b.$Rows" exact="table[$Check = '--- Selectability (what the miner would pick now) ---', $Status = 'INFO', $Detail = if $diagMinerCheckDemandFirst then 'Demand-first mode: urgency from live buy offers on primary stations (storage target scales priority only when an offer exists)' else 'Demand-off mode: fixed Resource Basket / slice-committed pick (urgency scoring skipped for mining gate)']"/>
             <do_if value="$selWBest != null">
               <append_to_list name="$sec3b.$Rows" exact="table[
                 $Check = 'Would Select',
@@ -3542,7 +3576,7 @@
               <append_to_list name="$sec3b.$Rows" exact="table[
                 $Check = 'Would Select',
                 $Status = 'WARN',
-                $Detail = 'no mineable ware has any primary-station demand right now (no deficit at any primary station for any reachable+discovered ware)'
+                $Detail = if $diagMinerCheckDemandFirst then 'no mineable ware has a live buy offer with primary delivery headroom right now' else 'no mineable ware has any primary-station demand right now (no deficit at any primary station for any reachable+discovered ware)'
               ]"/>
             </do_else>
             <!-- Demand Ranking: every ware with positive urgency, sorted desc by urgency,

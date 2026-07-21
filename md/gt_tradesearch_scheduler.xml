@@ -2431,6 +2431,169 @@
             <remove_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}"/>
           </do_if>
 
+          <!-- Phase 7 fleet dispatch (MK3 live success): assign distinct dest+ware routes to same-home
+               live + cache-saturation waiters from this TradeList. One finite pass — no self-reschedule.
+               Live ship keeps full TradeList; top dest is pre-reserved so waiters cannot steal it. -->
+          <set_value name="$fleetDispatchAssigned" exact="0"/>
+          <do_if value="$found and $tradeList? and $tradeList.count gt 0 and $homeSector? and $ship? and $ship.exists">
+            <create_list name="$fleetDispatchWaiters"/>
+            <set_value name="$fdSeen" exact="table[]"/>
+            <do_if value="global.$GT_SearchSemaphore.$LiveWaitersByHome? and global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}? and global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.count gt 0">
+              <do_all exact="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.count" counter="$fdWi">
+                <set_value name="$fdWShip" exact="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.{$fdWi}"/>
+                <do_if value="$fdWShip? and $fdWShip.exists and $fdWShip != $ship and not $fdSeen.{$fdWShip}?">
+                  <append_to_list name="$fleetDispatchWaiters" exact="$fdWShip"/>
+                  <set_value name="$fdSeen.{$fdWShip}" exact="true"/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <!-- Cache-saturation waiters: pool had entries but per-ship read returned 0; fresh live list can claim them. -->
+            <do_if value="global.$GT_SearchSemaphore.$CacheWaitersByHome? and global.$GT_SearchSemaphore.$CacheWaitersByHome.{$homeSector}? and global.$GT_SearchSemaphore.$CacheWaitersByHome.{$homeSector}.count gt 0">
+              <do_all exact="global.$GT_SearchSemaphore.$CacheWaitersByHome.{$homeSector}.count" counter="$fdCwi">
+                <set_value name="$fdWShip" exact="global.$GT_SearchSemaphore.$CacheWaitersByHome.{$homeSector}.{$fdCwi}"/>
+                <do_if value="$fdWShip? and $fdWShip.exists and $fdWShip != $ship and not $fdSeen.{$fdWShip}?">
+                  <append_to_list name="$fleetDispatchWaiters" exact="$fdWShip"/>
+                  <set_value name="$fdSeen.{$fdWShip}" exact="true"/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <do_if value="$fleetDispatchWaiters.count gt 0">
+              <set_value name="$fdClaimedDest" exact="table[]"/>
+              <set_value name="$fdMaxTrades" exact="[20, $tradeList.count].min"/>
+              <set_value name="$fdMaxWaiters" exact="[12, $fleetDispatchWaiters.count].min"/>
+              <!-- Pre-reserve top trade destination for the live worker. -->
+              <set_value name="$fdTopTrade" exact="$tradeList.{1}"/>
+              <do_if value="$fdTopTrade?">
+                <run_actions ref="md.GLX_Lib_Reservations.GLX_GenerateTradeKey" result="$fdTopKey">
+                  <param name="sellOffer" value="if $fdTopTrade.$SellOffer? then $fdTopTrade.$SellOffer else null"/>
+                  <param name="sellStation" value="if $fdTopTrade.$SellStation? then $fdTopTrade.$SellStation else null"/>
+                  <param name="deliveryStationId" value="if $fdTopTrade.$DeliveryStationId? then $fdTopTrade.$DeliveryStationId else null"/>
+                  <param name="ware" value="if $fdTopTrade.$Ware? then $fdTopTrade.$Ware else null"/>
+                </run_actions>
+                <do_if value="$fdTopKey? and $fdTopKey != ''">
+                  <run_actions ref="md.GLX_Lib_Reservations.GLX_ReserveTrade" result="$fdTopOk">
+                    <param name="tradeKey" value="$fdTopKey"/>
+                    <param name="ship" value="$ship"/>
+                    <param name="ttl" value="10s"/>
+                  </run_actions>
+                  <do_if value="$fdTopOk">
+                    <set_value name="$fdClaimedDest.{$fdTopKey}" exact="true"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+              <do_all exact="$fdMaxWaiters" counter="$fdAi">
+                <set_value name="$fdAssignee" exact="$fleetDispatchWaiters.{$fdAi}"/>
+                <do_if value="not $fdAssignee? or not $fdAssignee.exists">
+                  <continue/>
+                </do_if>
+                <set_value name="$fdAssignedTrade" exact="null"/>
+                <set_value name="$fdAssignedKey" exact="''"/>
+                <do_all exact="$fdMaxTrades" counter="$fdTi">
+                  <set_value name="$fdTrade" exact="$tradeList.{$fdTi}"/>
+                  <do_if value="not $fdTrade?">
+                    <continue/>
+                  </do_if>
+                  <!-- Skip trades this waiter already failed. -->
+                  <do_if value="$fdTrade.$FailedShips? and $fdTrade.$FailedShips.count gt 0">
+                    <set_value name="$fdFailedForShip" exact="false"/>
+                    <do_all exact="$fdTrade.$FailedShips.count" counter="$fdFi">
+                      <do_if value="$fdTrade.$FailedShips.{$fdFi} == $fdAssignee">
+                        <set_value name="$fdFailedForShip" exact="true"/>
+                        <break/>
+                      </do_if>
+                    </do_all>
+                    <do_if value="not $fdFailedForShip and $fdTrade.$FailedShipIdcodes? and $fdAssignee.idcode?">
+                      <do_all exact="$fdTrade.$FailedShipIdcodes.count" counter="$fdFi">
+                        <do_if value="$fdTrade.$FailedShipIdcodes.{$fdFi} == $fdAssignee.idcode">
+                          <set_value name="$fdFailedForShip" exact="true"/>
+                          <break/>
+                        </do_if>
+                      </do_all>
+                    </do_if>
+                    <do_if value="$fdFailedForShip">
+                      <continue/>
+                    </do_if>
+                  </do_if>
+                  <run_actions ref="md.GLX_Lib_Reservations.GLX_GenerateTradeKey" result="$fdKey">
+                    <param name="sellOffer" value="if $fdTrade.$SellOffer? then $fdTrade.$SellOffer else null"/>
+                    <param name="sellStation" value="if $fdTrade.$SellStation? then $fdTrade.$SellStation else null"/>
+                    <param name="deliveryStationId" value="if $fdTrade.$DeliveryStationId? then $fdTrade.$DeliveryStationId else null"/>
+                    <param name="ware" value="if $fdTrade.$Ware? then $fdTrade.$Ware else null"/>
+                  </run_actions>
+                  <do_if value="not $fdKey? or $fdKey == ''">
+                    <continue/>
+                  </do_if>
+                  <do_if value="$fdClaimedDest.{$fdKey}?">
+                    <continue/>
+                  </do_if>
+                  <run_actions ref="md.GLX_Lib_Reservations.GLX_IsTradeReserved" result="$fdBusy">
+                    <param name="tradeKey" value="$fdKey"/>
+                    <param name="ship" value="$fdAssignee"/>
+                  </run_actions>
+                  <do_if value="$fdBusy">
+                    <continue/>
+                  </do_if>
+                  <run_actions ref="md.GLX_Lib_Reservations.GLX_ReserveTrade" result="$fdOk">
+                    <param name="tradeKey" value="$fdKey"/>
+                    <param name="ship" value="$fdAssignee"/>
+                    <param name="ttl" value="10s"/>
+                  </run_actions>
+                  <do_if value="$fdOk">
+                    <set_value name="$fdClaimedDest.{$fdKey}" exact="true"/>
+                    <set_value name="$fdAssignedTrade" exact="$fdTrade"/>
+                    <set_value name="$fdAssignedKey" exact="$fdKey"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+                <do_if value="$fdAssignedTrade?">
+                  <set_value name="$fdAssignedTrade.$FleetDispatch" exact="true"/>
+                  <create_list name="$fdOneList"/>
+                  <append_to_list name="$fdOneList" exact="$fdAssignedTrade"/>
+                  <!-- Treat as cache-like so reject path retries without forcing a new live immediately. -->
+                  <signal_objects object="$fdAssignee" param="'GT_Trade_Found'" param2="table[
+                    $TradeList = $fdOneList,
+                    $SearchMethod = 'fleet_dispatch'
+                  ]" delay="1ms"/>
+                  <set_value name="$fleetDispatchAssigned" operation="add"/>
+                  <!-- Drop waiter so Reset / periodic cache wake does not also requeue them. -->
+                  <do_if value="global.$GT_SearchSemaphore.$LiveWaiterQueuedByHome? and global.$GT_SearchSemaphore.$LiveWaiterQueuedByHome.{$homeSector}? and global.$GT_SearchSemaphore.$LiveWaiterQueuedByHome.{$homeSector}.{$fdAssignee}?">
+                    <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterQueuedByHome.{$homeSector}.{$fdAssignee}"/>
+                  </do_if>
+                  <do_if value="global.$GT_SearchSemaphore.$LiveWaiterStartedAt? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}? and global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}.{$fdAssignee}?">
+                    <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterStartedAt.{$homeSector}.{$fdAssignee}"/>
+                  </do_if>
+                  <do_if value="global.$GT_SearchSemaphore.$LiveWaiterPassCount? and global.$GT_SearchSemaphore.$LiveWaiterPassCount.{$fdAssignee}?">
+                    <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterPassCount.{$fdAssignee}"/>
+                  </do_if>
+                  <do_if value="global.$GT_SearchSemaphore.$LiveWaiterWakePending? and global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$fdAssignee}?">
+                    <remove_value name="global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$fdAssignee}"/>
+                  </do_if>
+                  <do_if value="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}? and global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.count gt 0">
+                    <do_all exact="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.count" counter="$fdRmi" reverse="true">
+                      <do_if value="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.{$fdRmi} == $fdAssignee">
+                        <remove_value name="global.$GT_SearchSemaphore.$LiveWaitersByHome.{$homeSector}.{$fdRmi}"/>
+                      </do_if>
+                    </do_all>
+                  </do_if>
+                  <do_if value="global.$GT_SearchSemaphore.$CacheWaiterQueuedByHome? and global.$GT_SearchSemaphore.$CacheWaiterQueuedByHome.{$homeSector}? and global.$GT_SearchSemaphore.$CacheWaiterQueuedByHome.{$homeSector}.{$fdAssignee}?">
+                    <remove_value name="global.$GT_SearchSemaphore.$CacheWaiterQueuedByHome.{$homeSector}.{$fdAssignee}"/>
+                  </do_if>
+                  <do_if value="global.$GT_SearchSemaphore.$CacheWaiterStartedAt? and global.$GT_SearchSemaphore.$CacheWaiterStartedAt.{$homeSector}? and global.$GT_SearchSemaphore.$CacheWaiterStartedAt.{$homeSector}.{$fdAssignee}?">
+                    <remove_value name="global.$GT_SearchSemaphore.$CacheWaiterStartedAt.{$homeSector}.{$fdAssignee}"/>
+                  </do_if>
+                  <do_if value="global.$GT_SearchSemaphore.$CacheWaitersByHome.{$homeSector}? and global.$GT_SearchSemaphore.$CacheWaitersByHome.{$homeSector}.count gt 0">
+                    <do_all exact="global.$GT_SearchSemaphore.$CacheWaitersByHome.{$homeSector}.count" counter="$fdCrmi" reverse="true">
+                      <do_if value="global.$GT_SearchSemaphore.$CacheWaitersByHome.{$homeSector}.{$fdCrmi} == $fdAssignee">
+                        <remove_value name="global.$GT_SearchSemaphore.$CacheWaitersByHome.{$homeSector}.{$fdCrmi}"/>
+                      </do_if>
+                    </do_all>
+                  </do_if>
+                </do_if>
+              </do_all>
+              <debug_text text="'[GT-Scheduler] FleetDispatch home=' + $homeSector.knownname + ' live=' + $ship.idcode + ' assigned=' + $fleetDispatchAssigned + '/' + $fdMaxWaiters + ' trades=' + $fdMaxTrades + ' waiters=' + $fleetDispatchWaiters.count" chance="100"/>
+            </do_if>
+          </do_if>
+
           <!-- Wake waiters for this home key; fallback by active-home owner match to avoid missed notifications. -->
           <do_if value="global.$GT_SearchSemaphore.$LiveWaitersByHome? and global.$GT_SearchSemaphore.$LiveWaitersByHome.keys.count gt 0">
             <set_value name="$waiterHomeKeys" exact="global.$GT_SearchSemaphore.$LiveWaitersByHome.keys.list"/>

@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Per-ship cache read scoring: shipScore = profitCr / (1 + (ship→buy + buy→sell) × distancePenalty).
-     Does not mutate global cache rows — sets $ShipScore / $SelectionScore on list entries only. -->
+<!-- Per-ship cache read scoring (PPT): shipScore = profitCr / (dockOverhead + routeHops × distancePenalty).
+     dockOverhead defaults to 2.0 hop-equivalents (load+unload). Live offer unitprices refresh profit at read.
+     Does not mutate global cache pool rows — sets $ShipScore / $SelectionScore on list entries only. -->
 <aiscript name="lib.gt.cache.score_for_ship" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
   <params>
     <param name="tradeList" default="[]"/>
@@ -22,12 +23,25 @@
       </do_if>
 
       <set_value name="$penalty" exact="if $distancePenalty? and $distancePenalty ge 0 then $distancePenalty else 0.1"/>
+      <!-- PPT dock floor in hop-equivalents (load + unload). Optional global override. -->
+      <set_value name="$pptDockOverhead" exact="2.0"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Trading? and global.$GT_GlobalSettings.$Trading.$PptDockOverhead? and global.$GT_GlobalSettings.$Trading.$PptDockOverhead ge 0">
+        <set_value name="$pptDockOverhead" exact="global.$GT_GlobalSettings.$Trading.$PptDockOverhead"/>
+      </do_if>
       <set_value name="$shipSector" exact="null"/>
       <do_if value="$ship? and $ship.sector? and $ship.sector.exists">
         <set_value name="$shipSector" exact="$ship.sector"/>
       </do_if>
       <set_value name="$gdShipToBuy" exact="table[]"/>
       <set_value name="$gdBuyToSell" exact="table[]"/>
+      <set_value name="$csBlEpoch" exact="if global.$GT_BlacklistEpoch? then global.$GT_BlacklistEpoch else 0"/>
+      <set_value name="$csShipKey" exact="if $ship? and $ship.idcode? then ('$' + $ship.idcode) else '$unknown'"/>
+      <do_if value="not global.$GT_BlacklistPathCache?">
+        <set_value name="global.$GT_BlacklistPathCache" exact="table[]"/>
+      </do_if>
+      <do_if value="not global.$GT_SectorDistanceCache?">
+        <set_value name="global.$GT_SectorDistanceCache" exact="table[]"/>
+      </do_if>
 
       <do_all exact="$tradeList.count" counter="$si">
         <set_value name="$trade" exact="$tradeList.{$si}"/>
@@ -75,7 +89,25 @@
                 <set_value name="$shipToBuyDist" exact="$gdShipToBuy.{$shipSector}.{$buySector}"/>
               </do_if>
               <do_else>
-                <set_value name="$shipToBuyDist" exact="$ship.gatedistance.{$buySector}.{$blacklistGroup}.{$ship}"/>
+                <do_if value="not global.$GT_BlacklistPathCache.{$csBlEpoch}?">
+                  <set_value name="global.$GT_BlacklistPathCache.{$csBlEpoch}" exact="table[]"/>
+                </do_if>
+                <do_if value="not global.$GT_BlacklistPathCache.{$csBlEpoch}.{$shipSector}?">
+                  <set_value name="global.$GT_BlacklistPathCache.{$csBlEpoch}.{$shipSector}" exact="table[]"/>
+                </do_if>
+                <do_if value="not global.$GT_BlacklistPathCache.{$csBlEpoch}.{$shipSector}.{$buySector}?">
+                  <set_value name="global.$GT_BlacklistPathCache.{$csBlEpoch}.{$shipSector}.{$buySector}" exact="table[]"/>
+                </do_if>
+                <do_if value="not global.$GT_BlacklistPathCache.{$csBlEpoch}.{$shipSector}.{$buySector}.{$blacklistGroup}?">
+                  <set_value name="global.$GT_BlacklistPathCache.{$csBlEpoch}.{$shipSector}.{$buySector}.{$blacklistGroup}" exact="table[]"/>
+                </do_if>
+                <do_if value="global.$GT_BlacklistPathCache.{$csBlEpoch}.{$shipSector}.{$buySector}.{$blacklistGroup}.{$csShipKey}?">
+                  <set_value name="$shipToBuyDist" exact="global.$GT_BlacklistPathCache.{$csBlEpoch}.{$shipSector}.{$buySector}.{$blacklistGroup}.{$csShipKey}"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$shipToBuyDist" exact="$ship.gatedistance.{$buySector}.{$blacklistGroup}.{$ship}"/>
+                  <set_value name="global.$GT_BlacklistPathCache.{$csBlEpoch}.{$shipSector}.{$buySector}.{$blacklistGroup}.{$csShipKey}" exact="$shipToBuyDist"/>
+                </do_else>
                 <do_if value="not $gdShipToBuy.{$shipSector}?">
                   <set_value name="$gdShipToBuy.{$shipSector}" exact="table[]"/>
                 </do_if>
@@ -83,7 +115,16 @@
               </do_else>
             </do_elseif>
             <do_else>
-              <set_value name="$shipToBuyDist" exact="$ship.gatedistance.{$buySector}"/>
+              <do_if value="global.$GT_SectorDistanceCache.{$shipSector}? and global.$GT_SectorDistanceCache.{$shipSector}.{$buySector}?">
+                <set_value name="$shipToBuyDist" exact="global.$GT_SectorDistanceCache.{$shipSector}.{$buySector}"/>
+              </do_if>
+              <do_else>
+                <set_value name="$shipToBuyDist" exact="$ship.gatedistance.{$buySector}"/>
+                <do_if value="not global.$GT_SectorDistanceCache.{$shipSector}?">
+                  <set_value name="global.$GT_SectorDistanceCache.{$shipSector}" exact="table[]"/>
+                </do_if>
+                <set_value name="global.$GT_SectorDistanceCache.{$shipSector}.{$buySector}" exact="$shipToBuyDist"/>
+              </do_else>
             </do_else>
           </do_if>
 
@@ -105,7 +146,25 @@
                   <set_value name="$routeLegDist" exact="$gdBuyToSell.{$buySector}.{$sellSector}"/>
                 </do_if>
                 <do_else>
-                  <set_value name="$routeLegDist" exact="$buySector.gatedistance.{$sellSector}.{$blacklistGroup}.{$ship}"/>
+                  <do_if value="not global.$GT_BlacklistPathCache.{$csBlEpoch}?">
+                    <set_value name="global.$GT_BlacklistPathCache.{$csBlEpoch}" exact="table[]"/>
+                  </do_if>
+                  <do_if value="not global.$GT_BlacklistPathCache.{$csBlEpoch}.{$buySector}?">
+                    <set_value name="global.$GT_BlacklistPathCache.{$csBlEpoch}.{$buySector}" exact="table[]"/>
+                  </do_if>
+                  <do_if value="not global.$GT_BlacklistPathCache.{$csBlEpoch}.{$buySector}.{$sellSector}?">
+                    <set_value name="global.$GT_BlacklistPathCache.{$csBlEpoch}.{$buySector}.{$sellSector}" exact="table[]"/>
+                  </do_if>
+                  <do_if value="not global.$GT_BlacklistPathCache.{$csBlEpoch}.{$buySector}.{$sellSector}.{$blacklistGroup}?">
+                    <set_value name="global.$GT_BlacklistPathCache.{$csBlEpoch}.{$buySector}.{$sellSector}.{$blacklistGroup}" exact="table[]"/>
+                  </do_if>
+                  <do_if value="global.$GT_BlacklistPathCache.{$csBlEpoch}.{$buySector}.{$sellSector}.{$blacklistGroup}.{$csShipKey}?">
+                    <set_value name="$routeLegDist" exact="global.$GT_BlacklistPathCache.{$csBlEpoch}.{$buySector}.{$sellSector}.{$blacklistGroup}.{$csShipKey}"/>
+                  </do_if>
+                  <do_else>
+                    <set_value name="$routeLegDist" exact="$buySector.gatedistance.{$sellSector}.{$blacklistGroup}.{$ship}"/>
+                    <set_value name="global.$GT_BlacklistPathCache.{$csBlEpoch}.{$buySector}.{$sellSector}.{$blacklistGroup}.{$csShipKey}" exact="$routeLegDist"/>
+                  </do_else>
                   <do_if value="not $gdBuyToSell.{$buySector}?">
                     <set_value name="$gdBuyToSell.{$buySector}" exact="table[]"/>
                   </do_if>
@@ -113,7 +172,16 @@
                 </do_else>
               </do_elseif>
               <do_else>
-                <set_value name="$routeLegDist" exact="$buySector.gatedistance.{$sellSector}"/>
+                <do_if value="global.$GT_SectorDistanceCache.{$buySector}? and global.$GT_SectorDistanceCache.{$buySector}.{$sellSector}?">
+                  <set_value name="$routeLegDist" exact="global.$GT_SectorDistanceCache.{$buySector}.{$sellSector}"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$routeLegDist" exact="$buySector.gatedistance.{$sellSector}"/>
+                  <do_if value="not global.$GT_SectorDistanceCache.{$buySector}?">
+                    <set_value name="global.$GT_SectorDistanceCache.{$buySector}" exact="table[]"/>
+                  </do_if>
+                  <set_value name="global.$GT_SectorDistanceCache.{$buySector}.{$sellSector}" exact="$routeLegDist"/>
+                </do_else>
               </do_else>
             </do_if>
 
@@ -122,21 +190,56 @@
             </do_if>
             <do_else>
               <set_value name="$shipRouteDist" exact="$shipToBuyDist + $routeLegDist"/>
+              <!-- Live profit at read: prefer current offer unitprices over baked write-time $Profit. -->
               <set_value name="$profitCr" exact="0"/>
-              <do_if value="$trade.$Profit?">
-                <set_value name="$profitCr" exact="($trade.$Profit / 1Cr)i"/>
+              <set_value name="$liveAmt" exact="if $trade.$Amount? and $trade.$Amount gt 0 then $trade.$Amount else 0"/>
+              <set_value name="$liveBuyOffer" exact="if $trade.$BuyOffer? and @$trade.$BuyOffer.exists then $trade.$BuyOffer else null"/>
+              <set_value name="$liveSellOffer" exact="if $trade.$SellOffer? and @$trade.$SellOffer.exists then $trade.$SellOffer else null"/>
+              <set_value name="$liveFreeSupplier" exact="$trade.$PlayerFreeSupplier? and $trade.$PlayerFreeSupplier"/>
+              <do_if value="$liveAmt gt 0 and $liveBuyOffer? and $liveSellOffer? and $liveBuyOffer.unitprice? and $liveSellOffer.unitprice?">
+                <do_if value="$liveFreeSupplier">
+                  <set_value name="$profitCr" exact="(($liveSellOffer.unitprice * $liveAmt) / 1Cr)i"/>
+                </do_if>
+                <do_else>
+                  <set_value name="$liveUnitProfit" exact="$liveSellOffer.unitprice - $liveBuyOffer.unitprice"/>
+                  <do_if value="$liveUnitProfit gt 0">
+                    <set_value name="$profitCr" exact="(($liveUnitProfit * $liveAmt) / 1Cr)i"/>
+                  </do_if>
+                </do_else>
+                <!-- Refresh economics hints from live offers (ShipScore remains ranking authority). -->
+                <do_if value="$profitCr gt 0">
+                  <do_if value="$liveFreeSupplier">
+                    <set_value name="$trade.$Profit" exact="$liveSellOffer.unitprice * $liveAmt"/>
+                    <set_value name="$trade.$UnitProfit" exact="$liveSellOffer.unitprice"/>
+                  </do_if>
+                  <do_else>
+                    <set_value name="$trade.$Profit" exact="$liveUnitProfit * $liveAmt"/>
+                    <set_value name="$trade.$UnitProfit" exact="$liveUnitProfit"/>
+                  </do_else>
+                  <set_value name="$trade.$BuyPrice" exact="$liveBuyOffer.unitprice"/>
+                  <set_value name="$trade.$SellPrice" exact="$liveSellOffer.unitprice"/>
+                </do_if>
               </do_if>
+              <do_elseif value="$trade.$Profit?">
+                <set_value name="$profitCr" exact="($trade.$Profit / 1Cr)i"/>
+              </do_elseif>
               <do_elseif value="$trade.$UnitProfit? and $trade.$Amount?">
                 <set_value name="$profitCr" exact="(($trade.$UnitProfit * $trade.$Amount) / 1Cr)i"/>
               </do_elseif>
               <do_if value="$profitCr le 0 and $trade.$Score?">
                 <set_value name="$shipScore" exact="$trade.$Score"/>
               </do_if>
+              <do_elseif value="$profitCr le 0">
+                <set_value name="$shipScore" exact="0"/>
+              </do_elseif>
               <do_else>
-                <set_value name="$distanceFactor" exact="1.0 + ($shipRouteDist * $penalty)"/>
-                <do_if value="$distanceFactor gt 0">
-                  <set_value name="$shipScore" exact="$profitCr / $distanceFactor"/>
+                <!-- PPT: profit per hop-equivalent time (dock floor + travel hops × penalty). -->
+                <set_value name="$timeCost" exact="$pptDockOverhead + ($shipRouteDist * $penalty)"/>
+                <do_if value="$timeCost le 0">
+                  <set_value name="$timeCost" exact="0.01"/>
                 </do_if>
+                <set_value name="$shipScore" exact="$profitCr / $timeCost"/>
+                <set_value name="$trade.$PptTimeCost" exact="$timeCost"/>
               </do_else>
             </do_else>
           </do_else>

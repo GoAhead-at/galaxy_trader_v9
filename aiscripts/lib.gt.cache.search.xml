@@ -11,7 +11,7 @@
     <param name="minAbsoluteProfit" default="0"/>
     <param name="ignoreBuildStorage" default="false"/>
     <param name="ignoreCarrierAux" default="false"/>
-    <param name="maxEntries" default="100"/>
+    <param name="maxEntries" default="200"/>
     <param name="cacheReadOffset" default="0" comment="Rotates cache scan start so concurrent fleet ships pick different entries first"/>
     <param name="cacheMaxAge" default="300s"/> <!-- Matches $Fleet.$CacheTTL default -->
     <param name="cacheDropoffTolerance" default="15"/> <!-- Max % profit drop from cached value before rejection; also % slack on average-price band width at read (0 = strict band) -->
@@ -1524,7 +1524,8 @@
         </do_if>
       </do_if>
 
-      <!-- MK3: per-ship route score, sort, truncate (fleet spread rotation happens in order validation). -->
+      <!-- MK3: per-ship route score, sort, truncate (fleet spread rotation happens in order validation).
+           Neutral cache write may include BL-blocked pockets; score_for_ship drops unreachable ShipScore<=0. -->
       <do_if value="not this.$gt_cachePoolIsMk4 and $tradeList.count gt 0">
         <run_script name="'lib.gt.cache.score_for_ship'" result="$shipRouteScoreResult">
           <param name="tradeList" value="$tradeList"/>
@@ -1540,12 +1541,19 @@
         <do_if value="$shipRouteScoreResult? and $shipRouteScoreResult.$BestTrade?">
           <set_value name="$bestTrade" exact="$shipRouteScoreResult.$BestTrade"/>
         </do_if>
+        <do_else>
+          <set_value name="$bestTrade" exact="null"/>
+        </do_else>
         <do_if value="$shipRouteScoreResult? and $shipRouteScoreResult.$BestScore?">
           <set_value name="$bestScore" exact="$shipRouteScoreResult.$BestScore"/>
         </do_if>
-        <do_if value="$tradeList.count == 0">
+        <do_else>
+          <set_value name="$bestScore" exact="0"/>
+        </do_else>
+        <do_if value="$tradeList.count == 0 or not $bestTrade? or $bestScore le 0">
           <set_value name="$bestTrade" exact="null"/>
           <set_value name="$bestScore" exact="0"/>
+          <set_value name="$tradeList" exact="[]"/>
         </do_if>
         <do_elseif value="not $bestTrade? and $tradeList.count gt 0">
           <set_value name="$bestTrade" exact="$tradeList.{1}"/>
@@ -1556,11 +1564,20 @@
         </do_if>
       </do_if>
 
+      <set_value name="$cacheFoundOut" exact="false"/>
+      <do_if value="this.$gt_cachePoolIsMk4">
+        <set_value name="$cacheFoundOut" exact="($bestTrade != null) or ($tradeList.count gt 0)"/>
+      </do_if>
+      <do_else>
+        <!-- MK3: require per-ship BL-reachable score (neutral write may include unreachable pockets). -->
+        <set_value name="$cacheFoundOut" exact="($bestTrade != null) and ($bestScore gt 0) and ($tradeList.count gt 0)"/>
+      </do_else>
+
       <return value="table[
-        $Found = ($bestTrade != null) or ($tradeList.count gt 0),
-        $BestTrade = if $bestTrade? then $bestTrade else (if $tradeList.count gt 0 then $tradeList.{1} else null),
-        $BestScore = $bestScore,
-        $TradeList = $tradeList,
+        $Found = $cacheFoundOut,
+        $BestTrade = if $cacheFoundOut and $bestTrade? then $bestTrade else (if $cacheFoundOut and $tradeList.count gt 0 then $tradeList.{1} else null),
+        $BestScore = if $cacheFoundOut then $bestScore else 0,
+        $TradeList = if $cacheFoundOut then $tradeList else [],
         $PurgedStale = $purgedStaleCount,
         $PoolSizeAfter = $homeCacheCount
       ]"/>

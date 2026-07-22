@@ -814,19 +814,14 @@
           </do_if>
         </do_if>
         
-        <!-- Check if isolation has already been checked for this ship -->
-        <!-- Use safe operator @ for property access to prevent null errors -->
-        <set_value name="$isolationAlreadyChecked" exact="@$updatedState.$shipIsIsolatedChecked"/>
+        <!-- Always re-evaluate isolation (BL can change). The old alreadyChecked latch was broken:
+             @$state.$shipIsIsolatedChecked is null when unset, but $var? is still true after set_value,
+             so the full check never ran and shipIsIsolated stayed 0. Connectivity has its own 30s cache. -->
+        <set_value name="$currentSector" exact="$ship.sector"/>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Isolation check: alreadyChecked=' + (if $isolationAlreadyChecked? then 'yes' else 'no')" chance="100"/>
+          <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Isolation check: sector=' + (if $currentSector? and $currentSector.exists then @$currentSector.knownname else 'null')" chance="100"/>
         </do_if>
-        <do_if value="not $isolationAlreadyChecked?">
-          <!-- First time checking isolation for this ship -->
-          <set_value name="$currentSector" exact="$ship.sector"/>
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Current sector check: sector=' + (if $currentSector? then 'exists' else 'null')" chance="100"/>
-          </do_if>
-          <do_if value="$currentSector?">
+        <do_if value="$currentSector? and $currentSector.exists">
             <!-- Check if current sector is blacklisted (if yes, not isolated, it's just blacklisted) -->
             <run_actions ref="md.GT_Libraries_Blacklist.GT_GetBlacklistGroup" result="$blacklistgroup">
               <param name="ship" value="$ship"/>
@@ -836,7 +831,7 @@
               <param name="ship" value="$ship"/>
               <param name="blacklistgroup" value="$blacklistgroup"/>
             </run_actions>
-            <do_if value="$doWatch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-Isolation] (' + $ship.idcode + ') CurrentSector=' + @$currentSector.knownname + ' | CurrentSectorBlacklisted=' + $currentSectorIsBlacklisted + ' | blacklistgroup=' + $blacklistgroup" chance="100"/>
             </do_if>
             <do_if value="not $currentSectorIsBlacklisted">
@@ -844,13 +839,12 @@
               <run_actions ref="md.GT_Libraries_Blacklist.GT_CheckConnectedSectorsBlacklisted" result="$isolationCheck">
                 <param name="sector" value="$currentSector"/>
                 <param name="ship" value="$ship"/>
-                <param name="returnDetails" value="$doWatch"/>
+                <param name="returnDetails" value="true"/>
               </run_actions>
               <set_value name="$isolatedValue" exact="@$isolationCheck.$IsIsolated"/>
-              <set_value name="$shipIsIsolated" exact="if $isolatedValue? and ($isolatedValue == true or $isolatedValue == 1) then true else false"/>
-              <do_if value="$doWatch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <set_value name="$shipIsIsolated" exact="($isolatedValue == true) or ($isolatedValue == 1)"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                 <debug_text text="'[GT-Isolation] (' + $ship.idcode + ') Connected=' + @$isolationCheck.$ConnectedSectorsCount + ' | Blacklisted=' + @$isolationCheck.$BlacklistedSectorsCount + ' | OK=' + @$isolationCheck.$NonBlacklistedSectorsCount + ' | IsIsolated=' + $shipIsIsolated" chance="100"/>
-                <!-- When watched, GT_CheckConnectedSectorsBlacklisted returns $ConnectedSectors/$BlacklistedSectors/$NonBlacklistedSectors -->
                 <set_value name="$okList" exact="@$isolationCheck.$NonBlacklistedSectors"/>
                 <set_value name="$blList" exact="@$isolationCheck.$BlacklistedSectors"/>
                 <set_value name="$okCount" exact="if $okList != null then @$okList.count else 0"/>
@@ -878,15 +872,11 @@
               <!-- Ensure $updatedState is still valid (not null) before setting properties -->
               <set_value name="$updatedStatePreSetCheck" exact="@$updatedState.keys"/>
               <do_if value="$updatedStatePreSetCheck?">
-                <!-- $updatedState is valid - safe to set properties -->
                 <set_value name="$updatedState.$shipIsIsolated" exact="if $shipIsIsolated then 1 else 0"/>
-                <set_value name="$updatedState.$shipIsIsolatedChecked" exact="1"/>
               </do_if>
               <do_else>
-                <!-- $updatedState is null - reinitialize and set properties -->
                 <set_value name="$updatedState" exact="table[]"/>
                 <set_value name="$updatedState.$shipIsIsolated" exact="if $shipIsIsolated then 1 else 0"/>
-                <set_value name="$updatedState.$shipIsIsolatedChecked" exact="1"/>
                 <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                   <debug_text text="'[GT-Blacklist]  $updatedState was null before setting isolation properties - reinitialized'" chance="100"/>
                 </do_if>
@@ -912,7 +902,8 @@
               </do_if>
               
               <do_if value="$shipIsIsolated">
-                <!-- Set isolated flag for ship name updates (always set when isolated, not just on first detection) -->
+                <!-- Set isolated flag for ship name updates -->
+                <set_value name="$wasIsolated" exact="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?"/>
                 <do_if value="not global.$GT_IsolatedTradeActive?">
                   <set_value name="global.$GT_IsolatedTradeActive" exact="table[]"/>
                 </do_if>
@@ -922,6 +913,8 @@
                   <debug_text text="'[GT-Batch] (' + $ship.idcode + ') ISOLATION FLAG SET: global.$GT_IsolatedTradeActive.{$ship} = true'" chance="100"/>
                 </do_if>
                 
+                <!-- Logbook + name only on transition into isolation (avoid spam each search cycle). -->
+                <do_if value="not $wasIsolated">
                 <!-- Check if isolation was already logged (for logbook message only) -->
                 <set_value name="$isolationAlreadyLogged" exact="false"/>
                 <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$IsolationLogged?">
@@ -968,7 +961,7 @@
                   </do_if>
                 </do_if>
                 
-                <!-- Trigger ship name update to show [ISOLATED] flag (always, not just on first detection) -->
+                <!-- Trigger ship name update to show [ISOLATED] flag -->
                 <!-- Only update if ship has a pilot (required for name update) -->
                 <set_value name="$pilot" exact="@$ship.pilot"/>
                 <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -1010,7 +1003,28 @@
                     <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Triggered ship name update for isolated ship'" chance="100"/>
                   </do_if>
                 </do_if>
+                </do_if>
               </do_if>
+              <do_else>
+                <!-- Non-blacklisted current sector with at least one OK neighbor — clear stale isolation. -->
+                <do_if value="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?">
+                  <remove_value name="global.$GT_IsolatedTradeActive.{$ship}"/>
+                  <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$IsolationLogged?">
+                    <remove_value name="global.$GT_Ships.{$ship}.$IsolationLogged"/>
+                  </do_if>
+                  <set_value name="$pilot" exact="@$ship.pilot"/>
+                  <do_if value="$pilot? and $pilot.exists">
+                    <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
+                      $Ship = $ship,
+                      $pilot = $pilot,
+                      $nameType = 'trader'
+                    ]"/>
+                  </do_if>
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Ship no longer isolated - cleared [ISOLATED] flag'" chance="100"/>
+                  </do_if>
+                </do_if>
+              </do_else>
             </do_if>
             <do_else>
               <!-- Current sector is blacklisted - ship is not isolated, it's just in a blacklisted sector -->
@@ -1018,111 +1032,32 @@
               <!-- Clear isolated flag if it was previously set -->
               <do_if value="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?">
                 <remove_value name="global.$GT_IsolatedTradeActive.{$ship}"/>
+                <do_if value="global.$GT_Ships? and global.$GT_Ships.{$ship}? and global.$GT_Ships.{$ship}.$IsolationLogged?">
+                  <remove_value name="global.$GT_Ships.{$ship}.$IsolationLogged"/>
+                </do_if>
+                <set_value name="$pilot" exact="@$ship.pilot"/>
+                <do_if value="$pilot? and $pilot.exists">
+                  <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
+                    $Ship = $ship,
+                    $pilot = $pilot,
+                    $nameType = 'trader'
+                  ]"/>
+                </do_if>
               </do_if>
               <!-- Final safety check before setting properties -->
               <set_value name="$updatedStatePreSetCheck2" exact="@$updatedState.keys"/>
               <do_if value="$updatedStatePreSetCheck2?">
-                <!-- $updatedState is valid - safe to set properties -->
                 <set_value name="$updatedState.$shipIsIsolated" exact="0"/>
-                <set_value name="$updatedState.$shipIsIsolatedChecked" exact="1"/>
               </do_if>
               <do_else>
-                <!-- $updatedState is null - reinitialize and set properties -->
                 <set_value name="$updatedState" exact="table[]"/>
                 <set_value name="$updatedState.$shipIsIsolated" exact="0"/>
-                <set_value name="$updatedState.$shipIsIsolatedChecked" exact="1"/>
                 <do_if value="global.$GT_Config.$Debug.$Enabled and global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                   <debug_text text="'[GT-Blacklist]  $updatedState was null before setting isolation properties (blacklisted sector) - reinitialized'" chance="100"/>
                 </do_if>
               </do_else>
             </do_else>
           </do_if>
-        </do_if>
-        <do_else>
-          <!-- Isolation already checked - retrieve from state -->
-          <set_value name="$isolatedStateValue" exact="@$updatedState.$shipIsIsolated"/>
-          <set_value name="$shipIsIsolated" exact="if $isolatedStateValue? and ($isolatedStateValue == 1 or $isolatedStateValue == true) then true else false"/>
-          
-          <!-- CRITICAL: Also check global flag as authoritative source (state might be stale) -->
-          <!-- The global flag is set when isolation is detected, so it's the source of truth -->
-          <do_if value="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?">
-            <set_value name="$shipIsIsolated" exact="true"/>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Overriding cached isolation state with global flag (state=' + $isolatedStateValue + ', global=true)'" chance="100"/>
-            </do_if>
-          </do_if>
-          
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Cached isolation check: stateValue=' + $isolatedStateValue + ', shipIsIsolated=' + $shipIsIsolated + ', globalFlag=' + (if global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}? then 'true' else 'false')" chance="100"/>
-          </do_if>
-          
-          <!-- Set or clear isolated flag based on current state -->
-          <do_if value="$shipIsIsolated">
-            <!-- Ship is isolated - ensure flag is set -->
-            <!-- CRITICAL: Isolated and fallback are mutually exclusive - clear fallback flag when isolated is active -->
-            <do_if value="global.$GT_FallbackTradeActive? and global.$GT_FallbackTradeActive.{$ship}?">
-              <remove_value name="global.$GT_FallbackTradeActive.{$ship}"/>
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Cleared [FALLBACK] flag - isolated takes precedence'" chance="100"/>
-              </do_if>
-            </do_if>
-            
-            <do_if value="not global.$GT_IsolatedTradeActive?">
-              <set_value name="global.$GT_IsolatedTradeActive" exact="table[]"/>
-            </do_if>
-            <do_if value="not global.$GT_IsolatedTradeActive.{$ship}?">
-              <set_value name="global.$GT_IsolatedTradeActive.{$ship}" exact="true"/>
-            </do_if>
-            
-            <!-- Trigger ship name update to show [ISOLATED] flag (always when isolated) -->
-            <set_value name="$pilot" exact="@$ship.pilot"/>
-            <do_if value="$pilot? and $pilot.exists">
-              <set_value name="$pilotXP" exact="@global.$GT_Pilots.{$pilot}.$XP"/>
-              <do_if value="not $pilotXP?">
-                <set_value name="$pilotXP" exact="0"/>
-              </do_if>
-              <set_value name="$skillLevel" exact="1"/>
-              <do_all exact="15" counter="$lvl">
-                <do_if value="$pilotXP ge global.$GT_Config.$XP.$SkillThresholds.{$lvl}">
-                  <set_value name="$skillLevel" exact="$lvl"/>
-                </do_if>
-              </do_all>
-              <set_value name="$rankTitle" exact="'Lehrling'"/>
-              <do_if value="global.$GT_Config? and global.$GT_Config.$XP? and global.$GT_Config.$XP.$TraderTitles?">
-                <set_value name="$rankIndex" exact="($skillLevel / 3)i + 1"/>
-                <do_if value="$rankIndex gt global.$GT_Config.$XP.$TraderTitles.keys.count">
-                  <set_value name="$rankIndex" exact="global.$GT_Config.$XP.$TraderTitles.keys.count"/>
-                </do_if>
-                <do_if value="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}?">
-                  <set_value name="$rankTitle" exact="global.$GT_Config.$XP.$TraderTitles.{$rankIndex}"/>
-                </do_if>
-              </do_if>
-              
-              <!-- Signal ship name update with isolated nameType -->
-              <signal_objects object="player.galaxy" param="'GT_Update_Ship_Name'" param2="table[
-                $Ship = $ship,
-                $pilot = $pilot,
-                $xp = $pilotXP,
-                $level = $skillLevel,
-                $rank = $rankTitle,
-                $nameType = 'isolated'
-              ]"/>
-              
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Triggered ship name update for isolated ship (from cached state)'" chance="100"/>
-              </do_if>
-            </do_if>
-          </do_if>
-          <do_else>
-            <!-- Ship is not isolated - clear flag if it was set -->
-            <do_if value="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?">
-              <remove_value name="global.$GT_IsolatedTradeActive.{$ship}"/>
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Batch] (' + $ship.idcode + ') Ship no longer isolated - cleared [ISOLATED] flag'" chance="100"/>
-              </do_if>
-            </do_if>
-          </do_else>
-        </do_else>
         
         <!-- Return result table -->
         <set_value name="$result" exact="table[]"/>
@@ -1131,6 +1066,26 @@
         <return value="$result"/>
       </actions>
     </library>
+    
+    <!-- AI trade loop signals this each search cycle (batch processor removed in AI migration). -->
+    <cue name="HandleIsolationCheck" instantiate="true" version="1">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_Check_Isolation'"/>
+      </conditions>
+      <actions>
+        <set_value name="$ship" exact="null"/>
+        <do_if value="event.param2? and event.param2.$Ship?">
+          <set_value name="$ship" exact="event.param2.$Ship"/>
+        </do_if>
+        <do_if value="$ship? and $ship.exists">
+          <!-- Fresh state each call so isolation re-evaluates (BL can change). -->
+          <run_actions ref="md.GT_Libraries_Blacklist.GT_CheckAndHandleIsolation" result="$isoResult">
+            <param name="ship" value="$ship"/>
+            <param name="state" value="table[]"/>
+          </run_actions>
+        </do_if>
+      </actions>
+    </cue>
     
     <!-- Blacklist manager Lua is loaded via ui.xml (packed-safe).
          Initialization is handled by gt_threat_intelligence.xml on gt_blacklist_manager Ready. -->

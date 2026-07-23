@@ -1,13 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Unified cargo clearance / sell_only trade builder.
+     Territory: buyer must be within maxDistance jumps of homeSector (MaxSell from home).
+     Preference: rank by ship-current-sector distance (BL-aware when blacklistGroup set).
      Tier 1: buyers that can absorb the full on-board amount for a ware (best profit wins).
      Tier 2: partial buyers only when no full-load buyer exists (largest absorbable, then profit). -->
 <aiscript name="lib.gt.search.sell_only" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
   <params>
     <param name="ship" default="this.ship"/>
     <param name="buyOffers" default="[]"/>
-    <param name="homeSector" default="null"/>
-    <param name="maxDistance" default="0" comment="Gate distance from homeSector; 0 = no distance filter"/>
+    <param name="homeSector" default="null" comment="Territory origin (order home). MaxSell gate uses this."/>
+    <param name="maxDistance" default="0" comment="Max jumps from homeSector; 0 = no home-distance filter"/>
+    <param name="blacklistGroup" default="null" comment="When set, ship→buyer ranking distance is BL-aware; unreachable buyers are skipped"/>
     <param name="distancePenalty" default="0.1"/>
     <param name="priorityWares" default="[]"/>
     <param name="priorityScoreMultiplier" default="125"/>
@@ -31,8 +34,10 @@
       </do_if>
 
       <set_value name="$gtsoHome" exact="if $homeSector? and $homeSector.exists then $homeSector else $ship.sector"/>
+      <set_value name="$gtsoRankFrom" exact="if $ship.sector? and $ship.sector.exists then $ship.sector else $gtsoHome"/>
       <set_value name="$gtsoDistPenalty" exact="if $distancePenalty? and $distancePenalty ge 0 then $distancePenalty else 0.1"/>
       <set_value name="$gtsoMaxDist" exact="if $maxDistance? then $maxDistance else 0"/>
+      <set_value name="$gtsoBLGroup" exact="if $blacklistGroup? and $blacklistGroup != null then $blacklistGroup else null"/>
       <set_value name="$gtsoDedupe" exact="table[]"/>
       <create_list name="$gtsoCandidates"/>
       <set_value name="$gtsoMultPct" exact="if $priorityScoreMultiplier? then $priorityScoreMultiplier else 125"/>
@@ -64,16 +69,39 @@
         </do_if>
 
         <set_value name="$gtsoSellStation" exact="if $gtsoOffer.owner? then @$gtsoOffer.owner else $gtsoBuyer"/>
-        <set_value name="$gtsoDist" exact="-1"/>
-        <do_if value="$gtsoSellStation? and $gtsoSellStation.sector? and $gtsoHome? and $gtsoHome.exists">
-          <do_if value="$gtsoSellStation.sector == $gtsoHome">
-            <set_value name="$gtsoDist" exact="0"/>
+        <do_if value="not $gtsoSellStation? or not $gtsoSellStation.sector?">
+          <continue/>
+        </do_if>
+        <set_value name="$gtsoBuyerSector" exact="$gtsoSellStation.sector"/>
+
+        <!-- Territory gate: MaxSell (or order radius) from home — geographic jump distance. -->
+        <set_value name="$gtsoHomeDist" exact="-1"/>
+        <do_if value="$gtsoHome? and $gtsoHome.exists">
+          <do_if value="$gtsoBuyerSector == $gtsoHome">
+            <set_value name="$gtsoHomeDist" exact="0"/>
           </do_if>
           <do_else>
-            <set_value name="$gtsoDist" exact="$gtsoHome.gatedistance.{$gtsoSellStation.sector}"/>
+            <set_value name="$gtsoHomeDist" exact="$gtsoHome.gatedistance.{$gtsoBuyerSector}"/>
           </do_else>
         </do_if>
-        <do_if value="$gtsoMaxDist gt 0 and ($gtsoDist lt 0 or $gtsoDist gt $gtsoMaxDist)">
+        <do_if value="$gtsoMaxDist gt 0 and ($gtsoHomeDist lt 0 or $gtsoHomeDist gt $gtsoMaxDist)">
+          <continue/>
+        </do_if>
+
+        <!-- Preference distance: from ship current sector (BL-aware when group set). -->
+        <set_value name="$gtsoDist" exact="-1"/>
+        <do_if value="$gtsoRankFrom? and $gtsoRankFrom.exists">
+          <do_if value="$gtsoBuyerSector == $gtsoRankFrom">
+            <set_value name="$gtsoDist" exact="0"/>
+          </do_if>
+          <do_elseif value="$gtsoBLGroup?">
+            <set_value name="$gtsoDist" exact="$gtsoRankFrom.gatedistance.{$gtsoBuyerSector}.{$gtsoBLGroup}.{$ship}"/>
+          </do_elseif>
+          <do_else>
+            <set_value name="$gtsoDist" exact="$gtsoRankFrom.gatedistance.{$gtsoBuyerSector}"/>
+          </do_else>
+        </do_if>
+        <do_if value="$gtsoDist lt 0">
           <continue/>
         </do_if>
 
@@ -138,6 +166,7 @@
             $Absorbable = $gtsoAbsorbable,
             $TradeAmount = $gtsoTradeAmount,
             $Distance = $gtsoDist,
+            $HomeDistance = $gtsoHomeDist,
             $UnitPrice = $gtsoOffer.unitprice,
             $ProfitScore = $gtsoProfitScore,
             $IsFullLoad = $gtsoIsFullLoad,
@@ -222,7 +251,7 @@
       </do_if>
 
       <do_if value="$debugchance gt 0 and $haveBest">
-        <debug_text text="'[GT-Clearance] ' + $ship.idcode + ': built ' + $sortedTrades.count + ' sell_only candidate(s); best ' + (if $bestTrade.$Ware? then @$bestTrade.$Ware.name else '?') + ' x' + (if $bestTrade.$Amount? then $bestTrade.$Amount else 0) + ' fullLoad=' + (if $bestTrade.$ClearanceFullLoad? and $bestTrade.$ClearanceFullLoad then 'Y' else 'N') + ' score=' + $bestScore" chance="$debugchance"/>
+        <debug_text text="'[GT-Clearance] ' + $ship.idcode + ': built ' + $sortedTrades.count + ' sell_only candidate(s); best ' + (if $bestTrade.$Ware? then @$bestTrade.$Ware.name else '?') + ' x' + (if $bestTrade.$Amount? then $bestTrade.$Amount else 0) + ' fullLoad=' + (if $bestTrade.$ClearanceFullLoad? and $bestTrade.$ClearanceFullLoad then 'Y' else 'N') + ' shipDist=' + (if $bestTrade.$Distance? then $bestTrade.$Distance else -1) + ' score=' + $bestScore" chance="$debugchance"/>
       </do_if>
 
       <wait exact="1ms" comment="Cooperative yield before return (wake-loop guard)"/>

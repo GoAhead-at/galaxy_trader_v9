@@ -3800,6 +3800,11 @@
             <do_if value="$cacheFoundOnly and $cacheFoundOnlyTradeList? and $cacheFoundOnlyTradeList.count gt 0">
               <set_value name="this.$mk42PolicyNeedsLiveSearch" exact="false"/>
             </do_if>
+            <!-- Cache MISS (including pool full of currently-unusable rows): next request must
+                 ForceLiveSearch so the scheduler cannot downgrade mk42live back to a dead cache re-read. -->
+            <do_elseif value="not $cacheFoundOnly">
+              <set_value name="this.$mk42PolicyNeedsLiveSearch" exact="true"/>
+            </do_elseif>
             <!-- Pool has entries but this ship got zero: clear stale per-ship failure flags. -->
             <do_if value="not $cacheFoundOnly and $mk4HomeCacheCount gt 0 and $searchHomeSector? and $searchHomeSector.exists and global.$GT_TradeCacheMK42? and global.$GT_TradeCacheMK42.{$searchHomeSector}?">
               <do_all exact="global.$GT_TradeCacheMK42.{$searchHomeSector}.count" counter="$cacheMissFsi">
@@ -4372,10 +4377,12 @@
           </do_if>
         </do_if>
 
-        <!-- §3 searchDepth: breadth cap for validation. MK4 supply may extend cap to fit one
-             candidate per distinct ware when that exceeds searchDepth (score order, no diversify). -->
+        <!-- §3 searchDepth: breadth cap for validation.
+             MK4-2 dual-axis: static max searchDepth per delivery class when that class prio > 0
+             (BS=10 ST=6 → up to 30 BS + 30 ST). Matches bucket merge; priority only gates on/off
+             and validation try-order (higher prio class first). Flat first-N is single-class only. -->
         <set_value name="$searchDepthCap" exact="if this.$effectiveSearchDepth? then this.$effectiveSearchDepth else 30"/>
-        <do_if value="$pipelineFound and $pipelineTradeList.count gt $searchDepthCap">
+        <do_if value="$pipelineFound and $pipelineTradeList.count gt 0">
           <set_value name="$mk4PipelineDepthBefore" exact="$pipelineTradeList.count"/>
           <set_value name="$mk4DistinctWareCount" exact="0"/>
           <set_value name="$mk4DistinctWaresSeen" exact="table[]"/>
@@ -4387,18 +4394,119 @@
               <set_value name="$mk4DistinctWareCount" operation="add"/>
             </do_if>
           </do_all>
-          <set_value name="$mk4EffectiveDepthCap" exact="$searchDepthCap"/>
+          <set_value name="$mk4PerClassDepthCap" exact="$searchDepthCap"/>
           <do_if value="$searchMode? and $searchMode == 'buy_and_sell' and $mk4DistinctWareCount gt $searchDepthCap">
-            <set_value name="$mk4EffectiveDepthCap" exact="$mk4DistinctWareCount"/>
+            <set_value name="$mk4PerClassDepthCap" exact="$mk4DistinctWareCount"/>
           </do_if>
-          <do_if value="$pipelineTradeList.count gt $mk4EffectiveDepthCap">
+          <set_value name="$mk42DepthPerClass" exact="false"/>
+          <do_if value="$searchMode? and $searchMode == 'buy_and_sell' and this.$mk42Priorities?">
+            <set_value name="$mk42DepthPrioBs" exact="if this.$mk42Priorities.$Buildstorage? then this.$mk42Priorities.$Buildstorage else 0"/>
+            <set_value name="$mk42DepthPrioSt" exact="if this.$mk42Priorities.$Stations? then this.$mk42Priorities.$Stations else 0"/>
+            <set_value name="$mk42DepthPrioAx" exact="if this.$mk42Priorities.$Aux? then this.$mk42Priorities.$Aux else 0"/>
+            <set_value name="$mk42DepthHasBs" exact="false"/>
+            <set_value name="$mk42DepthHasSt" exact="false"/>
+            <set_value name="$mk42DepthHasAx" exact="false"/>
+            <set_value name="$mk42DepthCountBs" exact="0"/>
+            <set_value name="$mk42DepthCountSt" exact="0"/>
+            <set_value name="$mk42DepthCountAx" exact="0"/>
+            <do_all exact="$pipelineTradeList.count" counter="$mk42DhIdx">
+              <set_value name="$mk42DhTrade" exact="$pipelineTradeList.{$mk42DhIdx}"/>
+              <set_value name="$mk42DhClass" exact="if $mk42DhTrade.$CustomerClass? then @$mk42DhTrade.$CustomerClass else 'None'"/>
+              <do_if value="$mk42DhClass == 'Buildstorage' and $mk42DepthPrioBs gt 0">
+                <set_value name="$mk42DepthHasBs" exact="true"/>
+                <set_value name="$mk42DepthCountBs" operation="add"/>
+              </do_if>
+              <do_elseif value="$mk42DhClass == 'Stations' and $mk42DepthPrioSt gt 0">
+                <set_value name="$mk42DepthHasSt" exact="true"/>
+                <set_value name="$mk42DepthCountSt" operation="add"/>
+              </do_elseif>
+              <do_elseif value="$mk42DhClass == 'Aux' and $mk42DepthPrioAx gt 0">
+                <set_value name="$mk42DepthHasAx" exact="true"/>
+                <set_value name="$mk42DepthCountAx" operation="add"/>
+              </do_elseif>
+            </do_all>
+            <set_value name="$mk42DepthEnabledCount" exact="0"/>
+            <do_if value="$mk42DepthHasBs"><set_value name="$mk42DepthEnabledCount" operation="add"/></do_if>
+            <do_if value="$mk42DepthHasSt"><set_value name="$mk42DepthEnabledCount" operation="add"/></do_if>
+            <do_if value="$mk42DepthHasAx"><set_value name="$mk42DepthEnabledCount" operation="add"/></do_if>
+            <set_value name="$mk42DepthNeedsCap" exact="false"/>
+            <do_if value="$mk42DepthEnabledCount ge 1">
+              <do_if value="$mk42DepthCountBs gt $mk4PerClassDepthCap or $mk42DepthCountSt gt $mk4PerClassDepthCap or $mk42DepthCountAx gt $mk4PerClassDepthCap">
+                <set_value name="$mk42DepthNeedsCap" exact="true"/>
+              </do_if>
+              <do_if value="$mk42DepthEnabledCount ge 2">
+                <set_value name="$mk42DepthNeedsCap" exact="true"/>
+              </do_if>
+            </do_if>
+            <do_if value="$mk42DepthNeedsCap">
+              <set_value name="$mk42DepthPerClass" exact="true"/>
+              <create_list name="$pipelineTradeListCapped"/>
+              <set_value name="$mk42DepthPicked" exact="table[]"/>
+              <set_value name="$mk42DepthClassesLeft" exact="$mk42DepthEnabledCount"/>
+              <set_value name="$mk42DepthTakenBs" exact="false"/>
+              <set_value name="$mk42DepthTakenSt" exact="false"/>
+              <set_value name="$mk42DepthTakenAx" exact="false"/>
+              <!-- Emit higher-priority class first (try order); each class keeps up to searchDepth. -->
+              <do_while value="$mk42DepthClassesLeft gt 0">
+                <set_value name="$mk42DepthNextClass" exact="''"/>
+                <set_value name="$mk42DepthNextPrio" exact="-1"/>
+                <do_if value="not $mk42DepthTakenBs and $mk42DepthHasBs and $mk42DepthPrioBs gt $mk42DepthNextPrio">
+                  <set_value name="$mk42DepthNextClass" exact="'Buildstorage'"/>
+                  <set_value name="$mk42DepthNextPrio" exact="$mk42DepthPrioBs"/>
+                </do_if>
+                <do_if value="not $mk42DepthTakenSt and $mk42DepthHasSt and $mk42DepthPrioSt gt $mk42DepthNextPrio">
+                  <set_value name="$mk42DepthNextClass" exact="'Stations'"/>
+                  <set_value name="$mk42DepthNextPrio" exact="$mk42DepthPrioSt"/>
+                </do_if>
+                <do_if value="not $mk42DepthTakenAx and $mk42DepthHasAx and $mk42DepthPrioAx gt $mk42DepthNextPrio">
+                  <set_value name="$mk42DepthNextClass" exact="'Aux'"/>
+                  <set_value name="$mk42DepthNextPrio" exact="$mk42DepthPrioAx"/>
+                </do_if>
+                <do_if value="$mk42DepthNextClass == ''">
+                  <break/>
+                </do_if>
+                <set_value name="$mk42DepthTaken" exact="0"/>
+                <do_all exact="$pipelineTradeList.count" counter="$mk42DcIdx">
+                  <do_if value="$mk42DepthTaken ge $mk4PerClassDepthCap">
+                    <break/>
+                  </do_if>
+                  <do_if value="$mk42DepthPicked.{$mk42DcIdx}?">
+                    <continue/>
+                  </do_if>
+                  <set_value name="$mk42DcTrade" exact="$pipelineTradeList.{$mk42DcIdx}"/>
+                  <set_value name="$mk42DcClass" exact="if $mk42DcTrade.$CustomerClass? then @$mk42DcTrade.$CustomerClass else 'None'"/>
+                  <do_if value="$mk42DcClass == $mk42DepthNextClass">
+                    <append_to_list name="$pipelineTradeListCapped" exact="$mk42DcTrade"/>
+                    <set_value name="$mk42DepthPicked.{$mk42DcIdx}" exact="true"/>
+                    <set_value name="$mk42DepthTaken" operation="add"/>
+                  </do_if>
+                </do_all>
+                <do_if value="$mk42DepthNextClass == 'Buildstorage'">
+                  <set_value name="$mk42DepthTakenBs" exact="true"/>
+                </do_if>
+                <do_elseif value="$mk42DepthNextClass == 'Stations'">
+                  <set_value name="$mk42DepthTakenSt" exact="true"/>
+                </do_elseif>
+                <do_elseif value="$mk42DepthNextClass == 'Aux'">
+                  <set_value name="$mk42DepthTakenAx" exact="true"/>
+                </do_elseif>
+                <set_value name="$mk42DepthClassesLeft" operation="subtract"/>
+              </do_while>
+              <set_value name="$pipelineTradeList" exact="$pipelineTradeListCapped"/>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-MK4-Supply] ' + this.ship.idcode + ': searchDepth per-class before=' + $mk4PipelineDepthBefore + ' after=' + $pipelineTradeList.count + ' perClassCap=' + $mk4PerClassDepthCap + ' classes=' + $mk42DepthEnabledCount + ' BS=' + $mk42DepthCountBs + ' ST=' + $mk42DepthCountSt + ' AX=' + $mk42DepthCountAx" chance="100"/>
+              </do_if>
+            </do_if>
+          </do_if>
+          <!-- Single-class / non-MK42: flat first-N searchDepth (legacy). -->
+          <do_if value="not $mk42DepthPerClass and $pipelineTradeList.count gt $mk4PerClassDepthCap">
             <create_list name="$pipelineTradeListCapped"/>
-            <do_all exact="$mk4EffectiveDepthCap" counter="$sdIdx">
+            <do_all exact="$mk4PerClassDepthCap" counter="$sdIdx">
               <append_to_list name="$pipelineTradeListCapped" exact="$pipelineTradeList.{$sdIdx}"/>
             </do_all>
             <set_value name="$pipelineTradeList" exact="$pipelineTradeListCapped"/>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $searchMode? and $searchMode == 'buy_and_sell'">
-              <debug_text text="'[GT-MK4-Supply] ' + this.ship.idcode + ': searchDepth cap before=' + $mk4PipelineDepthBefore + ' after=' + $pipelineTradeList.count + ' configured=' + $searchDepthCap + ' effective=' + $mk4EffectiveDepthCap + ' distinctWares=' + $mk4DistinctWareCount" chance="100"/>
+              <debug_text text="'[GT-MK4-Supply] ' + this.ship.idcode + ': searchDepth cap before=' + $mk4PipelineDepthBefore + ' after=' + $pipelineTradeList.count + ' configured=' + $searchDepthCap + ' effective=' + $mk4PerClassDepthCap + ' distinctWares=' + $mk4DistinctWareCount" chance="100"/>
             </do_if>
           </do_if>
         </do_if>
@@ -4591,12 +4699,11 @@
               <do_elseif value="$freshTrade.$SellOffer.owner? and @$freshTrade.$SellOffer.owner.exists">
                 <set_value name="$freshSellStation" exact="@$freshTrade.$SellOffer.owner"/>
               </do_elseif>
-              <!-- Build-storage delivery refs go stale fast; recover the live build storage from the
-                   stable base station captured at match time (mirrors lib.gt.mk42.cache.search). -->
-              <do_elseif value="$freshTrade.$SellStationBase? and @$freshTrade.$SellStationBase.exists and @$freshTrade.$SellStationBase.buildstorage and @$freshTrade.$SellStationBase.buildstorage.exists">
+              <!-- BS refresh (vanilla): always prefer base.buildstorage over a stale parent-station handle. -->
+              <do_if value="$freshTrade.$SellStationBase? and @$freshTrade.$SellStationBase.exists and @$freshTrade.$SellStationBase.buildstorage and @$freshTrade.$SellStationBase.buildstorage.exists">
                 <set_value name="$freshSellStation" exact="@$freshTrade.$SellStationBase.buildstorage"/>
                 <set_value name="$freshTrade.$SellStation" exact="$freshSellStation"/>
-              </do_elseif>
+              </do_if>
               <do_if value="$freshBuyStation? and $freshBuyStation.exists and $freshBuyWare != null">
                 <find_sell_offer seller="$freshBuyStation" wares="$freshBuyWare" tradepartner="this.ship" result="$freshResolvedBuyOffer"/>
                 <do_if value="$freshResolvedBuyOffer?">
@@ -4604,9 +4711,11 @@
                 </do_if>
               </do_if>
               <do_if value="$freshSellStation? and $freshSellStation.exists and $freshSellWare != null">
-                <!-- Build storages expose "empty" buy offers; fetch with excludeempty/usereservations=false. -->
+                <!-- BS: vanilla trade.station (buyer=BS, bare offeramount / desiredamount). -->
                 <do_if value="@$freshSellStation.isclass.buildstorage">
-                  <find_buy_offer buyer="$freshSellStation" wares="$freshSellWare" tradepartner="this.ship" result="$freshResolvedSellOffer" excludeempty="false" usereservations="false"/>
+                  <find_buy_offer buyer="$freshSellStation" wares="$freshSellWare" result="$freshResolvedSellOffer" excludeempty="false">
+                    <offeramount min="1"/>
+                  </find_buy_offer>
                 </do_if>
                 <do_else>
                   <find_buy_offer buyer="$freshSellStation" wares="$freshSellWare" tradepartner="this.ship" result="$freshResolvedSellOffer"/>
@@ -4628,6 +4737,9 @@
               </do_if>
               <set_value name="$freshSellAmt" exact="@$freshTrade.$SellOffer.offeramount.{this.ship}"/>
               <do_if value="$freshDestIsBs">
+                <do_if value="(not $freshSellAmt? or $freshSellAmt le 0) and $freshTrade.$SellOffer.desiredamount? and @$freshTrade.$SellOffer.desiredamount gt 0">
+                  <set_value name="$freshSellAmt" exact="@$freshTrade.$SellOffer.desiredamount"/>
+                </do_if>
                 <do_if value="(not $freshSellAmt? or $freshSellAmt le 0) and @$freshTrade.$SellOffer.amount gt 0">
                   <set_value name="$freshSellAmt" exact="@$freshTrade.$SellOffer.amount"/>
                 </do_if>
@@ -4650,14 +4762,18 @@
           </do_if>
         </do_if>
 
-        <!-- Notify scheduler that this ship finished its search slot (semaphore release + dispatch) -->
+        <!-- Notify scheduler that this ship finished its search slot (semaphore release + dispatch).
+             SearchType MUST be mk42live (not bare 'live'): HandleSearchDone only releases
+             MK42LiveActiveShips on mk42live. Mis-tagging as live left the slot held, so the next
+             request was REJECTED reason=MK42LiveActiveShips until order restart / prio change. -->
         <set_value name="this.$mk42PolicyNeedsLiveSearch" exact="false"/>
         <signal_objects object="player.galaxy" param="'GT_Search_Done'" param2="table[
           $Ship = this.ship,
           $Found = $pipelineFound,
           $TradeList = $pipelineTradeList,
           $SearchMethod = $pipelineSearchMethod,
-          $SearchType = if this.$pipelineSearchMode? and this.$pipelineSearchMode == 'sell_only' then 'clearance' else 'live'
+          $SearchType = if this.$pipelineSearchMode? and this.$pipelineSearchMode == 'sell_only' then 'clearance' else 'mk42live',
+          $HomeSector = if $searchHomeSector? then $searchHomeSector else null
         ]"/>
         <resume label="wait_for_response"/>
       </do_if>
@@ -6188,94 +6304,28 @@
                     <do_elseif value="$currentTrade.$SellOffer.owner? and @$currentTrade.$SellOffer.owner.exists">
                       <set_value name="$preValSellStation" exact="@$currentTrade.$SellOffer.owner"/>
                     </do_elseif>
-                    <!-- Build-storage deliveries recreate their offer, build storage AND base every
-                         construction tick, so all cached refs are dead by execution time (-> buyer_missing
-                         at clamp). Re-discover the LIVE delivery the same way lib.gt.mk42.cache.search does:
-                         first the cheap base anchor, then find the current player buy offer by the cached
-                         sell sector + ware, disambiguated by the stored stable delivery idcode.
-                         DeliveryStationId for BS is base.idcode (== station.idcode): class-gate offer
-                         candidates so dual-demand wares (e.g. Energy Cells) cannot flip BS onto the station. -->
-                    <set_value name="$preValIsBsDelivery" exact="($currentTrade.$SellStationBase?) or ($currentTrade.$CustomerClass? and $currentTrade.$CustomerClass == 'Buildstorage') or ($preValSellStation? and @$preValSellStation.exists and @$preValSellStation.isclass.buildstorage)"/>
-                    <do_if value="$preValIsBsDelivery and $currentTrade.$SellStationBase? and @$currentTrade.$SellStationBase.exists and @$currentTrade.$SellStationBase.buildstorage and @$currentTrade.$SellStationBase.buildstorage.exists">
-                      <do_if value="(not $preValSellStation? or not @$preValSellStation.exists) or not @$preValSellStation.isclass.buildstorage">
-                        <set_value name="$preValSellStation" exact="@$currentTrade.$SellStationBase.buildstorage"/>
-                        <set_value name="$currentTrade.$SellStation" exact="$preValSellStation"/>
-                      </do_if>
-                    </do_if>
-                    <do_elseif value="(not $preValSellStation? or not @$preValSellStation.exists) and $currentTrade.$SellStationBase? and @$currentTrade.$SellStationBase.exists and @$currentTrade.$SellStationBase.buildstorage and @$currentTrade.$SellStationBase.buildstorage.exists">
+                    <!-- BS refresh (vanilla trade.station): buyer=station.buildstorage, excludeempty=false,
+                         bare offeramount so desiredamount is used when no money changes hands.
+                         Never sector-scan by base idcode (collides with the parent station). -->
+                    <do_if value="$currentTrade.$SellStationBase? and @$currentTrade.$SellStationBase.exists and @$currentTrade.$SellStationBase.buildstorage and @$currentTrade.$SellStationBase.buildstorage.exists">
                       <set_value name="$preValSellStation" exact="@$currentTrade.$SellStationBase.buildstorage"/>
-                    </do_elseif>
-                    <set_value name="$preValForceBsRescan" exact="$preValIsBsDelivery or (not $preValSellStation? or not @$preValSellStation.exists) or (@$preValSellStation.exists and @$preValSellStation.isclass.buildstorage) or ($currentTrade.$SellStationBase? and @$currentTrade.$SellStationBase.exists and $currentTrade.$SellStationBase.buildstorage?)"/>
-                    <set_value name="$preValBsBuyer" exact="null"/>
-                    <set_value name="$preValRePick" exact="null"/>
-                    <do_if value="$preValForceBsRescan and $currentTrade.$SellSector? and @$currentTrade.$SellSector.exists and $preValSellWare != null and $currentTrade.$DeliveryStationId?">
-                      <!-- Re-resolve the live buy offer with the PROVEN MK4-2 player buy-offer
-                           query (lib.gt.mk42.live.search.xml ~1368): scan player-owned buy offers for the ware
-                           in the sell sector with a BARE <offeramount min="1"/> (NO tradepartner). The bare
-                           offeramount lets the engine read the build storage's desiredamount (construction
-                           demand carries no funds); specifying tradepartner=ship forces the money-trade path
-                           that reads the 0 funds-amount -> nothing found -> false buyer_missing (XSD common.xsd
-                           offeramount: "uses the desired amount if money would NOT change hands"). Disambiguate
-                           by stable delivery idcode AND delivery class (BS vs station). -->
-                      <find_buy_offer wares="$preValSellWare" space="$currentTrade.$SellSector" result="$preValBsOffers" multiple="true">
-                        <match_buyer tradesknownto="this.ship.owner" owner="faction.player">
-                          <match_relation_to object="this.ship" relation="dock" comparison="ge"/>
-                          <match_relation_to faction="this.ship.owner" relation="enemy" comparison="not"/>
-                        </match_buyer>
-                        <offeramount min="1"/>
-                      </find_buy_offer>
-                      <do_if value="$preValBsOffers? and $preValBsOffers.count gt 0">
-                        <do_for_each name="$preValBsO" in="$preValBsOffers">
-                          <do_if value="not ($preValRePick? and @$preValRePick.exists) and $preValBsO? and @$preValBsO.exists">
-                            <set_value name="$preValBsCand" exact="null"/>
-                            <do_if value="$preValBsO.buyer? and @$preValBsO.buyer.exists">
-                              <set_value name="$preValBsCand" exact="@$preValBsO.buyer"/>
-                            </do_if>
-                            <do_elseif value="$preValBsO.owner? and @$preValBsO.owner.exists">
-                              <set_value name="$preValBsCand" exact="@$preValBsO.owner"/>
-                            </do_elseif>
-                            <do_if value="$preValBsCand? and @$preValBsCand.exists">
-                              <set_value name="$preValBsCandId" exact="if @$preValBsCand.isclass.buildstorage and $preValBsCand.base? and @$preValBsCand.base.exists then @$preValBsCand.base.idcode else @$preValBsCand.idcode"/>
-                              <do_if value="$preValBsCandId == $currentTrade.$DeliveryStationId">
-                                <set_value name="$preValClassOk" exact="false"/>
-                                <do_if value="$preValIsBsDelivery">
-                                  <do_if value="@$preValBsCand.isclass.buildstorage">
-                                    <set_value name="$preValClassOk" exact="true"/>
-                                  </do_if>
-                                </do_if>
-                                <do_else>
-                                  <do_if value="not @$preValBsCand.isclass.buildstorage">
-                                    <set_value name="$preValClassOk" exact="true"/>
-                                  </do_if>
-                                </do_else>
-                                <do_if value="$preValClassOk">
-                                  <set_value name="$preValRePick" exact="$preValBsO"/>
-                                  <set_value name="$preValBsBuyer" exact="$preValBsCand"/>
-                                  <set_value name="$preValSellStation" exact="$preValBsCand"/>
-                                  <set_value name="$currentTrade.$SellStation" exact="$preValBsCand"/>
-                                  <set_value name="$currentTrade.$SellOffer" exact="$preValBsO"/>
-                                </do_if>
-                              </do_if>
-                            </do_if>
-                          </do_if>
-                        </do_for_each>
-                      </do_if>
+                      <set_value name="$currentTrade.$SellStation" exact="$preValSellStation"/>
                     </do_if>
-                    <!-- Non-build-storage normal-station refresh (build storage already handled above). -->
-                    <do_if value="not $preValForceBsRescan and $preValSellStation? and $preValSellStation.exists and $preValSellWare != null and not @$preValSellStation.isclass.buildstorage">
-                      <find_buy_offer buyer="$preValSellStation" wares="$preValSellWare" tradepartner="this.ship" result="$preValFreshSellOffer"/>
-                      <do_if value="$preValFreshSellOffer?">
-                        <set_value name="$currentTrade.$SellOffer" exact="$preValFreshSellOffer"/>
+                    <do_if value="$preValSellStation? and $preValSellStation.exists and $preValSellWare != null">
+                      <do_if value="@$preValSellStation.isclass.buildstorage">
+                        <find_buy_offer buyer="$preValSellStation" wares="$preValSellWare" result="$preValFreshSellOffer" excludeempty="false">
+                          <offeramount min="1"/>
+                        </find_buy_offer>
+                        <do_if value="$preValFreshSellOffer?">
+                          <set_value name="$currentTrade.$SellOffer" exact="$preValFreshSellOffer"/>
+                        </do_if>
                       </do_if>
-                    </do_if>
-                    <do_if value="$preValForceBsRescan and @global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                      <debug_text text="'[GT-Reserve] ' + this.ship.idcode + ': BS re-resolve' +
-                        '\n  ware=' + (if $preValSellWare? then $preValSellWare.name else 'null') +
-                        '\n  deliveryId=' + (if $currentTrade.$DeliveryStationId? then $currentTrade.$DeliveryStationId else 'null') +
-                        '\n  bsBuyer found=' + (if $preValBsBuyer? and @$preValBsBuyer.exists then 1 else 0) +
-                        '\n  sellOffer.buyer alive=' + (if $currentTrade.$SellOffer.buyer? and @$currentTrade.$SellOffer.buyer.exists then 1 else 0) +
-                        '\n  sellOffer.owner alive=' + (if $currentTrade.$SellOffer.owner? and @$currentTrade.$SellOffer.owner.exists then 1 else 0)"
-                        chance="100"/>
+                      <do_else>
+                        <find_buy_offer buyer="$preValSellStation" wares="$preValSellWare" tradepartner="this.ship" result="$preValFreshSellOffer"/>
+                        <do_if value="$preValFreshSellOffer?">
+                          <set_value name="$currentTrade.$SellOffer" exact="$preValFreshSellOffer"/>
+                        </do_if>
+                      </do_else>
                     </do_if>
 
                     <!-- Check buy offer: available AND has SOME amount (clamping will handle exact amount reduction) -->
@@ -6325,8 +6375,11 @@
                     <!-- Check sell offer: effective amount (clamping will handle exact amount reduction) -->
                     <set_value name="$sellOfferAvailable" exact="$currentTrade.$SellOffer.available"/>
                     <set_value name="$sellOfferAmount" exact="@$currentTrade.$SellOffer.offeramount.{this.ship}"/>
-                    <do_if value="$preValForceBsRescan">
-                      <!-- Build storage: amount + cargo deficit fallbacks; subtract station-wide reservations. -->
+                    <do_if value="$preValSellStation? and @$preValSellStation.exists and @$preValSellStation.isclass.buildstorage">
+                      <!-- Build storage: desiredamount (vanilla) then amount; cargo deficit last. -->
+                      <do_if value="(not $sellOfferAmount? or $sellOfferAmount le 0) and $currentTrade.$SellOffer.desiredamount? and @$currentTrade.$SellOffer.desiredamount gt 0">
+                        <set_value name="$sellOfferAmount" exact="@$currentTrade.$SellOffer.desiredamount"/>
+                      </do_if>
                       <do_if value="(not $sellOfferAmount? or $sellOfferAmount le 0) and $currentTrade.$SellOffer.amount? and @$currentTrade.$SellOffer.amount gt 0">
                         <set_value name="$sellOfferAmount" exact="@$currentTrade.$SellOffer.amount"/>
                       </do_if>
@@ -6437,10 +6490,6 @@
                     </do_if>
                     <!-- Build Storage / internal delivery: .available may stay false while cargo deficit exists. -->
                     <set_value name="$sellOfferStillValid" exact="$sellOfferOwnerValid and ($sellOfferAmount? and $sellOfferAmount gt 0)"/>
-                    <!-- BS-class rows must keep a buildstorage buyer; never proceed with the parent station. -->
-                    <do_if value="$preValIsBsDelivery? and $preValIsBsDelivery and (not $preValSellStation? or not @$preValSellStation.exists or not @$preValSellStation.isclass.buildstorage)">
-                      <set_value name="$sellOfferStillValid" exact="false"/>
-                    </do_if>
                     
                     <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
                       <set_value name="$buyDesiredBefore" exact="@$currentTrade.$BuyOffer.desiredamount"/>
@@ -6663,25 +6712,45 @@
                 </do_if>
                 
                 <!-- Clamp sell order amount -->
-                <do_if value="not $clampFailed and $currentTrade.$SellOffer?">
+                <!-- Snapshot the offer before clamp_trade_amount: attribute eval of
+                     $currentTrade.$SellOffer can yield null (AI error: not of type trade) even when
+                     offeramount was readable moments earlier — common on unfunded BS buy offers. -->
+                <set_value name="$sellOfferForClamp" exact="null"/>
+                <do_if value="not $clampFailed and $currentTrade.$SellOffer? and @$currentTrade.$SellOffer.exists">
+                  <set_value name="$sellOfferForClamp" exact="@$currentTrade.$SellOffer"/>
+                </do_if>
+                <!-- '?' is true after set_value null (var defined); must use != null or clamp_trade_amount gets null trade. -->
+                <do_if value="not $clampFailed and $sellOfferForClamp != null">
+                  <!-- Resolve delivery customer the same way as validation ($sellStation): BS buy
+                       offers often have no live .buyer/.owner on the offer ref, while tradematch
+                       already stamped $SellStation. -->
                   <set_value name="$sellClampBuyer" exact="null"/>
-                  <do_if value="$currentTrade.$SellOffer.buyer?">
-                    <set_value name="$sellClampBuyer" exact="@$currentTrade.$SellOffer.buyer"/>
+                  <do_if value="$sellOfferForClamp.buyer? and @$sellOfferForClamp.buyer.exists">
+                    <set_value name="$sellClampBuyer" exact="@$sellOfferForClamp.buyer"/>
                   </do_if>
-                  <do_if value="$sellClampBuyer == null and $currentTrade.$SellOffer.owner?">
-                    <set_value name="$sellClampBuyer" exact="@$currentTrade.$SellOffer.owner"/>
+                  <do_if value="$sellClampBuyer == null and $sellOfferForClamp.owner? and @$sellOfferForClamp.owner.exists">
+                    <set_value name="$sellClampBuyer" exact="@$sellOfferForClamp.owner"/>
+                  </do_if>
+                  <do_if value="$sellClampBuyer == null and $sellStation? and $sellStation.exists">
+                    <set_value name="$sellClampBuyer" exact="$sellStation"/>
+                  </do_if>
+                  <do_if value="$sellClampBuyer == null and $currentTrade.$SellStation? and @$currentTrade.$SellStation.exists">
+                    <set_value name="$sellClampBuyer" exact="@$currentTrade.$SellStation"/>
                   </do_if>
                   <do_if value="$sellClampBuyer == null">
                     <set_value name="$tradesRejectedCargo" operation="add"/>
                     <set_value name="$clampFailed" exact="true"/>
                     <set_value name="$sellClampReason" exact="'buyer_missing'"/>
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' sell clamp buyer_missing (offer.buyer/owner and sellStation all unresolved) → Trying next trade...'" chance="100"/>
+                    </do_if>
                   </do_if>
                   
                   <do_if value="$isSellOnlyTrade">
                     <!-- Sell-only trade: Ship already has cargo, validate against ship cargo -->
                     <do_if value="not $clampFailed">
                       <clamp_trade_amount 
-                        trade="$currentTrade.$SellOffer" 
+                        trade="$sellOfferForClamp" 
                         amount="$finalSellAmount" 
                         buyer="$sellClampBuyer" 
                         seller="this.ship" 
@@ -6695,7 +6764,7 @@
                     <!-- Vanilla comment: "it is possible that this doesn't have the wares yet if they still need to be bought" -->
                     <do_if value="not $clampFailed">
                       <clamp_trade_amount 
-                        trade="$currentTrade.$SellOffer" 
+                        trade="$sellOfferForClamp" 
                         amount="$finalSellAmount" 
                         buyer="$sellClampBuyer" 
                         result="$finalSellAmount"
@@ -6704,8 +6773,8 @@
                   </do_else>
                   
                   <do_if value="@global.$GT_Config.$Debug.$Enabled and @global.$GT_Config.$Debug.$TradeSearch and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                    <set_value name="$sellOfferAmountAfterClamp" exact="@$currentTrade.$SellOffer.offeramount.{this.ship}"/>
-                    <set_value name="$sellDesiredAfterClamp" exact="@$currentTrade.$SellOffer.desiredamount"/>
+                    <set_value name="$sellOfferAmountAfterClamp" exact="@$sellOfferForClamp.offeramount.{this.ship}"/>
+                    <set_value name="$sellDesiredAfterClamp" exact="@$sellOfferForClamp.desiredamount"/>
                     <debug_text text="'[GT-Reserve] ' + this.ship.idcode + ': post-clamp SELL' +
                       '\n  original=' + $currentTrade.$Amount +
                       '\n  clamped=' + $finalSellAmount +
@@ -6743,6 +6812,25 @@
                       chance="100"/>
                   </do_if>
                 </do_if>
+                <do_elseif value="not $clampFailed and not $isSellOnlyTrade">
+                  <set_value name="$tradesRejectedOfferInvalid" operation="add"/>
+                  <set_value name="$clampFailed" exact="true"/>
+                  <set_value name="$sellClampReason" exact="'sell_offer_null'"/>
+                  <do_if value="$searchMethod == 'cache'">
+                    <signal_objects object="player.galaxy" param="'GT_Cache_Flag_Ship'" param2="table[
+                      $Ship = this.ship,
+                      $BuyOffer = @$currentTrade.$BuyOffer,
+                      $SellOffer = @$currentTrade.$SellOffer,
+                      $SellStation = if $sellStation? and $sellStation.exists then $sellStation else (if $currentTrade.$SellStation? and @$currentTrade.$SellStation.exists then @$currentTrade.$SellStation else null),
+                      $HomeSector = $searchHomeSector,
+                      $CachePool = 'mk42',
+                      $Reason = 'sell_offer_null'
+                    ]"/>
+                  </do_if>
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' sell clamp skipped (SellOffer null/dead) → Trying next trade...'" chance="100"/>
+                  </do_if>
+                </do_elseif>
                 
                 <!-- If clamping failed, continue to next trade -->
                 <do_if value="$clampFailed">
@@ -7370,88 +7458,19 @@
           <do_if value="$pendingTrade.$SellOffer?">
             <set_value name="$finalSellStation" exact="if $pendingTrade.$SellStation? and @$pendingTrade.$SellStation.exists then $pendingTrade.$SellStation else (if $pendingTrade.$SellOffer.buyer? and @$pendingTrade.$SellOffer.buyer.exists then @$pendingTrade.$SellOffer.buyer else (if $pendingTrade.$SellOffer.owner? and @$pendingTrade.$SellOffer.owner.exists then @$pendingTrade.$SellOffer.owner else null))"/>
             <set_value name="$finalSellWare" exact="if $pendingTrade.$SellOffer.ware? then @$pendingTrade.$SellOffer.ware else (if $pendingTrade.$Ware? then $pendingTrade.$Ware else null)"/>
-            <!-- Build-storage delivery refs die between clamp and order creation too; re-discover the live
-                 delivery (base anchor, then player buy offer by sell sector + ware matching the stable
-                 delivery idcode) so create_order gets a live offer. Mirrors lib.gt.mk42.cache.search.
-                 DeliveryStationId for BS is base.idcode (== station.idcode): class-gate candidates. -->
-            <set_value name="$finalIsBsDelivery" exact="($pendingTrade.$SellStationBase?) or ($pendingTrade.$CustomerClass? and $pendingTrade.$CustomerClass == 'Buildstorage') or ($finalSellStation? and @$finalSellStation.exists and @$finalSellStation.isclass.buildstorage)"/>
-            <do_if value="$finalIsBsDelivery and $pendingTrade.$SellStationBase? and @$pendingTrade.$SellStationBase.exists and @$pendingTrade.$SellStationBase.buildstorage and @$pendingTrade.$SellStationBase.buildstorage.exists">
-              <do_if value="(not $finalSellStation? or not @$finalSellStation.exists) or not @$finalSellStation.isclass.buildstorage">
-                <set_value name="$finalSellStation" exact="@$pendingTrade.$SellStationBase.buildstorage"/>
-                <set_value name="$pendingTrade.$SellStation" exact="$finalSellStation"/>
-              </do_if>
-            </do_if>
-            <do_elseif value="(not $finalSellStation? or not @$finalSellStation.exists) and $pendingTrade.$SellStationBase? and @$pendingTrade.$SellStationBase.exists and @$pendingTrade.$SellStationBase.buildstorage and @$pendingTrade.$SellStationBase.buildstorage.exists">
+            <!-- BS refresh (vanilla trade.station): buyer=station.buildstorage, excludeempty=false,
+                 bare offeramount so desiredamount is used when no money changes hands.
+                 Never sector-scan by base idcode (collides with the parent station). -->
+            <do_if value="$pendingTrade.$SellStationBase? and @$pendingTrade.$SellStationBase.exists and @$pendingTrade.$SellStationBase.buildstorage and @$pendingTrade.$SellStationBase.buildstorage.exists">
               <set_value name="$finalSellStation" exact="@$pendingTrade.$SellStationBase.buildstorage"/>
-            </do_elseif>
-            <set_value name="$finalForceBsRescan" exact="$finalIsBsDelivery or (not $finalSellStation? or not @$finalSellStation.exists) or (@$finalSellStation.exists and @$finalSellStation.isclass.buildstorage) or ($pendingTrade.$SellStationBase? and @$pendingTrade.$SellStationBase.exists and $pendingTrade.$SellStationBase.buildstorage?)"/>
-            <set_value name="$finalBsBuyer" exact="null"/>
-            <set_value name="$finalRePick" exact="null"/>
-            <do_if value="$finalForceBsRescan and $pendingTrade.$SellSector? and @$pendingTrade.$SellSector.exists and $finalSellWare != null and $pendingTrade.$DeliveryStationId?">
-              <!-- Re-resolve the live buy offer with the PROVEN MK4-2 player buy-offer query
-                   (lib.gt.mk42.live.search.xml ~1368): bare <offeramount min="1"/> (NO tradepartner) so the
-                   engine reads the build storage's desiredamount; tradepartner=ship would force the money path
-                   that reads 0 funds-amount -> false buyer_missing. Disambiguate by stable delivery idcode
-                   AND delivery class (BS vs station). -->
-              <find_buy_offer wares="$finalSellWare" space="$pendingTrade.$SellSector" result="$finalBsOffers" multiple="true">
-                <match_buyer tradesknownto="this.ship.owner" owner="faction.player">
-                  <match_relation_to object="this.ship" relation="dock" comparison="ge"/>
-                  <match_relation_to faction="this.ship.owner" relation="enemy" comparison="not"/>
-                </match_buyer>
-                <offeramount min="1"/>
-              </find_buy_offer>
-              <do_if value="$finalBsOffers? and $finalBsOffers.count gt 0">
-                <do_for_each name="$finalBsO" in="$finalBsOffers">
-                  <do_if value="not ($finalRePick? and @$finalRePick.exists) and $finalBsO? and @$finalBsO.exists">
-                    <set_value name="$finalBsCand" exact="null"/>
-                    <do_if value="$finalBsO.buyer? and @$finalBsO.buyer.exists">
-                      <set_value name="$finalBsCand" exact="@$finalBsO.buyer"/>
-                    </do_if>
-                    <do_elseif value="$finalBsO.owner? and @$finalBsO.owner.exists">
-                      <set_value name="$finalBsCand" exact="@$finalBsO.owner"/>
-                    </do_elseif>
-                    <do_if value="$finalBsCand? and @$finalBsCand.exists">
-                      <set_value name="$finalBsCandId" exact="if @$finalBsCand.isclass.buildstorage and $finalBsCand.base? and @$finalBsCand.base.exists then @$finalBsCand.base.idcode else @$finalBsCand.idcode"/>
-                      <do_if value="$finalBsCandId == $pendingTrade.$DeliveryStationId">
-                        <set_value name="$finalClassOk" exact="false"/>
-                        <do_if value="$finalIsBsDelivery">
-                          <do_if value="@$finalBsCand.isclass.buildstorage">
-                            <set_value name="$finalClassOk" exact="true"/>
-                          </do_if>
-                        </do_if>
-                        <do_else>
-                          <do_if value="not @$finalBsCand.isclass.buildstorage">
-                            <set_value name="$finalClassOk" exact="true"/>
-                          </do_if>
-                        </do_else>
-                        <do_if value="$finalClassOk">
-                          <set_value name="$finalRePick" exact="$finalBsO"/>
-                          <set_value name="$finalBsBuyer" exact="$finalBsCand"/>
-                          <set_value name="$finalSellStation" exact="$finalBsCand"/>
-                          <set_value name="$pendingTrade.$SellStation" exact="$finalBsCand"/>
-                          <set_value name="$pendingTrade.$SellOffer" exact="$finalBsO"/>
-                        </do_if>
-                      </do_if>
-                    </do_if>
-                  </do_if>
-                </do_for_each>
-              </do_if>
+              <set_value name="$pendingTrade.$SellStation" exact="$finalSellStation"/>
             </do_if>
-            <!-- Hard stop: a BS-class row must never create_trade_order against the parent station. -->
-            <do_if value="$finalIsBsDelivery and (not $finalSellStation? or not @$finalSellStation.exists or not @$finalSellStation.isclass.buildstorage)">
-              <set_value name="$finalSellOfferValid" exact="false"/>
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FINAL VALIDATION FAILED - BS delivery lost buildstorage buyer (would have docked at station)'" chance="100"/>
-              </do_if>
-            </do_if>
-            
-            <do_if value="$finalSellOfferValid and $finalSellStation? and $finalSellStation.exists and $finalSellWare != null">
+            <do_if value="$finalSellStation? and $finalSellStation.exists and $finalSellWare != null">
               <set_value name="$finalValidatedSellOffer" exact="null"/>
               <do_if value="@$finalSellStation.isclass.buildstorage">
-                <!-- Build storage already re-resolved above; reuse that live offer. -->
-                <do_if value="$pendingTrade.$SellOffer? and @$pendingTrade.$SellOffer.exists">
-                  <set_value name="$finalValidatedSellOffer" exact="@$pendingTrade.$SellOffer"/>
-                </do_if>
+                <find_buy_offer buyer="$finalSellStation" wares="$finalSellWare" result="$finalValidatedSellOffer" excludeempty="false">
+                  <offeramount min="1"/>
+                </find_buy_offer>
               </do_if>
               <do_else>
                 <find_buy_offer buyer="$finalSellStation" wares="$finalSellWare" tradepartner="this.ship" result="$finalValidatedSellOffer"/>
@@ -7461,6 +7480,9 @@
                 <set_value name="$pendingTrade.$SellOffer" exact="$finalValidatedSellOffer"/>
                 <set_value name="$finalSellEffectiveAmount" exact="@$finalValidatedSellOffer.offeramount.{this.ship}"/>
                 <do_if value="@$finalSellStation.isclass.buildstorage">
+                  <do_if value="(not $finalSellEffectiveAmount? or $finalSellEffectiveAmount le 0) and $finalValidatedSellOffer.desiredamount? and @$finalValidatedSellOffer.desiredamount gt 0">
+                    <set_value name="$finalSellEffectiveAmount" exact="@$finalValidatedSellOffer.desiredamount"/>
+                  </do_if>
                   <do_if value="(not $finalSellEffectiveAmount? or $finalSellEffectiveAmount le 0) and @$finalValidatedSellOffer.amount gt 0">
                     <set_value name="$finalSellEffectiveAmount" exact="@$finalValidatedSellOffer.amount"/>
                   </do_if>
@@ -9001,8 +9023,11 @@
           </do_if>
         </do_if>
         <do_else>
-          <!-- SAVEGAME GUARD: save/load resume mid reject-block without snapshot or reject counters. -->
-          <do_if value="not this.$gtRejectSearchMethod? and not $tradesRejectedPathSafe?">
+          <!-- SAVEGAME GUARD: save/load resume mid reject-block without snapshot or reject counters.
+               Must test $tradesRejectedPath (initialised at validation start), NOT $tradesRejectedPathSafe
+               (that safe copy is created only below). Using *Safe here always looked "unset" on a normal
+               first reject, skipped cache-exhaust→live, and left ships looping no_trade_retry on dead BS. -->
+          <do_if value="not this.$gtRejectSearchMethod? and not $tradesRejectedPath?">
             <resume label="no_trade_retry"/>
           </do_if>
           <!-- Full-sweep mode: no chunk continuation needed. -->
@@ -9192,11 +9217,13 @@
             <resume label="escape_from_blacklisted"/>
           </do_if>
           
-          <!-- Cache exhausted: retry remaining cache entries before forcing mk4live when rejections
-               are transient-only (stale offers / demand saturation) and the home pool is larger. -->
+          <!-- Cache exhausted: DemandReserved-only may retry cache (fleet saturation is temporary).
+               OfferInvalid must NOT retry cache: dead/null BS SellOffers never Flag without a live
+               offer ref, and the old clear-FailedShips+ForceLive=false path re-HIT the same 2 BS
+               rows forever while ST>0 station supply waited (LFK-591 BS=10 ST=6). -->
           <do_if value="this.$gtRejectSearchMethod? and this.$gtRejectSearchMethod == 'cache'">
-            <set_value name="$cacheHardRejectTotal" exact="this.$gtRejectPathSafe + this.$gtRejectDockingSafe + this.$gtRejectDistanceSafe + this.$gtRejectCargoSafe + this.$gtRejectRestrictionSafe + this.$gtRejectBlacklistedSafe"/>
-            <set_value name="$cacheTransientRejectTotal" exact="this.$gtRejectOfferInvalidSafe + this.$gtRejectDemandReservedSafe"/>
+            <set_value name="$cacheHardRejectTotal" exact="this.$gtRejectPathSafe + this.$gtRejectDockingSafe + this.$gtRejectDistanceSafe + this.$gtRejectCargoSafe + this.$gtRejectRestrictionSafe + this.$gtRejectBlacklistedSafe + this.$gtRejectOfferInvalidSafe"/>
+            <set_value name="$cacheTransientRejectTotal" exact="this.$gtRejectDemandReservedSafe"/>
             <set_value name="$cacheExhaustedTransientOnly" exact="this.$gtRejectTradeListCountSafe gt 0 and $cacheHardRejectTotal == 0 and $cacheTransientRejectTotal == this.$gtRejectTradeListCountSafe"/>
             <set_value name="$cacheExhaustHomeSector" exact="if this.$lastPriorityWaresHome? and this.$lastPriorityWaresHome.exists then this.$lastPriorityWaresHome else (if this.$effectiveHome? and this.$effectiveHome.isclass.sector then this.$effectiveHome else (if this.$effectiveHome? and this.$effectiveHome.sector? then @this.$effectiveHome.sector else this.ship.sector))"/>
             <set_value name="$cacheExhaustPoolSize" exact="0"/>
@@ -9205,47 +9232,9 @@
             </do_if>
             <do_if value="$cacheExhaustedTransientOnly and $cacheExhaustPoolSize gt this.$gtRejectTradeListCountSafe">
               <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache batch exhausted (transient-only) — retrying cache before live (' + this.$gtRejectTradeListCountSafe + '/' + $cacheExhaustPoolSize + ' entries tried, home=' + (if $cacheExhaustHomeSector.knownname? then @$cacheExhaustHomeSector.knownname else '?') + ')'" chance="100"/>
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Cache batch exhausted (demand-reserved) — retrying cache before live (' + this.$gtRejectTradeListCountSafe + '/' + $cacheExhaustPoolSize + ' entries tried, home=' + (if $cacheExhaustHomeSector.knownname? then @$cacheExhaustHomeSector.knownname else '?') + ')'" chance="100"/>
               </do_if>
-              <!-- Stale-offer rejections flag per-ship on entries; clear before retry so other pool rows can match. -->
-              <do_if value="$cacheExhaustHomeSector? and $cacheExhaustHomeSector.exists and global.$GT_TradeCacheMK42? and global.$GT_TradeCacheMK42.{$cacheExhaustHomeSector}?">
-                <do_all exact="global.$GT_TradeCacheMK42.{$cacheExhaustHomeSector}.count" counter="$cacheRetryFsi">
-                  <set_value name="$cacheRetryEntry" exact="global.$GT_TradeCacheMK42.{$cacheExhaustHomeSector}.{$cacheRetryFsi}"/>
-                  <do_if value="$cacheRetryEntry? and $cacheRetryEntry.$FailedShips? and $cacheRetryEntry.$FailedShips.count gt 0">
-                    <set_value name="$cacheRetryNewFailed" exact="[]"/>
-                    <set_value name="$cacheRetryNewFailedIds" exact="[]"/>
-                    <set_value name="$cacheRetryShipId" exact="if this.ship.idcode? then '' + this.ship.idcode else ''"/>
-                    <do_all exact="$cacheRetryEntry.$FailedShips.count" counter="$cacheRetryFsi2">
-                      <set_value name="$cacheRetryFs" exact="$cacheRetryEntry.$FailedShips.{$cacheRetryFsi2}"/>
-                      <set_value name="$cacheRetryFid" exact="null"/>
-                      <do_if value="$cacheRetryEntry.$FailedShipIdcodes? and $cacheRetryEntry.$FailedShipIdcodes.count ge $cacheRetryFsi2">
-                        <set_value name="$cacheRetryFid" exact="$cacheRetryEntry.$FailedShipIdcodes.{$cacheRetryFsi2}"/>
-                      </do_if>
-                      <set_value name="$cacheRetryMatch" exact="false"/>
-                      <do_if value="$cacheRetryFs == this.ship">
-                        <set_value name="$cacheRetryMatch" exact="true"/>
-                      </do_if>
-                      <do_elseif value="$cacheRetryFid? and $cacheRetryShipId != '' and $cacheRetryFid == $cacheRetryShipId">
-                        <set_value name="$cacheRetryMatch" exact="true"/>
-                      </do_elseif>
-                      <do_elseif value="(not $cacheRetryEntry.$FailedShipIdcodes? or $cacheRetryEntry.$FailedShipIdcodes.count lt $cacheRetryFsi2) and $cacheRetryShipId != '' and @$cacheRetryFs.exists and ('' + @$cacheRetryFs.idcode) == $cacheRetryShipId">
-                        <set_value name="$cacheRetryMatch" exact="true"/>
-                      </do_elseif>
-                      <do_if value="not $cacheRetryMatch">
-                        <append_to_list name="$cacheRetryNewFailed" exact="$cacheRetryFs"/>
-                        <do_if value="$cacheRetryFid?">
-                          <append_to_list name="$cacheRetryNewFailedIds" exact="$cacheRetryFid"/>
-                        </do_if>
-                        <do_elseif value="@$cacheRetryFs.exists">
-                          <append_to_list name="$cacheRetryNewFailedIds" exact="'' + @$cacheRetryFs.idcode"/>
-                        </do_elseif>
-                      </do_if>
-                    </do_all>
-                    <set_value name="$cacheRetryEntry.$FailedShips" exact="$cacheRetryNewFailed"/>
-                    <set_value name="$cacheRetryEntry.$FailedShipIdcodes" exact="$cacheRetryNewFailedIds"/>
-                  </do_if>
-                </do_all>
-              </do_if>
+              <!-- Keep FailedShips flags so reserved rows stay skipped and other pool rows can match. -->
               <set_value name="$signalMaxBuy" exact="$maxbuy"/>
               <set_value name="$signalMaxSell" exact="$maxsell"/>
               <do_if value="this.$effectiveMaxBuy?">

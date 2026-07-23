@@ -55,8 +55,7 @@
       </do_if>
 
       <set_value name="this.$gt_mk42Only" exact="true"/>
-      <!-- Per-search memo for build-storage re-discovery (find_buy_offer by sector+ware). Instance var
-           so it survives the loop's cooperative waits; reset every search since live offers change. -->
+      <!-- Per-search memo placeholder (kept for future offer refresh helpers). -->
       <set_value name="this.$reBuyMemo" exact="table[]"/>
       <set_value name="$cacheHomeKey" exact="$homeSector"/>
       <set_value name="$homeCache" exact="null"/>
@@ -286,13 +285,9 @@
           <break/>
         </do_if>
         <set_value name="$entry" exact="@$homeCache.{$i}"/>
-        <!-- Faction/trade-rule fast-reject (S2): the trade-rule outcome (cantradewith between the
-             cached buy/sell pair) is ship-independent; only the $ignoreTradeRules gate is ship-side.
-             cache.write stamps $TradeRuleBlocked once (while refs are fresh) for pairs a player
-             faction-restricted build storage will refuse. Skip such rows HERE - before the costly
-             build-storage re-resolve below - for ships that enforce trade rules. Rows lacking the
-             flag (older/un-stamped) still fall through to the authoritative live check further down.
-             Entries stay cached so ignoreTradeRules ships can still use them. -->
+        <!-- Faction/trade-rule fast-reject (S2): $TradeRuleBlocked is ship-independent
+             (restriction.factions excludes faction.player). Ignore any legacy
+             $CustomerFundsBlocked stamp — money is re-checked live below. -->
         <do_if value="not $ignoreTradeRules and $entry.$TradeRuleBlocked? and $entry.$TradeRuleBlocked">
           <set_value name="$rejReasons.$traderules_flagged" exact="if $rejReasons.$traderules_flagged? then $rejReasons.$traderules_flagged+1 else 1"/>
           <set_value name="$rejTotal" operation="add"/>
@@ -367,126 +362,45 @@
         <do_if value="not $entrySellStation? and $entry.$SellOffer? and @$entry.$SellOffer.exists and $entry.$SellOffer.owner? and @$entry.$SellOffer.owner.exists">
           <set_value name="$entrySellStation" exact="@$entry.$SellOffer.owner"/>
         </do_if>
-        <!-- Build-storage / player-construction deliveries recreate their trade offer, their build
-             storage AND its base station every construction tick, so EVERY captured component handle
-             (SellOffer, SellStation, SellStationBase) dies within tens of seconds -> sellstation_gone.
-             Caching a component reference can therefore never work for these rows. Instead we
-             re-DISCOVER the current live buy offer from PERMANENT keys: the cached sell SECTOR + WARE,
-             restricted to player-owned buyers, disambiguated by the delivery station's stable idcode.
-             This mirrors vanilla trade.station.xml, which always re-runs find_buy_offer against
-             station.buildstorage rather than caching the offer. The shared cache entry is repaired in
-             place so the rest of the fleet (and the order's own execution re-resolution) reuse it.
-             DeliveryStationId for BS is base.idcode (== station.idcode), so class markers
-             ($SellStationBase / $CustomerClass) must gate whether we accept BS or the station. -->
-        <set_value name="$entryIsBsDelivery" exact="($entry.$SellStationBase?) or ($entry.$CustomerClass? and $entry.$CustomerClass == 'Buildstorage')"/>
+        <!-- Stale BS delivery refs: recover via SellStationBase.buildstorage (vanilla trade.station).
+             DeliveryStationId is base.idcode (== station.idcode) — never sector-scan buy offers by that
+             id (station operational offers collide with BS construction offers). -->
+        <do_if value="$entry.$SellStationBase? and @$entry.$SellStationBase.exists and @$entry.$SellStationBase.buildstorage and @$entry.$SellStationBase.buildstorage.exists">
+          <set_value name="$entrySellStation" exact="@$entry.$SellStationBase.buildstorage"/>
+          <set_value name="$entry.$SellStation" exact="$entrySellStation"/>
+        </do_if>
         <do_if value="not $entrySellStation? or not @$entrySellStation.exists">
-          <!-- Fast path: base anchor still alive -> re-derive its current build storage cheaply. -->
-          <do_if value="$entryIsBsDelivery and $entry.$SellStationBase? and @$entry.$SellStationBase.exists">
-            <set_value name="$entryBaseBuildStorage" exact="@$entry.$SellStationBase.buildstorage"/>
-            <do_if value="$entryBaseBuildStorage? and @$entryBaseBuildStorage.exists">
-              <set_value name="$entrySellStation" exact="$entryBaseBuildStorage"/>
-              <set_value name="$entry.$SellStation" exact="$entryBaseBuildStorage"/>
-            </do_if>
-          </do_if>
-          <!-- Robust path: rediscover the live delivery by permanent DeliveryStationId.
-               BS rows: only buildstorage (base.idcode match). Station rows: only stations (idcode match).
-               Never prefer station over BS for a BS-class row (dual-demand wares e.g. Energy Cells). -->
-          <do_if value="(not $entrySellStation? or not @$entrySellStation.exists) and $entry.$DeliveryStationId? and $entry.$Ware? and $homeSector? and @$homeSector.exists">
+          <set_value name="$entryIsBsDelivery" exact="($entry.$SellStationBase?) or ($entry.$CustomerClass? and $entry.$CustomerClass == 'Buildstorage')"/>
+          <do_if value="$entry.$DeliveryStationId? and $homeSector? and @$homeSector.exists">
             <set_value name="$mk42DelIdTarget" exact="null"/>
             <find_sector_in_range name="$mk42DelIdScanSectors" object="$homeSector" maxdistance="[$maxDistance, $maxDistanceBuyLeg, $maxDistanceSellLeg, 1].max + 2" multiple="true"/>
             <do_if value="$mk42DelIdScanSectors? and $mk42DelIdScanSectors.count gt 0">
               <do_for_each name="$mk42DelIdScanSec" in="$mk42DelIdScanSectors">
                 <do_if value="not $mk42DelIdTarget? and $mk42DelIdScanSec? and @$mk42DelIdScanSec.exists">
-                  <do_if value="$entryIsBsDelivery">
-                    <find_object name="$mk42DelIdScanBsObjs" class="class.buildstorage" space="$mk42DelIdScanSec" owner="faction.player" multiple="true"/>
-                    <do_if value="$mk42DelIdScanBsObjs? and $mk42DelIdScanBsObjs.count gt 0">
-                      <do_for_each name="$mk42DelIdScanBsCand" in="$mk42DelIdScanBsObjs">
-                        <do_if value="not $mk42DelIdTarget? and $mk42DelIdScanBsCand? and @$mk42DelIdScanBsCand.exists and $mk42DelIdScanBsCand.base? and @$mk42DelIdScanBsCand.base.exists and @$mk42DelIdScanBsCand.base.idcode == $entry.$DeliveryStationId">
-                          <set_value name="$mk42DelIdTarget" exact="$mk42DelIdScanBsCand"/>
-                        </do_if>
-                      </do_for_each>
-                    </do_if>
+                  <find_station name="$mk42DelIdScanStations" space="$mk42DelIdScanSec" multiple="true"/>
+                  <do_if value="$mk42DelIdScanStations? and $mk42DelIdScanStations.count gt 0">
+                    <do_for_each name="$mk42DelIdScanSt" in="$mk42DelIdScanStations">
+                      <do_if value="not $mk42DelIdTarget? and $mk42DelIdScanSt? and @$mk42DelIdScanSt.exists and $mk42DelIdScanSt.idcode? and @$mk42DelIdScanSt.idcode == $entry.$DeliveryStationId and not @$mk42DelIdScanSt.isclass.buildstorage">
+                        <set_value name="$mk42DelIdTarget" exact="$mk42DelIdScanSt"/>
+                      </do_if>
+                    </do_for_each>
                   </do_if>
-                  <do_else>
-                    <find_station name="$mk42DelIdScanStations" space="$mk42DelIdScanSec" multiple="true"/>
-                    <do_if value="$mk42DelIdScanStations? and $mk42DelIdScanStations.count gt 0">
-                      <do_for_each name="$mk42DelIdScanSt" in="$mk42DelIdScanStations">
-                        <do_if value="not $mk42DelIdTarget? and $mk42DelIdScanSt? and @$mk42DelIdScanSt.exists and $mk42DelIdScanSt.idcode? and @$mk42DelIdScanSt.idcode == $entry.$DeliveryStationId and not @$mk42DelIdScanSt.isclass.buildstorage">
-                          <set_value name="$mk42DelIdTarget" exact="$mk42DelIdScanSt"/>
-                        </do_if>
-                      </do_for_each>
-                    </do_if>
-                  </do_else>
                 </do_if>
               </do_for_each>
             </do_if>
             <do_if value="$mk42DelIdTarget? and @$mk42DelIdTarget.exists">
-              <set_value name="$entrySellStation" exact="$mk42DelIdTarget"/>
-              <set_value name="$entry.$SellStation" exact="$mk42DelIdTarget"/>
+              <do_if value="$entryIsBsDelivery and $mk42DelIdTarget.buildstorage? and @$mk42DelIdTarget.buildstorage.exists">
+                <set_value name="$entrySellStation" exact="@$mk42DelIdTarget.buildstorage"/>
+                <set_value name="$entry.$SellStation" exact="$entrySellStation"/>
+                <set_value name="$entry.$SellStationBase" exact="$mk42DelIdTarget"/>
+              </do_if>
+              <do_elseif value="not $entryIsBsDelivery">
+                <set_value name="$entrySellStation" exact="$mk42DelIdTarget"/>
+                <set_value name="$entry.$SellStation" exact="$mk42DelIdTarget"/>
+              </do_elseif>
               <do_if value="not $entry.$SellSectorId? and $mk42DelIdTarget.sector? and @$mk42DelIdTarget.sector.exists and $mk42DelIdTarget.sector.idcode?">
                 <set_value name="$entry.$SellSectorId" exact="@$mk42DelIdTarget.sector.idcode"/>
               </do_if>
-            </do_if>
-          </do_if>
-          <set_value name="$reSellSector" exact="null"/>
-          <do_if value="$entry.$SellSector? and @$entry.$SellSector.exists">
-            <set_value name="$reSellSector" exact="$entry.$SellSector"/>
-          </do_if>
-          <do_elseif value="$entry.$SellSectorId? and $homeSector? and @$homeSector.exists">
-            <find_sector_in_range name="$mk42SecIdScanSectors" object="$homeSector" maxdistance="[$maxDistance, $maxDistanceBuyLeg, $maxDistanceSellLeg, 1].max + 2" multiple="true"/>
-            <do_if value="$mk42SecIdScanSectors? and $mk42SecIdScanSectors.count gt 0">
-              <do_for_each name="$mk42SecIdScanSec" in="$mk42SecIdScanSectors">
-                <do_if value="not $reSellSector? and $mk42SecIdScanSec? and @$mk42SecIdScanSec.exists and $mk42SecIdScanSec.idcode? and @$mk42SecIdScanSec.idcode == $entry.$SellSectorId">
-                  <set_value name="$reSellSector" exact="$mk42SecIdScanSec"/>
-                </do_if>
-              </do_for_each>
-            </do_if>
-          </do_elseif>
-          <do_if value="(not $entrySellStation? or not @$entrySellStation.exists) and $reSellSector? and @$reSellSector.exists and $entry.$Ware? and $entry.$DeliveryStationId?">
-            <find_buy_offer wares="$entry.$Ware" space="$reSellSector" result="$reBsOffers" multiple="true">
-              <match_buyer tradesknownto="$ship.owner" owner="faction.player">
-                <match_relation_to object="$ship" relation="dock" comparison="ge"/>
-                <match_relation_to faction="$ship.owner" relation="enemy" comparison="not"/>
-              </match_buyer>
-              <offeramount min="1"/>
-            </find_buy_offer>
-            <do_if value="$reBsOffers? and $reBsOffers.count gt 0">
-              <do_for_each name="$reBsO" in="$reBsOffers">
-                <do_if value="(not $entrySellStation? or not @$entrySellStation.exists) and $reBsO? and @$reBsO.exists">
-                  <set_value name="$reBsCand" exact="null"/>
-                  <do_if value="$reBsO.buyer? and @$reBsO.buyer.exists">
-                    <set_value name="$reBsCand" exact="@$reBsO.buyer"/>
-                  </do_if>
-                  <do_elseif value="$reBsO.owner? and @$reBsO.owner.exists">
-                    <set_value name="$reBsCand" exact="@$reBsO.owner"/>
-                  </do_elseif>
-                  <do_if value="$reBsCand? and @$reBsCand.exists">
-                    <set_value name="$reBsCandId" exact="if @$reBsCand.isclass.buildstorage and $reBsCand.base? and @$reBsCand.base.exists then @$reBsCand.base.idcode else @$reBsCand.idcode"/>
-                    <do_if value="$reBsCandId == $entry.$DeliveryStationId">
-                      <set_value name="$reClassOk" exact="false"/>
-                      <do_if value="$entryIsBsDelivery">
-                        <do_if value="@$reBsCand.isclass.buildstorage">
-                          <set_value name="$reClassOk" exact="true"/>
-                        </do_if>
-                      </do_if>
-                      <do_else>
-                        <do_if value="not @$reBsCand.isclass.buildstorage">
-                          <set_value name="$reClassOk" exact="true"/>
-                        </do_if>
-                      </do_else>
-                      <do_if value="$reClassOk">
-                        <set_value name="$entrySellStation" exact="$reBsCand"/>
-                        <set_value name="$entry.$SellStation" exact="$reBsCand"/>
-                        <set_value name="$entry.$SellOffer" exact="$reBsO"/>
-                        <do_if value="@$reBsCand.isclass.buildstorage and $reBsCand.base? and @$reBsCand.base.exists">
-                          <set_value name="$entry.$SellStationBase" exact="@$reBsCand.base"/>
-                          <set_value name="$entry.$DeliveryStationId" exact="@$reBsCand.base.idcode"/>
-                        </do_if>
-                      </do_if>
-                    </do_if>
-                  </do_if>
-                </do_if>
-              </do_for_each>
             </do_if>
           </do_if>
         </do_if>
@@ -583,15 +497,16 @@
           <continue/>
         </do_if>
 
-        <!-- Station existence (before distance / MK4 ware-type property access on station). -->
+        <!-- Station existence (before distance / MK4 ware-type property access on station).
+             Wrecks still .exists but tradewares/resources/products property lookups fail. -->
         <do_if value="not $entry.$IsSellOnly?">
-          <do_if value="not $entryBuyStation? or not @$entryBuyStation.exists">
+          <do_if value="not $entryBuyStation? or not @$entryBuyStation.exists or @$entryBuyStation.iswreck">
             <set_value name="$rejReasons.$buystation_gone" exact="if $rejReasons.$buystation_gone? then $rejReasons.$buystation_gone+1 else 1"/>
             <set_value name="$rejTotal" operation="add"/>
             <continue/>
           </do_if>
         </do_if>
-        <do_if value="not $entrySellStation? or not @$entrySellStation.exists">
+        <do_if value="not $entrySellStation? or not @$entrySellStation.exists or @$entrySellStation.iswreck">
           <set_value name="$rejReasons.$sellstation_gone" exact="if $rejReasons.$sellstation_gone? then $rejReasons.$sellstation_gone+1 else 1"/>
           <!-- Sub-diagnose [ANCHORv4]: record each raw fact INDEPENDENTLY (no elseif chain) so the
                breakdown cannot hide a state we did not anticipate. -->
@@ -652,35 +567,69 @@
           <set_value name="$rejTotal" operation="add"/>
           <continue/>
         </do_if>
-        <!-- Station-to-station trade rules: player-owned stations only (NPC×NPC ignores cantradewith). -->
-        <do_if value="not $ignoreTradeRules and not $entry.$IsSellOnly?">
-          <set_value name="$trPlayerStationInvolved" exact="false"/>
-          <do_if value="$entryBuyStation? and @$entryBuyStation.exists">
-            <do_if value="@$entryBuyStation.isplayerowned">
-              <set_value name="$trPlayerStationInvolved" exact="true"/>
+        <!-- Faction trade rules (restriction.factions vs ship owner) + customer funds.
+             Do not use offer.cantradewith.{otherStation} (conflates money with faction access). -->
+        <do_if value="not $entry.$IsSellOnly? and $ship? and @$ship.exists and $ship.owner?">
+          <set_value name="$trShipFaction" exact="@$ship.owner"/>
+          <do_if value="not $ignoreTradeRules">
+            <do_if value="$entry.$BuyOffer? and @$entry.$BuyOffer.exists and @$entry.$BuyOffer.restriction.factions.count">
+              <set_value name="$trBuyFactionBlocked" exact="false"/>
+              <do_if value="@$entry.$BuyOffer.restriction.inverted">
+                <do_if value="$entry.$BuyOffer.restriction.factions.indexof.{$trShipFaction}">
+                  <set_value name="$trBuyFactionBlocked" exact="true"/>
+                </do_if>
+              </do_if>
+              <do_else>
+                <do_if value="not $entry.$BuyOffer.restriction.factions.indexof.{$trShipFaction}">
+                  <set_value name="$trBuyFactionBlocked" exact="true"/>
+                </do_if>
+              </do_else>
+              <do_if value="$trBuyFactionBlocked">
+                <set_value name="$rejReasons.$traderules" exact="if $rejReasons.$traderules? then $rejReasons.$traderules+1 else 1"/>
+                <set_value name="$rejTotal" operation="add"/>
+                <continue/>
+              </do_if>
             </do_if>
-            <do_elseif value="@$entryBuyStation.isclass.buildstorage and $entryBuyStation.base? and @$entryBuyStation.base.exists and @$entryBuyStation.base.isplayerowned">
-              <set_value name="$trPlayerStationInvolved" exact="true"/>
-            </do_elseif>
+            <do_if value="$entry.$SellOffer? and @$entry.$SellOffer.exists and @$entry.$SellOffer.restriction.factions.count">
+              <set_value name="$trSellFactionBlocked" exact="false"/>
+              <do_if value="@$entry.$SellOffer.restriction.inverted">
+                <do_if value="$entry.$SellOffer.restriction.factions.indexof.{$trShipFaction}">
+                  <set_value name="$trSellFactionBlocked" exact="true"/>
+                </do_if>
+              </do_if>
+              <do_else>
+                <do_if value="not $entry.$SellOffer.restriction.factions.indexof.{$trShipFaction}">
+                  <set_value name="$trSellFactionBlocked" exact="true"/>
+                </do_if>
+              </do_else>
+              <do_if value="$trSellFactionBlocked">
+                <set_value name="$rejReasons.$traderules" exact="if $rejReasons.$traderules? then $rejReasons.$traderules+1 else 1"/>
+                <set_value name="$rejTotal" operation="add"/>
+                <continue/>
+              </do_if>
+            </do_if>
           </do_if>
-          <do_if value="not $trPlayerStationInvolved and $entrySellStation? and @$entrySellStation.exists">
+          <do_if value="$entrySellStation? and @$entrySellStation.exists and $entry.$SellOffer? and @$entry.$SellOffer.exists and $entry.$SellOffer.unitprice gt 0">
+            <set_value name="$trCustomerIsPlayer" exact="false"/>
             <do_if value="@$entrySellStation.isplayerowned">
-              <set_value name="$trPlayerStationInvolved" exact="true"/>
+              <set_value name="$trCustomerIsPlayer" exact="true"/>
             </do_if>
             <do_elseif value="@$entrySellStation.isclass.buildstorage and $entrySellStation.base? and @$entrySellStation.base.exists and @$entrySellStation.base.isplayerowned">
-              <set_value name="$trPlayerStationInvolved" exact="true"/>
+              <set_value name="$trCustomerIsPlayer" exact="true"/>
             </do_elseif>
-          </do_if>
-          <do_if value="$trPlayerStationInvolved">
-            <do_if value="$entry.$SellOffer? and @$entry.$SellOffer.exists and $entryBuyStation? and @$entryBuyStation.exists and not $entry.$SellOffer.cantradewith.{$entryBuyStation}">
-              <set_value name="$rejReasons.$traderules" exact="if $rejReasons.$traderules? then $rejReasons.$traderules+1 else 1"/>
-              <set_value name="$rejTotal" operation="add"/>
-              <continue/>
-            </do_if>
-            <do_if value="$entry.$BuyOffer? and @$entry.$BuyOffer.exists and $entrySellStation? and @$entrySellStation.exists and not $entry.$BuyOffer.cantradewith.{$entrySellStation}">
-              <set_value name="$rejReasons.$traderules" exact="if $rejReasons.$traderules? then $rejReasons.$traderules+1 else 1"/>
-              <set_value name="$rejTotal" operation="add"/>
-              <continue/>
+            <do_if value="$trCustomerIsPlayer">
+              <set_value name="$trFreeDelivery" exact="false"/>
+              <do_if value="$entryBuyStation? and @$entryBuyStation.exists and @$entryBuyStation.isplayerowned and @$entrySellStation.isplayerowned and $entryBuyStation.owner == $entrySellStation.owner">
+                <set_value name="$trFreeDelivery" exact="true"/>
+              </do_if>
+              <do_elseif value="$entryBuyStation? and @$entryBuyStation.exists and @$entrySellStation.isclass.buildstorage and $entrySellStation.base? and @$entrySellStation.base.exists and $entrySellStation.base == $entryBuyStation">
+                <set_value name="$trFreeDelivery" exact="true"/>
+              </do_elseif>
+              <do_if value="not $trFreeDelivery and @$entrySellStation.money lt $entry.$SellOffer.unitprice">
+                <set_value name="$rejReasons.$customer_no_funds" exact="if $rejReasons.$customer_no_funds? then $rejReasons.$customer_no_funds+1 else 1"/>
+                <set_value name="$rejTotal" operation="add"/>
+                <continue/>
+              </do_if>
             </do_if>
           </do_if>
         </do_if>
@@ -954,7 +903,10 @@
           </do_elseif>
           <do_if value="$mk42CacheDestIsBs and @$entry.$SellOffer.amount le 0">
             <set_value name="$sellOfferDemandFallback" exact="0"/>
-            <do_if value="$entrySellStation? and @$entrySellStation.exists">
+            <do_if value="$entry.$SellOffer.desiredamount? and @$entry.$SellOffer.desiredamount gt 0">
+              <set_value name="$sellOfferDemandFallback" exact="@$entry.$SellOffer.desiredamount"/>
+            </do_if>
+            <do_if value="$sellOfferDemandFallback le 0 and $entrySellStation? and @$entrySellStation.exists">
               <set_value name="$sellOfferDemandWare" exact="if $entry.$Ware? then $entry.$Ware else null"/>
               <do_if value="not $sellOfferDemandWare? and @$entry.$SellOffer.ware != null">
                 <set_value name="$sellOfferDemandWare" exact="@$entry.$SellOffer.ware"/>

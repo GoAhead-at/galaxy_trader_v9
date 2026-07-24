@@ -1,0 +1,357 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- lib.gt.mk42.validate.amounts - MK4-2 final amount validation: clamp buy/sell, sync amounts,
+     min-cargo-utilization filter, and profit recalculation/gate.
+     Ports the HYBRID APPROACH block out of order.trade.galaxytradermk42.xml (clamp_trade_amount
+     through the MK4 supply price-cap reject) into a single shared check.
+     No <wait> here - called mid trade_found validation, before FINAL DOCKING VERIFICATION. A yield
+     there would let already-queued SELL TradePerform run before BUY is queued (ERR_NOTHING_TO_SELL),
+     same reason lib.gt.mk42.free.supplier has no wait.
+     Mutates $trade.$Profit / $BuyPrice / $SellPrice in place on recalculation (same as the ported
+     order code) - caller's trade table reflects the validated amount/profit even without reading
+     the return table.
+     Does not signal GT_Cache_Flag_Ship for sell_offer_null - returns $NeedCacheFlagSellOfferNull so
+     the caller can build the signal with its own $searchHomeSector/$sellStation context. Does not
+     increment reject counters - caller maps $Reason to its own counters. -->
+<aiscript name="lib.gt.mk42.validate.amounts" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <params>
+    <param name="ship" default="this.ship"/>
+    <param name="trade" comment="Required trade table: $Amount/$BuyOffer/$SellOffer/$SellStation/$Ware/$Profit/$BuyPrice/$SellPrice"/>
+    <param name="buyStation" default="null" comment="Null ok for sell-only trades"/>
+    <param name="sellStation" default="null" comment="Null ok - falls back to offer.buyer/owner/trade.$SellStation"/>
+    <param name="isSellOnly" default="false"/>
+    <param name="searchMethod" default="''" comment="cache/live/live_fallback/... - gates min-cargo filter and cache-flag signal"/>
+    <param name="useMinCargoThreshold" default="false"/>
+    <param name="cargoTargetPct" default="50"/>
+    <param name="maxTrades" default="1" comment="le 1 enables the min-cargo-utilization filter"/>
+    <param name="priorityWares" default="[]" comment="Bypasses the min-cargo filter for these wares"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <!-- ================================================================= -->
+      <!-- 1. Clamp buy order amount (for non-sell-only trades) -->
+      <!-- ================================================================= -->
+      <set_value name="$finalBuyAmount" exact="$trade.$Amount"/>
+      <set_value name="$finalSellAmount" exact="$trade.$Amount"/>
+      <set_value name="$buyClampReason" exact="null"/>
+      <set_value name="$sellClampReason" exact="null"/>
+      <set_value name="$clampFailed" exact="false"/>
+      <set_value name="$buyClampSeller" exact="null"/>
+      <set_value name="$sellClampBuyer" exact="null"/>
+      <set_value name="$needCacheFlagSellOfferNull" exact="false"/>
+      <set_value name="$cargoUtilizationPct" exact="-1"/>
+
+      <do_if value="not $isSellOnly and $trade.$BuyOffer?">
+        <set_value name="$buyClampSeller" exact="null"/>
+        <do_if value="$trade.$BuyOffer.seller?">
+          <set_value name="$buyClampSeller" exact="@$trade.$BuyOffer.seller"/>
+        </do_if>
+        <do_if value="$buyClampSeller == null and $trade.$BuyOffer.owner?">
+          <set_value name="$buyClampSeller" exact="@$trade.$BuyOffer.owner"/>
+        </do_if>
+        <do_if value="$buyClampSeller != null">
+          <clamp_trade_amount
+            trade="$trade.$BuyOffer"
+            amount="$finalBuyAmount"
+            buyer="$ship"
+            seller="$buyClampSeller"
+            result="$finalBuyAmount"
+            reason="$buyClampReason"/>
+        </do_if>
+        <do_else>
+          <set_value name="$clampFailed" exact="true"/>
+          <set_value name="$buyClampReason" exact="'seller_missing'"/>
+        </do_else>
+
+        <do_if value="not $finalBuyAmount? or $finalBuyAmount == 0 or $finalBuyAmount lt 0">
+          <set_value name="$clampFailed" exact="true"/>
+        </do_if>
+      </do_if>
+
+      <!-- ================================================================= -->
+      <!-- 2. Clamp sell order amount -->
+      <!-- Snapshot the offer before clamp_trade_amount: attribute eval of $trade.$SellOffer can
+           yield null (AI error: not of type trade) even when offeramount was readable moments
+           earlier - common on unfunded BS buy offers. -->
+      <!-- ================================================================= -->
+      <set_value name="$sellOfferForClamp" exact="null"/>
+      <do_if value="not $clampFailed and $trade.$SellOffer? and @$trade.$SellOffer.exists">
+        <set_value name="$sellOfferForClamp" exact="@$trade.$SellOffer"/>
+      </do_if>
+      <!-- '?' is true after set_value null (var defined); must use != null or clamp_trade_amount gets null trade. -->
+      <do_if value="not $clampFailed and $sellOfferForClamp != null">
+        <!-- Resolve delivery customer the same way as order validation ($sellStation): BS buy offers
+             often have no live .buyer/.owner on the offer ref, while tradematch already stamped
+             $SellStation. -->
+        <set_value name="$sellClampBuyer" exact="null"/>
+        <do_if value="$sellOfferForClamp.buyer? and @$sellOfferForClamp.buyer.exists">
+          <set_value name="$sellClampBuyer" exact="@$sellOfferForClamp.buyer"/>
+        </do_if>
+        <do_if value="$sellClampBuyer == null and $sellOfferForClamp.owner? and @$sellOfferForClamp.owner.exists">
+          <set_value name="$sellClampBuyer" exact="@$sellOfferForClamp.owner"/>
+        </do_if>
+        <do_if value="$sellClampBuyer == null and $sellStation? and $sellStation.exists">
+          <set_value name="$sellClampBuyer" exact="$sellStation"/>
+        </do_if>
+        <do_if value="$sellClampBuyer == null and $trade.$SellStation? and @$trade.$SellStation.exists">
+          <set_value name="$sellClampBuyer" exact="@$trade.$SellStation"/>
+        </do_if>
+        <do_if value="$sellClampBuyer == null">
+          <set_value name="$clampFailed" exact="true"/>
+          <set_value name="$sellClampReason" exact="'buyer_missing'"/>
+        </do_if>
+
+        <do_if value="$isSellOnly">
+          <!-- Sell-only trade: ship already has cargo, validate against ship cargo -->
+          <do_if value="not $clampFailed">
+            <clamp_trade_amount
+              trade="$sellOfferForClamp"
+              amount="$finalSellAmount"
+              buyer="$sellClampBuyer"
+              seller="$ship"
+              result="$finalSellAmount"
+              reason="$sellClampReason"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <!-- Normal trade: ship doesn't have cargo yet (will buy first), don't check seller cargo.
+               Vanilla comment: "it is possible that this doesn't have the wares yet if they still
+               need to be bought" -->
+          <do_if value="not $clampFailed">
+            <clamp_trade_amount
+              trade="$sellOfferForClamp"
+              amount="$finalSellAmount"
+              buyer="$sellClampBuyer"
+              result="$finalSellAmount"
+              reason="$sellClampReason"/>
+          </do_if>
+        </do_else>
+
+        <do_if value="not $finalSellAmount? or $finalSellAmount == 0 or $finalSellAmount lt 0">
+          <!-- Free route: clamp_trade_amount still reports buyer_money on unfunded BS even when
+               buyfree / player-supplier means no credits move. Restore cargo/desired amount. -->
+          <run_script name="'lib.gt.mk42.free.supplier'" result="$sellMoneyFreeFlags">
+            <param name="trade" value="$trade"/>
+            <param name="buyStation" value="if $buyStation? then $buyStation else null"/>
+            <param name="sellOffer" value="if $sellOfferForClamp != null then $sellOfferForClamp else null"/>
+            <param name="sellStation" value="if $sellClampBuyer != null then $sellClampBuyer else null"/>
+          </run_script>
+          <set_value name="$sellClampFreeRoute" exact="$sellMoneyFreeFlags.$FreeDelivery"/>
+          <do_if value="$sellClampFreeRoute and $sellClampReason? and $sellClampReason == 'buyer_money'">
+            <set_value name="$sellFreeRestore" exact="if $trade.$Amount? then $trade.$Amount else 0"/>
+            <do_if value="$sellOfferForClamp.desiredamount? and @$sellOfferForClamp.desiredamount gt 0">
+              <set_value name="$sellFreeRestore" exact="[$sellFreeRestore, @$sellOfferForClamp.desiredamount].min"/>
+            </do_if>
+            <do_if value="$sellClampBuyer != null and $sellClampBuyer.exists and $trade.$Ware?">
+              <set_value name="$sellFreeCargo" exact="@$sellClampBuyer.cargo.{$trade.$Ware}.free"/>
+              <do_if value="$sellFreeCargo? and $sellFreeCargo ge 0">
+                <set_value name="$sellFreeRestore" exact="[$sellFreeRestore, $sellFreeCargo].min"/>
+              </do_if>
+            </do_if>
+            <do_if value="$sellFreeRestore gt 0">
+              <set_value name="$finalSellAmount" exact="$sellFreeRestore"/>
+              <do_if value="not $isSellOnly">
+                <set_value name="$finalBuyAmount" exact="[$finalBuyAmount, $sellFreeRestore].min"/>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_if>
+        <do_if value="not $finalSellAmount? or $finalSellAmount == 0 or $finalSellAmount lt 0">
+          <set_value name="$clampFailed" exact="true"/>
+        </do_if>
+      </do_if>
+      <do_elseif value="not $clampFailed and not $isSellOnly">
+        <!-- Unfunded BS buy offers often die between validation and clamp (exists=false).
+             Player-supplier free routes execute via virtualmoney on $SellStation and do not need the
+             live SellOffer - recover amount from the trade row + customer cargo. -->
+        <run_script name="'lib.gt.mk42.free.supplier'" result="$sellNullFreeFlags">
+          <param name="trade" value="$trade"/>
+          <param name="buyStation" value="if $buyStation? then $buyStation else null"/>
+        </run_script>
+        <set_value name="$sellClampFreeRoute" exact="$sellNullFreeFlags.$PlayerFreeSupplier"/>
+        <set_value name="$sellFreeCustomer" exact="null"/>
+        <do_if value="$sellClampFreeRoute">
+          <do_if value="$sellStation? and $sellStation.exists">
+            <set_value name="$sellFreeCustomer" exact="$sellStation"/>
+          </do_if>
+          <do_elseif value="$trade.$SellStation? and @$trade.$SellStation.exists">
+            <set_value name="$sellFreeCustomer" exact="@$trade.$SellStation"/>
+          </do_elseif>
+        </do_if>
+        <do_if value="$sellClampFreeRoute and $sellFreeCustomer != null and @$sellFreeCustomer.exists">
+          <set_value name="$sellFreeRestore" exact="if $finalSellAmount? and $finalSellAmount gt 0 then $finalSellAmount else (if $trade.$Amount? then $trade.$Amount else 0)"/>
+          <do_if value="$trade.$Ware? and $sellFreeCustomer.cargo.{$trade.$Ware}.free?">
+            <set_value name="$sellFreeCargo" exact="@$sellFreeCustomer.cargo.{$trade.$Ware}.free"/>
+            <do_if value="$sellFreeCargo? and $sellFreeCargo ge 0">
+              <set_value name="$sellFreeRestore" exact="[$sellFreeRestore, $sellFreeCargo].min"/>
+            </do_if>
+          </do_if>
+          <do_if value="$sellFreeRestore gt 0">
+            <set_value name="$finalSellAmount" exact="$sellFreeRestore"/>
+            <set_value name="$finalBuyAmount" exact="[$finalBuyAmount, $sellFreeRestore].min"/>
+          </do_if>
+          <do_else>
+            <set_value name="$clampFailed" exact="true"/>
+            <set_value name="$sellClampReason" exact="'sell_offer_null_no_cargo'"/>
+          </do_else>
+        </do_if>
+        <do_else>
+          <set_value name="$clampFailed" exact="true"/>
+          <set_value name="$sellClampReason" exact="'sell_offer_null'"/>
+          <do_if value="$searchMethod == 'cache'">
+            <set_value name="$needCacheFlagSellOfferNull" exact="true"/>
+          </do_if>
+        </do_else>
+      </do_elseif>
+
+      <do_if value="$clampFailed">
+        <set_value name="$clampReasonOut" exact="if $buyClampReason? then $buyClampReason else (if $sellClampReason? then $sellClampReason else 'clamp_failed')"/>
+        <return value="table[
+          $Ok = false, $Reason = $clampReasonOut,
+          $FinalBuyAmount = $finalBuyAmount, $FinalSellAmount = $finalSellAmount, $Profit = null,
+          $PlayerFreeSupplier = false, $BuyClampReason = $buyClampReason, $SellClampReason = $sellClampReason,
+          $ClampFailed = true, $CargoUtilizationPct = -1, $NeedCacheFlagSellOfferNull = $needCacheFlagSellOfferNull
+        ]"/>
+      </do_if>
+
+      <!-- ================================================================= -->
+      <!-- 3. CRITICAL: for NORMAL trades, BUY and SELL amounts must match.
+           clamp_trade_amount can clamp BUY (ship cargo/money) and SELL (buyer constraints)
+           independently. Final executed amount must be the minimum of both. -->
+      <!-- ================================================================= -->
+      <do_if value="not $isSellOnly">
+        <set_value name="$finalAmount" exact="[$finalBuyAmount, $finalSellAmount].min"/>
+        <set_value name="$finalBuyAmount" exact="$finalAmount"/>
+        <set_value name="$finalSellAmount" exact="$finalAmount"/>
+      </do_if>
+
+      <!-- ================================================================= -->
+      <!-- 4. Min fill when useMinCargoThreshold is on; post-clamp safety if offers shrink before order. -->
+      <!-- ================================================================= -->
+      <set_value name="$isIsolatedForCargoFilter" exact="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{$ship}?"/>
+      <set_value name="$applyMinCargoUtilFilter" exact="not $isSellOnly and not $isIsolatedForCargoFilter and $useMinCargoThreshold and ($searchMethod == 'cache' or $searchMethod == 'live' or $searchMethod == 'live_fallback') and (not $maxTrades? or $maxTrades le 1)"/>
+      <do_if value="$applyMinCargoUtilFilter">
+        <set_value name="$cargoUtilThresholdPct" exact="[10,[$cargoTargetPct,100].min].max"/>
+        <set_value name="$utilWare" exact="null"/>
+        <do_if value="$trade.$Ware?">
+          <set_value name="$utilWare" exact="$trade.$Ware"/>
+        </do_if>
+        <do_elseif value="$trade.$BuyOffer? and $trade.$BuyOffer.ware?">
+          <set_value name="$utilWare" exact="@$trade.$BuyOffer.ware"/>
+        </do_elseif>
+        <do_elseif value="$trade.$SellOffer? and $trade.$SellOffer.ware?">
+          <set_value name="$utilWare" exact="@$trade.$SellOffer.ware"/>
+        </do_elseif>
+
+        <set_value name="$utilVolumePerUnit" exact="1"/>
+        <do_if value="$utilWare?">
+          <do_if value="$utilWare.volume?">
+            <set_value name="$utilVolumePerUnit" exact="$utilWare.volume"/>
+          </do_if>
+        </do_if>
+
+        <set_value name="$shipCargoCapacityVol" exact="$ship.cargo.capacity.all"/>
+        <set_value name="$tradeCargoVolume" exact="$finalBuyAmount * $utilVolumePerUnit"/>
+        <set_value name="$requiredCargoVolume" exact="($shipCargoCapacityVol * $cargoUtilThresholdPct) / 100.0"/>
+        <set_value name="$cargoUtilizationPct" exact="if $shipCargoCapacityVol gt 0 then ($tradeCargoVolume * 100.0) / $shipCargoCapacityVol else 0"/>
+
+        <!-- Bypass cargo utilization for priority wares: player explicitly wants these even if low volume -->
+        <set_value name="$isPriorityWareForCargo" exact="false"/>
+        <do_if value="$priorityWares? and $priorityWares.count gt 0 and $utilWare?">
+          <do_all exact="$priorityWares.count" counter="$pwc">
+            <set_value name="$pwcItem" exact="$priorityWares.{$pwc}"/>
+            <do_if value="$pwcItem == $utilWare or ($pwcItem? and $pwcItem.id? and $utilWare.id? and $pwcItem.id == $utilWare.id)">
+              <set_value name="$isPriorityWareForCargo" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+        </do_if>
+
+        <do_if value="$tradeCargoVolume lt $requiredCargoVolume and not $isPriorityWareForCargo">
+          <return value="table[
+            $Ok = false, $Reason = 'min_cargo_util',
+            $FinalBuyAmount = $finalBuyAmount, $FinalSellAmount = $finalSellAmount, $Profit = null,
+            $PlayerFreeSupplier = false, $BuyClampReason = $buyClampReason, $SellClampReason = $sellClampReason,
+            $ClampFailed = false, $CargoUtilizationPct = $cargoUtilizationPct, $NeedCacheFlagSellOfferNull = false
+          ]"/>
+        </do_if>
+      </do_if>
+
+      <!-- ================================================================= -->
+      <!-- 5. Player-supplier free routes (virtualmoney / dead BS sell offer): no credits move; margin
+           (sell-buy) is meaningless when sell price is 0/null - treat as fulfillment profit 0. -->
+      <!-- ================================================================= -->
+      <set_value name="$validationFreeSupplier" exact="false"/>
+      <do_if value="not $isSellOnly">
+        <run_script name="'lib.gt.mk42.free.supplier'" result="$validationFreeFlags">
+          <param name="trade" value="$trade"/>
+          <param name="buyStation" value="if $buyStation? then $buyStation else null"/>
+        </run_script>
+        <set_value name="$validationFreeSupplier" exact="$validationFreeFlags.$PlayerFreeSupplier"/>
+      </do_if>
+
+      <set_value name="$buyPriceForRecalc" exact="null"/>
+      <set_value name="$sellPriceForRecalc" exact="null"/>
+
+      <!-- Use actual offer prices only (no stored-price fallback). -->
+      <do_if value="$trade.$BuyOffer? and $trade.$BuyOffer.unitprice?">
+        <set_value name="$buyPriceForRecalc" exact="$trade.$BuyOffer.unitprice"/>
+      </do_if>
+      <do_if value="$trade.$SellOffer? and $trade.$SellOffer.unitprice?">
+        <set_value name="$sellPriceForRecalc" exact="$trade.$SellOffer.unitprice"/>
+      </do_if>
+
+      <set_value name="$finalProfitRAW" exact="null"/>
+
+      <do_if value="$validationFreeSupplier">
+        <!-- No-money player supply: MK4 allows zero profit for fulfillment. -->
+        <set_value name="$finalProfitRAW" exact="0"/>
+        <set_value name="$trade.$Profit" exact="0"/>
+      </do_if>
+      <do_elseif value="$trade.$Amount? and $buyPriceForRecalc? and $sellPriceForRecalc?">
+        <!-- ALWAYS recalculate profit: (sellPrice - buyPrice) * finalAmount. Validates against
+             current market prices, not cached values. -->
+        <set_value name="$finalAmountForProfit" exact="if $isSellOnly then $finalSellAmount else $finalBuyAmount"/>
+        <set_value name="$recalculatedProfitRAW" exact="($sellPriceForRecalc - $buyPriceForRecalc) * $finalAmountForProfit"/>
+        <set_value name="$finalProfitRAW" exact="$recalculatedProfitRAW"/>
+
+        <!-- Update trade object profit (for logbook display) -->
+        <set_value name="$trade.$Profit" exact="$recalculatedProfitRAW"/>
+
+        <!-- Also update prices in trade object if they were missing (for future use) -->
+        <do_if value="not $trade.$BuyPrice?">
+          <set_value name="$trade.$BuyPrice" exact="$buyPriceForRecalc"/>
+        </do_if>
+        <do_if value="not $trade.$SellPrice?">
+          <set_value name="$trade.$SellPrice" exact="$sellPriceForRecalc"/>
+        </do_if>
+      </do_elseif>
+      <do_else>
+        <!-- Prices missing - cannot recalculate profit, reject trade -->
+        <return value="table[
+          $Ok = false, $Reason = 'profit_missing',
+          $FinalBuyAmount = $finalBuyAmount, $FinalSellAmount = $finalSellAmount, $Profit = null,
+          $PlayerFreeSupplier = $validationFreeSupplier, $BuyClampReason = $buyClampReason, $SellClampReason = $sellClampReason,
+          $ClampFailed = false, $CargoUtilizationPct = $cargoUtilizationPct, $NeedCacheFlagSellOfferNull = false
+        ]"/>
+      </do_else>
+
+      <!-- MK4 supply price-cap validation: reject only when supplier price exceeds customer buy price
+           (negative final profit). Zero-profit trades are valid for supply fulfillment. -->
+      <do_if value="not $finalProfitRAW? or $finalProfitRAW lt 0">
+        <return value="table[
+          $Ok = false, $Reason = 'profit_negative',
+          $FinalBuyAmount = $finalBuyAmount, $FinalSellAmount = $finalSellAmount, $Profit = $finalProfitRAW,
+          $PlayerFreeSupplier = $validationFreeSupplier, $BuyClampReason = $buyClampReason, $SellClampReason = $sellClampReason,
+          $ClampFailed = false, $CargoUtilizationPct = $cargoUtilizationPct, $NeedCacheFlagSellOfferNull = false
+        ]"/>
+      </do_if>
+
+      <return value="table[
+        $Ok = true, $Reason = '',
+        $FinalBuyAmount = $finalBuyAmount, $FinalSellAmount = $finalSellAmount, $Profit = $finalProfitRAW,
+        $PlayerFreeSupplier = $validationFreeSupplier, $BuyClampReason = $buyClampReason, $SellClampReason = $sellClampReason,
+        $ClampFailed = false, $CargoUtilizationPct = $cargoUtilizationPct, $NeedCacheFlagSellOfferNull = false
+      ]"/>
+    </actions>
+  </attention>
+</aiscript>

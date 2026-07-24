@@ -1,0 +1,273 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- lib.gt.mk42.validate.reach - MK4-2 unified docking + path + home-range reachability gate.
+     Ports the duplicated sell-only/normal dock-check + path-distance + home-range validation
+     out of order.trade.galaxytradermk42.xml into a single shared check.
+     No <wait> here - lib.gt.dockcheck already yields once per call, which is enough to keep
+     this synchronous from the caller's perspective. -->
+<aiscript name="lib.gt.mk42.validate.reach" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <params>
+    <param name="ship" default="this.ship"/>
+    <param name="buyStation" default="null" comment="Null ok for sell-only trades"/>
+    <param name="sellStation" default="null"/>
+    <param name="isSellOnly" default="false"/>
+    <param name="blacklistgroup" default="blacklistgroup.civilian"/>
+    <param name="sectorWhitelist" default="[]" comment="Whitelist overrides sector blacklist (matches GT_IsSectorBlacklisted)"/>
+    <param name="gdCache" default="table[]" comment="Escape/range gatedistance memo - mutated in place, also returned"/>
+    <param name="gdCacheBL" default="table[]" comment="Blacklist-aware gatedistance memo - mutated in place, also returned"/>
+    <param name="homeBase" default="null" comment="Station or sector - effectiveHome"/>
+    <param name="maxBuy" default="15"/>
+    <param name="maxSell" default="15"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <set_value name="$currentSector" exact="$ship.sector"/>
+
+      <!-- ================================================================= -->
+      <!-- 1. Docking - sell-only skips the buy-station probe (ship already has cargo) -->
+      <!-- ================================================================= -->
+      <set_value name="$canDockBuy" exact="true"/>
+      <do_if value="not $isSellOnly">
+        <run_script name="'lib.gt.dockcheck'" result="$mk42ReachBuyDock">
+          <param name="ship" value="$ship"/>
+          <param name="station" value="$buyStation"/>
+          <param name="purpose" value="'trade'"/>
+          <param name="useMemo" value="true"/>
+        </run_script>
+        <set_value name="$canDockBuy" exact="$mk42ReachBuyDock.$CanDock"/>
+      </do_if>
+
+      <run_script name="'lib.gt.dockcheck'" result="$mk42ReachSellDock">
+        <param name="ship" value="$ship"/>
+        <param name="station" value="$sellStation"/>
+        <param name="purpose" value="'trade'"/>
+        <param name="useMemo" value="true"/>
+      </run_script>
+      <set_value name="$canDockSell" exact="$mk42ReachSellDock.$CanDock"/>
+
+      <do_if value="not $canDockBuy or not $canDockSell">
+        <set_value name="$deniedStation" exact="if not $canDockBuy then $buyStation else $sellStation"/>
+        <set_value name="$deniedType" exact="if not $canDockBuy then 'BUY' else 'SELL'"/>
+        <return value="table[
+          $Ok = false, $Reason = 'docking_denied',
+          $CanDockBuy = $canDockBuy, $CanDockSell = $canDockSell,
+          $DeniedStation = $deniedStation, $DeniedType = $deniedType,
+          $BuyDistance = -1, $SellDistance = -1, $BuySector = null, $SellSector = null,
+          $CurrentSector = $currentSector, $CurrentSectorIsBlacklisted = false,
+          $BuyDistanceFromHome = -1, $SellDistanceFromHome = -1, $HomeSector = null,
+          $PathBlocked = false, $UnreachableStation = null, $UnreachableType = '',
+          $GdCache = $gdCache, $GdCacheBL = $gdCacheBL
+        ]"/>
+      </do_if>
+
+      <!-- ================================================================= -->
+      <!-- 2. Path distances - escape/blacklist memo (unified sell-only + normal) -->
+      <!-- ================================================================= -->
+      <set_value name="$buySector" exact="$currentSector"/>
+      <do_if value="not $isSellOnly and $buyStation?">
+        <set_value name="$buySector" exact="$buyStation.sector"/>
+      </do_if>
+      <set_value name="$sellSector" exact="$sellStation.sector"/>
+
+      <!-- Ship's current-sector blacklist state (whitelist overrides blacklist) -->
+      <set_value name="$currentSectorIsBlacklisted" exact="false"/>
+      <do_if value="$blacklistgroup?">
+        <set_value name="$currentSectorWhitelisted" exact="false"/>
+        <do_if value="$sectorWhitelist? and $sectorWhitelist.count gt 0">
+          <do_all exact="$sectorWhitelist.count" counter="$swIdx">
+            <do_if value="$sectorWhitelist.{$swIdx} == $currentSector">
+              <set_value name="$currentSectorWhitelisted" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <do_if value="not $currentSectorWhitelisted">
+          <set_value name="$currentSectorActivityBlacklisted" exact="@$currentSector.isblacklisted.{blacklisttype.sectoractivity}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+          <set_value name="$currentSectorTravelBlacklisted" exact="@$currentSector.isblacklisted.{blacklisttype.sectortravel}.{$blacklistgroup}.{this.assignedcontrolled}"/>
+          <set_value name="$currentSectorIsBlacklisted" exact="$currentSectorActivityBlacklisted or $currentSectorTravelBlacklisted"/>
+        </do_if>
+      </do_if>
+
+      <!-- Buy path: sell-only is always 0 (no travel - ship already has cargo) -->
+      <set_value name="$buyDistance" exact="-1"/>
+      <do_if value="$isSellOnly">
+        <set_value name="$buyDistance" exact="0"/>
+      </do_if>
+      <do_elseif value="$buySector == $currentSector">
+        <set_value name="$buyDistance" exact="0"/>
+      </do_elseif>
+      <do_elseif value="$currentSectorIsBlacklisted">
+        <!-- Escape: non-blacklist gatedistance (memoized) -->
+        <do_if value="$gdCache.{$currentSector}? and $gdCache.{$currentSector}.{$buySector}?">
+          <set_value name="$buyDistance" exact="$gdCache.{$currentSector}.{$buySector}"/>
+        </do_if>
+        <do_else>
+          <set_value name="$buyDistance" exact="$ship.gatedistance.{$buySector}"/>
+          <do_if value="not $gdCache.{$currentSector}?"><set_value name="$gdCache.{$currentSector}" exact="table[]"/></do_if>
+          <set_value name="$gdCache.{$currentSector}.{$buySector}" exact="$buyDistance"/>
+        </do_else>
+      </do_elseif>
+      <do_else>
+        <!-- Normal: blacklist-aware gatedistance (memoized) -->
+        <do_if value="$gdCacheBL.{$currentSector}? and $gdCacheBL.{$currentSector}.{$buySector}?">
+          <set_value name="$buyDistance" exact="$gdCacheBL.{$currentSector}.{$buySector}"/>
+        </do_if>
+        <do_else>
+          <set_value name="$buyDistance" exact="$ship.gatedistance.{$buySector}.{$blacklistgroup}.{$ship}"/>
+          <do_if value="not $gdCacheBL.{$currentSector}?"><set_value name="$gdCacheBL.{$currentSector}" exact="table[]"/></do_if>
+          <set_value name="$gdCacheBL.{$currentSector}.{$buySector}" exact="$buyDistance"/>
+        </do_else>
+      </do_else>
+
+      <!-- Sell path: calculated based on buy location -->
+      <set_value name="$sellDistance" exact="-1"/>
+      <do_if value="$sellSector == $buySector">
+        <set_value name="$sellDistance" exact="0"/>
+      </do_if>
+      <do_elseif value="$buySector == $currentSector">
+        <!-- Ship in buy sector: escape vs normal path to sell sector -->
+        <do_if value="$currentSectorIsBlacklisted">
+          <do_if value="$gdCache.{$currentSector}? and $gdCache.{$currentSector}.{$sellSector}?">
+            <set_value name="$sellDistance" exact="$gdCache.{$currentSector}.{$sellSector}"/>
+          </do_if>
+          <do_else>
+            <set_value name="$sellDistance" exact="$ship.gatedistance.{$sellSector}"/>
+            <do_if value="not $gdCache.{$currentSector}?"><set_value name="$gdCache.{$currentSector}" exact="table[]"/></do_if>
+            <set_value name="$gdCache.{$currentSector}.{$sellSector}" exact="$sellDistance"/>
+          </do_else>
+        </do_if>
+        <do_else>
+          <do_if value="$gdCacheBL.{$currentSector}? and $gdCacheBL.{$currentSector}.{$sellSector}?">
+            <set_value name="$sellDistance" exact="$gdCacheBL.{$currentSector}.{$sellSector}"/>
+          </do_if>
+          <do_else>
+            <set_value name="$sellDistance" exact="$ship.gatedistance.{$sellSector}.{$blacklistgroup}.{$ship}"/>
+            <do_if value="not $gdCacheBL.{$currentSector}?"><set_value name="$gdCacheBL.{$currentSector}" exact="table[]"/></do_if>
+            <set_value name="$gdCacheBL.{$currentSector}.{$sellSector}" exact="$sellDistance"/>
+          </do_else>
+        </do_else>
+      </do_elseif>
+      <do_else>
+        <!-- Normal: buy->sell blacklist-aware gatedistance (memoized) -->
+        <do_if value="$gdCacheBL.{$buySector}? and $gdCacheBL.{$buySector}.{$sellSector}?">
+          <set_value name="$sellDistance" exact="$gdCacheBL.{$buySector}.{$sellSector}"/>
+        </do_if>
+        <do_else>
+          <set_value name="$sellDistance" exact="$buySector.gatedistance.{$sellSector}.{$blacklistgroup}.{$ship}"/>
+          <do_if value="not $gdCacheBL.{$buySector}?"><set_value name="$gdCacheBL.{$buySector}" exact="table[]"/></do_if>
+          <set_value name="$gdCacheBL.{$buySector}.{$sellSector}" exact="$sellDistance"/>
+        </do_else>
+      </do_else>
+
+      <set_value name="$pathBlocked" exact="false"/>
+      <do_if value="not $isSellOnly and $buyDistance lt 0">
+        <set_value name="$pathBlocked" exact="true"/>
+      </do_if>
+      <do_if value="$sellDistance lt 0">
+        <set_value name="$pathBlocked" exact="true"/>
+      </do_if>
+
+      <do_if value="$pathBlocked">
+        <set_value name="$unreachableStation" exact="if ($buyDistance lt 0 and not $isSellOnly) then $buyStation else $sellStation"/>
+        <set_value name="$unreachableType" exact="if ($buyDistance lt 0 and not $isSellOnly) then 'BUY' else 'SELL'"/>
+        <return value="table[
+          $Ok = false, $Reason = 'path_blocked',
+          $CanDockBuy = $canDockBuy, $CanDockSell = $canDockSell,
+          $DeniedStation = null, $DeniedType = '',
+          $BuyDistance = $buyDistance, $SellDistance = $sellDistance,
+          $BuySector = $buySector, $SellSector = $sellSector,
+          $CurrentSector = $currentSector, $CurrentSectorIsBlacklisted = $currentSectorIsBlacklisted,
+          $BuyDistanceFromHome = -1, $SellDistanceFromHome = -1, $HomeSector = null,
+          $PathBlocked = $pathBlocked, $UnreachableStation = $unreachableStation, $UnreachableType = $unreachableType,
+          $GdCache = $gdCache, $GdCacheBL = $gdCacheBL
+        ]"/>
+      </do_if>
+
+      <!-- ================================================================= -->
+      <!-- 3. Home-range - resolve homeSector, check maxBuy/maxSell -->
+      <!-- ================================================================= -->
+      <set_value name="$homeSector" exact="null"/>
+      <do_if value="$homeBase? and @$homeBase.exists">
+        <do_if value="$homeBase.isclass.station">
+          <set_value name="$homeSector" exact="$homeBase.sector"/>
+        </do_if>
+        <do_elseif value="$homeBase.isclass.sector">
+          <set_value name="$homeSector" exact="$homeBase"/>
+        </do_elseif>
+      </do_if>
+      <do_if value="not $homeSector? or not $homeSector.exists">
+        <!-- Emergency fallback only - caller should always supply a valid homeBase -->
+        <set_value name="$homeSector" exact="$ship.sector"/>
+      </do_if>
+
+      <!-- Distance from HOME SECTOR to stations (range-only, no blacklist) -->
+      <set_value name="$buyDistanceFromHome" exact="0"/>
+      <do_if value="not $isSellOnly">
+        <set_value name="$buyDistanceFromHome" exact="-1"/>
+        <do_if value="$buySector == $homeSector">
+          <set_value name="$buyDistanceFromHome" exact="0"/>
+        </do_if>
+        <do_else>
+          <do_if value="$gdCache.{$homeSector}? and $gdCache.{$homeSector}.{$buySector}?">
+            <set_value name="$buyDistanceFromHome" exact="$gdCache.{$homeSector}.{$buySector}"/>
+          </do_if>
+          <do_else>
+            <set_value name="$buyDistanceFromHome" exact="$homeSector.gatedistance.{$buySector}"/>
+            <do_if value="not $gdCache.{$homeSector}?"><set_value name="$gdCache.{$homeSector}" exact="table[]"/></do_if>
+            <set_value name="$gdCache.{$homeSector}.{$buySector}" exact="$buyDistanceFromHome"/>
+          </do_else>
+        </do_else>
+      </do_if>
+
+      <set_value name="$sellDistanceFromHome" exact="-1"/>
+      <do_if value="$sellSector == $homeSector">
+        <set_value name="$sellDistanceFromHome" exact="0"/>
+      </do_if>
+      <do_else>
+        <do_if value="$gdCache.{$homeSector}? and $gdCache.{$homeSector}.{$sellSector}?">
+          <set_value name="$sellDistanceFromHome" exact="$gdCache.{$homeSector}.{$sellSector}"/>
+        </do_if>
+        <do_else>
+          <set_value name="$sellDistanceFromHome" exact="$homeSector.gatedistance.{$sellSector}"/>
+          <do_if value="not $gdCache.{$homeSector}?"><set_value name="$gdCache.{$homeSector}" exact="table[]"/></do_if>
+          <set_value name="$gdCache.{$homeSector}.{$sellSector}" exact="$sellDistanceFromHome"/>
+        </do_else>
+      </do_else>
+
+      <set_value name="$distanceCheckFailed" exact="false"/>
+      <do_if value="not $isSellOnly">
+        <do_if value="$buyDistanceFromHome lt 0 or $buyDistanceFromHome gt $maxBuy">
+          <set_value name="$distanceCheckFailed" exact="true"/>
+        </do_if>
+      </do_if>
+      <do_if value="$sellDistanceFromHome lt 0 or $sellDistanceFromHome gt $maxSell">
+        <set_value name="$distanceCheckFailed" exact="true"/>
+      </do_if>
+
+      <do_if value="$distanceCheckFailed">
+        <return value="table[
+          $Ok = false, $Reason = 'distance_exceeded',
+          $CanDockBuy = $canDockBuy, $CanDockSell = $canDockSell,
+          $DeniedStation = null, $DeniedType = '',
+          $BuyDistance = $buyDistance, $SellDistance = $sellDistance,
+          $BuySector = $buySector, $SellSector = $sellSector,
+          $CurrentSector = $currentSector, $CurrentSectorIsBlacklisted = $currentSectorIsBlacklisted,
+          $BuyDistanceFromHome = $buyDistanceFromHome, $SellDistanceFromHome = $sellDistanceFromHome, $HomeSector = $homeSector,
+          $PathBlocked = false, $UnreachableStation = null, $UnreachableType = '',
+          $GdCache = $gdCache, $GdCacheBL = $gdCacheBL
+        ]"/>
+      </do_if>
+
+      <return value="table[
+        $Ok = true, $Reason = '',
+        $CanDockBuy = $canDockBuy, $CanDockSell = $canDockSell,
+        $DeniedStation = null, $DeniedType = '',
+        $BuyDistance = $buyDistance, $SellDistance = $sellDistance,
+        $BuySector = $buySector, $SellSector = $sellSector,
+        $CurrentSector = $currentSector, $CurrentSectorIsBlacklisted = $currentSectorIsBlacklisted,
+        $BuyDistanceFromHome = $buyDistanceFromHome, $SellDistanceFromHome = $sellDistanceFromHome, $HomeSector = $homeSector,
+        $PathBlocked = false, $UnreachableStation = null, $UnreachableType = '',
+        $GdCache = $gdCache, $GdCacheBL = $gdCacheBL
+      ]"/>
+    </actions>
+  </attention>
+</aiscript>

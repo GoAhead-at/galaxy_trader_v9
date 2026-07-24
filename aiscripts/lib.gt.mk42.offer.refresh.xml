@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- lib.gt.mk42.offer.refresh — single place for MK4-2 buy/sell offer re-resolve.
+     Mutates $trade in place (table ref).
+     Yields 1ms before return: fresh-filter do_all calls this per candidate; immediate
+     return storms AIDirector. Safe here only — never call during SELL/BUY create_trade_order
+     queueing (that yield would start sells before buys → ERR_NOTHING_TO_SELL).
+
+     Modes:
+       both (default) — refresh supplier sell-offer + customer buy-offer
+       buy            — supplier find_sell_offer only
+       sell           — customer find_buy_offer only (BS-aware)
+
+     BS (vanilla trade.station): prefer SellStationBase.buildstorage, excludeempty=false,
+     bare offeramount so desiredamount applies when no money changes hands. -->
+<aiscript name="lib.gt.mk42.offer.refresh" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <params>
+    <param name="ship" default="this.ship"/>
+    <param name="trade" default="null" comment="Trade table with $BuyOffer/$SellOffer/$BuyStation/$SellStation/$Ware/$SellStationBase"/>
+    <param name="mode" default="'both'" comment="both | buy | sell"/>
+    <param name="ware" default="null" comment="Optional ware override; else $trade.$Ware / offer.ware"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <do_if value="not $trade? or $trade == null">
+        <set_value name="this.$mk42OfferRefreshResult" exact="table[
+          $Ok = false,
+          $Trade = null,
+          $BuyStation = null,
+          $SellStation = null,
+          $BuyAmount = 0,
+          $SellAmount = 0,
+          $DestIsBs = false,
+          $BuyRefreshed = false,
+          $SellRefreshed = false
+        ]"/>
+        <wait exact="1ms"/>
+        <return value="this.$mk42OfferRefreshResult"/>
+      </do_if>
+
+      <set_value name="$doBuy" exact="$mode == 'both' or $mode == 'buy'"/>
+      <set_value name="$doSell" exact="$mode == 'both' or $mode == 'sell'"/>
+      <set_value name="$buyRefreshed" exact="false"/>
+      <set_value name="$sellRefreshed" exact="false"/>
+
+      <set_value name="$resolvedWare" exact="if $ware? and $ware != null then $ware else (if $trade.$Ware? then $trade.$Ware else null)"/>
+      <do_if value="not $resolvedWare? and $trade.$BuyOffer? and $trade.$BuyOffer.ware?">
+        <set_value name="$resolvedWare" exact="@$trade.$BuyOffer.ware"/>
+      </do_if>
+      <do_if value="not $resolvedWare? and $trade.$SellOffer? and $trade.$SellOffer.ware?">
+        <set_value name="$resolvedWare" exact="@$trade.$SellOffer.ware"/>
+      </do_if>
+
+      <set_value name="$buyStation" exact="null"/>
+      <do_if value="$trade.$BuyStation? and @$trade.$BuyStation.exists">
+        <set_value name="$buyStation" exact="$trade.$BuyStation"/>
+      </do_if>
+      <do_elseif value="$trade.$BuyOffer? and $trade.$BuyOffer.seller? and @$trade.$BuyOffer.seller.exists">
+        <set_value name="$buyStation" exact="@$trade.$BuyOffer.seller"/>
+      </do_elseif>
+      <do_elseif value="$trade.$BuyOffer? and $trade.$BuyOffer.owner? and @$trade.$BuyOffer.owner.exists">
+        <set_value name="$buyStation" exact="@$trade.$BuyOffer.owner"/>
+      </do_elseif>
+
+      <set_value name="$sellStation" exact="null"/>
+      <do_if value="$trade.$SellStation? and @$trade.$SellStation.exists">
+        <set_value name="$sellStation" exact="$trade.$SellStation"/>
+      </do_if>
+      <do_elseif value="$trade.$SellOffer? and $trade.$SellOffer.buyer? and @$trade.$SellOffer.buyer.exists">
+        <set_value name="$sellStation" exact="@$trade.$SellOffer.buyer"/>
+      </do_elseif>
+      <do_elseif value="$trade.$SellOffer? and $trade.$SellOffer.owner? and @$trade.$SellOffer.owner.exists">
+        <set_value name="$sellStation" exact="@$trade.$SellOffer.owner"/>
+      </do_elseif>
+      <do_if value="$trade.$SellStationBase? and @$trade.$SellStationBase.exists and @$trade.$SellStationBase.buildstorage and @$trade.$SellStationBase.buildstorage.exists">
+        <set_value name="$sellStation" exact="@$trade.$SellStationBase.buildstorage"/>
+        <set_value name="$trade.$SellStation" exact="$sellStation"/>
+      </do_if>
+
+      <do_if value="$doBuy and $buyStation? and $buyStation.exists and $resolvedWare != null and $ship? and $ship.exists">
+        <find_sell_offer seller="$buyStation" wares="$resolvedWare" tradepartner="$ship" result="$freshBuyOffer"/>
+        <do_if value="$freshBuyOffer?">
+          <set_value name="$trade.$BuyOffer" exact="$freshBuyOffer"/>
+          <set_value name="$buyRefreshed" exact="true"/>
+        </do_if>
+      </do_if>
+
+      <do_if value="$doSell and $sellStation? and $sellStation.exists and $resolvedWare != null">
+        <set_value name="$freshSellOffer" exact="null"/>
+        <do_if value="@$sellStation.isclass.buildstorage">
+          <find_buy_offer buyer="$sellStation" wares="$resolvedWare" result="$freshSellOffer" excludeempty="false">
+            <offeramount min="1"/>
+          </find_buy_offer>
+        </do_if>
+        <do_else>
+          <do_if value="$ship? and $ship.exists">
+            <find_buy_offer buyer="$sellStation" wares="$resolvedWare" tradepartner="$ship" result="$freshSellOffer"/>
+          </do_if>
+          <do_else>
+            <find_buy_offer buyer="$sellStation" wares="$resolvedWare" result="$freshSellOffer"/>
+          </do_else>
+        </do_else>
+        <do_if value="$freshSellOffer?">
+          <set_value name="$trade.$SellOffer" exact="$freshSellOffer"/>
+          <set_value name="$sellRefreshed" exact="true"/>
+        </do_if>
+      </do_if>
+
+      <set_value name="$destIsBs" exact="false"/>
+      <do_if value="$sellStation? and @$sellStation.exists and @$sellStation.isclass.buildstorage">
+        <set_value name="$destIsBs" exact="true"/>
+      </do_if>
+      <do_elseif value="$trade.$SellStationBase? and @$trade.$SellStationBase.exists and $trade.$SellStationBase.buildstorage? and @$trade.$SellStationBase.buildstorage.exists">
+        <set_value name="$destIsBs" exact="true"/>
+      </do_elseif>
+
+      <set_value name="$buyAmount" exact="0"/>
+      <do_if value="$trade.$BuyOffer?">
+        <set_value name="$buyAmount" exact="@$trade.$BuyOffer.offeramount.{$ship}"/>
+        <do_if value="(not $buyAmount? or $buyAmount le 0) and @$trade.$BuyOffer.amount gt 0">
+          <set_value name="$buyAmount" exact="@$trade.$BuyOffer.amount"/>
+        </do_if>
+      </do_if>
+
+      <set_value name="$sellAmount" exact="0"/>
+      <do_if value="$trade.$SellOffer?">
+        <set_value name="$sellAmount" exact="@$trade.$SellOffer.offeramount.{$ship}"/>
+        <do_if value="$destIsBs">
+          <do_if value="(not $sellAmount? or $sellAmount le 0) and $trade.$SellOffer.desiredamount? and @$trade.$SellOffer.desiredamount gt 0">
+            <set_value name="$sellAmount" exact="@$trade.$SellOffer.desiredamount"/>
+          </do_if>
+          <do_if value="(not $sellAmount? or $sellAmount le 0) and @$trade.$SellOffer.amount gt 0">
+            <set_value name="$sellAmount" exact="@$trade.$SellOffer.amount"/>
+          </do_if>
+          <do_if value="(not $sellAmount? or $sellAmount le 0) and $sellStation? and $sellStation.exists and $resolvedWare?">
+            <set_value name="$sellAmount" exact="[0, $sellStation.cargo.{$resolvedWare}.target - $sellStation.cargo.{$resolvedWare}.count].max"/>
+          </do_if>
+        </do_if>
+      </do_if>
+      <do_elseif value="$destIsBs and $sellStation? and $sellStation.exists and $resolvedWare?">
+        <set_value name="$sellAmount" exact="[0, $sellStation.cargo.{$resolvedWare}.target - $sellStation.cargo.{$resolvedWare}.count].max"/>
+      </do_elseif>
+
+      <do_if value="not $buyAmount?">
+        <set_value name="$buyAmount" exact="0"/>
+      </do_if>
+      <do_if value="not $sellAmount?">
+        <set_value name="$sellAmount" exact="0"/>
+      </do_if>
+
+      <!-- Persist before yield — locals do not survive wait. Pre-queue only (see header). -->
+      <set_value name="this.$mk42OfferRefreshResult" exact="table[
+        $Ok = true,
+        $Trade = $trade,
+        $BuyStation = $buyStation,
+        $SellStation = $sellStation,
+        $BuyAmount = $buyAmount,
+        $SellAmount = $sellAmount,
+        $DestIsBs = $destIsBs,
+        $BuyRefreshed = $buyRefreshed,
+        $SellRefreshed = $sellRefreshed,
+        $Ware = $resolvedWare
+      ]"/>
+      <wait exact="1ms"/>
+      <return value="this.$mk42OfferRefreshResult"/>
+    </actions>
+  </attention>
+</aiscript>

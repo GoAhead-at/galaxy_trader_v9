@@ -508,6 +508,12 @@
       <!-- Demand gate memo: effective customer need is a function of (delivery customer, ware) only,
            so every supplier paired with the same customer reuses one get_ware_reservation result. -->
       <set_value name="this.$tm_demandMemo" exact="table[]"/>
+      <!-- Clamp ceiling memo: clamp_trade_amount returns min(amount, seller stock, buyer capacity,
+           buyer money), so each leg's ceiling depends on the offer alone. Probed once per offer with
+           that offer's own amount, then reused for every pair it appears in. The universal-cache and
+           direct clamp variants never mix because $universalCacheBasis is fixed for a run. -->
+      <set_value name="this.$tm_sellClampMemo" exact="table[]"/>
+      <set_value name="this.$tm_buyClampMemo" exact="table[]"/>
       <set_value name="this.$tm_pairsEvaluated" exact="0"/>
       <!-- Performance.$EarlyExitThreshold: hard cap on offer pairs examined per match run. -->
       <set_value name="this.$tm_pairBudget" exact="2000"/>
@@ -583,6 +589,12 @@
       </do_if>
       <do_if value="not this.$tm_demandMemo?">
         <set_value name="this.$tm_demandMemo" exact="table[]"/>
+      </do_if>
+      <do_if value="not this.$tm_sellClampMemo?">
+        <set_value name="this.$tm_sellClampMemo" exact="table[]"/>
+      </do_if>
+      <do_if value="not this.$tm_buyClampMemo?">
+        <set_value name="this.$tm_buyClampMemo" exact="table[]"/>
       </do_if>
       <do_if value="not this.$tm_pairsEvaluated?">
         <set_value name="this.$tm_pairsEvaluated" exact="0"/>
@@ -1420,12 +1432,26 @@
               </do_if>
             </do_if>
             <do_if value="$tmCacheClampSeller != null">
-              <set_value name="$tmCacheClampReason" exact="null"/>
-              <clamp_trade_amount trade="$sellOffer" amount="$tradeAmount" seller="$tmCacheClampSeller" result="$tradeAmount" reason="$tmCacheClampReason"/>
-              <do_if value="not $tradeAmount? or $tradeAmount le 0">
+              <!-- Supplier ceiling probed once per sell offer at that offer's own amount; every
+                   $tradeAmount for this offer is <= that probe, so min() below is exact. -->
+              <set_value name="$tmSellCeiling" exact="0"/>
+              <do_if value="this.$tm_sellClampMemo? and this.$tm_sellClampMemo.{$sellOffer}?">
+                <set_value name="$tmSellCeiling" exact="this.$tm_sellClampMemo.{$sellOffer}"/>
+              </do_if>
+              <do_else>
+                <clamp_trade_amount trade="$sellOffer" amount="$sellOfferAmount" seller="$tmCacheClampSeller" result="$tmSellCeiling"/>
+                <do_if value="not $tmSellCeiling?">
+                  <set_value name="$tmSellCeiling" exact="0"/>
+                </do_if>
+                <do_if value="this.$tm_sellClampMemo?">
+                  <set_value name="this.$tm_sellClampMemo.{$sellOffer}" exact="$tmSellCeiling"/>
+                </do_if>
+              </do_else>
+              <do_if value="$tmSellCeiling le 0">
                 <set_value name="this.$tm_tradesRejected" operation="add"/>
                 <continue/>
               </do_if>
+              <set_value name="$tradeAmount" exact="[$tradeAmount, $tmSellCeiling].min"/>
               <set_value name="$sellOfferAmount" exact="[$sellOfferAmount, $tradeAmount].min"/>
             </do_if>
             <do_else>
@@ -1442,12 +1468,25 @@
               </do_if>
             </do_if>
             <do_if value="$tmCacheClampBuyer != null">
-              <set_value name="$tmCacheSellClampReason" exact="null"/>
-              <clamp_trade_amount trade="$buyOffer" amount="$tradeAmount" buyer="$tmCacheClampBuyer" result="$tradeAmount" reason="$tmCacheSellClampReason"/>
-              <do_if value="not $tradeAmount? or $tradeAmount le 0">
+              <!-- Customer ceiling probed once per buy offer at that offer's own amount. -->
+              <set_value name="$tmBuyCeiling" exact="0"/>
+              <do_if value="this.$tm_buyClampMemo? and this.$tm_buyClampMemo.{$buyOffer}?">
+                <set_value name="$tmBuyCeiling" exact="this.$tm_buyClampMemo.{$buyOffer}"/>
+              </do_if>
+              <do_else>
+                <clamp_trade_amount trade="$buyOffer" amount="$buyOfferAmount" buyer="$tmCacheClampBuyer" result="$tmBuyCeiling"/>
+                <do_if value="not $tmBuyCeiling?">
+                  <set_value name="$tmBuyCeiling" exact="0"/>
+                </do_if>
+                <do_if value="this.$tm_buyClampMemo?">
+                  <set_value name="this.$tm_buyClampMemo.{$buyOffer}" exact="$tmBuyCeiling"/>
+                </do_if>
+              </do_else>
+              <do_if value="$tmBuyCeiling le 0">
                 <set_value name="this.$tm_tradesRejected" operation="add"/>
                 <continue/>
               </do_if>
+              <set_value name="$tradeAmount" exact="[$tradeAmount, $tmBuyCeiling].min"/>
               <set_value name="$buyOfferAmount" exact="[$buyOfferAmount, $tradeAmount].min"/>
             </do_if>
             <do_else>
@@ -1472,15 +1511,27 @@
             </do_if>
           </do_if>
           <do_if value="$tmClampBuySeller != null">
-            <set_value name="$tmClampPreview" exact="$tradeAmount"/>
-            <set_value name="$tmClampReason" exact="null"/>
-            <set_value name="$tmTradePartner" exact="if this.assignedcontrolled? then this.assignedcontrolled else $ship"/>
-            <clamp_trade_amount trade="$sellOffer" amount="$tmClampPreview" buyer="$tmTradePartner" seller="$tmClampBuySeller" result="$tmClampPreview" reason="$tmClampReason"/>
-            <do_if value="not $tmClampPreview? or $tmClampPreview le 0">
+            <!-- Supplier ceiling probed once per sell offer at that offer's own amount; the trade
+                 partner is fixed for the run, so the ceiling is reusable across every pair. -->
+            <set_value name="$tmSellCeiling" exact="0"/>
+            <do_if value="this.$tm_sellClampMemo? and this.$tm_sellClampMemo.{$sellOffer}?">
+              <set_value name="$tmSellCeiling" exact="this.$tm_sellClampMemo.{$sellOffer}"/>
+            </do_if>
+            <do_else>
+              <set_value name="$tmTradePartner" exact="if this.assignedcontrolled? then this.assignedcontrolled else $ship"/>
+              <clamp_trade_amount trade="$sellOffer" amount="$sellOfferAmount" buyer="$tmTradePartner" seller="$tmClampBuySeller" result="$tmSellCeiling"/>
+              <do_if value="not $tmSellCeiling?">
+                <set_value name="$tmSellCeiling" exact="0"/>
+              </do_if>
+              <do_if value="this.$tm_sellClampMemo?">
+                <set_value name="this.$tm_sellClampMemo.{$sellOffer}" exact="$tmSellCeiling"/>
+              </do_if>
+            </do_else>
+            <do_if value="$tmSellCeiling le 0">
               <set_value name="this.$tm_tradesRejected" operation="add"/>
               <continue/>
             </do_if>
-            <set_value name="$tradeAmount" exact="$tmClampPreview"/>
+            <set_value name="$tradeAmount" exact="[$tradeAmount, $tmSellCeiling].min"/>
             <set_value name="$sellOfferAmount" exact="[$sellOfferAmount, $tradeAmount].min"/>
           </do_if>
           <do_else>
@@ -1497,14 +1548,25 @@
             </do_if>
           </do_if>
           <do_if value="$tmClampSellBuyer != null">
-            <set_value name="$tmSellClampPreview" exact="$tradeAmount"/>
-            <set_value name="$tmSellClampReason" exact="null"/>
-            <clamp_trade_amount trade="$buyOffer" amount="$tmSellClampPreview" buyer="$tmClampSellBuyer" result="$tmSellClampPreview" reason="$tmSellClampReason"/>
-            <do_if value="not $tmSellClampPreview? or $tmSellClampPreview le 0">
+            <!-- Customer ceiling probed once per buy offer at that offer's own amount. -->
+            <set_value name="$tmBuyCeiling" exact="0"/>
+            <do_if value="this.$tm_buyClampMemo? and this.$tm_buyClampMemo.{$buyOffer}?">
+              <set_value name="$tmBuyCeiling" exact="this.$tm_buyClampMemo.{$buyOffer}"/>
+            </do_if>
+            <do_else>
+              <clamp_trade_amount trade="$buyOffer" amount="$buyOfferAmount" buyer="$tmClampSellBuyer" result="$tmBuyCeiling"/>
+              <do_if value="not $tmBuyCeiling?">
+                <set_value name="$tmBuyCeiling" exact="0"/>
+              </do_if>
+              <do_if value="this.$tm_buyClampMemo?">
+                <set_value name="this.$tm_buyClampMemo.{$buyOffer}" exact="$tmBuyCeiling"/>
+              </do_if>
+            </do_else>
+            <do_if value="$tmBuyCeiling le 0">
               <set_value name="this.$tm_tradesRejected" operation="add"/>
               <continue/>
             </do_if>
-            <set_value name="$tradeAmount" exact="[$tradeAmount, $tmSellClampPreview].min"/>
+            <set_value name="$tradeAmount" exact="[$tradeAmount, $tmBuyCeiling].min"/>
             <set_value name="$buyOfferAmount" exact="[$buyOfferAmount, $tradeAmount].min"/>
           </do_if>
           <do_else>

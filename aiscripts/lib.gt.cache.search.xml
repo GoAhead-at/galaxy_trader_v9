@@ -329,25 +329,6 @@
       <set_value name="$maxDistanceBuyLeg" exact="if $maxDistanceBuy? and $maxDistanceBuy gt 0 then $maxDistanceBuy else $maxDistance"/>
       <set_value name="$maxDistanceSellLeg" exact="if $maxDistanceSell? and $maxDistanceSell gt 0 then $maxDistanceSell else $maxDistance"/>
       <set_value name="this.$cs_homeDist" exact="table[]"/>
-      <!-- Fleet-min admission bar (gt_home_fleet_profile): the minimum, over all MK3 ships homed
-           here, of bucket capacity x that ship's cargotarget. The cache-refresh live search admits
-           rows against exactly this bar, so every ship homed here can execute any row in the pool.
-           Resolved once per search; this.$ so it survives the cooperative waits in the entry loop. -->
-      <set_value name="this.$cs_fleetMinContainer" exact="-1"/>
-      <set_value name="this.$cs_fleetMinSolid" exact="-1"/>
-      <set_value name="this.$cs_fleetMinLiquid" exact="-1"/>
-      <do_if value="$homeSector? and @$homeSector.exists and global.$GT_HomeFleetCargoProfile? and global.$GT_HomeFleetCargoProfile.{$homeSector}? and global.$GT_HomeFleetCargoProfile.{$homeSector}.$MinRequired?">
-        <set_value name="$csFleetMin" exact="global.$GT_HomeFleetCargoProfile.{$homeSector}.$MinRequired"/>
-        <do_if value="$csFleetMin.$container? and $csFleetMin.$container gt 0">
-          <set_value name="this.$cs_fleetMinContainer" exact="$csFleetMin.$container"/>
-        </do_if>
-        <do_if value="$csFleetMin.$solid? and $csFleetMin.$solid gt 0">
-          <set_value name="this.$cs_fleetMinSolid" exact="$csFleetMin.$solid"/>
-        </do_if>
-        <do_if value="$csFleetMin.$liquid? and $csFleetMin.$liquid gt 0">
-          <set_value name="this.$cs_fleetMinLiquid" exact="$csFleetMin.$liquid"/>
-        </do_if>
-      </do_if>
       <set_value name="this.$cs_homeDist.{$homeSector}" exact="0"/>
       <!-- If cache was populated with a smaller search radius than this ship needs, treat as miss
            so live search (with completion pass) can find trades outside the cached radius. -->
@@ -1268,34 +1249,19 @@
           <do_if value="$entry.$Ware? and $entry.$Ware.volume?">
             <set_value name="$minUtilVolumePerUnit" exact="$entry.$Ware.volume"/>
           </do_if>
-          <!-- Live offer ceilings only. The cached $Amount was clamped to the WRITING ship's hold
-               and wallet; execution re-clamps per ship, so folding it in here would judge a shared
-               row by a foreign ship's limits. -->
           <set_value name="$minUtilAmountLimit" exact="$preCheckSellAmt"/>
           <do_if value="$preCheckBuyAmt? and $preCheckBuyAmt lt $minUtilAmountLimit">
             <set_value name="$minUtilAmountLimit" exact="$preCheckBuyAmt"/>
           </do_if>
-          <set_value name="$minUtilTradeVolume" exact="$minUtilAmountLimit * $minUtilVolumePerUnit"/>
-          <!-- Compare against the fleet-min bar this row was admitted under, per transport bucket.
-               Using this ship's own capacity rejects every row sized for a smaller fleet member,
-               which empties the shared pool for every larger ship. -->
-          <set_value name="$minUtilTransport" exact="if $entryCargoTransport? then $entryCargoTransport else (if $entry.$Ware? and @$entry.$Ware.waretransport != null then @$entry.$Ware.waretransport else null)"/>
-          <set_value name="$minUtilRequiredVolume" exact="-1"/>
-          <do_if value="$minUtilTransport == waretransport.container and this.$cs_fleetMinContainer? and this.$cs_fleetMinContainer ge 0">
-            <set_value name="$minUtilRequiredVolume" exact="this.$cs_fleetMinContainer"/>
+          <!-- Prefer ship-agnostic OfferMaxAmount: cache rows are handed out as shared refs and
+               validation overwrites $Amount with the validating ship's cargo clamp, so reading
+               $Amount judges this row by a peer ship's hold and false-rejects larger ships. -->
+          <set_value name="$minUtilCachedAmount" exact="if $entry.$OfferMaxAmount? and $entry.$OfferMaxAmount gt 0 then $entry.$OfferMaxAmount else (if $entry.$Amount? then $entry.$Amount else 0)"/>
+          <do_if value="$minUtilCachedAmount gt 0 and $minUtilCachedAmount lt $minUtilAmountLimit">
+            <set_value name="$minUtilAmountLimit" exact="$minUtilCachedAmount"/>
           </do_if>
-          <do_elseif value="$minUtilTransport == waretransport.solid and this.$cs_fleetMinSolid? and this.$cs_fleetMinSolid ge 0">
-            <set_value name="$minUtilRequiredVolume" exact="this.$cs_fleetMinSolid"/>
-          </do_elseif>
-          <do_elseif value="$minUtilTransport == waretransport.liquid and this.$cs_fleetMinLiquid? and this.$cs_fleetMinLiquid ge 0">
-            <set_value name="$minUtilRequiredVolume" exact="this.$cs_fleetMinLiquid"/>
-          </do_elseif>
-          <do_else>
-            <!-- No fleet profile for this bucket, or a pre-fix search resumed from a save without
-                 the bar resolved: keep the per-ship bar so the gate still bites. -->
-            <set_value name="$minUtilCapBucket" exact="$ship.cargo.capacity.all"/>
-            <set_value name="$minUtilRequiredVolume" exact="($minUtilCapBucket * $cargoUtilThresholdPct) / 100.0"/>
-          </do_else>
+          <set_value name="$minUtilTradeVolume" exact="$minUtilAmountLimit * $minUtilVolumePerUnit"/>
+          <set_value name="$minUtilRequiredVolume" exact="($ship.cargo.capacity.all * $cargoUtilThresholdPct) / 100.0"/>
           <!-- Best row seen at this gate, so the funnel can report how far short the pool fell. -->
           <do_if value="$minUtilTradeVolume gt $cuBestVol">
             <set_value name="$cuBestVol" exact="$minUtilTradeVolume"/>
@@ -1428,8 +1394,50 @@
         </do_if>
 
         <set_value name="$gateReach.$g15_quota" exact="if $gateReach.$g15_quota? then $gateReach.$g15_quota+1 else 1"/>
-        <!-- Entry passed all filters -->
-        <append_to_list name="$tradeList" exact="$entry"/>
+        <!-- Entry passed all filters. Hand out a PRIVATE copy - never the cache-resident table.
+             Validation writes $Amount / $FinalBuyAmount and score_for_ship writes $ShipScore onto
+             the working row, so sharing the cache object lets one ship's cargo clamp and route score
+             overwrite the row every other ship then reads. Offers/stations stay shared game refs;
+             ship-specific score fields and ephemeral clamp fields are deliberately not copied, and
+             $Amount starts from the ship-agnostic $OfferMaxAmount. -->
+        <set_value name="$privateAmount" exact="if $entry.$OfferMaxAmount? and $entry.$OfferMaxAmount gt 0 then $entry.$OfferMaxAmount else (if $entry.$Amount? then $entry.$Amount else 0)"/>
+        <set_value name="$privateEntry" exact="table[
+          $Ware = if $entry.$Ware? then $entry.$Ware else null,
+          $CargoWareTransport = if $entry.$CargoWareTransport? then $entry.$CargoWareTransport else null,
+          $BuyOffer = if $entry.$BuyOffer? then $entry.$BuyOffer else null,
+          $SellOffer = if $entry.$SellOffer? then $entry.$SellOffer else null,
+          $Amount = $privateAmount,
+          $OfferMaxAmount = $privateAmount,
+          $BuyOfferAmount = if $entry.$BuyOfferAmount? then $entry.$BuyOfferAmount else null,
+          $SellOfferAmount = if $entry.$SellOfferAmount? then $entry.$SellOfferAmount else null,
+          $Score = if $entry.$Score? then $entry.$Score else 0,
+          $BuyStation = if $entry.$BuyStation? then $entry.$BuyStation else null,
+          $SellStation = if $entry.$SellStation? then $entry.$SellStation else null,
+          $SellStationBase = if $entry.$SellStationBase? then $entry.$SellStationBase else null,
+          $SupplierStationId = if $entry.$SupplierStationId? then $entry.$SupplierStationId else null,
+          $DeliveryStationId = if $entry.$DeliveryStationId? then $entry.$DeliveryStationId else null,
+          $DeliveryStationName = if $entry.$DeliveryStationName? then $entry.$DeliveryStationName else null,
+          $BuySector = if $entry.$BuySector? then $entry.$BuySector else null,
+          $BuySectorId = if $entry.$BuySectorId? then $entry.$BuySectorId else null,
+          $SellSector = if $entry.$SellSector? then $entry.$SellSector else null,
+          $SellSectorId = if $entry.$SellSectorId? then $entry.$SellSectorId else null,
+          $Distance = if $entry.$Distance? then $entry.$Distance else 0,
+          $HomeToBuyDistance = if $entry.$HomeToBuyDistance? then $entry.$HomeToBuyDistance else 0,
+          $HomeToSellDistance = if $entry.$HomeToSellDistance? then $entry.$HomeToSellDistance else 0,
+          $RouteDistance = if $entry.$RouteDistance? then $entry.$RouteDistance else 0,
+          $UnitProfit = if $entry.$UnitProfit? then $entry.$UnitProfit else 0,
+          $BuyPrice = if $entry.$BuyPrice? then $entry.$BuyPrice else 0,
+          $SellPrice = if $entry.$SellPrice? then $entry.$SellPrice else 0,
+          $ProfitPerUnit = if $entry.$ProfitPerUnit? then $entry.$ProfitPerUnit else 0,
+          $VolumePerUnit = if $entry.$VolumePerUnit? then $entry.$VolumePerUnit else 1,
+          $Profit = if $entry.$Profit? then $entry.$Profit else 0,
+          $PlayerFreeSupplier = if $entry.$PlayerFreeSupplier? then $entry.$PlayerFreeSupplier else false,
+          $IsSellOnly = if $entry.$IsSellOnly? then $entry.$IsSellOnly else false,
+          $TradeRuleBlocked = if $entry.$TradeRuleBlocked? then $entry.$TradeRuleBlocked else false,
+          $RouteKey = if $entry.$RouteKey? then $entry.$RouteKey else null,
+          $CachedAt = if $entry.$CachedAt? then $entry.$CachedAt else null
+        ]"/>
+        <append_to_list name="$tradeList" exact="$privateEntry"/>
         <set_value name="$foundCount" operation="add"/>
         <do_if value="$quotaWare != null">
           <set_value name="$foundPerWare.{$quotaWare}" exact="if $foundPerWare.{$quotaWare}? then ($foundPerWare.{$quotaWare} + 1) else 1"/>
@@ -1620,7 +1628,7 @@
         <set_value name="$gateFunnelStr" exact="$gateFunnelStr + ' -> quota=' + (if $gateReach.$g15_quota? then $gateReach.$g15_quota else 0)"/>
         <set_value name="$gateFunnelStr" exact="$gateFunnelStr + ' -> passed=' + $foundCount + ' -> scored=' + $scoredBeforeScoreGate + ' -> routescore=' + $bestScore"/>
         <do_if value="$cuBestVol ge 0">
-          <set_value name="$gateFunnelStr" exact="$gateFunnelStr + ' | cargoutil: bestVol=' + $cuBestVol + ' needVol=' + $cuNeedVol + ' (fleetMin c/s/l=' + (if this.$cs_fleetMinContainer? then this.$cs_fleetMinContainer else -1) + '/' + (if this.$cs_fleetMinSolid? then this.$cs_fleetMinSolid else -1) + '/' + (if this.$cs_fleetMinLiquid? then this.$cs_fleetMinLiquid else -1) + ', shipCap=' + $ship.cargo.capacity.all + ') bestAmt=' + $cuBestAmt + ' volPerUnit=' + $cuBestVolPerUnit + ' entryAmt=' + $cuBestEntryAmt"/>
+          <set_value name="$gateFunnelStr" exact="$gateFunnelStr + ' | cargoutil: bestVol=' + $cuBestVol + ' needVol=' + $cuNeedVol + ' (cap=' + $ship.cargo.capacity.all + ' x ' + $cargoUtilThresholdPct + '%) bestAmt=' + $cuBestAmt + ' volPerUnit=' + $cuBestVolPerUnit + ' entryAmt=' + $cuBestEntryAmt"/>
         </do_if>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-CacheSearch] ' + $ship.idcode + ': (' + (if this.$gt_cachePoolIsMk4 then 'MK4' else 'MK3') + ') FUNNEL pool=' + $homeCacheCount + ' purged=' + $purgedStaleCount + $gateFunnelStr" chance="100"/>

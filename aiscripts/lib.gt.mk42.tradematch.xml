@@ -544,6 +544,26 @@
            that offer's own amount, then reused for every pair it appears in. -->
       <set_value name="this.$tm_sellClampMemo" exact="table[]"/>
       <set_value name="this.$tm_buyClampMemo" exact="table[]"/>
+      <!-- Route legality memo: the verdict depends on (start, buy sector, sell sector, ware) only,
+           and start/home/owner/blacklist are fixed for a run, so every offer pair sharing a sector
+           pair reuses one verdict instead of re-running the two get_jump_path probes. Commit-time
+           re-validation in the order still runs against the ship's live sector. -->
+      <set_value name="this.$tm_routeLegalityMemo" exact="table[]"/>
+      <!-- Contraband already aboard (multitrade legs) makes even a legal-ware route checkable, so the
+           per-pair gate cannot skip legal wares while the hold is dirty. Scanned once per run - the
+           hold does not change during a match. -->
+      <set_value name="this.$tm_holdHasContraband" exact="false"/>
+      <do_if value="$allowIllegal and $enforceRouteIllegalLegality and $ship != null">
+        <set_value name="$tmHoldCargo" exact="$ship.cargo.list"/>
+        <do_if value="$tmHoldCargo? and $tmHoldCargo.count gt 0">
+          <do_all exact="$tmHoldCargo.count" counter="$tmhc">
+            <do_if value="$tmHoldCargo.{$tmhc}? and @$tmHoldCargo.{$tmhc}.illegal gt 0">
+              <set_value name="this.$tm_holdHasContraband" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+        </do_if>
+      </do_if>
       <set_value name="this.$tm_pairsEvaluated" exact="0"/>
       <!-- Performance.$EarlyExitThreshold: hard cap on offer pairs examined per match run. -->
       <set_value name="this.$tm_pairBudget" exact="2000"/>
@@ -626,6 +646,12 @@
       </do_if>
       <do_if value="not this.$tm_buyClampMemo?">
         <set_value name="this.$tm_buyClampMemo" exact="table[]"/>
+      </do_if>
+      <do_if value="not this.$tm_routeLegalityMemo?">
+        <set_value name="this.$tm_routeLegalityMemo" exact="table[]"/>
+      </do_if>
+      <do_if value="not this.$tm_holdHasContraband?">
+        <set_value name="this.$tm_holdHasContraband" exact="false"/>
       </do_if>
       <do_if value="not this.$tm_pairsEvaluated?">
         <set_value name="this.$tm_pairsEvaluated" exact="0"/>
@@ -1498,21 +1524,45 @@
             <continue/>
           </do_if>
 
-          <!-- Optional route-illegal filter: contraband only — legal wares skip jump-path probe. -->
-          <do_if value="$allowIllegal and $enforceRouteIllegalLegality and @$ware.illegal gt 0">
-            <run_script name="'lib.gt.pathfinding'" result="$routeLegality">
-              <param name="mode" value="'route_legality'"/>
-              <param name="ship" value="$ship"/>
-              <param name="homeSector" value="$homeSector"/>
-              <param name="blacklistGroup" value="$blacklistGroup"/>
-              <param name="allowIllegal" value="$allowIllegal"/>
-              <param name="enforceRouteIllegalLegality" value="$enforceRouteIllegalLegality"/>
-              <param name="startSector" value="$ship.sector"/>
-              <param name="buySector" value="$buyStation.sector"/>
-              <param name="sellSector" value="$sellStation.sector"/>
-              <param name="ware" value="$ware"/>
-            </run_script>
-            <do_if value="not $routeLegality.$IsLegal">
+          <!-- Optional route-illegal filter: contraband only — legal wares skip jump-path probe.
+               Memoized per (buy sector, sell sector, ware): the verdict is a property of the route,
+               not of the offer pair, so suppliers/customers in the same sector pair share one probe
+               instead of each paying two get_jump_path calls. -->
+          <do_if value="$allowIllegal and $enforceRouteIllegalLegality and (@$ware.illegal gt 0 or this.$tm_holdHasContraband)">
+            <set_value name="$tmRlBuySector" exact="$buyStation.sector"/>
+            <set_value name="$tmRlSellSector" exact="$sellStation.sector"/>
+            <set_value name="$tmRlCanMemo" exact="this.$tm_routeLegalityMemo? and $tmRlBuySector != null and $tmRlSellSector != null and $ware != null"/>
+            <set_value name="$tmRlIsLegal" exact="true"/>
+            <set_value name="$tmRlMemoHit" exact="false"/>
+            <do_if value="$tmRlCanMemo and this.$tm_routeLegalityMemo.{$tmRlBuySector}? and this.$tm_routeLegalityMemo.{$tmRlBuySector}.{$tmRlSellSector}? and this.$tm_routeLegalityMemo.{$tmRlBuySector}.{$tmRlSellSector}.{$ware}?">
+              <set_value name="$tmRlIsLegal" exact="this.$tm_routeLegalityMemo.{$tmRlBuySector}.{$tmRlSellSector}.{$ware}"/>
+              <set_value name="$tmRlMemoHit" exact="true"/>
+            </do_if>
+            <do_if value="not $tmRlMemoHit">
+              <run_script name="'lib.gt.pathfinding'" result="$routeLegality">
+                <param name="mode" value="'route_legality'"/>
+                <param name="ship" value="$ship"/>
+                <param name="homeSector" value="$homeSector"/>
+                <param name="blacklistGroup" value="$blacklistGroup"/>
+                <param name="allowIllegal" value="$allowIllegal"/>
+                <param name="enforceRouteIllegalLegality" value="$enforceRouteIllegalLegality"/>
+                <param name="startSector" value="$ship.sector"/>
+                <param name="buySector" value="$buyStation.sector"/>
+                <param name="sellSector" value="$sellStation.sector"/>
+                <param name="ware" value="$ware"/>
+              </run_script>
+              <set_value name="$tmRlIsLegal" exact="$routeLegality.$IsLegal"/>
+              <do_if value="$tmRlCanMemo">
+                <do_if value="not this.$tm_routeLegalityMemo.{$tmRlBuySector}?">
+                  <set_value name="this.$tm_routeLegalityMemo.{$tmRlBuySector}" exact="table[]"/>
+                </do_if>
+                <do_if value="not this.$tm_routeLegalityMemo.{$tmRlBuySector}.{$tmRlSellSector}?">
+                  <set_value name="this.$tm_routeLegalityMemo.{$tmRlBuySector}.{$tmRlSellSector}" exact="table[]"/>
+                </do_if>
+                <set_value name="this.$tm_routeLegalityMemo.{$tmRlBuySector}.{$tmRlSellSector}.{$ware}" exact="$tmRlIsLegal"/>
+              </do_if>
+            </do_if>
+            <do_if value="not $tmRlIsLegal">
               <set_value name="this.$tm_tradesRejected" operation="add"/>
               <set_value name="this.$tm_tradesRejectedRouteIllegal" operation="add"/>
               <continue/>

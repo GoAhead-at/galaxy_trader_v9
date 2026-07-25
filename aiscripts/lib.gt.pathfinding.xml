@@ -170,6 +170,13 @@
       <!-- ================================================================= -->
       <!-- MODE: route_enforce_precheck                                        -->
       <!-- Pre-transit guard: read ActiveTradePolicy, check next sector.       -->
+      <!--                                                                     -->
+      <!-- UNREACHABLE - no caller. The live guard is inlined twice in         -->
+      <!-- move.generic.xml (capital gate path + non-capital move_to path)     -->
+      <!-- because X4 binds result= to the next run_script, so this mode       -->
+      <!-- cannot be called from there. Kept as the readable reference for     -->
+      <!-- the abort contract; change move.generic when changing behaviour,    -->
+      <!-- and do not assume this copy is in sync.                             -->
       <!-- ================================================================= -->
       <do_if value="$mode == 'route_enforce_precheck'">
         <set_value name="$result" exact="table[
@@ -289,8 +296,26 @@
           <return value="$result"/>
         </do_if>
 
-        <!-- Legal wares cannot trigger route-illegal blocks; skip expensive jump-path build (parity with GT_CheckRouteLegality). -->
-        <do_if value="not $ware? or @$ware.illegal le 0">
+        <!-- Contraband already in the hold counts toward the route check (multitrade parity with the
+             runtime guard in move.generic, which walks the whole cargo list). Without this a legal
+             ware could be routed through a sector where cargo from an earlier leg is illegal, and the
+             ship would abort mid-flight instead of never planning that route.
+             Cheap boolean only - the ware list is rebuilt after the path build, since locals do not
+             survive the chunked jump-path yields. -->
+        <set_value name="$holdHasContraband" exact="false"/>
+        <do_if value="$ship != null">
+          <set_value name="$shipCargoList" exact="$ship.cargo.list"/>
+          <do_all exact="$shipCargoList.count" counter="$rlcc">
+            <do_if value="$shipCargoList.{$rlcc}? and @$shipCargoList.{$rlcc}.illegal gt 0">
+              <set_value name="$holdHasContraband" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+        </do_if>
+
+        <!-- Legal wares cannot trigger route-illegal blocks; skip expensive jump-path build (parity
+             with GT_CheckRouteLegality). Only valid while the hold carries no contraband of its own. -->
+        <do_if value="(not $ware? or @$ware.illegal le 0) and not $holdHasContraband">
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-PATH] route_legality skipped: legal ware (' + (if $ware? then @$ware.id else 'null') + ')'" chance="100"/>
           </do_if>
@@ -448,6 +473,21 @@
         <remove_value name="this.$rlRouteSignature"/>
         <remove_value name="this.$rlRouteSigIdx"/>
 
+        <!-- Wares that must clear every sector on the route: whatever contraband is already aboard,
+             plus the candidate ware when it is contraband. Duplicates are harmless (same verdict).
+             Rebuilt here rather than carried across the chunked path build above, and held on this.
+             so it survives the legality loop's own yields. -->
+        <set_value name="this.$rlCheckWares" exact="[]"/>
+        <do_all exact="$ship.cargo.list.count" counter="$rlcw0">
+          <do_if value="$ship.cargo.list.{$rlcw0}? and @$ship.cargo.list.{$rlcw0}.illegal gt 0">
+            <append_to_list name="this.$rlCheckWares" exact="$ship.cargo.list.{$rlcw0}"/>
+          </do_if>
+        </do_all>
+        <set_value name="this.$rlCargoDirty" exact="this.$rlCheckWares.count gt 0"/>
+        <do_if value="$ware? and @$ware.illegal gt 0">
+          <append_to_list name="this.$rlCheckWares" exact="$ware"/>
+        </do_if>
+
         <!-- Cache lookup (path-aware key). -->
         <do_if value="not global.$GT_RouteLegalityCache?">
           <set_value name="global.$GT_RouteLegalityCache" exact="table[]"/>
@@ -464,12 +504,17 @@
             </do_all>
           </do_if>
         </do_if>
-        <do_if value="$cachedEntry? and $cachedEntry.$CheckedAt? and (player.age - $cachedEntry.$CheckedAt) le $routeCacheTtl">
+        <!-- Cargo-dependent verdicts are never served from (or written to) the shared cache: the key
+             has no cargo component, so one loaded ship would poison the entry for every other ship
+             on the same route. Per-run memos in tradematch still cover the hot path. -->
+        <do_if value="not this.$rlCargoDirty and $cachedEntry? and $cachedEntry.$CheckedAt? and (player.age - $cachedEntry.$CheckedAt) le $routeCacheTtl">
           <set_value name="$result" exact="$cachedEntry"/>
           <set_value name="$result.$RouteSectors" exact="$routeSectors"/>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-PATH] route_legality cache_hit: legal=' + $result.$IsLegal + ', reason=' + $result.$Reason + ', routeSectors=' + $routeSectors.count + ', sig=' + $routeSignature" chance="100"/>
           </do_if>
+          <remove_value name="this.$rlCheckWares"/>
+          <remove_value name="this.$rlCargoDirty"/>
           <wait exact="1ms" comment="Cooperative yield before immediate return (wake-loop guard)"/>
           <return value="$result"/>
         </do_if>
@@ -490,13 +535,16 @@
           <do_while value="this.$rlLegalityIdx le $legalityChunkEnd and this.$rlIsLegal">
             <set_value name="$checkSector" exact="this.$rlRouteSectorsForLegality.{this.$rlLegalityIdx}"/>
             <do_if value="$checkSector? and $checkSector.policefaction and ($checkSector.policefaction != $shipOwner)">
-              <do_if value="$ware.illegalto.{$checkSector.policefaction}.{$shipOwner}">
-                <set_value name="this.$rlIsLegal" exact="false"/>
-                <set_value name="this.$rlBlockedSector" exact="$checkSector"/>
-                <set_value name="this.$rlBlockedPolice" exact="$checkSector.policefaction"/>
-                <set_value name="this.$rlReason" exact="'illegal_on_route'"/>
-                <break/>
-              </do_if>
+              <do_all exact="this.$rlCheckWares.count" counter="$rlcw">
+                <set_value name="$rlCheckWare" exact="this.$rlCheckWares.{$rlcw}"/>
+                <do_if value="$rlCheckWare? and $rlCheckWare.illegalto.{$checkSector.policefaction}.{$shipOwner}">
+                  <set_value name="this.$rlIsLegal" exact="false"/>
+                  <set_value name="this.$rlBlockedSector" exact="$checkSector"/>
+                  <set_value name="this.$rlBlockedPolice" exact="$checkSector.policefaction"/>
+                  <set_value name="this.$rlReason" exact="'illegal_on_route'"/>
+                  <break/>
+                </do_if>
+              </do_all>
             </do_if>
             <set_value name="this.$rlLegalityIdx" exact="this.$rlLegalityIdx + 1"/>
           </do_while>
@@ -508,6 +556,9 @@
         <set_value name="$blockedSector" exact="this.$rlBlockedSector"/>
         <set_value name="$blockedPolice" exact="this.$rlBlockedPolice"/>
         <set_value name="$reason" exact="this.$rlReason"/>
+        <set_value name="$cargoDirty" exact="this.$rlCargoDirty"/>
+        <remove_value name="this.$rlCheckWares"/>
+        <remove_value name="this.$rlCargoDirty"/>
         <remove_value name="this.$rlRouteSectorsForLegality"/>
         <remove_value name="this.$rlIsLegal"/>
         <remove_value name="this.$rlBlockedSector"/>
@@ -527,6 +578,13 @@
         ]"/>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-PATH] route_legality evaluated: legal=' + $result.$IsLegal + ', reason=' + $result.$Reason + ', blockedSector=' + $result.$BlockedSector + ', blockedPolice=' + $result.$BlockedPoliceFaction + ', routeSectors=' + $routeSectors.count + ', sig=' + $routeSignature" chance="100"/>
+        </do_if>
+
+        <!-- Cargo-dependent verdict: return without storing. The cache key has no cargo component,
+             so persisting this would apply one ship's hold to every other ship on the same route. -->
+        <do_if value="$cargoDirty">
+          <wait exact="1ms" comment="Cooperative yield before return (wake-loop guard)"/>
+          <return value="$result"/>
         </do_if>
 
         <!-- Cache store -->
@@ -558,6 +616,18 @@
           <set_value name="global.$GT_RouteLegalityCache.{$homeSector}.{$buySector}.{$sellSector}.{$ware}.{$allowIllegal}.{$enforceRouteIllegalLegality}.{$shipOwner}.{$resolvedBlacklistGroup}.{$routeStart}" exact="[]"/>
         </do_if>
         <set_value name="$routeEntryList" exact="global.$GT_RouteLegalityCache.{$homeSector}.{$buySector}.{$sellSector}.{$ware}.{$allowIllegal}.{$enforceRouteIllegalLegality}.{$shipOwner}.{$resolvedBlacklistGroup}.{$routeStart}"/>
+        <!-- Drop entries from superseded blacklist epochs: the epoch is baked into $RouteSignature,
+             so they can never match again and would otherwise accumulate in the savegame forever.
+             Runs on store only, which is exactly the first access after an epoch bump. -->
+        <do_if value="$routeEntryList? and $routeEntryList.count gt 0">
+          <set_value name="$routeEntryKept" exact="[]"/>
+          <do_all exact="$routeEntryList.count" counter="$reli0">
+            <do_if value="$routeEntryList.{$reli0}? and $routeEntryList.{$reli0}.$BlacklistEpoch? and $routeEntryList.{$reli0}.$BlacklistEpoch == $result.$BlacklistEpoch">
+              <append_to_list name="$routeEntryKept" exact="$routeEntryList.{$reli0}"/>
+            </do_if>
+          </do_all>
+          <set_value name="$routeEntryList" exact="$routeEntryKept"/>
+        </do_if>
         <set_value name="$routeEntryUpdated" exact="false"/>
         <do_if value="$routeEntryList? and $routeEntryList.count gt 0">
           <do_all exact="$routeEntryList.count" counter="$reli2">

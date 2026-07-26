@@ -211,13 +211,16 @@ local function installCrewHighlightHook()
                         logRecolor("pass=" .. tostring(passId) .. " row=" .. tostring(checked) .. " normalized personRef key in map but tagged name empty: " .. tostring(personRefKeyNormalized))
                     else
                         noMapEntry = noMapEntry + 1
-                        logRecolor(
-                            "pass=" .. tostring(passId) ..
-                            " row=" .. tostring(checked) ..
-                            " no map entry personRef=" .. tostring(personRefKey) ..
-                            " personRefNormalized=" .. tostring(personRefKeyNormalized) ..
-                            " uiName='" .. tostring(personentry and personentry.name) .. "'"
-                        )
+                        -- Muted: expected for non-GT crew rows. Set to true to re-enable.
+                        if false then
+                            logRecolor(
+                                "pass=" .. tostring(passId) ..
+                                " row=" .. tostring(checked) ..
+                                " no map entry personRef=" .. tostring(personRefKey) ..
+                                " personRefNormalized=" .. tostring(personRefKeyNormalized) ..
+                                " uiName='" .. tostring(personentry and personentry.name) .. "'"
+                            )
+                        end
                         local now = getElapsedTime()
                         if (not missDiagDone) and diagnoseMiss and ((now - lastMissDiagTime) >= MISS_DIAG_THROTTLE_SECONDS) then
                             missDiagDone = true

@@ -8,7 +8,9 @@
       1. AddAcademyAction listens to Interact_Menu_API.Get_Actions and adds
          the top-level "Trading Academy" entry when at least one selected
          player ship has a pilot below the highest course target level
-         (GT-service and non-GT ships such as Hold Position).
+         (GT-service and non-GT ships such as Hold Position). It also adds
+         "Cancel Training" when any selected ship has queued/in-flight
+         academy or manual training (or an active DockAndTrain order).
       2. GT_AcademyAction publishes ship/course context to the player NPC
          blackboard and raises gt.openAcademyContext for the Lua submenu.
       3. The Lua submenu aggregates personalized cost/duration per course
@@ -16,6 +18,8 @@
          gt_academy_course_chosen with a batch enrollment table.
       4. HandleAcademyCourseChosen enrolls every eligible ship in the batch
          (non-GT pilots are light-registered via Register_Pilot_ForAcademy).
+      5. GT_CancelTrainingAction permanently clears enrollment markers and
+         DockAndTrain so cancelled training cannot re-dispatch.
   -->
   <cues>
 
@@ -262,6 +266,218 @@
       </actions>
     </library>
 
+    <!-- True when pilot/ship has queued academy, manual training, in-flight session, or DockAndTrain. -->
+    <library name="GT_Academy_PilotHasCancellableTraining" purpose="run_actions">
+      <params>
+        <param name="ship" default="null"/>
+      </params>
+      <actions>
+        <do_if value="not ($ship? and $ship.exists and $ship.isclass.ship and $ship.isplayerowned and $ship.pilot?)">
+          <return value="false"/>
+        </do_if>
+        <set_value name="$pilot" exact="$ship.pilot"/>
+        <do_if value="global.$GT_Pilots? and global.$GT_Pilots.{$pilot}?">
+          <do_if value="global.$GT_Pilots.{$pilot}.$AcademyEnrollment?">
+            <return value="true"/>
+          </do_if>
+          <do_if value="global.$GT_Pilots.{$pilot}.$ManualTrainingRequested? and global.$GT_Pilots.{$pilot}.$ManualTrainingRequested">
+            <return value="true"/>
+          </do_if>
+          <do_if value="global.$GT_Pilots.{$pilot}.$TrainingState? and (global.$GT_Pilots.{$pilot}.$TrainingState == 'manual_training_queued' or global.$GT_Pilots.{$pilot}.$TrainingState == 'training_in_progress')">
+            <return value="true"/>
+          </do_if>
+        </do_if>
+        <do_if value="$ship.orders?">
+          <do_all exact="$ship.orders.count" counter="$oi">
+            <do_if value="@$ship.orders.{$oi}.id == 'DockAndTrain'">
+              <return value="true"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <do_if value="@($ship.defaultorder).id == 'DockAndTrain'">
+          <return value="true"/>
+        </do_if>
+        <return value="false"/>
+      </actions>
+    </library>
+
+    <!-- Collect selected player ships that can cancel training (incl. interact target). -->
+    <library name="GT_CollectCancelTrainingShips" purpose="run_actions">
+      <params>
+        <param name="target" default="null"/>
+        <param name="eventParam" default="null"/>
+      </params>
+      <actions>
+        <set_value name="$ships" exact="[]"/>
+        <set_value name="$seen" exact="table[]"/>
+        <set_value name="$selList" exact="null"/>
+        <do_if value="$eventParam? and $eventParam.$selectedplayerships?">
+          <set_value name="$selList" exact="$eventParam.$selectedplayerships"/>
+        </do_if>
+        <do_if value="$selList?">
+          <set_value name="$listCount" exact="0"/>
+          <do_if value="$selList.count?">
+            <set_value name="$listCount" exact="$selList.count"/>
+          </do_if>
+          <do_if value="$listCount gt 0">
+            <do_all exact="$listCount" counter="$si">
+              <set_value name="$selShip" exact="$selList.{$si}"/>
+              <set_value name="$seenKey" exact="if $selShip? and $selShip.idcode? then '$' + $selShip.idcode else ''"/>
+              <do_if value="$seenKey != '' and not $seen.{$seenKey}?">
+                <run_actions ref="GT_Academy_PilotHasCancellableTraining" result="$canCancel">
+                  <param name="ship" value="$selShip"/>
+                </run_actions>
+                <do_if value="$canCancel">
+                  <append_to_list name="$ships" exact="$selShip"/>
+                  <set_value name="$seen.{$seenKey}" exact="true"/>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_if>
+          <do_else>
+            <do_all exact="16" counter="$si">
+              <do_if value="$selList.{$si}?">
+                <set_value name="$selShip" exact="$selList.{$si}"/>
+                <set_value name="$seenKey" exact="if $selShip? and $selShip.idcode? then '$' + $selShip.idcode else ''"/>
+                <do_if value="$seenKey != '' and not $seen.{$seenKey}?">
+                  <run_actions ref="GT_Academy_PilotHasCancellableTraining" result="$canCancel">
+                    <param name="ship" value="$selShip"/>
+                  </run_actions>
+                  <do_if value="$canCancel">
+                    <append_to_list name="$ships" exact="$selShip"/>
+                    <set_value name="$seen.{$seenKey}" exact="true"/>
+                  </do_if>
+                </do_if>
+              </do_if>
+            </do_all>
+          </do_else>
+        </do_if>
+        <do_if value="$target? and $target.exists and $target.isclass.ship and $target.isplayerowned and $target.pilot?">
+          <set_value name="$seenKey" exact="if $target.idcode? then '$' + $target.idcode else ''"/>
+          <do_if value="$seenKey != '' and not $seen.{$seenKey}?">
+            <run_actions ref="GT_Academy_PilotHasCancellableTraining" result="$canCancel">
+              <param name="ship" value="$target"/>
+            </run_actions>
+            <do_if value="$canCancel">
+              <append_to_list name="$ships" exact="$target"/>
+              <set_value name="$seen.{$seenKey}" exact="true"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        <return value="table[$Count = $ships.count, $Ships = $ships]"/>
+      </actions>
+    </library>
+
+    <!-- Permanently cancel queued/in-flight training for one ship (no re-dispatch). -->
+    <library name="GT_CancelShipTraining" purpose="run_actions">
+      <params>
+        <param name="ship" default="null"/>
+      </params>
+      <actions>
+        <set_value name="$result" exact="table[$Success = false, $Pilot = null]"/>
+        <do_if value="not ($ship? and $ship.exists and $ship.pilot?)">
+          <return value="$result"/>
+        </do_if>
+        <set_value name="$pilot" exact="$ship.pilot"/>
+        <do_if value="not global.$GT_Pilots? or not global.$GT_Pilots.{$pilot}?">
+          <!-- Still drop orphan DockAndTrain if present. -->
+          <do_if value="$ship.orders?">
+            <do_all exact="$ship.orders.count" counter="$toi">
+              <do_if value="@$ship.orders.{$toi}.id == 'DockAndTrain'">
+                <cancel_order order="$ship.orders.{$toi}"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_if>
+          <return value="$result"/>
+        </do_if>
+
+        <!-- 1) Wipe enrollment / queue markers so MD cannot re-dispatch DockAndTrain. -->
+        <remove_value name="global.$GT_Pilots.{$pilot}.$AcademyEnrollment"/>
+        <remove_value name="global.$GT_Pilots.{$pilot}.$PendingSkillLevel"/>
+        <remove_value name="global.$GT_Pilots.{$pilot}.$ManualTrainingRequested"/>
+        <remove_value name="global.$GT_Pilots.{$pilot}.$NextTrainingRetryAt"/>
+        <remove_value name="global.$GT_Pilots.{$pilot}.$TrainingStarted"/>
+        <remove_value name="global.$GT_Pilots.{$pilot}.$TrainingDuration"/>
+        <remove_value name="global.$GT_Pilots.{$pilot}.$TrainingStation"/>
+        <remove_value name="global.$GT_Pilots.{$pilot}.$TrainingCost"/>
+        <run_actions ref="md.GT_Libraries_General.GT_ClearTrainingBlocked">
+          <param name="pilot" value="$pilot"/>
+          <param name="clear_blocked_level" value="true"/>
+        </run_actions>
+
+        <!-- 2) Name handling: strip accidental (T:1) only when XP is 0.
+             XP gt 0 keeps the existing pilot tag; GT-service ships refresh ship name. -->
+        <set_value name="$currentXP" exact="0"/>
+        <do_if value="global.$GT_Pilots.{$pilot}.$XP?">
+          <set_value name="$currentXP" exact="global.$GT_Pilots.{$pilot}.$XP"/>
+        </do_if>
+        <do_if value="$currentXP le 0">
+          <set_value name="$restoreName" exact="null"/>
+          <do_if value="global.$GT_Pilots.{$pilot}.$OriginalPilotName? and global.$GT_Pilots.{$pilot}.$OriginalPilotName != ''">
+            <set_value name="$restoreName" exact="global.$GT_Pilots.{$pilot}.$OriginalPilotName"/>
+          </do_if>
+          <do_elseif value="global.$GT_Pilots.{$pilot}.$PilotName? and global.$GT_Pilots.{$pilot}.$PilotName != ''">
+            <set_value name="$restoreName" exact="global.$GT_Pilots.{$pilot}.$PilotName"/>
+          </do_elseif>
+          <do_if value="$restoreName? and $restoreName != '' and $pilot.name != $restoreName">
+            <set_object_name object="$pilot" name="$restoreName"/>
+          </do_if>
+          <do_if value="$restoreName? and $restoreName != ''">
+            <set_value name="global.$GT_Pilots.{$pilot}.$PilotName" exact="$restoreName"/>
+            <set_value name="global.$GT_Pilots.{$pilot}.$OriginalPilotName" exact="$restoreName"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <run_actions ref="md.GLX_Lib_Orders.GLX_ShipIsInGTService" result="$shipInGTService">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          <do_if value="$shipInGTService">
+            <set_value name="$displayLevel" exact="1"/>
+            <do_if value="global.$GT_Pilots.{$pilot}.$Level?">
+              <set_value name="$displayLevel" exact="global.$GT_Pilots.{$pilot}.$Level"/>
+            </do_if>
+            <do_elseif value="global.$GT_Config? and global.$GT_Config.$XP? and global.$GT_Config.$XP.$SkillThresholds?">
+              <do_all exact="15" counter="$skillLevelCheck">
+                <do_if value="$currentXP ge global.$GT_Config.$XP.$SkillThresholds.{$skillLevelCheck}">
+                  <set_value name="$displayLevel" exact="$skillLevelCheck"/>
+                </do_if>
+              </do_all>
+            </do_elseif>
+            <run_actions ref="md.GT_Ship_Management.Update_Ship_Name">
+              <param name="ship" value="$ship"/>
+              <param name="pilot" value="$pilot"/>
+              <param name="xp" value="$currentXP"/>
+              <param name="level" value="$displayLevel"/>
+              <param name="nameType" value="'trader'"/>
+            </run_actions>
+          </do_if>
+        </do_else>
+
+        <!-- 3) Break in-dock wait / cancel DockAndTrain. Reason skips HandleAbortTraining re-tag. -->
+        <signal_objects object="$ship" param="'GT_Abort_Training'" param2="table[
+          $Pilot  = $pilot,
+          $Ship   = $ship,
+          $Reason = 'AcademyPlayerCancelled'
+        ]"/>
+        <do_if value="$ship.orders?">
+          <do_all exact="$ship.orders.count" counter="$toi">
+            <do_if value="@$ship.orders.{$toi}.id == 'DockAndTrain'">
+              <cancel_order order="$ship.orders.{$toi}"/>
+              <break/>
+            </do_if>
+          </do_all>
+        </do_if>
+
+        <set_value name="$result.$Success" exact="true"/>
+        <set_value name="$result.$Pilot" exact="$pilot"/>
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+          <debug_text text="'[GT Academy] Cancelled training for pilot ' + $pilot.name + ' on ship ' + $ship.idcode + ' (xp=' + $currentXP + ')'" chance="100"/>
+        </do_if>
+        <return value="$result"/>
+      </actions>
+    </library>
+
     <!-- ============================================================== -->
     <!-- Add "Trading Academy" entry to the right-click context menu     -->
     <!-- ============================================================== -->
@@ -296,6 +512,80 @@
             </do_if>
           </do_if>
         </do_if>
+
+        <!-- Cancel Training: show whenever selected ships have queued/in-flight training
+             (independent of Academy.$Enabled so accidental enrollments stay recoverable). -->
+        <do_if value="$target.isclass.{class.ship} and $target.isplayerowned and not $useVanillaXPOnly and global.$GT_Config?">
+          <run_actions ref="GT_CollectCancelTrainingShips" result="$cancelSelection">
+            <param name="target" value="$target"/>
+            <param name="eventParam" value="event.param"/>
+          </run_actions>
+          <do_if value="$cancelSelection.$Count ge 1">
+            <signal_cue_instantly
+              cue="md.Interact_Menu_API.Add_Action"
+              param="table[
+                $id       = 'gt_mk3_cancel_training',
+                $text     = {77000,9929},
+                $section  = 'gt_actions',
+                $callback = GT_CancelTrainingAction
+              ]"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT Academy] Added Cancel Training for ' + $cancelSelection.$Count + ' ship(s); trigger=' + $target.idcode" chance="100"/>
+            </do_if>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- ============================================================== -->
+    <!-- Player clicked "Cancel Training" - clear enrollment permanently -->
+    <!-- ============================================================== -->
+    <cue name="GT_CancelTrainingAction" instantiate="true" namespace="this">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$component" exact="event.param.$object"/>
+        <do_if value="not $component? or not $component.exists">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT Academy] GT_CancelTrainingAction aborted: missing component'" chance="100"/>
+          </do_if>
+        </do_if>
+        <do_else>
+          <run_actions ref="GT_CollectCancelTrainingShips" result="$cancelSelection">
+            <param name="target" value="$component"/>
+            <param name="eventParam" value="event.param"/>
+          </run_actions>
+          <do_if value="$cancelSelection.$Count lt 1">
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GT Academy] GT_CancelTrainingAction aborted: no cancellable ships in selection'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <set_value name="$cancelledCount" exact="0"/>
+            <set_value name="$firstPilotName" exact="''"/>
+            <do_all exact="$cancelSelection.$Ships.count" counter="$ci">
+              <set_value name="$cancelShip" exact="$cancelSelection.$Ships.{$ci}"/>
+              <run_actions ref="GT_CancelShipTraining" result="$cancelResult">
+                <param name="ship" value="$cancelShip"/>
+              </run_actions>
+              <do_if value="$cancelResult.$Success">
+                <set_value name="$cancelledCount" operation="add"/>
+                <do_if value="$firstPilotName == '' and $cancelResult.$Pilot?">
+                  <set_value name="$firstPilotName" exact="$cancelResult.$Pilot.name"/>
+                </do_if>
+              </do_if>
+            </do_all>
+            <do_if value="$cancelledCount ge 1">
+              <do_if value="$cancelledCount == 1 and $firstPilotName != ''">
+                <show_notification text="{77000,9937}.[$firstPilotName]" timeout="6s" priority="7"/>
+              </do_if>
+              <do_else>
+                <show_notification text="{77000,9938}.[$cancelledCount]" timeout="6s" priority="7"/>
+              </do_else>
+            </do_if>
+          </do_else>
+        </do_else>
       </actions>
     </cue>
 

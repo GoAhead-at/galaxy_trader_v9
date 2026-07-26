@@ -443,6 +443,8 @@
 
         <!-- Current Activity State (comprehensive GT state detection) -->
         <set_value name="$activityState" exact="'Unknown'"/>
+        <set_value name="$diagIsGTFleetAssist" exact="false"/>
+        <set_value name="$diagAssistCmdOrder" exact="''"/>
         <set_value name="$activityDesc" exact="'Could not determine ship activity'"/>
         <set_value name="$activityStatus" exact="'INFO'"/>
 
@@ -510,6 +512,30 @@
               <set_value name="$activityState" exact="'OTHER ORDER: ' + $activeOrderId"/>
               <set_value name="$activityDesc" exact="'Ship is executing a non-GT order (' + $activeOrderId + '). This order may have been queued externally or by another mod.'"/>
               <set_value name="$activityStatus" exact="'INFO'"/>
+            </do_else>
+          </do_elseif>
+          <do_elseif value="$activeOrderId == 'Assist'">
+            <!-- Fleet subordinates normally keep Assist as the active order while Assist
+                 run_scripts the commander's GT order. Do not call that a "non-GT" order. -->
+            <set_value name="$assistIsGTFleet" exact="false"/>
+            <set_value name="$assistCmdOrder" exact="''"/>
+            <do_if value="$ship.commander? and $ship.commander.exists and $ship.commander.defaultorder?">
+              <do_if value="global.$GT_ProtectedOrderIDs? and (global.$GT_ProtectedOrderIDs.indexof.{@$ship.commander.defaultorder.id} or (@$ship.commander.defaultorder.id == 'Assist' and $ship.commander.defaultorder.$baseorder? and global.$GT_ProtectedOrderIDs.indexof.{@$ship.commander.defaultorder.$baseorder.id}))">
+                <set_value name="$assistIsGTFleet" exact="true"/>
+                <set_value name="$assistCmdOrder" exact="if @$ship.commander.defaultorder.id == 'Assist' and $ship.commander.defaultorder.$baseorder? then @$ship.commander.defaultorder.$baseorder.id else @$ship.commander.defaultorder.id"/>
+              </do_if>
+            </do_if>
+            <do_if value="$assistIsGTFleet">
+              <set_value name="$diagIsGTFleetAssist" exact="true"/>
+              <set_value name="$diagAssistCmdOrder" exact="$assistCmdOrder"/>
+              <set_value name="$activityState" exact="'FLEET ASSIST (' + $assistCmdOrder + ')'"/>
+              <set_value name="$activityDesc" exact="'Fleet subordinate on Assist - this is normal. Assist inherits the commander GT order and runs trade cycles between waits. Empty cargo means the ship is between cycles, or no route passed min cargo fill / reservations - see Pair Details.'"/>
+              <set_value name="$activityStatus" exact="'INFO'"/>
+            </do_if>
+            <do_else>
+              <set_value name="$activityState" exact="'OTHER ORDER: Assist'"/>
+              <set_value name="$activityDesc" exact="'Ship is on Assist but the commander is not running a GalaxyTrader order. Trading will not start until the commander has a GT default order (or this ship is given one directly).'"/>
+              <set_value name="$activityStatus" exact="'WARN'"/>
             </do_else>
           </do_elseif>
           <do_elseif value="$activeOrderId == 'Equip' or $activeOrderId == 'Resupply'">
@@ -1907,6 +1933,19 @@
         <set_value name="$mk2OrderIgnoreOffers" exact="false"/>
         <set_value name="$mk2SupplierList" exact="[]"/>
         <set_value name="$mk2CustomerList" exact="[]"/>
+        <!-- Min-fill / low-volume (runtime skipMinTrade). Defaults match order.trade.galaxytradermk2.xml init.
+             Initialized for all orders so the MK2 verdict branch can read them safely. -->
+        <set_value name="$mk2MinFillPercent" exact="25"/>
+        <set_value name="$mk2AllowLowVolume" exact="false"/>
+        <set_value name="$mk2LowVolumeFloorPercent" exact="10"/>
+        <set_value name="$mk2LowVolumeFloorEffPercent" exact="10"/>
+        <set_value name="$mk2PairCount" exact="0"/>
+        <set_value name="$mk2PairPass" exact="0"/>
+        <set_value name="$mk2PairTooSmall" exact="0"/>
+        <set_value name="$mk2FirstPassPair" exact="''"/>
+        <set_value name="$mk2FirstTooSmallPair" exact="''"/>
+        <set_value name="$mk2BestDemandScore" exact="-1"/>
+        <set_value name="$mk2BestTooSmallDemand" exact="-1"/>
         <do_if value="$orderId == 'GalaxyTraderMK2'">
           <append_to_list name="$sec3.$Rows" exact="table[$Check = '--- MK2 Specific ---', $Status = 'INFO', $Detail = '']"/>
           <do_if value="$gtOrder? and $gtOrder.$sourceList? and $gtOrder.$sourceList.count?">
@@ -2017,6 +2056,29 @@
           </do_if>
           <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Storage Thresholds (min/static/max)', $Status = 'INFO', $Detail = '' + $mk2MinStorage + '% / ' + $mk2StaticStorage + '% / ' + $mk2MaxStorage + '% (source must be ABOVE static; dest must be AT OR BELOW min' + (if $mk2OrderBidirectional then '; bidirectional ladder enforced' else '; independent thresholds') + ')']"/>
           <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Selection Scoring', $Status = 'INFO', $Detail = 'Target demand only: score base = max(0, 100 - destination fill %). Lower storage = higher priority. Equal fill % adds random tiebreak at runtime (not reproducible in diagnose). Source surplus, route distance, and sticky lane no longer affect ware pick order.']"/>
+
+          <!-- Runtime skipMinTrade thresholds (order.trade.galaxytradermk2.xml init + main_loop).
+               minCargoFillPercent lives in MK2 Global Settings (not on the order object).
+               allowlowvolume / lowvolumefloorpercent are order params (inherited via Assist). -->
+          <set_value name="$mk2MinFillPercent" exact="25"/>
+          <do_if value="global.$GT_MK2_GlobalSettings? and global.$GT_MK2_GlobalSettings.$Distribution? and global.$GT_MK2_GlobalSettings.$Distribution.$MinimumCargoFillPercent?">
+            <set_value name="$mk2MinFillPercent" exact="[10, [100, global.$GT_MK2_GlobalSettings.$Distribution.$MinimumCargoFillPercent].min].max"/>
+          </do_if>
+          <set_value name="$mk2AllowLowVolume" exact="if $gtOrder.$allowlowvolume? then $gtOrder.$allowlowvolume else false"/>
+          <set_value name="$mk2LowVolumeFloorPercent" exact="10"/>
+          <do_if value="$gtOrder.$lowvolumefloorpercent?">
+            <set_value name="$mk2LowVolumeFloorPercent" exact="[1, [50, $gtOrder.$lowvolumefloorpercent].min].max"/>
+          </do_if>
+          <set_value name="$mk2PilotForFill" exact="[1, [15, $skillLevel].min].max"/>
+          <set_value name="$mk2LowFloorProfileMin" exact="[1, 20 - ($mk2PilotForFill / 3)i].max"/>
+          <set_value name="$mk2LowVolumeFloorEffPercent" exact="if $mk2AllowLowVolume then [$mk2LowVolumeFloorPercent, $mk2LowFloorProfileMin].max else $mk2LowVolumeFloorPercent"/>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Minimum Cargo Fill', $Status = 'INFO', $Detail = '' + $mk2MinFillPercent + '% of this ship ware capacity (MK2 Global Settings). Runtime refuses trips below this size (skipMinTrade) unless Allow Low Volume applies.']"/>
+          <set_value name="$mk2LowVolDetail" exact="'OFF - only full Minimum Cargo Fill (' + $mk2MinFillPercent + '%) trips are accepted. Enable on the MK2 order to allow smaller shuttle loads.'"/>
+          <do_if value="$mk2AllowLowVolume">
+            <set_value name="$mk2LowVolDetail" exact="'ON - floor ' + $mk2LowVolumeFloorEffPercent + '% effective (order floor ' + $mk2LowVolumeFloorPercent + '%, pilot profile min ' + $mk2LowFloorProfileMin + '% at level ' + $mk2PilotForFill + '). Critical dest (at or below 5%) can half that floor.'"/>
+          </do_if>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Allow Low Volume', $Status = if $mk2AllowLowVolume then 'PASS' else 'INFO', $Detail = $mk2LowVolDetail]"/>
+          <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Diagnose vs Runtime Gaps', $Status = 'INFO', $Detail = 'Pair eval mirrors station gates + min cargo fill. Not simulated: in-flight ware reservations / fleet fairness, ping-pong anti-oscillation, docking permission, sector blacklist. If rows say PASS but the ship stays empty, check those next.']"/>
 
           <!-- Per-source / per-ware static-storage gate evaluation.
                Mirrors the runtime gate at order.trade.galaxytraderMK2.xml line 1410:
@@ -7389,15 +7451,18 @@
                via storage discovery without a formal offer (runtime lines 1313 / 1459).
                We mirror those gates 1:1 here so each row carries a verdict + reasoning
                line that maps directly to a runtime skip counter (illegal/cargo, noSrcOffer,
-               srcNoTarget, srcBelowStatic, self, peerRole, distance, noDstOffer, noNeed, minTrade).
-               Reservations (skipReserved) are intentionally NOT modelled - they require
-               get_ware_reservation which can mutate engine state in unpredictable ways
-               from an MD diagnostic context, and the player-actionable signal is already
-               captured by the other gates. -->
+               srcNoTarget, srcBelowStatic, self, peerRole, distance, noDstOffer, noNeed, minTrade/tooSmall).
+               Min cargo fill uses MK2 Global Settings + Allow Low Volume (same formula as runtime).
+               Reservations (skipReserved), ping-pong, docking, and blacklist are intentionally NOT
+               modelled - reservations require get_ware_reservation which can mutate engine state
+               from an MD diagnostic context. PASS means executable ignoring those last gaps. -->
           <set_value name="$mk2PairCount" exact="0"/>
           <set_value name="$mk2PairPass" exact="0"/>
+          <set_value name="$mk2PairTooSmall" exact="0"/>
           <set_value name="$mk2FirstPassPair" exact="''"/>
+          <set_value name="$mk2FirstTooSmallPair" exact="''"/>
           <set_value name="$mk2BestDemandScore" exact="-1"/>
+          <set_value name="$mk2BestTooSmallDemand" exact="-1"/>
           <set_value name="$mk2PairSkipIllegal" exact="0"/>
           <set_value name="$mk2PairSkipNoSrc" exact="0"/>
           <set_value name="$mk2PairSkipSrcNoTarget" exact="0"/>
@@ -7426,13 +7491,6 @@
             <set_value name="$mk2OrderAllowIllegal" exact="if $gtOrder.$allowillegal? then $gtOrder.$allowillegal else false"/>
             <set_value name="$mk2OrderEnforceRouteIllegal" exact="if $gtOrder.$enforceRouteIllegalLegality? then $gtOrder.$enforceRouteIllegalLegality else false"/>
             <set_value name="$mk2OrderMaxDist" exact="if $gtOrder.$maxDistance? then $gtOrder.$maxDistance else 0"/>
-            <set_value name="$mk2OrderMinFill" exact="0"/>
-            <do_if value="this.$debug? and false">
-              <!-- minCargoFillPercent is read from the live trader instance (this.$minCargoFillPercent)
-                   and is not exposed on the order object; we approximate using the order's
-                   minimum-trade derivation - see runtime line 1398. The diag uses 1 as a
-                   safe lower bound, matching the [1, ...].max guard. -->
-            </do_if>
             <set_value name="$mk2RowCap" exact="40"/>
             <do_all exact="$mk2SupplierList.count" counter="$pmsi">
               <set_value name="$pmSrc" exact="$mk2SupplierList.{$pmsi}"/>
@@ -7728,12 +7786,13 @@
                     </do_else>
                   </do_if>
 
-                  <!-- Gate 9: minimum trade amount (skipMinTrade, runtime line 1659).
-                       Use a 1-unit floor here - the diag does not have access to
-                       this.$minCargoFillPercent or low-volume profile, so we report PASS
-                       whenever the engine could move at least 1 unit. The runtime check
-                       is added to the reason string when the trade would be tiny. -->
+                  <!-- Gate 9: minimum trade amount (skipMinTrade).
+                       Mirrors runtime: normal floor = max(1, cargo.max * minCargoFillPercent / 100).
+                       Allow Low Volume (pilot L6+ or critical dest &lt;=5%) lowers the floor to the
+                       effective low-volume %. Critical need can half that floor again. -->
                   <set_value name="$pmTradeAmount" exact="0"/>
+                  <set_value name="$pmMinTradeRequired" exact="0"/>
+                  <set_value name="$pmUsedLowVolume" exact="false"/>
                   <do_if value="$pmStatus2 == 'PASS'">
                     <set_value name="$pmTradeAmount" exact="[$pmShipCargoMax, $pmSrcOfferAmount, $pmDstOfferAmount].min"/>
                     <do_if value="$pmTradeAmount le 0">
@@ -7741,6 +7800,35 @@
                       <set_value name="$pmReason2" exact="'minTrade: computed trade amount is 0 (cargo room ' + $pmShipCargoMax + ', src offer ' + $pmSrcOfferAmount + ', dst demand ' + $pmDstOfferAmount + ')'"/>
                       <set_value name="$mk2PairSkipMinTrade" operation="add"/>
                     </do_if>
+                    <do_else>
+                      <set_value name="$pmMinTradeRequired" exact="[1, (($pmShipCargoMax * $mk2MinFillPercent) / 100)i].max"/>
+                      <set_value name="$pmIsCriticalNeed" exact="$pmDstRatio le 5"/>
+                      <set_value name="$pmCanLowVolume" exact="false"/>
+                      <do_if value="$mk2AllowLowVolume">
+                        <do_if value="$skillLevel ge 6 or $pmIsCriticalNeed">
+                          <set_value name="$pmCanLowVolume" exact="true"/>
+                        </do_if>
+                      </do_if>
+                      <do_if value="$pmCanLowVolume">
+                        <set_value name="$pmMinTradeRequired" exact="[1, (($pmShipCargoMax * $mk2LowVolumeFloorEffPercent) / 100)i].max"/>
+                        <do_if value="$pmIsCriticalNeed">
+                          <set_value name="$pmMinTradeRequired" exact="[1, ($pmMinTradeRequired / 2)i].max"/>
+                        </do_if>
+                        <set_value name="$pmUsedLowVolume" exact="true"/>
+                      </do_if>
+                      <do_if value="$pmTradeAmount lt $pmMinTradeRequired">
+                        <set_value name="$pmStatus2" exact="'WARN'"/>
+                        <set_value name="$pmDemandScore" exact="[0, 100 - $pmDstRatio].max"/>
+                        <set_value name="$pmFillNote" exact="if $pmUsedLowVolume then ('low-volume floor ' + $mk2LowVolumeFloorEffPercent + '%' + (if $pmIsCriticalNeed then ' halved for critical dest' else '')) else ('Minimum Cargo Fill ' + $mk2MinFillPercent + '%')"/>
+                        <set_value name="$pmReason2" exact="'tooSmall: trade ' + $pmTradeAmount + ' &lt; required ' + $pmMinTradeRequired + ' (' + $pmFillNote + ' of hold ' + $pmShipCargoMax + '). Runtime skipMinTrade - enable Allow Low Volume, lower Minimum Cargo Fill in MK2 Global Settings, wait for larger dest demand, or use a smaller ship.'"/>
+                        <set_value name="$mk2PairSkipMinTrade" operation="add"/>
+                        <set_value name="$mk2PairTooSmall" operation="add"/>
+                        <do_if value="$pmDemandScore gt $mk2BestTooSmallDemand">
+                          <set_value name="$mk2BestTooSmallDemand" exact="$pmDemandScore"/>
+                          <set_value name="$mk2FirstTooSmallPair" exact="$pmWare.name + ': ' + $pmRoute2 + ' trade=' + $pmTradeAmount + ' need at least ' + $pmMinTradeRequired + ' (hold ' + $pmShipCargoMax + ')'"/>
+                        </do_if>
+                      </do_if>
+                    </do_else>
                   </do_if>
 
                   <!-- Gate 10: Illegal Route Filter (route_legality parity, runtime queue gate) -->
@@ -7768,18 +7856,27 @@
 
                   <do_if value="$pmStatus2 == 'PASS'">
                     <set_value name="$pmDemandScore" exact="[0, 100 - $pmDstRatio].max"/>
-                    <set_value name="$pmReason2" exact="'eligible: demand=' + $pmDemandScore + ' (dst ' + $pmDstRatio + '% fill) bucket=' + $pmBucket + ' src=' + $pmSrcRatio + '% trade=' + $pmTradeAmount + ' units (equal fill % uses random tiebreak at runtime; final amount may be lower after fairness/reservation)'"/>
+                    <set_value name="$pmReason2" exact="'eligible: demand=' + $pmDemandScore + ' (dst ' + $pmDstRatio + '% fill) bucket=' + $pmBucket + ' src=' + $pmSrcRatio + '% trade=' + $pmTradeAmount + ' units (meets minFill ' + $pmMinTradeRequired + '; equal fill % uses random tiebreak at runtime; final amount may be lower after fairness/reservation)'"/>
                     <set_value name="$mk2PairPass" operation="add"/>
                     <do_if value="$pmDemandScore gt $mk2BestDemandScore">
                       <set_value name="$mk2BestDemandScore" exact="$pmDemandScore"/>
-                      <set_value name="$mk2FirstPassPair" exact="$pmWare.name + ': ' + $pmRoute2 + ' (demand ' + $pmDemandScore + ', dst ' + $pmDstRatio + '% fill)'"/>
+                      <set_value name="$mk2FirstPassPair" exact="$pmWare.name + ': ' + $pmRoute2 + ' (demand ' + $pmDemandScore + ', dst ' + $pmDstRatio + '% fill, trade ' + $pmTradeAmount + ')'"/>
                     </do_if>
                   </do_if>
 
                   <set_value name="$mk2PairCount" operation="add"/>
                   <do_if value="$mk2PairRows.count lt $mk2RowCap">
-                    <set_value name="$pmMk2SortKey" exact="if $pmStatus2 == 'PASS' then $pmDemandScore else -1"/>
-                    <set_value name="$pmMk2Col5" exact="if $pmStatus2 == 'PASS' then ('demand ' + $pmDemandScore + ' (dst ' + $pmDstRatio + '% fill)') else ''"/>
+                    <set_value name="$pmMk2SortKey" exact="-1"/>
+                    <do_if value="$pmStatus2 == 'PASS'">
+                      <set_value name="$pmMk2SortKey" exact="1000000 + $pmDemandScore"/>
+                    </do_if>
+                    <do_elseif value="$pmStatus2 == 'WARN'">
+                      <set_value name="$pmMk2SortKey" exact="$pmDemandScore"/>
+                    </do_elseif>
+                    <set_value name="$pmMk2Col5" exact="''"/>
+                    <do_if value="$pmStatus2 == 'PASS' or $pmStatus2 == 'WARN'">
+                      <set_value name="$pmMk2Col5" exact="'demand ' + $pmDemandScore + ' (dst ' + $pmDstRatio + '% fill)'"/>
+                    </do_if>
                     <append_to_list name="$mk2PairRows" exact="table[$Check = $pmWare.name, $Status = $pmStatus2, $Detail = $pmRoute2, $Col4 = 'src ' + $pmSrcRatio + '% / dst ' + $pmDstRatio + '%', $Col5 = $pmMk2Col5, $Col6 = $pmReason2, $SortKey = $pmMk2SortKey]"/>
                   </do_if>
                 </do_all>
@@ -7815,13 +7912,18 @@
           </do_if>
 
           <!-- Header row + skip summary so the player can read the picture at a glance. -->
-          <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'MK2 Pairs Evaluated', $Status = if $mk2PairPass gt 0 then 'PASS' else (if $mk2PairCount == 0 then 'WARN' else 'FAIL'), $Detail = '' + $mk2PairCount + ' src*dst*ware combinations checked, ' + $mk2PairPass + ' PASS, ' + ($mk2PairCount - $mk2PairPass) + ' BLOCK (showing first ' + $mk2PairRows.count + ')']"/>
-          <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'MK2 Pair Legend', $Status = 'INFO', $Detail = 'Col5 demand score = max(0, 100 - destination fill %). Runtime picks highest demand; equal fill % adds random tiebreak (not shown here). Distance does not affect ware selection.']"/>
+          <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'MK2 Pairs Evaluated', $Status = if $mk2PairPass gt 0 then 'PASS' else (if $mk2PairCount == 0 then 'WARN' else 'FAIL'), $Detail = '' + $mk2PairCount + ' src*dst*ware combinations checked, ' + $mk2PairPass + ' PASS (executable now), ' + $mk2PairTooSmall + ' WARN tooSmall (below min cargo fill), ' + ($mk2PairCount - $mk2PairPass - $mk2PairTooSmall) + ' BLOCK (showing first ' + $mk2PairRows.count + ')']"/>
+          <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'MK2 Pair Legend', $Status = 'INFO', $Detail = 'PASS = meets station gates AND Minimum Cargo Fill for this ship. WARN tooSmall = stations want the ware but shipment &lt; min fill (runtime skipMinTrade). BLOCK = hard gate fail. Col5 demand = max(0, 100 - dest fill %). Runtime picks highest demand among PASS rows; equal fill % random tiebreak.']"/>
           <do_if value="$mk2NoBasketWares">
             <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'No Pairs', $Status = 'WARN', $Detail = if $mk2AutoSourceMode then 'Auto-source active - classic pair mesh not applicable' else 'No source/destination stations configured (see MK2 Specific section)']"/>
           </do_if>
           <do_if value="$mk2PairCount gt 0">
-            <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Skip Breakdown', $Status = 'INFO', $Detail = 'illegal/cargo=' + $mk2PairSkipIllegal + ', routeIllegal=' + $mk2PairSkipRouteIllegal + ', noSrcOffer=' + $mk2PairSkipNoSrc + ', srcNoTarget=' + $mk2PairSkipSrcNoTarget + ', srcBelowStatic=' + $mk2PairSkipBelowStatic + ', self=' + $mk2PairSkipSelf + ', peerRole=' + $mk2PairSkipPeerRole + ', distance=' + $mk2PairSkipDistance + ', noDstOffer=' + $mk2PairSkipNoDst + ', noNeed=' + $mk2PairSkipNoNeed + ', minTrade=' + $mk2PairSkipMinTrade]"/>
+            <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Skip Breakdown', $Status = 'INFO', $Detail = 'illegal/cargo=' + $mk2PairSkipIllegal + ', routeIllegal=' + $mk2PairSkipRouteIllegal + ', noSrcOffer=' + $mk2PairSkipNoSrc + ', srcNoTarget=' + $mk2PairSkipSrcNoTarget + ', srcBelowStatic=' + $mk2PairSkipBelowStatic + ', self=' + $mk2PairSkipSelf + ', peerRole=' + $mk2PairSkipPeerRole + ', distance=' + $mk2PairSkipDistance + ', noDstOffer=' + $mk2PairSkipNoDst + ', noNeed=' + $mk2PairSkipNoNeed + ', minTrade/tooSmall=' + $mk2PairSkipMinTrade]"/>
+          </do_if>
+          <do_if value="$ship? and $ship.exists">
+            <do_if value="$ship.$mk2LastSkipReason? and $ship.$mk2LastSkipReason != ''">
+              <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Runtime Last Skip', $Status = 'WARN', $Detail = '' + $ship.$mk2LastSkipReason]"/>
+            </do_if>
           </do_if>
           <do_all exact="$mk2PairRows.count" counter="$pmri">
             <append_to_list name="$sec8b.$Rows" exact="$mk2PairRows.{$pmri}"/>
@@ -8543,13 +8645,45 @@
              to them. -->
         <do_elseif value="$orderId == 'GalaxyTraderMK2' and $mk2PairCount gt 0">
           <do_if value="$mk2PairPass gt 0">
-            <set_value name="$verdict" exact="'TRADES AVAILABLE (MK2): ' + $mk2PairPass + ' of ' + $mk2PairCount + ' configured source/dest/ware combination(s) are eligible' + (if $mk2FirstPassPair != '' then ' (highest demand: ' + $mk2FirstPassPair + ')' else '') + '. MK2 trades ONLY its assigned source/destination lists - the sector-wide Search Summary above does not apply to this order.'"/>
-            <append_to_list name="$suggestions" exact="'Eligible pairs exist, so a not-trading ship is limited by a runtime factor this diagnostic does not model: in-flight reservations and fleet fairness (sibling traders may have already claimed the destination intake), search cadence, equal-fill random tiebreak, or the ship currently running another order (e.g. Assist while a fleet subordinate) before it re-enters the MK2 loop. Reservations are intentionally not simulated here (see MK2 pair-eval note).'"/>
-            <append_to_list name="$suggestions" exact="'Among eligible wares, runtime prefers the emptiest destination (lowest fill %). If several destinations share the same fill %, ware choice is random - use Pair Details demand scores to see which routes rank highest.'"/>
+            <set_value name="$verdict" exact="'TRADES AVAILABLE (MK2): ' + $mk2PairPass + ' of ' + $mk2PairCount + ' configured source/dest/ware combination(s) meet station gates AND Minimum Cargo Fill for this ship' + (if $mk2FirstPassPair != '' then ' (highest demand: ' + $mk2FirstPassPair + ')' else '') + (if $mk2PairTooSmall gt 0 then ('. Also ' + $mk2PairTooSmall + ' route(s) are too small for this hold - see WARN rows') else '') + '. MK2 trades ONLY its assigned source/destination lists.'"/>
+            <do_if value="$diagIsGTFleetAssist">
+              <append_to_list name="$suggestions" exact="'This ship is on fleet Assist (normal for MK2 subordinates under ' + $diagAssistCmdOrder + '). Empty cargo usually means it is between trade cycles - wait a short while, or confirm the commander is still on GalaxyTraderMK2.'"/>
+            </do_if>
+            <do_if value="$cargoUsed le 0">
+              <append_to_list name="$suggestions" exact="'Ship hold is empty right now. If it stays empty across several diagnose refreshes, runtime may still be blocked by in-flight reservations / fleet fairness (not simulated here), docking permission, sector blacklist, or ping-pong protection after a reverse haul.'"/>
+            </do_if>
+            <append_to_list name="$suggestions" exact="'Among PASS rows, runtime prefers the emptiest destination (highest demand). Equal fill % picks randomly. WARN tooSmall rows are ignored until demand grows or you enable Allow Low Volume / lower Minimum Cargo Fill / assign a smaller ship.'"/>
           </do_if>
+          <do_elseif value="$mk2PairTooSmall gt 0">
+            <set_value name="$verdict" exact="'MK2 IDLE (ship too large for current demand): ' + $mk2PairTooSmall + ' of ' + $mk2PairCount + ' route(s) pass station gates but each shipment is below Minimum Cargo Fill (' + $mk2MinFillPercent + '%) for this hold' + (if $mk2AllowLowVolume then ('; Allow Low Volume floor ' + $mk2LowVolumeFloorEffPercent + '%') else ' (Allow Low Volume is OFF)') + '. Runtime skipMinTrade - the ship will not leave.' + (if $mk2FirstTooSmallPair != '' then (' Worst/highest-demand example: ' + $mk2FirstTooSmallPair + '.') else '')"/>
+            <append_to_list name="$suggestions" exact="'Enable Allow Low Volume on the MK2 order (lets smaller shuttle loads when pilot level is 6+ or dest is critical at or below 5%).'"/>
+            <append_to_list name="$suggestions" exact="'OR lower Minimum Cargo Fill in GalaxyTrader MK2 Global Settings (current ' + $mk2MinFillPercent + '%).'"/>
+            <append_to_list name="$suggestions" exact="'OR assign a smaller freighter to this route, OR wait until the destination buy offer is large enough for a full min-fill load.'"/>
+          </do_elseif>
           <do_else>
-            <set_value name="$verdict" exact="'MK2 NO ELIGIBLE PAIRS: all ' + $mk2PairCount + ' configured source/dest/ware combination(s) are currently blocked - see the MK2 Skip Breakdown and Pair Details for the per-gate reasons (typically noDstOffer / noNeed / noSrcOffer).'"/>
-            <append_to_list name="$suggestions" exact="'Confirm destination stations actually buy the source wares (noDstOffer), that destinations are below minStorage so they still need stock (noNeed), and that sources publish sell offers (noSrcOffer).'"/>
+            <set_value name="$verdict" exact="'MK2 NO ELIGIBLE PAIRS: all ' + $mk2PairCount + ' configured source/dest/ware combination(s) are currently blocked - see the MK2 Skip Breakdown and Pair Details for the per-gate reasons.'"/>
+            <do_if value="$mk2PairSkipNoDst gt 0">
+              <append_to_list name="$suggestions" exact="'noDstOffer (' + $mk2PairSkipNoDst + '): destination does not buy that ware (not a resource/tradeware, or relation/policy blocks).'"/>
+            </do_if>
+            <do_if value="$mk2PairSkipNoNeed gt 0">
+              <append_to_list name="$suggestions" exact="'noNeed (' + $mk2PairSkipNoNeed + '): destination fill is above Min Storage % (' + $mk2MinStorage + '%) and source does not trigger the rebalance bucket.'"/>
+            </do_if>
+            <do_if value="$mk2PairSkipNoSrc gt 0">
+              <append_to_list name="$suggestions" exact="'noSrcOffer (' + $mk2PairSkipNoSrc + '): source has no usable sell offer (or ware-exchange storage discovery did not apply).'"/>
+            </do_if>
+            <do_if value="$mk2PairSkipBelowStatic gt 0">
+              <append_to_list name="$suggestions" exact="'srcBelowStatic (' + $mk2PairSkipBelowStatic + '): source fill is at or below Static Storage % (' + $mk2StaticStorage + '%).'"/>
+            </do_if>
+            <do_if value="$mk2PairSkipDistance gt 0">
+              <append_to_list name="$suggestions" exact="'distance (' + $mk2PairSkipDistance + '): gate path missing or longer than Max Distance (' + (if $gtOrder.$maxDistance? then $gtOrder.$maxDistance else 0) + ').'"/>
+            </do_if>
+            <do_if value="$mk2PairSkipRouteIllegal gt 0">
+              <append_to_list name="$suggestions" exact="'routeIllegal (' + $mk2PairSkipRouteIllegal + '): illegal ware path blocked by Illegal Route Filter.'"/>
+            </do_if>
+            <do_if value="$mk2PairSkipMinTrade gt 0">
+              <append_to_list name="$suggestions" exact="'minTrade (' + $mk2PairSkipMinTrade + '): trade amount computed to 0 (no overlapping capacity).'"/>
+            </do_if>
+            <append_to_list name="$suggestions" exact="'Confirm destinations buy the source wares, destinations are below minStorage, and sources publish sell offers. See each Pair Details row for the exact gate.'"/>
           </do_else>
         </do_elseif>
         <!-- Priority 3: Money cap active.

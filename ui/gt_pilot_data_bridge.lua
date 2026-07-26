@@ -386,9 +386,12 @@ local function onReceivePilotData(_, param)
             
             table.insert(pilots, pilotInfo)
             
-            debugLog(string.format("  Pilot %d: %s (%s) - Level %d, Pilot: %s Cr, Ship: %s Cr", 
-                i, pilotInfo.pilotName, pilotInfo.shipType, pilotInfo.level, 
-                pilotInfo.pilotProfitFormatted, pilotInfo.shipProfitFormatted))
+            -- Muted: per-pilot dump noise. Set to true to re-enable.
+            if false then
+                debugLog(string.format("  Pilot %d: %s (%s) - Level %d, Pilot: %s Cr, Ship: %s Cr", 
+                    i, pilotInfo.pilotName, pilotInfo.shipType, pilotInfo.level, 
+                    pilotInfo.pilotProfitFormatted, pilotInfo.shipProfitFormatted))
+            end
         else
             debugLog(string.format("  WARNING: Pilot %d has incomplete data (%d fields)", i, #fields))
         end
@@ -473,18 +476,21 @@ local function onReceivePilotIdMap(_, param)
     end
 
     GT_PilotData.gtPilotIdMap = idMap
-    debugLog(string.format(
-        "PilotIdMap replaced: incomingLogical=%d totalKeys=%d malformed=%d wireU64=%d decodedU64=%d decodeFail=%d aliasAdds=%d raw_len=%d sampleKeys=[%s]",
-        entryCount,
-        totalKeys,
-        malformedCount,
-        u64WireCount,
-        u64DecodedCount,
-        u64DecodeFailed,
-        aliasKeyAdds,
-        string.len(tostring(param or "")),
-        table.concat(sampleKeys, ", ")
-    ))
+    -- Muted: routine full-replace noise. Set to true to re-enable.
+    if false then
+        debugLog(string.format(
+            "PilotIdMap replaced: incomingLogical=%d totalKeys=%d malformed=%d wireU64=%d decodedU64=%d decodeFail=%d aliasAdds=%d raw_len=%d sampleKeys=[%s]",
+            entryCount,
+            totalKeys,
+            malformedCount,
+            u64WireCount,
+            u64DecodedCount,
+            u64DecodeFailed,
+            aliasKeyAdds,
+            string.len(tostring(param or "")),
+            table.concat(sampleKeys, ", ")
+        ))
+    end
     if malformedCount > 0 then
         debugLog(string.format("WARNING: Received malformed PilotIdMap entries: %d", malformedCount))
     end

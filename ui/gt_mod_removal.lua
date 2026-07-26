@@ -380,7 +380,8 @@ local function GT_ReconcileSlots(_, params)
     end
 
     hasShip, shipWare, hasEngine, engineWare = ReadInstalledSlotWares(shipId)
-    if isDebugLoggingEnabled() then
+    -- Muted: routine reconcile noise. Set to true (and keep debug toggle) to re-enable.
+    if false and isDebugLoggingEnabled() then
         logDebug(string.format(
             "Reconcile ship=%s reason=%s desiredShip=%s desiredEngine=%s observedShip=%s observedEngine=%s",
             shipIdCode, reason, desiredShip, desiredEngine, shipWare, engineWare

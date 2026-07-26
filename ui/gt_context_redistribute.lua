@@ -1404,7 +1404,10 @@ publishMapSelectionShipCount = function()
     if bridge and bridge.GetPlayerBlackboardId then
         SetNPCBlackboard(bridge.GetPlayerBlackboardId(), "$GT_PilotExchange_SelectionShipCount", count)
     end
-    logPilotExchangeMenu("publishMapSelectionShipCount eligibleGT=" .. tostring(count))
+    -- Muted: selection-count publish noise. Set to true to re-enable.
+    if false then
+        logPilotExchangeMenu("publishMapSelectionShipCount eligibleGT=" .. tostring(count))
+    end
     return count
 end
 

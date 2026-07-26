@@ -5215,7 +5215,7 @@
         <do_else>
           <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Search Pipeline', $Status = 'INFO', $Detail = $pipelineState + ' (Sell max: ' + ($activeSellPriceMax * 100) + '%, Buy min: ' + ($activeBuyPriceMin * 100) + '%)']"/>
         </do_else>
-        <set_value name="$diagOfferScanModeDetail" exact="'tradepartner + per-ship offeramount (mirrors lib.gt.live.search.xml; pair gates mirror trade_found validation)'"/>
+        <set_value name="$diagOfferScanModeDetail" exact="'tradepartner + per-ship offeramount (mirrors lib.gt.live.search.xml; pair walk mirrors lib.gt.tradematch + trade_found validation)'"/>
         <do_if value="($orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2') and $diagMk4BuildStorageOnlyMode">
           <set_value name="$diagOfferScanModeDetail" exact="'BS buyer-targeted + player buy-offer supplemental (mirrors lib.gt.live.search MK4 completion pass; post-filter buyer=buildstorage + coverage)'"/>
         </do_if>
@@ -6063,15 +6063,31 @@
         <do_if value="$diagPriorityMultPct gt 300">
           <set_value name="$diagPriorityMultPct" exact="300"/>
         </do_if>
-        <!-- Performance caps for generic trader pair scan (MK1 uses dedicated export path above). -->
-        <set_value name="$diagPairEvalCap" exact="1000"/>
-        <set_value name="$diagPairDisplayCap" exact="80"/>
+        <!-- Pair eval budget mirrors lib.gt.tradematch Performance.$EarlyExitThreshold (not a separate diag cap). -->
+        <set_value name="$diagPairEvalCap" exact="2000"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$EarlyExitThreshold?">
+          <set_value name="$diagPairEvalCap" exact="[100, [10000, @global.$GT_GlobalSettings.$Performance.$EarlyExitThreshold].min].max"/>
+        </do_if>
+        <set_value name="$diagPairEvalCap" exact="($diagPairEvalCap)i"/>
+        <set_value name="$diagPairDisplayCap" exact="1000"/>
+        <set_value name="$diagPairDetailsTruncated" exact="false"/>
+        <set_value name="$diagMaxTradesPerWare" exact="20"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxTradesPerWare?">
+          <set_value name="$diagMaxTradesPerWare" exact="@global.$GT_GlobalSettings.$Performance.$MaxTradesPerWare"/>
+        </do_if>
+        <do_if value="$diagMaxTradesPerWare lt 1">
+          <set_value name="$diagMaxTradesPerWare" exact="1"/>
+        </do_if>
+        <set_value name="$diagTradesPerWare" exact="table[]"/>
         <set_value name="$diagPathfindBudget" exact="160"/>
         <set_value name="$diagHitEvalCap" exact="false"/>
         <set_value name="$pairDetails" exact="[]"/>
-        <!-- Diagnostics show EVERY evaluated pair with its verdict + reason (FAIL rows are the whole
-             point of a ship-specific search-state diagnosis), instead of silently dropping
-             trade-rule / policy rejections. -->
+        <set_value name="$diagTopKApplied" exact="false"/>
+        <set_value name="$diagTopK" exact="0"/>
+        <set_value name="$diagSellBeforeTopK" exact="0"/>
+        <set_value name="$diagBuyBeforeTopK" exact="0"/>
+        <!-- Record every pair examined (budget = EarlyExitThreshold). Pair Details lists all examined
+             rows score-sorted; Pair Details list capped at diagPairDisplayCap (top scores). -->
 
         <set_value name="$bestDiagProfit" exact="0"/>
         <set_value name="$bestDiagPairDesc" exact="'none'"/>
@@ -6286,7 +6302,133 @@
           <!-- MK2 uses dedicated source/dest pair eval in sec8b; skip generic sector-wide tradematch scan. -->
         </do_elseif>
         <do_else>
-        <!-- Sell-driven pairing (mirrors lib.gt.tradematch.xml outer sell loop). -->
+        <!-- Runtime parity (lib.gt.tradematch Phase 6): top-K bid-ask prune before pairing.
+             Keep cheapest K supplier sells + dearest K customer buys per ware so Pair Details
+             reflects the candidate set ships actually match, not a mono-ware flood of the first sell. -->
+        <set_value name="$diagSellBeforeTopK" exact="if $allSellOffers? then $allSellOffers.count else 0"/>
+        <set_value name="$diagBuyBeforeTopK" exact="if $allBuyOffers? then $allBuyOffers.count else 0"/>
+        <set_value name="$diagTopK" exact="20"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$MaxOffersPerWareForMatching?">
+          <set_value name="$diagTopK" exact="@global.$GT_GlobalSettings.$Performance.$MaxOffersPerWareForMatching"/>
+        </do_if>
+        <do_if value="$diagTopK lt 5">
+          <set_value name="$diagTopK" exact="5"/>
+        </do_if>
+        <do_if value="$diagTopK gt 100">
+          <set_value name="$diagTopK" exact="100"/>
+        </do_if>
+        <set_value name="$diagFactionPriorityNum" exact="if $factionPriority then 1 else 0"/>
+        <set_value name="$diagTkSellsByWare" exact="table[]"/>
+        <do_all exact="$diagSellBeforeTopK" counter="$tkSi">
+          <set_value name="$tkOffer" exact="@$allSellOffers.{$tkSi}"/>
+          <do_if value="$tkOffer? and @$tkOffer.exists and $tkOffer.ware? and $tkOffer.unitprice?">
+            <set_value name="$tkWare" exact="@$tkOffer.ware"/>
+            <do_if value="$tkWare != null">
+              <do_if value="not $diagTkSellsByWare.{$tkWare}?">
+                <create_list name="$diagTkSellsByWare.{$tkWare}"/>
+              </do_if>
+              <append_to_list name="$diagTkSellsByWare.{$tkWare}" exact="$tkOffer"/>
+            </do_if>
+          </do_if>
+        </do_all>
+        <set_value name="$diagTkBuysByWare" exact="table[]"/>
+        <do_all exact="$diagBuyBeforeTopK" counter="$tkBi">
+          <set_value name="$tkOffer" exact="@$allBuyOffers.{$tkBi}"/>
+          <do_if value="$tkOffer? and @$tkOffer.exists and $tkOffer.ware? and $tkOffer.unitprice?">
+            <set_value name="$tkWare" exact="@$tkOffer.ware"/>
+            <do_if value="$tkWare != null">
+              <do_if value="not $diagTkBuysByWare.{$tkWare}?">
+                <create_list name="$diagTkBuysByWare.{$tkWare}"/>
+              </do_if>
+              <append_to_list name="$diagTkBuysByWare.{$tkWare}" exact="$tkOffer"/>
+            </do_if>
+          </do_if>
+        </do_all>
+        <create_list name="$allSellOffers"/>
+        <set_value name="$diagPrunedSellsByWare" exact="table[]"/>
+        <set_value name="$diagPrunedBuysByWare" exact="table[]"/>
+        <set_value name="$diagTkSellWareCount" exact="if @$diagTkSellsByWare.keys.count != null then @$diagTkSellsByWare.keys.count else 0"/>
+        <do_all exact="$diagTkSellWareCount" counter="$tkWi">
+          <set_value name="$tkWare" exact="$diagTkSellsByWare.keys.{$tkWi}"/>
+          <set_value name="$tkWareSells" exact="$diagTkSellsByWare.{$tkWare}"/>
+          <do_if value="not $tkWareSells? or $tkWareSells.count == 0">
+            <continue/>
+          </do_if>
+          <do_if value="not $diagPrunedSellsByWare.{$tkWare}?">
+            <create_list name="$diagPrunedSellsByWare.{$tkWare}"/>
+          </do_if>
+          <do_if value="$diagFactionPriorityNum gt 0">
+            <create_list name="$tkPlayerSells"/>
+            <create_list name="$tkNpcSells"/>
+            <do_all exact="$tkWareSells.count" counter="$tkOi">
+              <set_value name="$tkOffer" exact="$tkWareSells.{$tkOi}"/>
+              <set_value name="$tkSeller" exact="null"/>
+              <do_if value="$tkOffer.seller? and @$tkOffer.seller.exists">
+                <set_value name="$tkSeller" exact="@$tkOffer.seller"/>
+              </do_if>
+              <do_elseif value="$tkOffer.owner?">
+                <set_value name="$tkSeller" exact="@$tkOffer.owner"/>
+              </do_elseif>
+              <do_if value="$tkSeller? and @$tkSeller.isplayerowned">
+                <append_to_list name="$tkPlayerSells" exact="$tkOffer"/>
+              </do_if>
+              <do_else>
+                <append_to_list name="$tkNpcSells" exact="$tkOffer"/>
+              </do_else>
+            </do_all>
+            <do_if value="$tkPlayerSells.count gt 1">
+              <sort_list list="$tkPlayerSells" sortbyvalue="loop.element.unitprice" sortdescending="false"/>
+            </do_if>
+            <do_if value="$tkNpcSells.count gt 1">
+              <sort_list list="$tkNpcSells" sortbyvalue="loop.element.unitprice" sortdescending="false"/>
+            </do_if>
+            <set_value name="$tkKeepPlayer" exact="[$tkPlayerSells.count, $diagTopK].min"/>
+            <do_all exact="$tkKeepPlayer" counter="$tkOi">
+              <append_to_list name="$allSellOffers" exact="$tkPlayerSells.{$tkOi}"/>
+              <append_to_list name="$diagPrunedSellsByWare.{$tkWare}" exact="$tkPlayerSells.{$tkOi}"/>
+            </do_all>
+            <set_value name="$tkKeepNpc" exact="[$diagTopK - $tkKeepPlayer, $tkNpcSells.count].min"/>
+            <do_if value="$tkKeepNpc gt 0">
+              <do_all exact="$tkKeepNpc" counter="$tkOi">
+                <append_to_list name="$allSellOffers" exact="$tkNpcSells.{$tkOi}"/>
+                <append_to_list name="$diagPrunedSellsByWare.{$tkWare}" exact="$tkNpcSells.{$tkOi}"/>
+              </do_all>
+            </do_if>
+          </do_if>
+          <do_else>
+            <do_if value="$tkWareSells.count gt 1">
+              <sort_list list="$tkWareSells" sortbyvalue="loop.element.unitprice" sortdescending="false"/>
+            </do_if>
+            <set_value name="$tkKeep" exact="[$tkWareSells.count, $diagTopK].min"/>
+            <do_all exact="$tkKeep" counter="$tkOi">
+              <append_to_list name="$allSellOffers" exact="$tkWareSells.{$tkOi}"/>
+              <append_to_list name="$diagPrunedSellsByWare.{$tkWare}" exact="$tkWareSells.{$tkOi}"/>
+            </do_all>
+          </do_else>
+        </do_all>
+        <create_list name="$allBuyOffers"/>
+        <set_value name="$diagTkBuyWareCount" exact="if @$diagTkBuysByWare.keys.count != null then @$diagTkBuysByWare.keys.count else 0"/>
+        <do_all exact="$diagTkBuyWareCount" counter="$tkWi">
+          <set_value name="$tkWare" exact="$diagTkBuysByWare.keys.{$tkWi}"/>
+          <set_value name="$tkWareBuys" exact="$diagTkBuysByWare.{$tkWare}"/>
+          <do_if value="not $tkWareBuys? or $tkWareBuys.count == 0">
+            <continue/>
+          </do_if>
+          <do_if value="not $diagPrunedBuysByWare.{$tkWare}?">
+            <create_list name="$diagPrunedBuysByWare.{$tkWare}"/>
+          </do_if>
+          <do_if value="$tkWareBuys.count gt 1">
+            <sort_list list="$tkWareBuys" sortbyvalue="loop.element.unitprice" sortdescending="true"/>
+          </do_if>
+          <set_value name="$tkKeep" exact="[$tkWareBuys.count, $diagTopK].min"/>
+          <do_all exact="$tkKeep" counter="$tkOi">
+            <append_to_list name="$allBuyOffers" exact="$tkWareBuys.{$tkOi}"/>
+            <append_to_list name="$diagPrunedBuysByWare.{$tkWare}" exact="$tkWareBuys.{$tkOi}"/>
+          </do_all>
+        </do_all>
+        <set_value name="$diagTopKApplied" exact="true"/>
+
+        <!-- Sell-driven pairing (mirrors lib.gt.tradematch.xml outer sell loop on pruned flat list). -->
         <do_all exact="$allSellOffers.count" counter="$soi">
           <do_if value="$diagHitEvalCap">
             <break/>
@@ -6319,16 +6461,50 @@
             </do_if>
           </do_if>
 
-          <do_all exact="$allBuyOffers.count" counter="$boi">
+          <!-- Per-ware trade cap (mirrors lib.gt.tradematch outer-loop early skip). -->
+          <do_if value="$pairWare? and $diagTradesPerWare.{$pairWare}? and $diagTradesPerWare.{$pairWare} ge $diagMaxTradesPerWare">
+            <continue/>
+          </do_if>
+
+          <set_value name="$diagBuyListForWare" exact="if $diagPrunedBuysByWare.{$pairWare}? then $diagPrunedBuysByWare.{$pairWare} else []"/>
+          <set_value name="$diagBuyLoopCount" exact="if $diagBuyListForWare? then $diagBuyListForWare.count else 0"/>
+          <do_if value="$diagBuyLoopCount == 0">
+            <continue/>
+          </do_if>
+          <!-- Whole-band spread prune (mirrors lib.gt.tradematch sell-mode: best buy is index 1 after top-K DESC sort). -->
+          <set_value name="$diagSellPlayerFree" exact="false"/>
+          <set_value name="$diagSellBuyStation" exact="null"/>
+          <do_if value="$sellOffer.seller? and @$sellOffer.seller.exists">
+            <set_value name="$diagSellBuyStation" exact="@$sellOffer.seller"/>
+          </do_if>
+          <do_elseif value="$sellOffer.owner?">
+            <set_value name="$diagSellBuyStation" exact="@$sellOffer.owner"/>
+          </do_elseif>
+          <do_if value="$ignorePlayerPricing and $orderId == 'GalaxyTraderMK3' and $diagSellBuyStation? and @$diagSellBuyStation.isplayerowned">
+            <set_value name="$diagSellPlayerFree" exact="true"/>
+          </do_if>
+          <do_if value="($orderId == 'GalaxyTraderMK3' or $orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2') and not $diagSellPlayerFree">
+            <set_value name="$diagBestBuyOffer" exact="$diagBuyListForWare.{1}"/>
+            <do_if value="$diagBestBuyOffer? and $diagBestBuyOffer.unitprice? and $sellOffer.unitprice?">
+              <set_value name="$diagBestSpread" exact="$diagBestBuyOffer.unitprice - $sellOffer.unitprice"/>
+              <do_if value="$diagBestSpread lt 0">
+                <continue/>
+              </do_if>
+            </do_if>
+          </do_if>
+
+          <do_all exact="$diagBuyLoopCount" counter="$boi">
             <do_if value="$diagHitEvalCap">
               <break/>
             </do_if>
-            <set_value name="$buyOffer" exact="$allBuyOffers.{$boi}"/>
+            <set_value name="$buyOffer" exact="$diagBuyListForWare.{$boi}"/>
             <do_if value="not $buyOffer.exists or not $buyOffer.ware?">
               <continue/>
             </do_if>
-            <do_if value="$buyOffer.ware != $pairWare">
-              <continue/>
+
+            <!-- Per-ware trade cap (mirrors lib.gt.tradematch inner-loop break). -->
+            <do_if value="$pairWare? and $diagTradesPerWare.{$pairWare}? and $diagTradesPerWare.{$pairWare} ge $diagMaxTradesPerWare">
+              <break/>
             </do_if>
 
             <!-- Skip same station -->
@@ -7301,6 +7477,13 @@
             <do_if value="$diagUseSelectionSort and $pairSelectionScore != $pairScore">
               <set_value name="$pairShowSel" exact="true"/>
             </do_if>
+            <!-- Tradematch TradeList parity: count scored trades per ware (mirrors tm_tradesPerWare). -->
+            <do_if value="$pairScore gt 0 and $pairWare?">
+              <do_if value="not $diagTradesPerWare.{$pairWare}?">
+                <set_value name="$diagTradesPerWare.{$pairWare}" exact="0"/>
+              </do_if>
+              <set_value name="$diagTradesPerWare.{$pairWare}" operation="add"/>
+            </do_if>
 
             <!-- Record pass / track best (sort key matches runtime validation order on MK3/MK4). -->
             <do_if value="$pairVerdict == 'PASS'">
@@ -7347,11 +7530,8 @@
             <do_elseif value="$diagPairPlayerFreeSupplier">
               <set_value name="$pdReason" exact="'IPP: gross NPC sell income; internal buy leg (no credits); profit/ROI/min-money/margin gates bypassed at search, cache, and trade_found'"/>
             </do_elseif>
-            <!-- Always capture PASS rows (executable trades for this ship); cap only the FAIL rows so a
-                 flood of trade-rule rejections cannot crowd the executable pairs out of the display. -->
-            <do_if value="$pairVerdict == 'PASS' or $pairDetails.count lt $diagPairDisplayCap">
-              <append_to_list name="$pairDetails" exact="table[$Check = $pairWare.name, $Status = $pdStatus, $Detail = $pdRoute, $Col4 = $pdProfitStr, $Col5 = $pdScoreStr, $Col6 = $pdReason, $SortKey = $pdSortKey]"/>
-            </do_if>
+            <!-- Record every evaluated pair (bounded by diagPairEvalCap). Score-sort then display cap. -->
+            <append_to_list name="$pairDetails" exact="table[$Check = $pairWare.name, $Status = $pdStatus, $Detail = $pdRoute, $Col4 = $pdProfitStr, $Col5 = $pdScoreStr, $Col6 = $pdReason, $SortKey = $pdSortKey, $IsPass = ($pairVerdict == 'PASS')]"/>
           </do_all>
         </do_all>
         </do_else>
@@ -7388,6 +7568,15 @@
             </do_if>
           </do_all>
           <set_value name="$pairDetails" exact="$pairDetailsSorted"/>
+        </do_if>
+        <!-- Pair Details UI cap: keep score-sorted order, show top diagPairDisplayCap rows only. -->
+        <do_if value="$pairDetails.count gt $diagPairDisplayCap">
+          <set_value name="$pairDetailsTrunc" exact="[]"/>
+          <do_all exact="$diagPairDisplayCap" counter="$pdti">
+            <append_to_list name="$pairDetailsTrunc" exact="$pairDetails.{$pdti}"/>
+          </do_all>
+          <set_value name="$pairDetails" exact="$pairDetailsTrunc"/>
+          <set_value name="$diagPairDetailsTruncated" exact="true"/>
         </do_if>
         <!-- Runtime dispatch preview: score-sort passing pairs, then fresh-offer filter (mirrors live pipeline). -->
         <do_if value="$orderId != 'GalaxyMiner' and $diagRuntimePassPairs.count gt 0">
@@ -7465,7 +7654,12 @@
         <!-- Add pair evaluation summary -->
         <do_if value="$orderId != 'GalaxyTraderMK2'">
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Scoring Model', $Status = 'INFO', $Detail = 'Score distance = home→buy + buy→sell (route-aware)' + (if $diagUseSelectionSort then ('; validation sort = score / (1 + ship→buy × ' + $diagShipProxWeight + ') after priority boost') else '')]"/>
-        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Total Pairs Evaluated', $Status = 'INFO', $Detail = '' + $pairCount + (if $diagHitEvalCap then (' (cap ' + $diagPairEvalCap + ' reached — counts may be truncated)') else '')]"/>
+        <do_if value="$diagTopKApplied">
+          <append_to_list name="$sec8.$Rows" exact="table[$Check = 'TradeMatch Top-K Prune', $Status = 'PASS', $Detail = 'K=' + $diagTopK + ' (MaxOffersPerWareForMatching): sells ' + $diagSellBeforeTopK + '→' + $allSellOffers.count + ', buys ' + $diagBuyBeforeTopK + '→' + $allBuyOffers.count + ' (cheapest suppliers / dearest customers per ware; mirrors lib.gt.tradematch)']"/>
+        </do_if>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Pair Walk Parity', $Status = 'INFO', $Detail = 'Sell order = post top-K flat list (lib.gt.tradematch); per-ware buys DESC; whole-band spread skip; MaxTradesPerWare=' + $diagMaxTradesPerWare + '; pair budget EarlyExitThreshold=' + $diagPairEvalCap]"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Pair Verdict Layer', $Status = 'INFO', $Detail = 'PASS/FAIL in Pair Details = trade_found validation on top of tradematch gates (cargo util, offeramount, fresh-offer preview). Tradematch may still score trades that FAIL here.']"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Total Pairs Evaluated', $Status = 'INFO', $Detail = '' + $pairCount + (if $diagHitEvalCap then (' (EarlyExitThreshold ' + $diagPairEvalCap + ' reached — same cap as lib.gt.tradematch)') else '')]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Pairs Passing All Checks', $Status = if $passCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $passCount + ' / ' + $pairCount + ' (executable parity — mirrors trade_found validation)']"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Runtime Dispatch (fresh-offer filter)', $Status = if $diagRuntimeDispatchCount gt 0 then 'PASS' else (if $passCount gt 0 then 'WARN' else 'FAIL'), $Detail = '' + $diagRuntimeDispatchCount + ' / ' + $passCount + ' passing pairs would reach validation (mirrors live pipeline)']"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Runtime Dispatch Preview', $Status = if $diagRuntimeDispatchCount gt 0 then 'PASS' else 'INFO', $Detail = if $diagRuntimeDispatchCount gt 0 then ('Best: ' + $diagRuntimeBestDispatch + ' | Top: ' + $diagRuntimeBatchPreview) else $diagRuntimeBatchPreview]"/>
@@ -8104,7 +8298,7 @@
           </do_all>
         </do_elseif>
         <do_else>
-          <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Pairs Evaluated', $Status = 'INFO', $Detail = '' + $pairCount + ' scanned, ' + $pairDetails.count + ' shown (' + $passCount + ' PASS, ' + ($pairCount - $passCount) + ' FAIL — verdict + reason shown per row)']"/>
+          <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Pairs Evaluated', $Status = 'INFO', $Detail = '' + $pairCount + ' examined (tradematch walk budget ' + $diagPairEvalCap + '), ' + $pairDetails.count + ' rows listed score-sorted (' + $passCount + ' PASS trade_found, ' + ($pairCount - $passCount) + ' FAIL)' + (if $diagPairDetailsTruncated then (' — top ' + $diagPairDisplayCap + ' by score; raise cap in diagnose if needed') else '') + '. UI paginates large tables.']"/>
           <do_if value="($orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2')">
             <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'MK4 Pair Legend', $Status = 'INFO', $Detail = 'PASS = executable now; FAIL: customer_no_funds / sell_clamp buyer_money = destination station/BS account empty/low; mk4_trade_rules = offer.restriction.factions. Player supplier = free virtualmoney. [player]/[NPC] = supplier ownership.']"/>
           </do_if>

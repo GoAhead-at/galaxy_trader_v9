@@ -3224,21 +3224,29 @@
           </do_if>
           
           <!-- ==================================================================================== -->
-          <!-- MECHANIC 2: Early money gate - skip entire trade search pipeline when player is broke -->
-          <!-- Threshold: MinPlayerMoney + 1000 Cr safety buffer.                                   -->
-          <!-- This prevents the expensive cache search / work loop from running when there is      -->
-          <!-- no meaningful budget left. Ships go directly to insufficient_funds cooldown.          -->
+          <!-- MECHANIC 2: Early money gate - skip the trade search pipeline when the account that  -->
+          <!-- pays for the buy leg is empty. That account is the one vanilla bills                 -->
+          <!-- (this.container.money): the commander station for a station-assigned ship, otherwise -->
+          <!-- the player wallet. MinPlayerMoney is a player-wallet reserve and is only applied     -->
+          <!-- there; a station account is gated at zero, like vanilla.                             -->
           <!-- Works with MECHANIC 1 (authoritative guard budget clamp at trade creation):           -->
           <!--   Mechanic 1 = clamp trade volume to fit budget  (trade creation)                    -->
           <!--   Mechanic 2 = stop searching when budget is exhausted (search start)                -->
           <!-- ==================================================================================== -->
-          <set_value name="$earlyMoneyCheck" exact="player.money"/>
+          <run_script name="'lib.gt.pay.account'" result="$earlyPayAccount">
+            <param name="ship" value="this.ship"/>
+          </run_script>
+          <set_value name="$earlyMoneyCheck" exact="$earlyPayAccount.$Money"/>
+          <set_value name="$earlyPayIsPlayerWallet" exact="$earlyPayAccount.$IsPlayerWallet"/>
           <do_if value="not this.$minPlayerMoney?">
             <run_script name="'lib.gt.attention.min_player_money'" result="this.$minPlayerMoney"/>
           </do_if>
-          <set_value name="$moneyGateThreshold" exact="(this.$minPlayerMoney + 1000)Cr"/>
+          <set_value name="$moneyGateThreshold" exact="if $earlyPayIsPlayerWallet then (this.$minPlayerMoney + 1000)Cr else 0"/>
           <do_if value="$earlyMoneyCheck le $moneyGateThreshold">
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': EARLY MONEY GATE: player money=' + ($earlyMoneyCheck / 100) + ' Cr at or below threshold=' + (this.$minPlayerMoney + 1000) + ' Cr (MinPlayerMoney=' + this.$minPlayerMoney + ' + 1000 buffer) - skipping trade search'" chance="100"/>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': EARLY MONEY GATE: ' +
+              (if $earlyPayIsPlayerWallet then 'player wallet' else 'account of ' + (if $earlyPayAccount.$Account != null then @$earlyPayAccount.$Account.knownname else 'commander')) +
+              '=' + ($earlyMoneyCheck / 100) + ' Cr at or below threshold=' + ($moneyGateThreshold / 100) + ' Cr' +
+              (if $earlyPayIsPlayerWallet then ' (MinPlayerMoney=' + this.$minPlayerMoney + ' + 1000 buffer)' else '') + ' - skipping trade search'" chance="100"/>
             <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
             <resume label="no_trade_retry"/>
           </do_if>
@@ -3249,8 +3257,10 @@
                and that case is already handled by the early gate. Clearing it here prevents a
                solvent fleet from staying frozen on a stale wealth snapshot (the cap could have
                been recorded at a higher balance than the player currently holds). The per-trade
-               authoritative budget guard still blocks any individual unaffordable trade. -->
-          <do_if value="global.$GT_MoneyCapActive? and global.$GT_MoneyCapActive">
+               authoritative budget guard still blocks any individual unaffordable trade.
+               Only a player-wallet payer may clear it: a station-funded ship says nothing about
+               the wallet balance the cap describes. -->
+          <do_if value="$earlyPayIsPlayerWallet and global.$GT_MoneyCapActive? and global.$GT_MoneyCapActive">
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GLOBAL MONEY CAP CLEARED (solvent): player money=' + ($earlyMoneyCheck / 100) + ' Cr above gate threshold (' + ($moneyGateThreshold / 100) + ' Cr) - resuming fleet trade searches'" chance="100"/>
             </do_if>
@@ -4795,18 +4805,24 @@
         <debug_text text="'[GT-AI] ' + this.ship.idcode + ': REACHED trade_found label - starting blacklist validation at game time ' + player.age" chance="100"/>
       </do_if>
       
-      <!-- FAST MONEY CHECK: Short-circuit the expensive 20-trade validation loop when player
-           money has dropped below the threshold since this ship's search started.
-           Checks static threshold (MinPlayerMoney + 1000 buffer). The fleet money cap is NOT
-           consulted here: it is a wealth snapshot and must never block a ship that already holds
-           more than the threshold. The per-trade authoritative guard handles unaffordable trades. -->
+      <!-- FAST MONEY CHECK: Short-circuit the expensive 20-trade validation loop when the account
+           that pays the buy leg has dropped below the threshold since this ship's search started.
+           Same account as the early gate (vanilla this.container.money): commander station when
+           station-assigned, else the player wallet with its MinPlayerMoney + 1000 reserve.
+           The fleet money cap is NOT consulted here: it is a wealth snapshot and must never block
+           a ship that already holds more than the threshold. -->
       <do_if value="not this.$minPlayerMoney?">
         <run_script name="'lib.gt.attention.min_player_money'" result="this.$minPlayerMoney"/>
       </do_if>
-      <set_value name="$fastMoneyThreshold" exact="(this.$minPlayerMoney + 1000)Cr"/>
-      <do_if value="player.money le $fastMoneyThreshold">
+      <run_script name="'lib.gt.pay.account'" result="$fastPayAccount">
+        <param name="ship" value="this.ship"/>
+      </run_script>
+      <set_value name="$fastMoneyThreshold" exact="if $fastPayAccount.$IsPlayerWallet then (this.$minPlayerMoney + 1000)Cr else 0"/>
+      <do_if value="$fastPayAccount.$Money le $fastMoneyThreshold">
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FAST MONEY CHECK at trade_found: player.money=' + (player.money / 100) + ' Cr, threshold=' + (this.$minPlayerMoney + 1000) + ' Cr - skipping validation, backing off'" chance="100"/>
+          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': FAST MONEY CHECK at trade_found: ' +
+            (if $fastPayAccount.$IsPlayerWallet then 'player wallet' else 'account of ' + (if $fastPayAccount.$Account != null then @$fastPayAccount.$Account.knownname else 'commander')) +
+            '=' + ($fastPayAccount.$Money / 100) + ' Cr, threshold=' + ($fastMoneyThreshold / 100) + ' Cr - skipping validation, backing off'" chance="100"/>
         </do_if>
         <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
         <resume label="no_trade_retry"/>
@@ -6930,8 +6946,15 @@
                  and budget checks. -->
           <create_list name="$mk4QueueableTrades"/>
           <create_list name="$mk4PreparedCandidates"/>
-          <set_value name="$mk4QueueBudgetMoney" exact="player.money"/>
-          <set_value name="$mk4QueueMinMoney" exact="if this.$minPlayerMoney? then this.$minPlayerMoney else 1000"/>
+          <!-- Budget = the account the engine bills for the buy legs (vanilla this.container.money):
+               the commander station when station-assigned, else the player wallet. MinPlayerMoney is
+               a player-wallet reserve, so a station account keeps no reserve. -->
+          <run_script name="'lib.gt.pay.account'" result="$mk4PayAccount">
+            <param name="ship" value="this.ship"/>
+          </run_script>
+          <set_value name="$mk4QueueBudgetMoney" exact="$mk4PayAccount.$Money"/>
+          <set_value name="$mk4QueuePayIsPlayerWallet" exact="$mk4PayAccount.$IsPlayerWallet"/>
+          <set_value name="$mk4QueueMinMoney" exact="if not $mk4QueuePayIsPlayerWallet then 0 else (if this.$minPlayerMoney? then this.$minPlayerMoney else 1000)"/>
           <set_value name="$mk4QueueSourceCount" exact="0"/>
           <set_value name="$mk4PrimaryBudgetBlocked" exact="false"/>
           <!-- TRUE only when the primary leg fails for a genuine money reason (cannot afford even
@@ -7639,11 +7662,17 @@
 
           <do_if value="$mk4PrimaryBudgetBlocked or $mk4QueueableTrades.count == 0">
             <do_if value="$mk4FleetMoneyInsolvent">
-              <!-- Genuine insolvency: the primary leg cannot afford even 1 unit above
-                   MinPlayerMoney. Raise the fleet-wide money cap and back off long. -->
-              <set_value name="global.$GT_MoneyCapActive" exact="true"/>
-              <set_value name="global.$GT_MoneyCapMoney" exact="player.money"/>
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GLOBAL MONEY CAP SET: player.money=' + (player.money / 100) + ' Cr — cannot afford 1 unit above MinPlayerMoney (' + $mk4QueueMinMoney + ' Cr)'" chance="100"/>
+              <!-- Genuine insolvency: the primary leg cannot afford even 1 unit from the billed
+                   account. The fleet-wide cap describes the player wallet, so only a wallet payer
+                   raises it - one underfunded station must not freeze the whole fleet. -->
+              <do_if value="$mk4QueuePayIsPlayerWallet">
+                <set_value name="global.$GT_MoneyCapActive" exact="true"/>
+                <set_value name="global.$GT_MoneyCapMoney" exact="player.money"/>
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GLOBAL MONEY CAP SET: player.money=' + (player.money / 100) + ' Cr — cannot afford 1 unit above MinPlayerMoney (' + $mk4QueueMinMoney + ' Cr)'" chance="100"/>
+              </do_if>
+              <do_else>
+                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': station account cannot afford 1 unit: ' + (if $mk4PayAccount.$Account != null then @$mk4PayAccount.$Account.knownname else 'commander') + '=' + ($mk4QueueBudgetMoney / 100) + ' Cr — fleet money cap not raised (station-assigned payer)'" chance="100"/>
+              </do_else>
               <set_value name="this.$lastNoTradeReason" exact="'insufficient_funds'"/>
             </do_if>
             <do_else>
@@ -8463,6 +8492,7 @@
           <set_value name="this.$gtRejectRestrictionSafe" exact="$tradesRejectedRestrictionSafe"/>
           <set_value name="this.$gtRejectDemandReservedSafe" exact="$tradesRejectedDemandReservedSafe"/>
           <set_value name="this.$gtRejectSearchMethod" exact="$searchMethod"/>
+
           
           <!-- Search method already captured earlier in trade_found label -->
           <!-- (from cache, signal param2, or global storage) -->
@@ -9179,9 +9209,19 @@
           </do_if>
           <set_value name="$timeSinceLastInsufficientFundsLogbook" exact="player.age - $lastInsufficientFundsLogbook"/>
           <do_if value="$timeSinceLastInsufficientFundsLogbook ge 300s or $lastInsufficientFundsLogbook == 0">
-            <set_value name="$playerMoneyDisplay" exact="player.money / 100"/>
-            <set_value name="$thresholdDisplay" exact="if this.$minPlayerMoney? then this.$minPlayerMoney else 1000"/>
-            <set_value name="$logbookMessage" exact="'Commander,\n\nTrading operations paused — insufficient funds.\n\nPlayer account: ' + $playerMoneyDisplay + ' Cr\nMinimum required: ' + $thresholdDisplay + ' Cr\n\nI will resume trading automatically once funds are above the threshold.\n\nYou can adjust the minimum in:\nGalaxyTrader Settings &gt; Fleet &gt; Min Player Money\n\nStanding by,\nAboard ' + this.ship.knownname"/>
+            <!-- Name the account that is actually short: a station-assigned ship spends its
+                 commander station's account, where Min Player Money does not apply. -->
+            <run_script name="'lib.gt.pay.account'" result="$logPayAccount">
+              <param name="ship" value="this.ship"/>
+            </run_script>
+            <set_value name="$payMoneyDisplay" exact="$logPayAccount.$Money / 100"/>
+            <do_if value="$logPayAccount.$IsPlayerWallet">
+              <set_value name="$thresholdDisplay" exact="if this.$minPlayerMoney? then this.$minPlayerMoney else 1000"/>
+              <set_value name="$logbookMessage" exact="'Commander,\n\nTrading operations paused - insufficient funds.\n\nPlayer account: ' + $payMoneyDisplay + ' Cr\nMinimum required: ' + $thresholdDisplay + ' Cr\n\nI will resume trading automatically once funds are above the threshold.\n\nYou can adjust the minimum in:\nGalaxyTrader Settings &gt; Fleet &gt; Min Player Money\n\nStanding by,\nAboard ' + this.ship.knownname"/>
+            </do_if>
+            <do_else>
+              <set_value name="$logbookMessage" exact="'Commander,\n\nTrading operations paused - my station account cannot fund a purchase.\n\nStation: ' + (if $logPayAccount.$Account != null then @$logPayAccount.$Account.knownname else 'commander') + '\nStation account: ' + $payMoneyDisplay + ' Cr\n\nI am assigned to that station, so my purchases are paid from its account, not from your personal funds. Transfer credits to the station to resume.\n\nStanding by,\nAboard ' + this.ship.knownname"/>
+            </do_else>
             <signal_objects object="player.galaxy" param="'GT_WriteLogbook'" param2="table[
               $Message = $logbookMessage,
               $Category = 'alerts',

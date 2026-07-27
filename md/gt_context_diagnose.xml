@@ -1234,7 +1234,29 @@
         <do_if value="global.$GT_AIParameters? and global.$GT_AIParameters.{$ship}? and global.$GT_AIParameters.{$ship}.$MinPlayerMoney? and global.$GT_AIParameters.{$ship}.$MinPlayerMoney gt $minPlayerMoney">
           <set_value name="$minPlayerMoney" exact="global.$GT_AIParameters.{$ship}.$MinPlayerMoney"/>
         </do_if>
-        <set_value name="$moneyGateThreshold" exact="$minPlayerMoney + 100000"/>
+        <!-- Billed account, mirroring lib.gt.pay.account: the first station in the ship's commander
+             chain, else the player wallet. The ship itself is never the source - a ship account only
+             exists as vanilla's temporary account for an in-flight trade order. Min Player Money is
+             a wallet reserve and does not apply to a station account, which vanilla only requires to
+             be non-empty. -->
+        <set_value name="$payAccount" exact="null"/>
+        <do_if value="$ship? and @$ship.exists">
+          <set_value name="$payHop" exact="if $ship.commander? and @$ship.commander.exists and @$ship.commander != $ship then @$ship.commander else null"/>
+          <set_value name="$payHops" exact="0"/>
+          <do_while value="$payAccount == null and $payHop != null and $payHops lt 8">
+            <set_value name="$payHops" operation="add"/>
+            <do_if value="@$payHop.isclass.station">
+              <set_value name="$payAccount" exact="$payHop"/>
+            </do_if>
+            <do_else>
+              <set_value name="$payHop" exact="if $payHop.commander? and @$payHop.commander.exists and @$payHop.commander != $payHop then @$payHop.commander else null"/>
+            </do_else>
+          </do_while>
+        </do_if>
+        <set_value name="$payIsPlayerWallet" exact="$payAccount == null"/>
+        <set_value name="$payMoney" exact="if $payAccount != null then @$payAccount.money else player.money"/>
+        <set_value name="$payAccountLabel" exact="if $payIsPlayerWallet then 'player wallet' else 'station account of ' + (if $payAccount != null and @$payAccount.knownname != null then @$payAccount.knownname else 'commander')"/>
+        <set_value name="$moneyGateThreshold" exact="if $payIsPlayerWallet then ($minPlayerMoney + 100000) else 0"/>
 
         <!-- ======================================================== -->
         <!-- SECTION 3: Configuration Snapshot                        -->
@@ -1265,6 +1287,9 @@
 
         <!-- Min Player Money (global gate - ships wait below this) -->
         <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Min Player Money', $Status = 'INFO', $Detail = '' + ($minPlayerMoney / 100) + ' Cr (ships idle below this)']"/>
+
+        <!-- Which account pays this ship's purchases (vanilla billing) -->
+        <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Buy Leg Paid By', $Status = 'INFO', $Detail = (if $payIsPlayerWallet then 'Player wallet' else 'Station account: ' + (if $payAccount != null and @$payAccount.knownname != null then @$payAccount.knownname else 'commander')) + ' - ' + ($payMoney / 100) + ' Cr' + (if $payIsPlayerWallet then ' (Min Player Money applies)' else ' (Min Player Money does not apply)')]"/>
 
         <!-- Max distance (maxbuy / maxsell from order params) -->
         <!-- IMPORTANT: order param default expressions use this.ship which doesn't resolve in MD context.
@@ -6077,7 +6102,6 @@
         <set_value name="$rejectMK4ForeignCustomer" exact="0"/>
         <set_value name="$rejectMK4SupplierPolicy" exact="0"/>
         <set_value name="$rejectMK4TradeRules" exact="0"/>
-        <set_value name="$rejectMK4CustomerNoFunds" exact="0"/>
         <set_value name="$rejectMK4ServeHomeScope" exact="0"/>
         <set_value name="$rejectMK4BuildStorageOnly" exact="0"/>
         <set_value name="$rejectMK4DemandReservedExhausted" exact="0"/>
@@ -6664,7 +6688,7 @@
             <!-- IPP player-supplier: mirror runtime MinPlayerMoney skip (order.trade.galaxytrader.xml). -->
             <set_value name="$maxByMoney" exact="999999"/>
             <do_if value="not $diagPairPlayerFreeSupplier and $buyPrice gt 0">
-              <set_value name="$maxByMoney" exact="$playerMoney / $buyPrice"/>
+              <set_value name="$maxByMoney" exact="$payMoney / $buyPrice"/>
             </do_if>
             <set_value name="$maxByOffer" exact="[$sellOfferAmount, $buyOfferAmount].min"/>
             <set_value name="$maxAmount" exact="[$maxByCargo, $maxByMoney, $maxByOffer].min"/>
@@ -6752,54 +6776,9 @@
                 </do_if>
               </do_if>
             </do_if>
-            <!-- Customer funds (NOT Ignore-Trade-Rules gated): empty player BS/station account is
-                 NOT a trade-rule failure. cantradewith.{otherStation} returns false when broke and
-                 was mislabeled as mk4_trade_rules.
-                 Resolve the paying account the same way as sell clamp / validate.amounts
-                 (offer.buyer → owner → sellStation), not player.money. -->
-            <do_if value="$pairVerdict == 'PASS' and ($orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2')">
-              <do_if value="$buyOffer? and @$buyOffer.exists and $sellStation? and $sellStation.exists and $buyOffer.unitprice gt 0">
-                <set_value name="$diagCustPayAccount" exact="null"/>
-                <do_if value="$buyOffer.buyer? and @$buyOffer.buyer.exists">
-                  <set_value name="$diagCustPayAccount" exact="@$buyOffer.buyer"/>
-                </do_if>
-                <do_if value="$diagCustPayAccount == null and $buyOffer.owner? and @$buyOffer.owner.exists">
-                  <set_value name="$diagCustPayAccount" exact="@$buyOffer.owner"/>
-                </do_if>
-                <do_if value="$diagCustPayAccount == null">
-                  <set_value name="$diagCustPayAccount" exact="$sellStation"/>
-                </do_if>
-                <set_value name="$diagCustomerIsPlayer" exact="false"/>
-                <do_if value="$diagCustPayAccount != null and @$diagCustPayAccount.isplayerowned">
-                  <set_value name="$diagCustomerIsPlayer" exact="true"/>
-                </do_if>
-                <do_elseif value="$diagCustPayAccount != null and @$diagCustPayAccount.isclass.buildstorage and $diagCustPayAccount.base? and @$diagCustPayAccount.base.exists and @$diagCustPayAccount.base.isplayerowned">
-                  <set_value name="$diagCustomerIsPlayer" exact="true"/>
-                </do_elseif>
-                <do_elseif value="@$sellStation.isplayerowned">
-                  <set_value name="$diagCustomerIsPlayer" exact="true"/>
-                </do_elseif>
-                <do_elseif value="@$sellStation.isclass.buildstorage and $sellStation.base? and @$sellStation.base.exists and @$sellStation.base.isplayerowned">
-                  <set_value name="$diagCustomerIsPlayer" exact="true"/>
-                </do_elseif>
-                <do_if value="$diagCustomerIsPlayer">
-                  <!-- Match lib.gt.mk42.cache.search: buyfree OR player supplier. NPC→empty stays FAIL. -->
-                  <set_value name="$diagFreeDelivery" exact="false"/>
-                  <do_if value="@$buyOffer.buyfree or @$buyOffer.buyfree.{$sellStation}">
-                    <set_value name="$diagFreeDelivery" exact="true"/>
-                  </do_if>
-                  <do_elseif value="$buyStation? and $buyStation.exists and @$buyStation.isplayerowned">
-                    <set_value name="$diagFreeDelivery" exact="true"/>
-                  </do_elseif>
-                  <set_value name="$diagCustPayMoney" exact="if $diagCustPayAccount != null and $diagCustPayAccount.exists then @$diagCustPayAccount.money else @$sellStation.money"/>
-                  <do_if value="not $diagFreeDelivery and $diagCustPayMoney lt $buyOffer.unitprice">
-                    <set_value name="$pairVerdict" exact="'FAIL'"/>
-                    <set_value name="$pairReason" exact="'customer_no_funds: ' + (if $sellStation.knownname? then $sellStation.knownname else 'customer') + ' account has ' + ($diagCustPayMoney / 100) + ' Cr, needs ' + ($buyOffer.unitprice / 100) + ' Cr/unit'"/>
-                    <set_value name="$rejectMK4CustomerNoFunds" operation="add"/>
-                  </do_if>
-                </do_if>
-              </do_if>
-            </do_if>
+            <!-- No customer-funds check: a player-to-player delivery is buyfree in vanilla, so the
+                 destination station / build storage account never pays for a supply run. The NPC
+                 purchase is billed to the player account, which the money gate already covers. -->
             <!-- Faction trade rules only: offer.restriction.factions vs ship owner (ITR bypasses).
                  Never use cantradewith.{otherStation} here (conflates empty BS account with faction rules). -->
             <do_if value="$pairVerdict == 'PASS' and not $ignoreTradeRules and ($orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2') and $ship? and $ship.exists and $ship.owner?">
@@ -7054,7 +7033,7 @@
               <do_if value="$maxAmount le 0">
                 <do_if value="$maxByMoney le 0">
                   <set_value name="$pairVerdict" exact="'FAIL'"/>
-                  <set_value name="$pairReason" exact="'cant_afford (need ' + ($buyPrice / 100) + ' Cr/unit, have ' + ($playerMoney / 100) + ' Cr)'"/>
+                  <set_value name="$pairReason" exact="'cant_afford (need ' + ($buyPrice / 100) + ' Cr/unit, ' + $payAccountLabel + ' has ' + ($payMoney / 100) + ' Cr)'"/>
                   <set_value name="$rejectCantAfford" operation="add"/>
                 </do_if>
                 <do_else>
@@ -7182,10 +7161,11 @@
                 </do_else>
                 <do_if value="not $diagClampAmount? or $diagClampAmount le 0">
                   <set_value name="$pairVerdict" exact="'FAIL'"/>
-                  <!-- Buy-leg clamp (ship buys from supplier). Rare when player.money is high. -->
+                  <!-- Buy-leg clamp (ship buys from supplier): the engine bills the ship's account,
+                       i.e. the commander station when assigned, else the player wallet. -->
                   <do_if value="$diagClampReason? and $diagClampReason == 'buyer_money'">
                     <set_value name="$diagNeedCr" exact="if $buyPrice? and $buyPrice gt 0 then ($buyPrice / 100) else 0"/>
-                    <set_value name="$pairReason" exact="'buy_clamp_zero (ship cannot pay supplier at ' + $diagNeedCr + ' Cr/u; player=' + (player.money / 100) + ' Cr, ship=' + (@$ship.money / 100) + ' Cr - not destination station)'"/>
+                    <set_value name="$pairReason" exact="'buy_clamp_zero (ship cannot pay supplier at ' + $diagNeedCr + ' Cr/u; billed ' + $payAccountLabel + '=' + ($payMoney / 100) + ' Cr - not destination station)'"/>
                   </do_if>
                   <do_elseif value="$diagClampReason? and $diagClampReason == 'seller_cargo'">
                     <set_value name="$pairReason" exact="'buy_clamp_zero (supplier has no exportable stock - broker phantom or fully reserved)'"/>
@@ -7220,13 +7200,40 @@
                 </do_if>
                 <do_if value="$diagClampSellBuyer != null">
                   <set_value name="$diagSellClampReason" exact="null"/>
+                  <set_value name="$diagSellClampInput" exact="$diagClampAmount"/>
                   <clamp_trade_amount trade="$buyOffer" amount="$diagClampAmount" buyer="$diagClampSellBuyer" result="$diagClampAmount" reason="$diagSellClampReason"/>
+                  <!-- Mirror the free-route restore in lib.gt.mk42.validate.amounts: a player-owned
+                       customer pays nothing for the delivery (player-to-player is buyfree), so the
+                       vanilla buyer_money clamp must not zero the pair here either. -->
+                  <do_if value="(not $diagClampAmount? or $diagClampAmount le 0) and $diagSellClampReason? and $diagSellClampReason == 'buyer_money'">
+                    <set_value name="$diagSellCustomerIsPlayer" exact="false"/>
+                    <do_if value="@$diagClampSellBuyer.isplayerowned">
+                      <set_value name="$diagSellCustomerIsPlayer" exact="true"/>
+                    </do_if>
+                    <do_elseif value="@$diagClampSellBuyer.isclass.buildstorage and $diagClampSellBuyer.base? and @$diagClampSellBuyer.base.exists and @$diagClampSellBuyer.base.isplayerowned">
+                      <set_value name="$diagSellCustomerIsPlayer" exact="true"/>
+                    </do_elseif>
+                    <do_if value="$diagSellCustomerIsPlayer">
+                      <set_value name="$diagClampAmount" exact="$diagSellClampInput"/>
+                      <do_if value="$buyOffer.desiredamount? and @$buyOffer.desiredamount gt 0">
+                        <set_value name="$diagClampAmount" exact="[$diagClampAmount, @$buyOffer.desiredamount].min"/>
+                      </do_if>
+                      <do_if value="$buyOffer.ware?">
+                        <set_value name="$diagSellRestoreWare" exact="@$buyOffer.ware"/>
+                        <set_value name="$diagSellRestoreCargo" exact="@$diagClampSellBuyer.cargo.{$diagSellRestoreWare}.free"/>
+                        <do_if value="$diagSellRestoreCargo? and $diagSellRestoreCargo ge 0">
+                          <set_value name="$diagClampAmount" exact="[$diagClampAmount, $diagSellRestoreCargo].min"/>
+                        </do_if>
+                      </do_if>
+                    </do_if>
+                  </do_if>
                   <do_if value="not $diagClampAmount? or $diagClampAmount le 0">
                     <set_value name="$pairVerdict" exact="'FAIL'"/>
-                    <!-- Sell-leg clamp: buyer_money = DESTINATION station/BS account, never player.money. -->
+                    <!-- Sell-leg clamp: buyer_money = DESTINATION station/BS account, never player.money.
+                         Only reachable for an NPC customer now (player customers restore above). -->
                     <do_if value="$diagSellClampReason? and $diagSellClampReason == 'buyer_money'">
                       <set_value name="$diagCustMoneyCr" exact="if $diagClampSellBuyer? and $diagClampSellBuyer.exists then (@$diagClampSellBuyer.money / 100) else 0"/>
-                      <set_value name="$pairReason" exact="'sell_clamp_zero (station account cannot pay: ' + (if $sellStationLabel? then $sellStationLabel else 'customer') + ' has ' + $diagCustMoneyCr + ' Cr - fund that station/BS, or buy from a player supplier for free virtualmoney delivery)'"/>
+                      <set_value name="$pairReason" exact="'sell_clamp_zero (station account cannot pay: ' + (if $sellStationLabel? then $sellStationLabel else 'customer') + ' has ' + $diagCustMoneyCr + ' Cr)'"/>
                       <set_value name="$rejectSellClampNoFunds" operation="add"/>
                     </do_if>
                     <do_elseif value="$diagSellClampReason? and $diagSellClampReason == 'buyer_cargo'">
@@ -7777,7 +7784,6 @@
           <append_to_list name="$sec8.$Rows" exact="table[$Check = 'MK4 Foreign Customer Blocked', $Status = if $rejectMK4ForeignCustomer gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectMK4ForeignCustomer]"/>
           <append_to_list name="$sec8.$Rows" exact="table[$Check = 'MK4 Supplier Policy Blocked', $Status = if $rejectMK4SupplierPolicy gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectMK4SupplierPolicy]"/>
           <append_to_list name="$sec8.$Rows" exact="table[$Check = 'MK4 Trade Rules Blocked (offer.restriction.factions)', $Status = if $rejectMK4TradeRules gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectMK4TradeRules + ' (true faction restriction on offer; Ignore Trade Rules bypasses; empty BS account is NOT counted here)']"/>
-          <append_to_list name="$sec8.$Rows" exact="table[$Check = 'MK4 Customer No Funds (station account)', $Status = if $rejectMK4CustomerNoFunds gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectMK4CustomerNoFunds + ' (destination station/BS cannot afford 1 unit; Ignore Trade Rules does not bypass)']"/>
           <append_to_list name="$sec8.$Rows" exact="table[$Check = 'MK4 Serve-Home Scope Blocked', $Status = if $rejectMK4ServeHomeScope gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectMK4ServeHomeScope]"/>
           <append_to_list name="$sec8.$Rows" exact="table[$Check = 'MK4 Build Storage Only Blocked', $Status = if $rejectMK4BuildStorageOnly gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectMK4BuildStorageOnly]"/>
           <append_to_list name="$sec8.$Rows" exact="table[$Check = 'MK4 Demand Reserved Exhausted', $Status = if $rejectMK4DemandReservedExhausted gt 0 then 'WARN' else 'INFO', $Detail = '' + $rejectMK4DemandReservedExhausted]"/>
@@ -8377,7 +8383,7 @@
         <do_else>
           <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'Pairs Evaluated', $Status = 'INFO', $Detail = '' + $pairCount + ' examined (tradematch walk budget ' + $diagPairEvalCap + '), ' + $pairDetails.count + ' rows listed score-sorted (' + $passCount + ' PASS trade_found, ' + ($pairCount - $passCount) + ' FAIL)' + (if $diagPairDetailsTruncated then (' — top ' + $diagPairDisplayCap + ' by score; raise cap in diagnose if needed') else '') + '. UI paginates large tables.']"/>
           <do_if value="($orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2')">
-            <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'MK4 Pair Legend', $Status = 'INFO', $Detail = 'PASS = executable now; FAIL: customer_no_funds / sell_clamp buyer_money = destination station/BS account empty/low; mk4_trade_rules = offer.restriction.factions. Player supplier = free virtualmoney. [player]/[NPC] = supplier ownership.']"/>
+            <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'MK4 Pair Legend', $Status = 'INFO', $Detail = 'PASS = executable now; FAIL: mk4_trade_rules = offer.restriction.factions. Player customers pay nothing (player-to-player is buyfree), so their account balance never blocks a pair. Player supplier = free virtualmoney. [player]/[NPC] = supplier ownership.']"/>
           </do_if>
           <do_if value="$ignorePlayerPricing and $orderId == 'GalaxyTraderMK3'">
             <append_to_list name="$sec8b.$Rows" exact="table[$Check = 'IPP Pair Legend', $Status = 'INFO', $Detail = '[IPP] = player-owned supplier; gross NPC income scoring; internal buy leg (no credit transfer); profit/ROI/min-money/margin gates bypassed. [NPC] = non-player supplier. Runtime still picks highest score overall.']"/>
@@ -9064,9 +9070,14 @@
           <append_to_list name="$suggestions" exact="'Assign ship to a commander or set a home sector'"/>
         </do_elseif>
         <!-- Priority 2: Money gate -->
-        <do_elseif value="$playerMoney le $moneyGateThreshold">
-          <set_value name="$verdict" exact="'BLOCKED: Money gate - player funds too low (' + ($playerMoney / 100) + ' Cr lt ' + ($moneyGateThreshold / 100) + ' Cr threshold)'"/>
-          <append_to_list name="$suggestions" exact="'Increase player funds or lower MinPlayerMoney setting'"/>
+        <do_elseif value="$payMoney le $moneyGateThreshold">
+          <set_value name="$verdict" exact="'BLOCKED: Money gate - ' + $payAccountLabel + ' too low (' + ($payMoney / 100) + ' Cr lt ' + ($moneyGateThreshold / 100) + ' Cr threshold)'"/>
+          <do_if value="$payIsPlayerWallet">
+            <append_to_list name="$suggestions" exact="'Increase player funds or lower MinPlayerMoney setting'"/>
+          </do_if>
+          <do_else>
+            <append_to_list name="$suggestions" exact="'This ship is assigned to a station, so vanilla bills that station account for its purchases (not your personal funds). Transfer credits to ' + (if $payAccount != null and @$payAccount.knownname != null then @$payAccount.knownname else 'the commander station') + ', or unassign the ship to trade from the player wallet.'"/>
+          </do_else>
         </do_elseif>
         <!-- Priority 2b: MK2 verdict from the station-pair eval, NOT the sector-wide scan.
              MK2 only trades its configured source/destination lists, so the generic Search
@@ -9402,10 +9413,6 @@
             <set_value name="$maxReject" exact="$rejectMK4TradeRules"/>
             <set_value name="$maxRejectName" exact="'mk4_trade_rules_blocked (offer.restriction.factions)'"/>
           </do_if>
-          <do_if value="$rejectMK4CustomerNoFunds gt $maxReject">
-            <set_value name="$maxReject" exact="$rejectMK4CustomerNoFunds"/>
-            <set_value name="$maxRejectName" exact="'customer_no_funds (BS/station account empty or too low)'"/>
-          </do_if>
           <do_if value="$rejectMK4ServeHomeScope gt $maxReject">
             <set_value name="$maxReject" exact="$rejectMK4ServeHomeScope"/>
             <set_value name="$maxRejectName" exact="'mk4_serve_home_scope_blocked'"/>
@@ -9470,9 +9477,6 @@
           </do_if>
           <do_if value="($orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2') and $rejectMK4TradeRules gt 0">
             <append_to_list name="$suggestions" exact="'Trade rules block ' + $rejectMK4TradeRules + ' pair(s): offer.restriction.factions excludes this ship (mk4_trade_rules). Enable Ignore Trade Rules, or widen the offer faction list.'"/>
-          </do_if>
-          <do_if value="($orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2') and $rejectMK4CustomerNoFunds gt 0">
-            <append_to_list name="$suggestions" exact="'Destination station/BS account empty/low on ' + $rejectMK4CustomerNoFunds + ' pair(s) (customer_no_funds, offer not buyfree, supplier not player). Fund those accounts, or buy from a player supplier (free virtualmoney). Ignore Trade Rules does not fix this.'"/>
           </do_if>
           <do_if value="($orderId == 'GalaxyTraderMK4Supply' or $orderId == 'GalaxyTraderMK4Supply2') and $rejectMK4SupplierPolicy gt 0">
             <append_to_list name="$suggestions" exact="'Review MK4 supplier policy (buyFromPlayer / buyFromFaction). Current policy excludes many suppliers.'"/>

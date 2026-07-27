@@ -3276,18 +3276,25 @@
              First-time baseline initialization must not invalidate cache.
              Also folds in $effectiveIgnorePlayerPricing and $searchFactionPriority so toggling
              MK3 "Ignore Player Pricing" or faction priority invalidates cache entries produced
-             under the old policy (scores bake faction bonus at write time). -->
+             under the old policy (scores bake faction bonus at write time).
+             Search radii are part of the signature as well: pool rows carry the distances they were
+             written at, and the read-time distance gate drops every row that exceeds a reduced
+             range - without invalidation the whole home pool becomes permanently unreadable. -->
         <set_value name="$ippTag" exact="if $searchIgnorePlayerPricing? and $searchIgnorePlayerPricing then '1' else '0'"/>
         <set_value name="$fpTag" exact="if $searchFactionPriority? then $searchFactionPriority else 0"/>
-        <set_value name="$pwSig" exact="'0|' + (if $effectivePriorityScoreMultiplier? then $effectivePriorityScoreMultiplier else 125) + '|IPP=' + $ippTag + '|FP=' + $fpTag"/>
+        <set_value name="$distTag" exact="'|D=' + $searchExecutionMaxBuy + '/' + $searchExecutionMaxSell + '/' + $searchDiscoveryMaxDistance"/>
+        <!-- Live search scans blacklist-aware, so pool contents depend on the blacklist too. -->
+        <set_value name="$distTag" exact="$distTag + '|BL=' + (if global.$GT_BlacklistEpoch? then global.$GT_BlacklistEpoch else 0)"/>
+        <set_value name="$pwSig" exact="'0|' + (if $effectivePriorityScoreMultiplier? then $effectivePriorityScoreMultiplier else 125) + '|IPP=' + $ippTag + '|FP=' + $fpTag + $distTag"/>
         <do_if value="$effectivePriorityWares? and typeof $effectivePriorityWares == datatype.list and $effectivePriorityWares.count gt 0">
-          <set_value name="$pwSig" exact="'' + $effectivePriorityWares.count + '|' + (if $effectivePriorityScoreMultiplier? then $effectivePriorityScoreMultiplier else 125) + '|IPP=' + $ippTag + '|FP=' + $fpTag + '|'"/>
+          <set_value name="$pwSig" exact="'' + $effectivePriorityWares.count + '|' + (if $effectivePriorityScoreMultiplier? then $effectivePriorityScoreMultiplier else 125) + '|IPP=' + $ippTag + '|FP=' + $fpTag + $distTag + '|'"/>
           <do_all exact="$effectivePriorityWares.count" counter="$pwi">
             <set_value name="$pw" exact="$effectivePriorityWares.{$pwi}"/>
             <set_value name="$pwSig" exact="$pwSig + (if $pwi gt 1 then ',' else '') + (if $pw? and $pw != null and $pw.id? then @$pw.id else '?')"/>
           </do_all>
         </do_if>
         <set_value name="$priorityWaresChanged" exact="this.$lastPriorityWaresSig? and this.$lastPriorityWaresSig != $pwSig"/>
+        <set_value name="$priorityWaresChangedFrom" exact="if this.$lastPriorityWaresSig? then this.$lastPriorityWaresSig else '(none)'"/>
         <do_if value="$priorityWaresChanged and $searchHomeSector? and $searchHomeSector.exists">
           <!-- Clear cache for this home sector only (triggers live search on next lookup) -->
           <do_if value="global.$GT_TradeCache? and global.$GT_TradeCache.{$searchHomeSector}?">
@@ -3299,7 +3306,7 @@
               <remove_value name="global.$GT_TradeCacheMaxDistance.{$searchHomeSector}"/>
             </do_if>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Priority wares changed - cleared cache for home sector ' + (if $searchHomeSector.knownname? then @$searchHomeSector.knownname else '?') + ' (next search will run live)'" chance="100"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Search settings changed - cleared cache for home sector ' + (if $searchHomeSector.knownname? then @$searchHomeSector.knownname else '?') + ' (next search will run live) sig: ' + $priorityWaresChangedFrom + ' -> ' + $pwSig" chance="100"/>
             </do_if>
           </do_if>
         </do_if>
@@ -3479,7 +3486,11 @@
           <set_value name="$pipelineTradeList" exact="if $cacheSearchResult.$TradeList? then @$cacheSearchResult.$TradeList else []"/>
         </do_if>
         <do_else>
-          <!-- 2) Pathfinding (discovery radius — fleet cache fill, neutral BL; read filters per ship).
+          <!-- 2) Pathfinding (discovery radius, neutral range scan scoped to non-blacklisted sectors).
+               A fleet blacklist configured as "block all except X" reduces the opportunity set to X
+               instead of scanning the full jump radius and discarding the rest at cache read.
+               filterBlacklistedSpaces drops blocked sectors by membership only, so allowed sectors
+               that home cannot reach through the blacklist stay searchable for stranded ships.
                sell_only (CL): spaces from ship current sector (BL-aware). Scan radius =
                ship→home + MaxSell so the home MaxSell bubble stays reachable when the ship
                is away from home; territory gate remains home MaxSell in lib.gt.search.sell_only. -->
@@ -3507,7 +3518,9 @@
             <param name="maxDistanceBuy" value="$pathMaxBuy"/>
             <param name="maxDistanceSell" value="$pathMaxSell"/>
             <param name="ignoreBlacklist" value="if $searchMode? and $searchMode == 'sell_only' then false else true"/>
+            <param name="filterBlacklistedSpaces" value="true"/>
             <param name="blacklistGroup" value="if this.$blacklistgroup? then this.$blacklistgroup else blacklistgroup.civilian"/>
+            <param name="sectorWhitelist" value="if $effectiveSectorWhitelist? and $effectiveSectorWhitelist != null then $effectiveSectorWhitelist else []"/>
           </run_script>
           <!-- SAVEGAME GUARD -->
           <do_if value="not $searchMode?">
@@ -4278,6 +4291,7 @@
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Priority-first reorder SKIPPED: no priority wares (this.$effectivePriorityWares=' + (if this.$effectivePriorityWares? and this.$effectivePriorityWares != null then this.$effectivePriorityWares.count else 'null') + ')'" chance="100"/>
         </do_if>
       </do_if>
+      <set_value name="$priorityBoundary" exact="0"/>
       <do_if value="$pwForReorder? and $pwForReorder != null and $pwForReorder.count gt 0 and $tradeList? and $tradeList.count gt 0">
         <create_list name="$priorityTrades"/>
         <create_list name="$nonPriorityTrades"/>
@@ -4326,9 +4340,17 @@
           <append_to_list name="$reorderedList" exact="$nonPriorityTrades.{$ni}"/>
         </do_all>
         <set_value name="$tradeList" exact="$reorderedList"/>
+        <!-- Fleet spread below rotates within this boundary so it cannot undo the priority ordering. -->
+        <set_value name="$priorityBoundary" exact="$priorityTrades.count"/>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <do_if value="$priorityTrades.count gt 0">
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Priority-first reorder: ' + $priorityTrades.count + ' priority-ware trades moved to front of ' + $tradeList.count + ' (validation will try priority wares first)'" chance="100"/>
+            <set_value name="$pwFrontNames" exact="''"/>
+            <do_all exact="[$priorityTrades.count, 5].min" counter="$pfi">
+              <set_value name="$pfTrade" exact="$priorityTrades.{$pfi}"/>
+              <set_value name="$pfWare" exact="if $pfTrade.$Ware? then $pfTrade.$Ware else (if $pfTrade.$BuyOffer? then @$pfTrade.$BuyOffer.ware else null)"/>
+              <set_value name="$pwFrontNames" exact="$pwFrontNames + (if $pfi gt 1 then ', ' else '') + (if $pfWare? and $pfWare != null then @$pfWare.name else '?')"/>
+            </do_all>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Priority-first reorder: ' + $priorityTrades.count + ' priority-ware trades moved to front of ' + $tradeList.count + ' [' + $pwFrontNames + '] (validation will try priority wares first)'" chance="100"/>
           </do_if>
           <do_else>
             <!-- Diagnostic: priority wares configured but no matching trades found -->
@@ -4368,19 +4390,29 @@
       </do_if>
 
       <!-- Fleet spread (cache only): after ship-route cache sort (lib.gt.cache.score_for_ship), rotate
-           the list by scheduler cacheReadOffset so concurrent ships validate different trades first. -->
+           the list by scheduler cacheReadOffset so concurrent ships validate different trades first.
+           Rotation runs separately inside the priority block and the non-priority tail: a single
+           whole-list rotation would move priority-ware trades behind the tail again. With no priority
+           wares the boundary is 0 and this collapses to the previous whole-list rotation. -->
       <do_if value="$searchMethod == 'cache' and $tradeList? and $tradeList.count gt 1 and this.$lastCacheReadOffset?">
-        <set_value name="$fleetSpreadStart" exact="this.$lastCacheReadOffset % $tradeList.count"/>
-        <do_if value="$fleetSpreadStart gt 0">
-          <set_value name="$fleetSpreadCount" exact="$tradeList.count"/>
+        <set_value name="$fleetSpreadCount" exact="$tradeList.count"/>
+        <set_value name="$fleetSpreadBoundary" exact="if $priorityBoundary? then [$priorityBoundary, $fleetSpreadCount].min else 0"/>
+        <set_value name="$fleetSpreadTailCount" exact="$fleetSpreadCount - $fleetSpreadBoundary"/>
+        <set_value name="$fleetSpreadPrioStart" exact="if $fleetSpreadBoundary gt 0 then (this.$lastCacheReadOffset % $fleetSpreadBoundary) else 0"/>
+        <set_value name="$fleetSpreadTailStart" exact="if $fleetSpreadTailCount gt 0 then (this.$lastCacheReadOffset % $fleetSpreadTailCount) else 0"/>
+        <do_if value="$fleetSpreadPrioStart gt 0 or $fleetSpreadTailStart gt 0">
           <create_list name="$fleetSpreadList"/>
-          <do_all exact="$fleetSpreadCount" counter="$fleetSpreadIdx">
-            <set_value name="$fleetSpreadPick" exact="((($fleetSpreadStart + $fleetSpreadIdx - 1) % $fleetSpreadCount) + 1)"/>
+          <do_all exact="$fleetSpreadBoundary" counter="$fleetSpreadPrioIdx">
+            <set_value name="$fleetSpreadPick" exact="((($fleetSpreadPrioStart + $fleetSpreadPrioIdx - 1) % $fleetSpreadBoundary) + 1)"/>
+            <append_to_list name="$fleetSpreadList" exact="$tradeList.{$fleetSpreadPick}"/>
+          </do_all>
+          <do_all exact="$fleetSpreadTailCount" counter="$fleetSpreadTailIdx">
+            <set_value name="$fleetSpreadPick" exact="($fleetSpreadBoundary + ((($fleetSpreadTailStart + $fleetSpreadTailIdx - 1) % $fleetSpreadTailCount) + 1))"/>
             <append_to_list name="$fleetSpreadList" exact="$tradeList.{$fleetSpreadPick}"/>
           </do_all>
           <set_value name="$tradeList" exact="$fleetSpreadList"/>
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Fleet-spread rotated cache trade list by ' + $fleetSpreadStart + ' of ' + $fleetSpreadCount + ' (reduces herd collision on top trade)'" chance="100"/>
+            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Fleet-spread rotated cache trade list: priority block by ' + $fleetSpreadPrioStart + ' of ' + $fleetSpreadBoundary + ', remainder by ' + $fleetSpreadTailStart + ' of ' + $fleetSpreadTailCount + ' (reduces herd collision, keeps priority wares first)'" chance="100"/>
           </do_if>
         </do_if>
       </do_if>

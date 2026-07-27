@@ -2086,10 +2086,13 @@
           <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Diagnose vs Runtime Gaps', $Status = 'INFO', $Detail = 'Pair eval mirrors station gates + min cargo fill. Not simulated: in-flight ware reservations / fleet fairness, ping-pong anti-oscillation, docking permission, sector blacklist. If rows say PASS but the ship stays empty, check those next.']"/>
 
           <!-- Per-source / per-ware static-storage gate evaluation.
-               Mirrors the runtime gate at order.trade.galaxytraderMK2.xml line 1410:
-                 sourceRatio = (cargo.{ware}.count * 100) / cargo.{ware}.target
-                 if sourceRatio &lt;= staticStorage  -> skipSourceBelowStatic (no trade)
-               We omit the get_ware_reservation correction (in-flight buy reservations) because
+               Mirrors the runtime gate at order.trade.galaxytraderMK2.xml:
+                 effective = cargo - outgoing buy reservations
+                 sourceRatio = (effective * 100) / cargo.target
+                 surplus = max(0, effective - floor(target * staticStorage / 100))
+                 if sourceRatio <= staticStorage or surplus <= 0 -> skipSourceBelowStatic
+                 else shippable amount is capped to surplus (fleet cannot drain through the reserve).
+               Diagnose omits the get_ware_reservation correction (in-flight buy reservations) because
                that is a small overstatement only and the diag is meant to surface the
                player-actionable threshold, not produce byte-exact numbers. Capped at 12 rows
                to avoid swamping the report when many wares are involved. -->
@@ -2148,7 +2151,7 @@
                       <set_value name="$mk2BestSourceDetail" exact="@$mk2SrcStation.knownname + ' [' + @$mk2SrcStation.idcode + '] ' + $mk2sw + ' = ' + $mk2swCount + ' / ' + $mk2swTarget + ' (' + $mk2swRatio + '%)'"/>
                     </do_if>
                     <do_if value="$mk2SrcRowsAdded lt $mk2SrcRowCap">
-                      <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Source Reserve: ' + @$mk2SrcStation.knownname + ' / ' + $mk2sw, $Status = if $mk2swPasses then 'PASS' else 'BLOCK', $Detail = '' + $mk2swCount + ' / ' + $mk2swTarget + ' = ' + $mk2swRatio + '% ' + (if $mk2swPasses then '&gt; ' else '&lt;= ') + $mk2StaticStorage + '% staticStorage' + (if $mk2swPasses then ' (eligible to ship)' else ' (BELOW reserve - runtime refuses to drain)')]"/>
+                      <append_to_list name="$sec3.$Rows" exact="table[$Check = 'Source Reserve: ' + @$mk2SrcStation.knownname + ' / ' + $mk2sw, $Status = if $mk2swPasses then 'PASS' else 'BLOCK', $Detail = '' + $mk2swCount + ' / ' + $mk2swTarget + ' = ' + $mk2swRatio + '% ' + (if $mk2swPasses then '&gt; ' else '&lt;= ') + $mk2StaticStorage + '% staticStorage' + (if $mk2swPasses then ' (eligible; runtime ships only surplus above this floor)' else ' (BELOW reserve - runtime refuses to drain)')]"/>
                       <set_value name="$mk2SrcRowsAdded" operation="add"/>
                     </do_if>
                   </do_else>
@@ -3917,6 +3920,16 @@
         </do_else>
         <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Cache Max Distance', $Status = $cacheDistResult, $Detail = $cacheDistDetail]"/>
 
+        <!-- Cache invalidation signature (order.trade.galaxytrader): priority wares, priority multiplier,
+             Ignore Player Pricing, faction priority, search radii and blacklist epoch. When the current
+             inputs no longer match the stored signature the whole home pool is dropped on the ship's
+             next search, which otherwise reads as "the cache emptied itself". -->
+        <do_if value="$orderId == 'GalaxyTraderMK3'">
+          <set_value name="$diagPwSig" exact="if $ship.$lastPriorityWaresSig? then '' + $ship.$lastPriorityWaresSig else ''"/>
+          <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Cache Invalidation Signature', $Status = 'INFO', $Detail = if $diagPwSig != '' then ($diagPwSig + '  [wareCount|prioMult|IPP|FP|D=maxbuy/maxsell/discovery|BL=epoch|wareIds]') else 'not recorded yet (ship has not run a search since load)']"/>
+          <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Blacklist Epoch (current)', $Status = 'INFO', $Detail = 'BL=' + (if global.$GT_BlacklistEpoch? then global.$GT_BlacklistEpoch else 0) + ' - if the signature above carries a different BL= or D=, the next search clears this home pool and runs live']"/>
+        </do_if>
+
         <!-- MK3 home fleet cargo profile (cache-refresh totalvolume fleet-min; F7 diagnose) -->
         <do_if value="$orderId == 'GalaxyTraderMK3'">
           <append_to_list name="$sec7.$Rows" exact="table[$Check = '--- Home Fleet Cargo Profile ---', $Status = 'INFO', $Detail = 'Cache-refresh live search uses fleet-min (same all ships); cache read uses per-ship cargotarget%; cache write is ship-agnostic']"/>
@@ -5088,7 +5101,7 @@
             </do_if>
           </do_if>
           <do_else>
-            <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Last Cache Search Result', $Status = 'INFO', $Detail = 'no runtime verdict recorded yet (ship has not run a cache-phase search since load, or its order does not publish one)']"/>
+            <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Last Cache Search Result', $Status = 'INFO', $Detail = 'no runtime verdict recorded - the snapshot is only published when a cache search finds nothing usable, so this also means every cache read so far succeeded (or the order does not publish one)']"/>
           </do_else>
           <do_if value="$cacheRejectOfferAmount gt 0">
             <append_to_list name="$sec7.$Rows" exact="table[$Check = 'Rejected: Zero Offer Amount', $Status = 'WARN', $Detail = '' + $cacheRejectOfferAmount + ' entries failed per-ship offeramount/demand fallback (saturation or stale offers)']"/>
@@ -5145,6 +5158,11 @@
             <append_to_list name="$searchAnchors" exact="$mk2aSec"/>
           </do_if>
         </do_all>
+        <!-- MK3 live search enumerates the radius neutrally and then drops sectors that are themselves
+             blacklisted (lib.gt.pathfinding spaces mode, filterBlacklistedSpaces). Sectors the home
+             cannot path to through a blocked sector stay in scope, so the blacklist-aware path gate
+             used for the other orders would under-report MK3 scope. -->
+        <set_value name="$diagScopeMembershipOnly" exact="$orderId == 'GalaxyTraderMK3'"/>
         <do_if value="$searchAnchors.count gt 0">
           <!-- Always include the anchor sectors themselves -->
           <do_all exact="$searchAnchors.count" counter="$anchi">
@@ -5166,19 +5184,48 @@
                 <do_all exact="$nearbySectors.count" counter="$si">
                   <set_value name="$nearbySec" exact="$nearbySectors.{$si}"/>
                   <do_if value="$nearbySec != $anchExpandSec and not $searchSectors.indexof.{$nearbySec}">
-                    <!-- Diagnose parity fix: only include sectors reachable with blacklist-aware pathing. -->
-                    <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculatePathDistance" result="$diagSecDist">
-                      <param name="ship" value="$ship"/>
-                      <param name="fromSector" value="$anchExpandSec"/>
-                      <param name="toSector" value="$nearbySec"/>
-                      <param name="blacklistgroup" value="$diagBlacklistGroup"/>
-                      <param name="useEscapeMode" value="false"/>
-                    </run_actions>
-                    <do_if value="$diagSecDist ge 0 and $diagSecDist le $diagSearchDistance">
-                      <append_to_list name="$searchSectors" exact="$nearbySec"/>
+                    <do_if value="$diagScopeMembershipOnly">
+                      <!-- Membership only: the sector itself must not be blocked; whitelisted sectors
+                           stay in scope. Mirrors lib.gt.pathfinding filterBlacklistedSpaces. -->
+                      <set_value name="$diagScopeWhitelisted" exact="false"/>
+                      <do_if value="$sectorWhitelist? and $sectorWhitelist != null and $sectorWhitelist.count gt 0">
+                        <do_all exact="$sectorWhitelist.count" counter="$diagScopeWi">
+                          <do_if value="$sectorWhitelist.{$diagScopeWi} == $nearbySec">
+                            <set_value name="$diagScopeWhitelisted" exact="true"/>
+                            <break/>
+                          </do_if>
+                        </do_all>
+                      </do_if>
+                      <set_value name="$diagScopeBlocked" exact="$diagBlacklistGroup? and ($nearbySec.isblacklisted.{blacklisttype.sectoractivity}.{$diagBlacklistGroup}.{$ship} or $nearbySec.isblacklisted.{blacklisttype.sectortravel}.{$diagBlacklistGroup}.{$ship})"/>
+                      <do_if value="$diagScopeWhitelisted or not $diagScopeBlocked">
+                        <append_to_list name="$searchSectors" exact="$nearbySec"/>
+                      </do_if>
                     </do_if>
+                    <do_else>
+                      <!-- Diagnose parity fix: only include sectors reachable with blacklist-aware pathing. -->
+                      <run_actions ref="md.GT_Libraries_Pathfinding.GT_CalculatePathDistance" result="$diagSecDist">
+                        <param name="ship" value="$ship"/>
+                        <param name="fromSector" value="$anchExpandSec"/>
+                        <param name="toSector" value="$nearbySec"/>
+                        <param name="blacklistgroup" value="$diagBlacklistGroup"/>
+                        <param name="useEscapeMode" value="false"/>
+                      </run_actions>
+                      <do_if value="$diagSecDist ge 0 and $diagSecDist le $diagSearchDistance">
+                        <append_to_list name="$searchSectors" exact="$nearbySec"/>
+                      </do_if>
+                    </do_else>
                   </do_if>
                 </do_all>
+              </do_if>
+            </do_all>
+          </do_if>
+          <!-- A stranded ship must still be able to trade where it is: runtime keeps the ship's own
+               sector and its commander's sector in scope even when blocked. -->
+          <do_if value="$diagScopeMembershipOnly">
+            <do_all exact="2" counter="$diagScopeEx">
+              <set_value name="$diagScopeExSec" exact="if $diagScopeEx == 1 then (if @$ship.zone.issuperhighway then @$ship.zone.destination.sector else @$ship.sector) else (if $ship.commander? and $ship.commander.exists then @$ship.commander.sector else null)"/>
+              <do_if value="$diagScopeExSec? and $diagScopeExSec != null and $diagScopeExSec.exists and not $searchSectors.indexof.{$diagScopeExSec}">
+                <append_to_list name="$searchSectors" exact="$diagScopeExSec"/>
               </do_if>
             </do_all>
           </do_if>
@@ -5221,6 +5268,7 @@
         </do_if>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Offer Scan Mode', $Status = 'INFO', $Detail = $diagOfferScanModeDetail]"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Sectors In Range', $Status = 'INFO', $Detail = '' + $searchSectors.count + ' sectors (distance=' + $diagSearchDistance + ')']"/>
+        <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Sector Scope Model', $Status = 'INFO', $Detail = if $diagScopeMembershipOnly then 'membership-only blacklist filter (mirrors lib.gt.pathfinding filterBlacklistedSpaces): blocked sectors dropped, allowed sectors behind a blocked one kept, whitelist and ship/commander sector exempt' else 'blacklist-aware path distance from anchor sector']"/>
         <do_if value="$orderId == 'GalaxyTraderMK2'">
           <append_to_list name="$sec8.$Rows" exact="table[$Check = 'MK2 Sector Scan Note', $Status = 'INFO', $Detail = 'Offer counts below are informational only. MK2 trades exclusively between configured source/destination stations - see Pair Details (MK2 pair eval) for eligibility and demand-ranked selection.']"/>
         </do_if>
@@ -7579,6 +7627,7 @@
           <set_value name="$diagPairDetailsTruncated" exact="true"/>
         </do_if>
         <!-- Runtime dispatch preview: score-sort passing pairs, then fresh-offer filter (mirrors live pipeline). -->
+        <set_value name="$diagRuntimePrioCount" exact="0"/>
         <do_if value="$orderId != 'GalaxyMiner' and $diagRuntimePassPairs.count gt 0">
           <set_value name="$diagRuntimeSorted" exact="$diagRuntimePassPairs"/>
           <do_if value="$diagRuntimePassPairs.count gt 1">
@@ -7605,6 +7654,31 @@
                 <set_value name="$drClaimed.{$drBestIdx}" exact="true"/>
               </do_if>
             </do_all>
+          </do_if>
+          <!-- MK3 validation moves priority-ware trades to the front of the score-sorted list, so a
+               higher-scoring non-priority pair is only tried after them. -->
+          <do_if value="$orderId == 'GalaxyTraderMK3' and $priorityWares.count gt 0 and $diagRuntimeSorted.count gt 1">
+            <set_value name="$drPrioList" exact="[]"/>
+            <set_value name="$drRestList" exact="[]"/>
+            <do_all exact="$diagRuntimeSorted.count" counter="$drpk">
+              <set_value name="$drPrioRow" exact="$diagRuntimeSorted.{$drpk}"/>
+              <do_if value="$drPrioRow.$Ware? and $priorityWares.indexof.{$drPrioRow.$Ware}">
+                <append_to_list name="$drPrioList" exact="$drPrioRow"/>
+              </do_if>
+              <do_else>
+                <append_to_list name="$drRestList" exact="$drPrioRow"/>
+              </do_else>
+            </do_all>
+            <do_if value="$drPrioList.count gt 0 and $drRestList.count gt 0">
+              <set_value name="$diagRuntimeSorted" exact="[]"/>
+              <do_all exact="$drPrioList.count" counter="$drpa">
+                <append_to_list name="$diagRuntimeSorted" exact="$drPrioList.{$drpa}"/>
+              </do_all>
+              <do_all exact="$drRestList.count" counter="$drra">
+                <append_to_list name="$diagRuntimeSorted" exact="$drRestList.{$drra}"/>
+              </do_all>
+            </do_if>
+            <set_value name="$diagRuntimePrioCount" exact="$drPrioList.count"/>
           </do_if>
           <set_value name="$diagRuntimeFreshList" exact="[]"/>
           <set_value name="$diagRuntimePreviewParts" exact="[]"/>
@@ -7663,6 +7737,9 @@
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Pairs Passing All Checks', $Status = if $passCount gt 0 then 'PASS' else 'FAIL', $Detail = '' + $passCount + ' / ' + $pairCount + ' (executable parity — mirrors trade_found validation)']"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Runtime Dispatch (fresh-offer filter)', $Status = if $diagRuntimeDispatchCount gt 0 then 'PASS' else (if $passCount gt 0 then 'WARN' else 'FAIL'), $Detail = '' + $diagRuntimeDispatchCount + ' / ' + $passCount + ' passing pairs would reach validation (mirrors live pipeline)']"/>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Runtime Dispatch Preview', $Status = if $diagRuntimeDispatchCount gt 0 then 'PASS' else 'INFO', $Detail = if $diagRuntimeDispatchCount gt 0 then ('Best: ' + $diagRuntimeBestDispatch + ' | Top: ' + $diagRuntimeBatchPreview) else $diagRuntimeBatchPreview]"/>
+        <do_if value="$orderId == 'GalaxyTraderMK3'">
+          <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Dispatch Order Model', $Status = 'INFO', $Detail = (if $priorityWares.count gt 0 then ('priority-first: ' + $diagRuntimePrioCount + ' priority-ware pairs ahead of the rest, both score-sorted') else 'score-sorted (no priority wares configured)') + '; on cache reads fleet spread rotates within the priority block and within the remainder by offset ' + (if $ship.$lastCacheReadOffset? then '' + $ship.$lastCacheReadOffset else 'n/a') + ', so the ship can start at a different entry than Best above']"/>
+        </do_if>
         <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Best Passing Pair', $Status = if $passCount gt 0 then 'PASS' else 'FAIL', $Detail = $bestDiagPairDesc]"/>
         <do_if value="$ignorePlayerPricing and $orderId == 'GalaxyTraderMK3'">
           <append_to_list name="$sec8.$Rows" exact="table[$Check = 'Best IPP Pair (player supplier)', $Status = if $bestIppPairScore gt 0 then 'PASS' else 'WARN', $Detail = $bestIppPairDesc]"/>

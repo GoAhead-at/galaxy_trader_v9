@@ -9,6 +9,8 @@
     <param name="maxDistanceSell" default="0" comment="Optional delivery-leg radius. 0 = use maxDistance. When set with maxDistanceBuy, BuySpaces/SellSpaces are split."/>
     <param name="blacklistGroup" default="null"/>
     <param name="ignoreBlacklist" default="false" comment="spaces mode: neutral home-range sector list (cache fill). BL enforced at cache read via lib.gt.cache.score_for_ship."/>
+    <param name="sectorWhitelist" default="[]" comment="spaces mode: GT order whitelist. Blacklisted sectors listed here stay in scope."/>
+    <param name="filterBlacklistedSpaces" default="false" comment="spaces mode: drop sectors that are themselves blacklisted, without requiring a blacklist-aware path from home. Keeps home-disconnected but allowed sectors in scope."/>
     <param name="allowIllegal" default="false"/>
     <param name="enforceRouteIllegalLegality" default="false"/>
     <param name="startSector" default="null"/>
@@ -672,7 +674,8 @@
 
       <!-- Dual-radius: scan at max(buy,sell), then split BuySpaces (supplier) / SellSpaces (delivery).
            ignoreBlacklist=true (cache fill): neutral gatedistance only — per-ship BL is applied at
-           cache read (lib.gt.cache.score_for_ship) from the reader's current sector. -->
+           cache read (lib.gt.cache.score_for_ship) from the reader's current sector.
+           Blocked sectors are removed afterwards via filterBlacklistedSpaces (membership only). -->
       <set_value name="$buyLeg" exact="if $maxDistanceBuy? and $maxDistanceBuy gt 0 then $maxDistanceBuy else $maxDistance"/>
       <set_value name="$sellLeg" exact="if $maxDistanceSell? and $maxDistanceSell gt 0 then $maxDistanceSell else $maxDistance"/>
       <set_value name="$combinedMax" exact="[$buyLeg, $sellLeg, $maxDistance].max"/>
@@ -682,18 +685,119 @@
            hasblacklist.{...}.{$blacklistgroup} even when applyblacklist=false, and {null} aborts.
            Neutral fill is controlled only by applyblacklist=false. -->
       <set_value name="$spacesBlacklistGroup" exact="if $blacklistGroup? and $blacklistGroup != null then $blacklistGroup else blacklistgroup.civilian"/>
-      <run_script name="'lib.find.sectors.inrange'" result="$spaces">
-        <param name="refobject" value="$refobject"/>
-        <param name="mingatedistance" value="0"/>
-        <param name="maxgatedistance" value="$combinedMax"/>
-        <param name="applyblacklist" value="$applySpacesBlacklist"/>
-        <param name="blacklistgroup" value="$spacesBlacklistGroup"/>
-        <param name="returndistancetable" value="false"/>
-        <param name="debugchance" value="$debugchance"/>
-      </run_script>
+      <set_value name="$mspBlGroup" exact="$spacesBlacklistGroup"/>
+      <set_value name="$mspHasBlacklist" exact="$ship? and $ship.exists and ($ship.hasblacklist.{blacklisttype.sectoractivity}.{$mspBlGroup} or $ship.hasblacklist.{blacklisttype.sectortravel}.{$mspBlGroup})"/>
+      <set_value name="$mspScoping" exact="$filterBlacklistedSpaces? and $filterBlacklistedSpaces and $mspHasBlacklist"/>
 
-      <do_if value="not $spaces?">
-        <set_value name="$spaces" exact="[]"/>
+      <!-- Shared scope cache: the blacklist-scoped opportunity set depends only on home sector,
+           radius and the blacklist, so the whole fleet reuses one enumeration instead of every ship
+           re-walking the radius to reach the same answer. Skipped when an order whitelist is set
+           (per-fleet input that does not belong in a home-keyed entry). TTL covers sectors the
+           player discovers after the entry was built. -->
+      <set_value name="$mspWlCount" exact="if $sectorWhitelist? and $sectorWhitelist != null then $sectorWhitelist.count else 0"/>
+      <set_value name="$mspCacheable" exact="$mspScoping and not $applySpacesBlacklist and $mspWlCount == 0"/>
+      <set_value name="$mspBlEpoch" exact="if global.$GT_BlacklistEpoch? then global.$GT_BlacklistEpoch else 0"/>
+      <set_value name="$mspFromCache" exact="false"/>
+      <do_if value="$mspCacheable">
+        <do_if value="not global.$GT_SpacesScopeCache?">
+          <set_value name="global.$GT_SpacesScopeCache" exact="table[]"/>
+        </do_if>
+        <do_if value="global.$GT_SpacesScopeCache.{$refobject}? and global.$GT_SpacesScopeCache.{$refobject}.{$combinedMax}? and global.$GT_SpacesScopeCache.{$refobject}.{$combinedMax}.{$mspBlGroup}?">
+          <set_value name="$mspEntry" exact="global.$GT_SpacesScopeCache.{$refobject}.{$combinedMax}.{$mspBlGroup}"/>
+          <do_if value="$mspEntry.$Epoch == $mspBlEpoch and $mspEntry.$Spaces? and (player.age - $mspEntry.$CachedAt) lt 60s">
+            <set_value name="$spaces" exact="$mspEntry.$Spaces"/>
+            <set_value name="$mspFromCache" exact="true"/>
+          </do_if>
+        </do_if>
+      </do_if>
+
+      <do_if value="not $mspFromCache">
+        <run_script name="'lib.find.sectors.inrange'" result="$spaces">
+          <param name="refobject" value="$refobject"/>
+          <param name="mingatedistance" value="0"/>
+          <param name="maxgatedistance" value="$combinedMax"/>
+          <param name="applyblacklist" value="$applySpacesBlacklist"/>
+          <param name="blacklistgroup" value="$spacesBlacklistGroup"/>
+          <param name="returndistancetable" value="false"/>
+          <param name="debugchance" value="$debugchance"/>
+        </run_script>
+
+        <do_if value="not $spaces?">
+          <set_value name="$spaces" exact="[]"/>
+        </do_if>
+
+        <!-- Membership-only blacklist filter: drop sectors that are themselves blocked, but keep
+             sectors the home cannot path to under the blacklist. Vanilla applyblacklist=true would
+             also require a blacklist-aware home<->sector path, which removes allowed sectors sitting
+             behind a blocked one - ships stranded on that side must still find trades there.
+             Reachability stays a per-ship concern at validation. Ship/commander sector exemptions are
+             applied after the cache so the stored list stays fleet-shareable. -->
+        <do_if value="$mspScoping and $spaces.count gt 0">
+          <create_list name="$mspAllowed"/>
+          <do_all exact="$spaces.count" counter="$mspi">
+            <set_value name="$mspSector" exact="$spaces.{$mspi}"/>
+            <set_value name="$mspWhitelisted" exact="false"/>
+            <do_if value="$mspWlCount gt 0">
+              <do_all exact="$mspWlCount" counter="$mspw">
+                <do_if value="$sectorWhitelist.{$mspw} == $mspSector">
+                  <set_value name="$mspWhitelisted" exact="true"/>
+                  <break/>
+                </do_if>
+              </do_all>
+            </do_if>
+            <do_if value="not $mspWhitelisted and ($mspSector.isblacklisted.{blacklisttype.sectoractivity}.{$mspBlGroup}.{$ship} or $mspSector.isblacklisted.{blacklisttype.sectortravel}.{$mspBlGroup}.{$ship})">
+              <continue/>
+            </do_if>
+            <append_to_list name="$mspAllowed" exact="$mspSector"/>
+          </do_all>
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $mspAllowed.count != $spaces.count">
+            <debug_text text="'[GT-Pathfinding] ' + $ship.idcode + ': blacklist-scoped live search spaces ' + $spaces.count + ' -> ' + $mspAllowed.count + ' sectors (home-disconnected allowed sectors kept)'" chance="100"/>
+          </do_if>
+          <set_value name="$spaces" exact="$mspAllowed"/>
+        </do_if>
+
+        <do_if value="$mspCacheable">
+          <do_if value="not global.$GT_SpacesScopeCache.{$refobject}?">
+            <set_value name="global.$GT_SpacesScopeCache.{$refobject}" exact="table[]"/>
+          </do_if>
+          <do_if value="not global.$GT_SpacesScopeCache.{$refobject}.{$combinedMax}?">
+            <set_value name="global.$GT_SpacesScopeCache.{$refobject}.{$combinedMax}" exact="table[]"/>
+          </do_if>
+          <set_value name="global.$GT_SpacesScopeCache.{$refobject}.{$combinedMax}.{$mspBlGroup}" exact="table[
+            $Epoch = $mspBlEpoch,
+            $CachedAt = player.age,
+            $Spaces = $spaces
+          ]"/>
+        </do_if>
+      </do_if>
+
+      <!-- Ship and commander sector stay in scope even when blocked: a stranded ship must be able to
+           trade where it is. Applied per ship, outside the shared entry. -->
+      <do_if value="$mspScoping and $ship? and $ship.exists">
+        <!-- Copy first: $spaces may reference the shared cache entry, which must not be mutated. -->
+        <create_list name="$mspFinal"/>
+        <do_all exact="$spaces.count" counter="$mspCi">
+          <append_to_list name="$mspFinal" exact="$spaces.{$mspCi}"/>
+        </do_all>
+        <set_value name="$mspShipSector" exact="if @$ship.zone.issuperhighway then @$ship.zone.destination.sector else @$ship.sector"/>
+        <set_value name="$mspCommanderSector" exact="if $ship.commander? and $ship.commander.exists then @$ship.commander.sector else null"/>
+        <do_all exact="2" counter="$mspEx">
+          <set_value name="$mspExSector" exact="if $mspEx == 1 then $mspShipSector else $mspCommanderSector"/>
+          <do_if value="not $mspExSector? or $mspExSector == null or not $mspExSector.exists">
+            <continue/>
+          </do_if>
+          <set_value name="$mspExListed" exact="false"/>
+          <do_all exact="$mspFinal.count" counter="$mspExj">
+            <do_if value="$mspFinal.{$mspExj} == $mspExSector">
+              <set_value name="$mspExListed" exact="true"/>
+              <break/>
+            </do_if>
+          </do_all>
+          <do_if value="not $mspExListed">
+            <append_to_list name="$mspFinal" exact="$mspExSector"/>
+          </do_if>
+        </do_all>
+        <set_value name="$spaces" exact="$mspFinal"/>
       </do_if>
 
       <!-- Filter out threat-blacklisted sectors (skip when neutral cache-fill opportunity set). -->

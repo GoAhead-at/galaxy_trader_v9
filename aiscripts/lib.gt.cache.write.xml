@@ -20,6 +20,7 @@
     <param name="cacheDropoffTolerance" default="15"/> <!-- Accepted at call site for API compat; band filter is read-time only (lib.gt.cache.search). -->
     <param name="sellPriceMax" default="1.0" comment="Unused at write; per-ship band filter runs at cache read."/>
     <param name="buyPriceMin" default="-1.0" comment="Unused at write; per-ship band filter runs at cache read."/>
+    <param name="signalCacheUpdated" default="true" comment="When false, caller signals GT_MK4_Cache_Updated after its own post-write work (MK3 post-refresh)."/>
     <param name="debugchance" default="0"/>
   </params>
   <patch sinceversion="2">
@@ -71,6 +72,12 @@
       </do_else>
 
       <set_value name="$cacheNow" exact="player.age"/>
+      <set_value name="this.$gt_cacheNow" exact="$cacheNow"/>
+      <set_value name="this.$gt_cacheMaxEntries" exact="200"/>
+      <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries?">
+        <set_value name="this.$gt_cacheMaxEntries" exact="@global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries"/>
+      </do_if>
+      <set_value name="this.$gt_cacheMaxEntries" exact="(this.$gt_cacheMaxEntries)i"/>
 
       <!-- Phase 1: Write-time cleanup -->
       <set_value name="$expiredCount" exact="0"/>
@@ -170,9 +177,31 @@
         <debug_text text="'[GT-CacheWrite] ' + this.ship.idcode + ': (' + $poolLabel + ') Write-time cleanup removed ' + $expiredCount + ' expired/stale entries from ' + $homeSector.knownname + ' (remaining: ' + $remainingAfterCleanup + ')'" chance="100"/>
       </do_if>
 
+      <!-- Bulk MK3 refresh: writing >= cap rows means replace the pool. Prevents insert-to-2k then
+           O(n^2) age-trim hitch (log: silent ~1s between trim and CacheSearch BEGIN). -->
+      <do_if value="not this.$gt_cachePoolIsMk4 and $tradeList.count ge this.$gt_cacheMaxEntries">
+        <set_value name="global.$GT_TradeCache.{$homeSector}" exact="[]"/>
+      </do_if>
+
       <!-- Phase 2: Sorted insertion by $Score descending -->
       <do_all exact="$tradeList.count" counter="$ti">
+        <set_value name="$cacheNow" exact="this.$gt_cacheNow"/>
         <set_value name="$newTrade" exact="$tradeList.{$ti}"/>
+        <!-- MK3 at-cap skip: score-sorted pool - if this row cannot beat the tail, skip enrichment. -->
+        <do_if value="not this.$gt_cachePoolIsMk4">
+          <set_value name="$preInsertSize" exact="if @global.$GT_TradeCache.{$homeSector}.count != null then @global.$GT_TradeCache.{$homeSector}.count else 0"/>
+          <do_if value="$preInsertSize ge this.$gt_cacheMaxEntries">
+            <set_value name="$tailScore" exact="if @global.$GT_TradeCache.{$homeSector}.{$preInsertSize}.$Score != null then @global.$GT_TradeCache.{$homeSector}.{$preInsertSize}.$Score else 0"/>
+            <set_value name="$incomingScore" exact="if $newTrade.$Score? then @$newTrade.$Score else 0"/>
+            <do_if value="$incomingScore le $tailScore">
+              <set_value name="$tiInt" exact="($ti)i"/>
+              <do_if value="($tiInt % this.$writeBatchSize) == 0">
+                <wait exact="this.$gt_yieldMs * 1ms" comment="Yield while skipping at-cap low-score rows"/>
+              </do_if>
+              <continue/>
+            </do_if>
+          </do_if>
+        </do_if>
         <set_value name="$newTrade.$CachedAt" exact="$cacheNow"/>
         <set_value name="$newTrade.$Timestamp" exact="$cacheNow"/>
         <!-- Snapshot delivery station name so diagnose can show stale cache rows after offer refs die. -->
@@ -491,6 +520,14 @@
           </do_else>
         </do_else>
 
+        <!-- MK3: stay at cap during insert (score-sorted). Avoids growing to thousands then trimming. -->
+        <do_if value="not this.$gt_cachePoolIsMk4">
+          <set_value name="$postInsertSize" exact="if @global.$GT_TradeCache.{$homeSector}.count != null then @global.$GT_TradeCache.{$homeSector}.count else 0"/>
+          <do_if value="$postInsertSize gt this.$gt_cacheMaxEntries">
+            <remove_value name="global.$GT_TradeCache.{$homeSector}.{$postInsertSize}"/>
+          </do_if>
+        </do_if>
+
         <set_value name="$tiInt" exact="($ti)i"/>
         <do_if value="($tiInt % this.$writeBatchSize) == 0">
           <wait exact="this.$gt_yieldMs * 1ms" comment="Yield between sorted insertions"/>
@@ -504,13 +541,10 @@
       <do_else>
         <set_value name="$finalCacheSize" exact="if @global.$GT_TradeCache.{$homeSector}.count != null then @global.$GT_TradeCache.{$homeSector}.count else 0"/>
       </do_else>
-      <!-- MK3 pool: when over cap, evict oldest entries by $CachedAt (not lowest home $Score tail).
-           MK3 cache read scans the full pool and re-ranks per ship; age trim keeps fresh home-valid rows. -->
-      <do_if value="not this.$gt_cachePoolIsMk4 and $finalCacheSize gt 0">
-        <set_value name="$cacheMaxEntries" exact="200"/>
-        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries?">
-          <set_value name="$cacheMaxEntries" exact="@global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries"/>
-        </do_if>
+      <!-- MK3 safety-net trim: insert path already keeps size <= cap. Yielding age-trim only if still over. -->
+      <do_if value="not this.$gt_cachePoolIsMk4 and $finalCacheSize gt this.$gt_cacheMaxEntries">
+        <set_value name="$cacheMaxEntries" exact="this.$gt_cacheMaxEntries"/>
+        <set_value name="$trimEvicted" exact="0"/>
         <do_while value="$finalCacheSize gt $cacheMaxEntries">
           <set_value name="$oldestIdx" exact="1"/>
           <set_value name="$oldestTs" exact="null"/>
@@ -533,6 +567,10 @@
           </do_all>
           <remove_value name="global.$GT_TradeCache.{$homeSector}.{$oldestIdx}"/>
           <set_value name="$finalCacheSize" operation="subtract"/>
+          <set_value name="$trimEvicted" operation="add"/>
+          <do_if value="(($trimEvicted)i % 5) == 0">
+            <wait exact="this.$gt_yieldMs * 1ms" comment="Yield safety-net cache trim"/>
+          </do_if>
         </do_while>
       </do_if>
       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -561,9 +599,12 @@
           </do_if>
         </do_else>
       </do_if>
-      <!-- Wake same-home waiters on any pool write (MK3 traders + MK4 supply). -->
+      <!-- Wake same-home waiters on any pool write (MK3 traders + MK4 supply).
+           MK3 live-refresh callers set signalCacheUpdated=false and signal after post-refresh
+           cache.search + FleetDispatch so 244 Reset wakes do not fight the writer. -->
       <set_value name="$cacheWakeNeeded" exact="$homeSector? and $homeSector.exists and ($tradeList.count gt 0 or $metadataUpdated)"/>
-      <do_if value="$cacheWakeNeeded">
+      <set_value name="$doCacheUpdatedSignal" exact="if $signalCacheUpdated? then $signalCacheUpdated else true"/>
+      <do_if value="$cacheWakeNeeded and $doCacheUpdatedSignal">
         <signal_objects object="player.galaxy" param="'GT_MK4_Cache_Updated'" param2="table[
           $HomeSector = $homeSector,
           $MaxDistance = $maxSearchDistance,

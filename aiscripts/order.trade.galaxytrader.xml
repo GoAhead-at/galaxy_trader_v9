@@ -3818,7 +3818,10 @@
               <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Executable filter (' + $execFilterPassLabel + '): before=' + $matchBeforeExecFilter + ', after=' + $matchTradeList.count + ', removed=' + ($matchBeforeExecFilter - $matchTradeList.count)" chance="100"/>
             </do_if>
 
-            <!-- 5b) Cache refresh: write station-side survivors (fleet-min live search; ship-agnostic rows). -->
+            <!-- 5b) Cache refresh: write station-side survivors (fleet-min live search; ship-agnostic rows).
+                 Defer GT_MK4_Cache_Updated until after post-refresh so mass waiter wakes do not
+                 compete with this ship's cache.search / FleetDispatch (log: hitch then assign).
+                 Persist wake payload on this.* before cache.search yields wipe locals. -->
             <do_if value="$matchTradeListForCache.count gt 0">
               <run_script name="'lib.gt.cache.write'" result="$liveCacheWriteResult">
                 <param name="tradeList" value="$matchTradeListForCache"/>
@@ -3828,7 +3831,18 @@
                 <param name="sellPriceMax" value="$searchSellPriceMax"/>
                 <param name="buyPriceMin" value="$searchBuyPriceMin"/>
                 <param name="cacheDropoffTolerance" value="if global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet? and global.$GT_GlobalSettings.$Fleet.$CacheDropoffTolerance? then @global.$GT_GlobalSettings.$Fleet.$CacheDropoffTolerance else 15"/>
+                <param name="signalCacheUpdated" value="false"/>
               </run_script>
+              <set_value name="this.$gt_pendingCacheWake" exact="null"/>
+              <do_if value="$liveCacheWriteResult? and $liveCacheWriteResult.$Written? and $liveCacheWriteResult.$Written gt 0">
+                <set_value name="this.$gt_pendingCacheWake" exact="table[
+                  $HomeSector = $searchHomeSector,
+                  $MaxDistance = $searchDiscoveryMaxDistance,
+                  $Written = @$liveCacheWriteResult.$Written,
+                  $CacheSize = if $liveCacheWriteResult.$CacheSize? then @$liveCacheWriteResult.$CacheSize else 0,
+                  $CachePool = 'mk3'
+                ]"/>
+              </do_if>
             </do_if>
 
             <!-- 5c) Re-read cache with per-ship cargotarget + execution radius (do not execute fleet-min live rows directly). -->
@@ -3857,6 +3871,7 @@
               <param name="cacheReadOffset" value="$searchCacheReadOffset"/>
               <param name="distancePenalty" value="if $gt_distancepenalty? then $gt_distancepenalty else (if this.$effectiveDistancePenalty? then (this.$effectiveDistancePenalty / 50.0) else 0.1)"/>
               <param name="blacklistGroup" value="if this.$blacklistgroup? then this.$blacklistgroup else blacklistgroup.civilian"/>
+              <param name="skipReadTimePurge" value="true"/>
             </run_script>
             <set_value name="$postRefreshFound" exact="false"/>
             <do_if value="$postRefreshCacheResult? and $postRefreshCacheResult.$Found?">
@@ -3908,16 +3923,15 @@
 
         <!-- SAVEGAME GUARD -->
         <do_if value="not $pipelineFound?">
+          <do_if value="this.$gt_pendingCacheWake? and this.$gt_pendingCacheWake.$Written? and this.$gt_pendingCacheWake.$Written gt 0">
+            <signal_objects object="player.galaxy" param="'GT_MK4_Cache_Updated'" param2="this.$gt_pendingCacheWake"/>
+            <remove_value name="this.$gt_pendingCacheWake"/>
+          </do_if>
           <signal_objects object="player.galaxy" param="'GT_Search_Abort'" param2="table[$Ship = this.ship]"/>
           <resume label="no_trade_retry"/>
         </do_if>
 
-        <!-- ═══════════════════════════════════════════════════════════════════════════
-             FALLBACK SEARCH: When normal pipeline yields no trades, attempt a fallback
-             search with relaxed parameters before giving up.
-             See lib.gt.fallback.search.xml for the full pipeline (pathfinding / live /
-             tradematch / scoring with relaxed params, centered on ship position).
-             ═══════════════════════════════════════════════════════════════════════════ -->
+        <!-- FALLBACK SEARCH: when normal pipeline yields no trades (lib.gt.fallback.search). -->
         <do_if value="not $pipelineFound and $searchMode? and $searchMode == 'buy_and_sell'">
           <!-- Check conditions: not isolated, not already in fallback -->
           <set_value name="$isIsolated" exact="global.$GT_IsolatedTradeActive? and global.$GT_IsolatedTradeActive.{this.ship}?"/>
@@ -3946,6 +3960,10 @@
             </run_script>
             <!-- SAVEGAME GUARD -->
             <do_if value="not $searchMode?">
+              <do_if value="this.$gt_pendingCacheWake? and this.$gt_pendingCacheWake.$Written? and this.$gt_pendingCacheWake.$Written gt 0">
+                <signal_objects object="player.galaxy" param="'GT_MK4_Cache_Updated'" param2="this.$gt_pendingCacheWake"/>
+                <remove_value name="this.$gt_pendingCacheWake"/>
+              </do_if>
               <signal_objects object="player.galaxy" param="'GT_Search_Abort'" param2="table[$Ship = this.ship]"/>
               <resume label="no_trade_retry"/>
             </do_if>
@@ -3992,6 +4010,10 @@
 
         <!-- Final pipeline result check -->
         <do_if value="not $pipelineFound">
+          <do_if value="this.$gt_pendingCacheWake? and this.$gt_pendingCacheWake.$Written? and this.$gt_pendingCacheWake.$Written gt 0">
+            <signal_objects object="player.galaxy" param="'GT_MK4_Cache_Updated'" param2="this.$gt_pendingCacheWake"/>
+            <remove_value name="this.$gt_pendingCacheWake"/>
+          </do_if>
           <signal_objects object="player.galaxy" param="'GT_Search_Abort'" param2="table[$Ship = this.ship]"/>
           <resume label="no_trade_retry"/>
         </do_if>
@@ -4183,6 +4205,11 @@
           $SearchType = if this.$pipelineSearchMode? and this.$pipelineSearchMode == 'sell_only' then 'clearance' else 'live',
           $HomeSector = $searchHomeSector
         ]"/>
+        <!-- After FleetDispatch: wake remaining same-home waiters (deferred from cache.write). -->
+        <do_if value="this.$gt_pendingCacheWake? and this.$gt_pendingCacheWake.$Written? and this.$gt_pendingCacheWake.$Written gt 0">
+          <signal_objects object="player.galaxy" param="'GT_MK4_Cache_Updated'" param2="this.$gt_pendingCacheWake"/>
+          <remove_value name="this.$gt_pendingCacheWake"/>
+        </do_if>
         <resume label="wait_for_response"/>
       </do_if>
       

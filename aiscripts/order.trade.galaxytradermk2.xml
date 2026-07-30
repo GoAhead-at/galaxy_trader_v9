@@ -2405,8 +2405,15 @@
                 <continue/>
               </do_if>
 
-              <!-- MK2 selection score: demand primary; classic multi-source adds player-tier then cheaper. -->
-              <set_value name="$demandScore" exact="[0, 100 - $destRatio].max"/>
+              <!-- MK2 selection score: remaining unreserved demand primary (vanilla miner pattern).
+                   Need buckets stay on physical fill; score treats inbound sell reservations as
+                   already-covered stock so peer claims demote this ware for the next ship. -->
+              <set_value name="$effectiveDestRatio" exact="$destRatio"/>
+              <do_if value="this.$fleetcoordination and $incomingReservedAmount gt 0">
+                <set_value name="$effectiveDestCount" exact="[$dest.cargo.{this.$mk2ScoringWare}.count + $incomingReservedAmount, 0].max"/>
+                <set_value name="$effectiveDestRatio" exact="($effectiveDestCount * 100) / $destTarget"/>
+              </do_if>
+              <set_value name="$demandScore" exact="[0, 100 - $effectiveDestRatio].max"/>
               <set_value name="$demandTiebreak" exact="[0, 9999].randominrange"/>
               <set_value name="$score" exact="($demandScore * 10000000) + $demandTiebreak"/>
               <do_if value="this.$mk2ScoringSource? and this.$mk2ScoringSource.exists and this.$mk2ScoringSource.isplayerowned">
@@ -2431,6 +2438,7 @@
                 $NeedBucket = $needBucket,
                 $Score = $score,
                 $DestRatio = $destRatio,
+                $EffectiveDestRatio = $effectiveDestRatio,
                 $SourceOffer = this.$mk2ScoringSourceOffer,
                 $DestOffer = $destOffer,
                 $SourceOfferAmount = this.$mk2ScoringSourceOfferAmount,
@@ -2863,13 +2871,21 @@
                   <continue/>
                 </do_if>
 
-                <set_value name="$demandScore" exact="[0, 100 - $destRatio].max"/>
-                <set_value name="$demandTiebreak" exact="[0, 9999].randominrange"/>
-                <set_value name="$score" exact="(($demandScore * 10000) * $bucketWeight) + $demandTiebreak"/>
+                <!-- Re-fetch after ware_fairness yield (locals do not survive run_script). -->
                 <set_value name="$incomingReservedAmount" exact="0"/>
                 <do_if value="this.$fleetcoordination">
                   <get_ware_reservation object="$dest" ware="$ware" type="sell" virtual="false" result="$incomingReservedAmount"/>
                 </do_if>
+                <!-- Remaining unreserved demand (count + inbound sell reserved). -->
+                <set_value name="$destTargetSafe" exact="[$dest.cargo.{$ware}.target, 1].max"/>
+                <set_value name="$effectiveDestRatio" exact="$destRatio"/>
+                <do_if value="this.$fleetcoordination and $incomingReservedAmount gt 0">
+                  <set_value name="$effectiveDestCount" exact="[$dest.cargo.{$ware}.count + $incomingReservedAmount, 0].max"/>
+                  <set_value name="$effectiveDestRatio" exact="($effectiveDestCount * 100) / $destTargetSafe"/>
+                </do_if>
+                <set_value name="$demandScore" exact="[0, 100 - $effectiveDestRatio].max"/>
+                <set_value name="$demandTiebreak" exact="[0, 9999].randominrange"/>
+                <set_value name="$score" exact="(($demandScore * 10000) * $bucketWeight) + $demandTiebreak"/>
                 <append_to_list name="this.$mk2TradeList" exact="table[
                   $Ware = $ware,
                   $Source = $source,
@@ -2879,6 +2895,7 @@
                   $NeedBucket = $needBucket,
                   $Score = $score,
                   $DestRatio = $destRatio,
+                  $EffectiveDestRatio = $effectiveDestRatio,
                   $SourceOffer = this.$mk2ScoringSourceOffer,
                   $DestOffer = $destOffer,
                   $SourceOfferAmount = this.$mk2ScoringSourceOfferAmount,
@@ -2975,7 +2992,7 @@
         <!-- Automated GT: always internal so Dock→move.generic enforces ship travel blacklist -->
         <set_value name="this.$mk2TradeOrderInternal" exact="true"/>
         <do_if value="this.$debuglevel ge 1">
-          <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': selected trade ' + this.$mk2BestTrade.$Ware + ' from ' + this.$mk2BestTrade.$Source.knownname + ' to ' + this.$mk2BestTrade.$Destination.knownname + ' amount=' + this.$mk2BestTrade.$Amount + ' score=' + this.$mk2BestScore + ' destDemandFill=' + (if this.$mk2BestTrade.$DestRatio? then this.$mk2BestTrade.$DestRatio else 'n/a') + '% incomingReserved=' + (if this.$mk2BestTrade.$IncomingReservedAmount? then this.$mk2BestTrade.$IncomingReservedAmount else 0) + ' effectiveNeed=' + this.$mk2BestDestOfferAmount + ' internal=' + this.$mk2TradeOrderInternal + ' ignoreRules=' + this.$ignoretraderules" chance="this.$debugchance"/>
+          <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': selected trade ' + this.$mk2BestTrade.$Ware + ' from ' + this.$mk2BestTrade.$Source.knownname + ' to ' + this.$mk2BestTrade.$Destination.knownname + ' amount=' + this.$mk2BestTrade.$Amount + ' score=' + this.$mk2BestScore + ' destDemandFill=' + (if this.$mk2BestTrade.$DestRatio? then this.$mk2BestTrade.$DestRatio else 'n/a') + '% effectiveFill=' + (if this.$mk2BestTrade.$EffectiveDestRatio? then this.$mk2BestTrade.$EffectiveDestRatio else 'n/a') + '% incomingReserved=' + (if this.$mk2BestTrade.$IncomingReservedAmount? then this.$mk2BestTrade.$IncomingReservedAmount else 0) + ' effectiveNeed=' + this.$mk2BestDestOfferAmount + ' internal=' + this.$mk2TradeOrderInternal + ' ignoreRules=' + this.$ignoretraderules" chance="this.$debugchance"/>
         </do_if>
         <set_value name="this.$lastTradeSource" exact="this.$mk2BestTrade.$Source"/>
         <set_value name="this.$lastTradeDestination" exact="this.$mk2BestTrade.$Destination"/>
@@ -3269,10 +3286,13 @@
             <wait exact="this.$gt_criticalYieldMs * 1ms" comment="Desync MK2 multi-ware queue creation across ships"/>
             <create_list name="this.$mk2WareExchangeLegs"/>
             <create_list name="this.$mk2SourceReservations"/>
+            <create_list name="this.$mk2DestReservations"/>
             <!-- Phase 1: queue all buys first (official offers + ware-exchange pickups).
                  Commit an outgoing buy reservation immediately so peer MK2 ships see the claim
                  before create_trade_order / ware-exchange queue finishes. Re-check surplus after
-                 reserve so concurrent selectors cannot push the source through the static floor. -->
+                 reserve so concurrent selectors cannot push the source through the static floor.
+                 With fleetcoordination, also stamp dest sell reservations early so peer scoring
+                 sees inbound claims (mirrors source buy stamp; vanilla type=sell reduces buy offers). -->
             <do_all exact="this.$mk2FinalQueueTrades.count" counter="$mqbi">
               <set_value name="this.$mk2QueuedTrade" exact="this.$mk2FinalQueueTrades.{$mqbi}"/>
               <do_if value="this.$mk2QueuedTrade.$QueuedAmount? and this.$mk2QueuedTrade.$QueuedAmount gt 0 and this.$mk2QueuedTrade.$Source? and this.$mk2QueuedTrade.$Source.exists and this.$mk2QueuedTrade.$Ware?">
@@ -3322,6 +3342,24 @@
                   </do_else>
                 </do_if>
                 <append_to_list name="this.$mk2SourceReservations" exact="table[$Station = $mk2ResSrc, $Ware = $mk2ResWare]"/>
+                <!-- Dest sell claim: clamp to remaining unreserved need so peers do not see over-commit. -->
+                <do_if value="this.$fleetcoordination and this.$mk2QueuedTrade.$QueuedAmount gt 0 and this.$mk2QueuedTrade.$Destination? and this.$mk2QueuedTrade.$Destination.exists">
+                  <set_value name="$mk2DstRes" exact="this.$mk2QueuedTrade.$Destination"/>
+                  <set_value name="$mk2DstWare" exact="$mk2ResWare"/>
+                  <set_value name="$mk2DstWant" exact="this.$mk2QueuedTrade.$QueuedAmount"/>
+                  <get_ware_reservation object="$mk2DstRes" ware="$mk2DstWare" type="sell" virtual="false" result="$mk2DstTotalBefore"/>
+                  <get_ware_reservation object="$mk2DstRes" ware="$mk2DstWare" type="sell" reserver="this.ship" virtual="false" result="$mk2DstSelfBefore"/>
+                  <set_value name="$mk2DstOthers" exact="[$mk2DstTotalBefore - $mk2DstSelfBefore, 0].max"/>
+                  <set_value name="$mk2DstNeed" exact="[$mk2DstRes.cargo.{$mk2DstWare}.target - $mk2DstRes.cargo.{$mk2DstWare}.count, 0].max"/>
+                  <set_value name="$mk2DstMaxAllowed" exact="[$mk2DstNeed - $mk2DstOthers, 0].max"/>
+                  <do_if value="$mk2DstWant gt $mk2DstMaxAllowed">
+                    <set_value name="$mk2DstWant" exact="$mk2DstMaxAllowed"/>
+                  </do_if>
+                  <do_if value="$mk2DstWant gt 0">
+                    <add_ware_reservation object="$mk2DstRes" type="sell" reserver="this.ship" ware="$mk2DstWare" amount="$mk2DstWant" duration="4h" replace="true" virtual="false"/>
+                    <append_to_list name="this.$mk2DestReservations" exact="table[$Station = $mk2DstRes, $Ware = $mk2DstWare]"/>
+                  </do_if>
+                </do_if>
                 <set_value name="this.$mk2FinalQueueTrades.{$mqbi}" exact="this.$mk2QueuedTrade"/>
               </do_if>
               <do_if value="this.$mk2DenyTrade">
@@ -3421,7 +3459,7 @@
                 </do_if>
               </do_if>
             </do_if>
-            <!-- Drop pre-commit source reservations if queue was denied before orders run. -->
+            <!-- Drop pre-commit source/dest reservations if queue was denied before orders run. -->
             <do_if value="this.$mk2DenyTrade and this.$mk2SourceReservations? and this.$mk2SourceReservations.count gt 0">
               <do_all exact="this.$mk2SourceReservations.count" counter="$mk2Sri">
                 <set_value name="$mk2SrcRes" exact="this.$mk2SourceReservations.{$mk2Sri}"/>
@@ -3430,6 +3468,15 @@
                 </do_if>
               </do_all>
               <create_list name="this.$mk2SourceReservations"/>
+            </do_if>
+            <do_if value="this.$mk2DenyTrade and this.$mk2DestReservations? and this.$mk2DestReservations.count gt 0">
+              <do_all exact="this.$mk2DestReservations.count" counter="$mk2Dri">
+                <set_value name="$mk2DstResClear" exact="this.$mk2DestReservations.{$mk2Dri}"/>
+                <do_if value="$mk2DstResClear.$Station? and @$mk2DstResClear.$Station.exists and $mk2DstResClear.$Ware?">
+                  <remove_ware_reservation object="$mk2DstResClear.$Station" reserver="this.ship" type="sell" ware="$mk2DstResClear.$Ware" virtual="false"/>
+                </do_if>
+              </do_all>
+              <create_list name="this.$mk2DestReservations"/>
             </do_if>
             <do_if value="not this.$mk2DenyTrade and this.$allowillegal and this.$enforceRouteIllegalLegality">
               <do_if value="not global.$GT_Ships?">
@@ -3528,7 +3575,7 @@
           <remove_value name="this.$destinationThreatData"/>
           <set_value name="this.$mk2CycleTradeFailed" exact="true"/>
         </do_if>
-        <!-- Release any remaining MK2-owned source buy reservations after the order queue empties. -->
+        <!-- Release any remaining MK2-owned source buy / dest sell reservations after the order queue empties. -->
         <do_if value="this.$mk2SourceReservations? and this.$mk2SourceReservations.count gt 0">
           <do_all exact="this.$mk2SourceReservations.count" counter="$mk2SriDone">
             <set_value name="$mk2SrcResDone" exact="this.$mk2SourceReservations.{$mk2SriDone}"/>
@@ -3537,6 +3584,15 @@
             </do_if>
           </do_all>
           <create_list name="this.$mk2SourceReservations"/>
+        </do_if>
+        <do_if value="this.$mk2DestReservations? and this.$mk2DestReservations.count gt 0">
+          <do_all exact="this.$mk2DestReservations.count" counter="$mk2DriDone">
+            <set_value name="$mk2DstResDone" exact="this.$mk2DestReservations.{$mk2DriDone}"/>
+            <do_if value="$mk2DstResDone.$Station? and @$mk2DstResDone.$Station.exists and $mk2DstResDone.$Ware?">
+              <remove_ware_reservation object="$mk2DstResDone.$Station" reserver="this.ship" type="sell" ware="$mk2DstResDone.$Ware" virtual="false"/>
+            </do_if>
+          </do_all>
+          <create_list name="this.$mk2DestReservations"/>
         </do_if>
         <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}.$ActiveTradePolicy?">
           <remove_value name="global.$GT_Ships.{this.ship}.$ActiveTradePolicy"/>
@@ -3737,7 +3793,7 @@
     </do_if>
     <remove_value name="this.$maintenance_transition"/>
 
-    <!-- Release source buy reservations claimed for in-flight MK2 pickups. -->
+    <!-- Release source buy / dest sell reservations claimed for in-flight MK2 legs. -->
     <do_if value="this.$mk2SourceReservations? and this.$mk2SourceReservations.count gt 0">
       <do_all exact="this.$mk2SourceReservations.count" counter="$mk2SriAbort">
         <set_value name="$mk2SrcResAbort" exact="this.$mk2SourceReservations.{$mk2SriAbort}"/>
@@ -3746,6 +3802,15 @@
         </do_if>
       </do_all>
       <create_list name="this.$mk2SourceReservations"/>
+    </do_if>
+    <do_if value="this.$mk2DestReservations? and this.$mk2DestReservations.count gt 0">
+      <do_all exact="this.$mk2DestReservations.count" counter="$mk2DriAbort">
+        <set_value name="$mk2DstResAbort" exact="this.$mk2DestReservations.{$mk2DriAbort}"/>
+        <do_if value="$mk2DstResAbort.$Station? and @$mk2DstResAbort.$Station.exists and $mk2DstResAbort.$Ware?">
+          <remove_ware_reservation object="$mk2DstResAbort.$Station" reserver="this.ship" type="sell" ware="$mk2DstResAbort.$Ware" virtual="false"/>
+        </do_if>
+      </do_all>
+      <create_list name="this.$mk2DestReservations"/>
     </do_if>
 
     <!-- Clear stale clearance naming flag on order abort only when cargo is actually empty. -->

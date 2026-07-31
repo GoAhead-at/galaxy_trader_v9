@@ -197,6 +197,7 @@
       <set_value name="this.$gt_cs_now" exact="$now"/>
       <set_value name="this.$gt_cs_cacheMaxAge" exact="$cacheMaxAge"/>
       <set_value name="this.$gt_cs_cacheHomeKey" exact="$cacheHomeKey"/>
+      <set_value name="this.$gt_cs_purgedStaleCount" exact="0"/>
       <wait exact="this.$gt_yieldMs * 1ms" comment="Yield before purge/scan so MD/other AI can run after cache.write"/>
       <set_value name="$homeCacheCount" exact="this.$gt_cs_homeCacheCount"/>
       <set_value name="$now" exact="this.$gt_cs_now"/>
@@ -209,10 +210,15 @@
       <do_else>
         <set_value name="$homeCache" exact="@global.$GT_TradeCache.{$cacheHomeKey}"/>
       </do_else>
-      <set_value name="$purgedStaleCount" exact="0"/>
+      <set_value name="$purgedStaleCount" exact="this.$gt_cs_purgedStaleCount"/>
       <!-- Read-time purge: TTL + dead refs only. Skip when caller just wrote this pool (post-refresh). -->
       <do_if value="not this.$gt_cs_skipPurge">
       <do_all exact="$homeCacheCount" counter="$pci" reverse="true">
+        <!-- Restore after prior purge yield (locals wiped by wait). -->
+        <set_value name="$cacheHomeKey" exact="this.$gt_cs_cacheHomeKey"/>
+        <set_value name="$now" exact="this.$gt_cs_now"/>
+        <set_value name="$cacheMaxAge" exact="this.$gt_cs_cacheMaxAge"/>
+        <set_value name="$purgedStaleCount" exact="this.$gt_cs_purgedStaleCount"/>
         <set_value name="$livePurgeCount" exact="0"/>
         <do_if value="this.$gt_cachePoolIsMk4">
           <set_value name="$livePurgeCount" exact="if @global.$GT_TradeCacheMK4.{$cacheHomeKey}.count != null then @global.$GT_TradeCacheMK4.{$cacheHomeKey}.count else 0"/>
@@ -307,6 +313,7 @@
               <remove_value name="global.$GT_TradeCache.{$cacheHomeKey}.{$pci}"/>
             </do_else>
             <set_value name="$purgedStaleCount" operation="add"/>
+            <set_value name="this.$gt_cs_purgedStaleCount" exact="$purgedStaleCount"/>
           </do_if>
         </do_if>
         <set_value name="$pciInt" exact="($pci)i"/>
@@ -315,18 +322,29 @@
         </do_if>
       </do_all>
       </do_if>
+      <!-- Always rebind after purge path: purge yields wipe locals even when purged=0.
+           Snapshot $homeCacheCount alone is not enough - scan uses $homeCache.count. -->
+      <set_value name="$cacheHomeKey" exact="null"/>
+      <do_if value="this.$gt_cs_cacheHomeKey?">
+        <set_value name="$cacheHomeKey" exact="this.$gt_cs_cacheHomeKey"/>
+      </do_if>
+      <do_elseif value="$homeSector?">
+        <set_value name="$cacheHomeKey" exact="$homeSector"/>
+        <set_value name="this.$gt_cs_cacheHomeKey" exact="$cacheHomeKey"/>
+      </do_elseif>
+      <set_value name="$purgedStaleCount" exact="if this.$gt_cs_purgedStaleCount? then this.$gt_cs_purgedStaleCount else 0"/>
+      <set_value name="$homeCache" exact="null"/>
+      <do_if value="$cacheHomeKey? and this.$gt_cachePoolIsMk4">
+        <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}"/>
+      </do_if>
+      <do_elseif value="$cacheHomeKey?">
+        <set_value name="$homeCache" exact="@global.$GT_TradeCache.{$cacheHomeKey}"/>
+      </do_elseif>
+      <set_value name="$homeCacheCount" exact="0"/>
+      <do_if value="$homeCache?">
+        <set_value name="$homeCacheCount" exact="@$homeCache.count"/>
+      </do_if>
       <do_if value="$purgedStaleCount gt 0">
-        <set_value name="$homeCache" exact="null"/>
-        <do_if value="this.$gt_cachePoolIsMk4">
-          <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}"/>
-        </do_if>
-        <do_else>
-          <set_value name="$homeCache" exact="@global.$GT_TradeCache.{$cacheHomeKey}"/>
-        </do_else>
-        <set_value name="$homeCacheCount" exact="0"/>
-        <do_if value="$homeCache?">
-          <set_value name="$homeCacheCount" exact="@$homeCache.count"/>
-        </do_if>
         <set_value name="$poolLabel" exact="if this.$gt_cachePoolIsMk4 then 'MK4' else 'MK3'"/>
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-CacheSearch] ' + $ship.idcode + ': (' + $poolLabel + ') Read-time purge removed ' + $purgedStaleCount + ' stale entries from ' + $cacheHomeKey.knownname + ' (remaining: ' + $homeCacheCount + ')'" chance="100"/>
@@ -422,8 +440,8 @@
         <do_else>
           <set_value name="$i" exact="$visitIdx"/>
         </do_else>
-        <!-- Bounds guard: list may have shrunk since $homeCacheCount was captured -->
-        <do_if value="$i gt $homeCache.count">
+        <!-- Bounds guard: list may have shrunk / $homeCache wiped by a prior yield -->
+        <do_if value="not $homeCache? or $i gt @$homeCache.count">
           <continue/>
         </do_if>
         <set_value name="$entry" exact="@$homeCache.{$i}"/>
@@ -1484,8 +1502,76 @@
             <break/>
           </do_if>
         </do_if>
+        <!-- Flush before wait, restore after: scan locals do not survive yield (params do). -->
         <do_if value="($visitIdx % 5) == 0">
+          <set_value name="this.$gt_cs_tradeList" exact="$tradeList"/>
+          <set_value name="this.$gt_cs_foundCount" exact="$foundCount"/>
+          <set_value name="this.$gt_cs_bestScore" exact="$bestScore"/>
+          <set_value name="this.$gt_cs_bestTrade" exact="$bestTrade"/>
+          <set_value name="this.$gt_cs_foundPerWare" exact="$foundPerWare"/>
+          <set_value name="this.$gt_cs_gateReach" exact="$gateReach"/>
+          <set_value name="this.$gt_cs_cacheHomeKey" exact="$cacheHomeKey"/>
+          <set_value name="this.$gt_cs_now" exact="$now"/>
+          <set_value name="this.$gt_cs_cacheMaxAge" exact="$cacheMaxAge"/>
+          <set_value name="this.$gt_cs_maxDistanceBuyLeg" exact="$maxDistanceBuyLeg"/>
+          <set_value name="this.$gt_cs_maxDistanceSellLeg" exact="$maxDistanceSellLeg"/>
+          <set_value name="this.$gt_cs_isSellOnlySearch" exact="$isSellOnlySearch"/>
+          <set_value name="this.$gt_cs_isIsolatedMode" exact="$isIsolatedMode"/>
+          <set_value name="this.$gt_cs_cargoUtilThresholdPct" exact="$cargoUtilThresholdPct"/>
+          <set_value name="this.$gt_cs_perWareCap" exact="$perWareCap"/>
+          <set_value name="this.$gt_cs_wareBasketCount" exact="$wareBasketCount"/>
+          <set_value name="this.$gt_cs_reScanMaxDist" exact="$reScanMaxDist"/>
+          <set_value name="this.$gt_cs_bandPriceCheckActive" exact="$bandPriceCheckActive"/>
+          <set_value name="this.$gt_cs_bandSupplierQtyMax" exact="$bandSupplierQtyMax"/>
+          <set_value name="this.$gt_cs_bandCustomerQtyMin" exact="$bandCustomerQtyMin"/>
+          <set_value name="this.$gt_cs_bandMinQtySpread" exact="$bandMinQtySpread"/>
+          <set_value name="this.$gt_cs_cuBestVol" exact="$cuBestVol"/>
+          <set_value name="this.$gt_cs_cuBestAmt" exact="$cuBestAmt"/>
+          <set_value name="this.$gt_cs_cuBestVolPerUnit" exact="$cuBestVolPerUnit"/>
+          <set_value name="this.$gt_cs_cuBestEntryAmt" exact="$cuBestEntryAmt"/>
+          <set_value name="this.$gt_cs_cuNeedVol" exact="$cuNeedVol"/>
+          <set_value name="this.$gt_cs_homeCacheCount" exact="$homeCacheCount"/>
+          <set_value name="this.$gt_cs_purgedStaleCount" exact="$purgedStaleCount"/>
+          <set_value name="this.$gt_cs_loopSpan" exact="$loopSpan"/>
+          <set_value name="this.$gt_cs_startOffset" exact="$startOffset"/>
           <wait exact="this.$gt_yieldMs * 1ms" comment="Yield cache scan loop"/>
+          <set_value name="$tradeList" exact="this.$gt_cs_tradeList"/>
+          <set_value name="$foundCount" exact="this.$gt_cs_foundCount"/>
+          <set_value name="$bestScore" exact="this.$gt_cs_bestScore"/>
+          <set_value name="$bestTrade" exact="this.$gt_cs_bestTrade"/>
+          <set_value name="$foundPerWare" exact="this.$gt_cs_foundPerWare"/>
+          <set_value name="$gateReach" exact="this.$gt_cs_gateReach"/>
+          <set_value name="$cacheHomeKey" exact="this.$gt_cs_cacheHomeKey"/>
+          <set_value name="$now" exact="this.$gt_cs_now"/>
+          <set_value name="$cacheMaxAge" exact="this.$gt_cs_cacheMaxAge"/>
+          <set_value name="$maxDistanceBuyLeg" exact="this.$gt_cs_maxDistanceBuyLeg"/>
+          <set_value name="$maxDistanceSellLeg" exact="this.$gt_cs_maxDistanceSellLeg"/>
+          <set_value name="$isSellOnlySearch" exact="this.$gt_cs_isSellOnlySearch"/>
+          <set_value name="$isIsolatedMode" exact="this.$gt_cs_isIsolatedMode"/>
+          <set_value name="$cargoUtilThresholdPct" exact="this.$gt_cs_cargoUtilThresholdPct"/>
+          <set_value name="$perWareCap" exact="this.$gt_cs_perWareCap"/>
+          <set_value name="$wareBasketCount" exact="this.$gt_cs_wareBasketCount"/>
+          <set_value name="$reScanMaxDist" exact="this.$gt_cs_reScanMaxDist"/>
+          <set_value name="$bandPriceCheckActive" exact="this.$gt_cs_bandPriceCheckActive"/>
+          <set_value name="$bandSupplierQtyMax" exact="this.$gt_cs_bandSupplierQtyMax"/>
+          <set_value name="$bandCustomerQtyMin" exact="this.$gt_cs_bandCustomerQtyMin"/>
+          <set_value name="$bandMinQtySpread" exact="this.$gt_cs_bandMinQtySpread"/>
+          <set_value name="$cuBestVol" exact="this.$gt_cs_cuBestVol"/>
+          <set_value name="$cuBestAmt" exact="this.$gt_cs_cuBestAmt"/>
+          <set_value name="$cuBestVolPerUnit" exact="this.$gt_cs_cuBestVolPerUnit"/>
+          <set_value name="$cuBestEntryAmt" exact="this.$gt_cs_cuBestEntryAmt"/>
+          <set_value name="$cuNeedVol" exact="this.$gt_cs_cuNeedVol"/>
+          <set_value name="$homeCacheCount" exact="this.$gt_cs_homeCacheCount"/>
+          <set_value name="$purgedStaleCount" exact="this.$gt_cs_purgedStaleCount"/>
+          <set_value name="$loopSpan" exact="this.$gt_cs_loopSpan"/>
+          <set_value name="$startOffset" exact="this.$gt_cs_startOffset"/>
+          <set_value name="$homeCache" exact="null"/>
+          <do_if value="this.$gt_cachePoolIsMk4">
+            <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}"/>
+          </do_if>
+          <do_else>
+            <set_value name="$homeCache" exact="@global.$GT_TradeCache.{$cacheHomeKey}"/>
+          </do_else>
         </do_if>
       </do_all>
 
@@ -1498,10 +1584,18 @@
            it fall through to live search. Using them here let one large freighter erase the whole
            sector pool 0.2s after it was written. -->
       <set_value name="$purgedDeadCount" exact="0"/>
-      <do_if value="$foundCount == 0 and @$homeCache != null and $homeCache.count gt 0">
+      <do_if value="$foundCount == 0 and $homeCache? and @$homeCache.count gt 0">
         <set_value name="$deadScanCount" exact="@$homeCache.count"/>
         <do_all exact="$deadScanCount" counter="$ddi" reverse="true">
-          <do_if value="$ddi gt $homeCache.count">
+          <set_value name="$cacheHomeKey" exact="this.$gt_cs_cacheHomeKey"/>
+          <set_value name="$homeCache" exact="null"/>
+          <do_if value="this.$gt_cachePoolIsMk4">
+            <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}"/>
+          </do_if>
+          <do_else>
+            <set_value name="$homeCache" exact="@global.$GT_TradeCache.{$cacheHomeKey}"/>
+          </do_else>
+          <do_if value="not $homeCache? or $ddi gt @$homeCache.count">
             <continue/>
           </do_if>
           <set_value name="$deadEntry" exact="@$homeCache.{$ddi}"/>

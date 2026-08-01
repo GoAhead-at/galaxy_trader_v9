@@ -1,0 +1,342 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- lib.gt.mk42.station.list.match — MK4-2 station whitelist/blacklist for one candidate.
+     No <wait>: safe during tradematch / trade_found / diagnose.
+
+     Role split (one shared list per WL/BL):
+       - Player-owned stations can be customers and suppliers.
+       - NPC stations can only be suppliers (ignored for customer checks).
+       - Build storage follows its .base station (do not need BS on the list).
+       - Aux / non-station candidates are not filtered.
+
+     Whitelist:
+       - Customer filter active only if the list has at least one player-owned station.
+         Then only those player stations (and their BS) may be supplied.
+       - Supplier filter active only if the list has at least one NPC station.
+         Then suppliers must be on the list (player or NPC entries both count).
+       - Empty side = unrestricted for that role (e.g. HQ-only WL => supply HQ only,
+         all NPC suppliers still allowed).
+
+     Blacklist (same structure, block instead of allow):
+       - Customer filter active if any player-owned station is listed -> do not supply them.
+       - Supplier filter active if any NPC station is listed -> do not buy from listed
+         stations (player + NPC entries on the BL both block when this side is active).
+
+     Blacklist wins over whitelist when both apply to the same candidate/role.
+     mode=index builds role tables + prioSig fragment; mode=check needs role=customer|supplier. -->
+<aiscript name="lib.gt.mk42.station.list.match" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <params>
+    <param name="mode" default="'check'" comment="check = allow one candidate; index = build membership tables + sig fragment"/>
+    <param name="role" default="'customer'" comment="customer | supplier (check mode)"/>
+    <param name="candidate" default="null" comment="Station, buildstorage, or other object to test (check mode)"/>
+    <param name="whitelist" default="[]"/>
+    <param name="blacklist" default="[]"/>
+    <!-- Optional prebuilt tables/flags from index mode (avoids re-walking lists). -->
+    <param name="whitelistCustomerTable" default="null"/>
+    <param name="whitelistSupplierTable" default="null"/>
+    <param name="blacklistCustomerTable" default="null"/>
+    <param name="blacklistSupplierTable" default="null"/>
+    <param name="whitelistCustomerActive" default="null"/>
+    <param name="whitelistSupplierActive" default="null"/>
+    <param name="blacklistCustomerActive" default="null"/>
+    <param name="blacklistSupplierActive" default="null"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <set_value name="$wl" exact="if $whitelist? and $whitelist != null then $whitelist else []"/>
+      <set_value name="$bl" exact="if $blacklist? and $blacklist != null then $blacklist else []"/>
+      <do_if value="typeof $wl != datatype.list">
+        <set_value name="$wl" exact="[]"/>
+      </do_if>
+      <do_if value="typeof $bl != datatype.list">
+        <set_value name="$bl" exact="[]"/>
+      </do_if>
+
+      <do_if value="$mode == 'index'">
+        <set_value name="$wlCustTable" exact="table[]"/>
+        <set_value name="$wlSupTable" exact="table[]"/>
+        <set_value name="$blCustTable" exact="table[]"/>
+        <set_value name="$blSupTable" exact="table[]"/>
+        <set_value name="$wlCustActive" exact="false"/>
+        <set_value name="$wlSupActive" exact="false"/>
+        <set_value name="$blCustActive" exact="false"/>
+        <set_value name="$blSupActive" exact="false"/>
+        <set_value name="$sigIds" exact="[]"/>
+
+        <do_all exact="$wl.count" counter="$wli">
+          <set_value name="$wObj" exact="$wl.{$wli}"/>
+          <do_if value="not $wObj? or not @$wObj.exists">
+            <continue/>
+          </do_if>
+          <set_value name="$wAnchor" exact="$wObj"/>
+          <do_if value="$wObj.isclass.buildstorage and $wObj.base? and @$wObj.base.exists">
+            <set_value name="$wAnchor" exact="@$wObj.base"/>
+          </do_if>
+          <do_if value="not $wAnchor.isclass.station">
+            <continue/>
+          </do_if>
+          <!-- Every listed station can be a supplier membership hit; only player activates customer side. -->
+          <set_value name="$wlSupTable.{$wAnchor}" exact="true"/>
+          <do_if value="@$wAnchor.isplayerowned">
+            <set_value name="$wlCustTable.{$wAnchor}" exact="true"/>
+            <set_value name="$wlCustActive" exact="true"/>
+          </do_if>
+          <do_else>
+            <set_value name="$wlSupActive" exact="true"/>
+          </do_else>
+          <do_if value="$wAnchor.idcode?">
+            <append_to_list name="$sigIds" exact="'W:' + @$wAnchor.idcode"/>
+          </do_if>
+        </do_all>
+
+        <do_all exact="$bl.count" counter="$bli">
+          <set_value name="$bObj" exact="$bl.{$bli}"/>
+          <do_if value="not $bObj? or not @$bObj.exists">
+            <continue/>
+          </do_if>
+          <set_value name="$bAnchor" exact="$bObj"/>
+          <do_if value="$bObj.isclass.buildstorage and $bObj.base? and @$bObj.base.exists">
+            <set_value name="$bAnchor" exact="@$bObj.base"/>
+          </do_if>
+          <do_if value="not $bAnchor.isclass.station">
+            <continue/>
+          </do_if>
+          <set_value name="$blSupTable.{$bAnchor}" exact="true"/>
+          <do_if value="@$bAnchor.isplayerowned">
+            <set_value name="$blCustTable.{$bAnchor}" exact="true"/>
+            <set_value name="$blCustActive" exact="true"/>
+          </do_if>
+          <do_else>
+            <set_value name="$blSupActive" exact="true"/>
+          </do_else>
+          <do_if value="$bAnchor.idcode?">
+            <append_to_list name="$sigIds" exact="'B:' + @$bAnchor.idcode"/>
+          </do_if>
+        </do_all>
+
+        <set_value name="$listSig" exact="'0'"/>
+        <do_if value="$sigIds.count gt 0">
+          <sort_list list="$sigIds"/>
+          <set_value name="$listSig" exact="''"/>
+          <do_all exact="$sigIds.count" counter="$si">
+            <set_value name="$listSig" exact="$listSig + (if $si gt 1 then ',' else '') + $sigIds.{$si}"/>
+          </do_all>
+        </do_if>
+        <return value="table[
+          $WhitelistCustomerTable = $wlCustTable,
+          $WhitelistSupplierTable = $wlSupTable,
+          $BlacklistCustomerTable = $blCustTable,
+          $BlacklistSupplierTable = $blSupTable,
+          $WhitelistCustomerActive = $wlCustActive,
+          $WhitelistSupplierActive = $wlSupActive,
+          $BlacklistCustomerActive = $blCustActive,
+          $BlacklistSupplierActive = $blSupActive,
+          $ListActive = $wlCustActive or $wlSupActive or $blCustActive or $blSupActive,
+          $ListSig = $listSig
+        ]"/>
+      </do_if>
+
+      <!-- check mode -->
+      <set_value name="$checkRole" exact="if $role? then $role else 'customer'"/>
+      <set_value name="$havePrebuiltActives" exact="$whitelistCustomerActive? and $whitelistCustomerActive != null and $whitelistSupplierActive? and $whitelistSupplierActive != null and $blacklistCustomerActive? and $blacklistCustomerActive != null and $blacklistSupplierActive? and $blacklistSupplierActive != null"/>
+      <do_if value="$havePrebuiltActives">
+        <set_value name="$wlCustActive" exact="$whitelistCustomerActive"/>
+        <set_value name="$wlSupActive" exact="$whitelistSupplierActive"/>
+        <set_value name="$blCustActive" exact="$blacklistCustomerActive"/>
+        <set_value name="$blSupActive" exact="$blacklistSupplierActive"/>
+      </do_if>
+      <do_else>
+        <set_value name="$wlCustActive" exact="false"/>
+        <set_value name="$wlSupActive" exact="false"/>
+        <set_value name="$blCustActive" exact="false"/>
+        <set_value name="$blSupActive" exact="false"/>
+        <do_all exact="$wl.count" counter="$wli3">
+          <set_value name="$wObj3" exact="$wl.{$wli3}"/>
+          <do_if value="not $wObj3? or not @$wObj3.exists">
+            <continue/>
+          </do_if>
+          <set_value name="$wAnchor3" exact="$wObj3"/>
+          <do_if value="$wObj3.isclass.buildstorage and $wObj3.base? and @$wObj3.base.exists">
+            <set_value name="$wAnchor3" exact="@$wObj3.base"/>
+          </do_if>
+          <do_if value="not $wAnchor3.isclass.station">
+            <continue/>
+          </do_if>
+          <do_if value="@$wAnchor3.isplayerowned">
+            <set_value name="$wlCustActive" exact="true"/>
+          </do_if>
+          <do_else>
+            <set_value name="$wlSupActive" exact="true"/>
+          </do_else>
+        </do_all>
+        <do_all exact="$bl.count" counter="$bli3">
+          <set_value name="$bObj3" exact="$bl.{$bli3}"/>
+          <do_if value="not $bObj3? or not @$bObj3.exists">
+            <continue/>
+          </do_if>
+          <set_value name="$bAnchor3" exact="$bObj3"/>
+          <do_if value="$bObj3.isclass.buildstorage and $bObj3.base? and @$bObj3.base.exists">
+            <set_value name="$bAnchor3" exact="@$bObj3.base"/>
+          </do_if>
+          <do_if value="not $bAnchor3.isclass.station">
+            <continue/>
+          </do_if>
+          <do_if value="@$bAnchor3.isplayerowned">
+            <set_value name="$blCustActive" exact="true"/>
+          </do_if>
+          <do_else>
+            <set_value name="$blSupActive" exact="true"/>
+          </do_else>
+        </do_all>
+      </do_else>
+
+      <do_if value="$checkRole == 'supplier'">
+        <do_if value="not $wlSupActive and not $blSupActive">
+          <return value="table[$Allowed = true, $Reason = 'inactive', $Anchor = null]"/>
+        </do_if>
+      </do_if>
+      <do_else>
+        <do_if value="not $wlCustActive and not $blCustActive">
+          <return value="table[$Allowed = true, $Reason = 'inactive', $Anchor = null]"/>
+        </do_if>
+      </do_else>
+
+      <do_if value="not $candidate? or not @$candidate.exists">
+        <return value="table[$Allowed = true, $Reason = 'no_candidate', $Anchor = null]"/>
+      </do_if>
+
+      <set_value name="$anchor" exact="$candidate"/>
+      <do_if value="$candidate.isclass.buildstorage and $candidate.base? and @$candidate.base.exists">
+        <set_value name="$anchor" exact="@$candidate.base"/>
+      </do_if>
+      <do_if value="not $anchor.isclass.station">
+        <return value="table[$Allowed = true, $Reason = 'non_station', $Anchor = $anchor]"/>
+      </do_if>
+
+      <!-- NPC cannot be a delivery customer. -->
+      <do_if value="$checkRole == 'customer' and not @$anchor.isplayerowned">
+        <return value="table[$Allowed = true, $Reason = 'npc_not_customer', $Anchor = $anchor]"/>
+      </do_if>
+
+      <set_value name="$wlCustTable" exact="if $whitelistCustomerTable? and $whitelistCustomerTable != null then $whitelistCustomerTable else null"/>
+      <set_value name="$wlSupTable" exact="if $whitelistSupplierTable? and $whitelistSupplierTable != null then $whitelistSupplierTable else null"/>
+      <set_value name="$blCustTable" exact="if $blacklistCustomerTable? and $blacklistCustomerTable != null then $blacklistCustomerTable else null"/>
+      <set_value name="$blSupTable" exact="if $blacklistSupplierTable? and $blacklistSupplierTable != null then $blacklistSupplierTable else null"/>
+
+      <do_if value="$checkRole == 'supplier'">
+        <do_if value="$blSupActive">
+          <set_value name="$onBl" exact="false"/>
+          <do_if value="$blSupTable? and $blSupTable != null">
+            <do_if value="$blSupTable.{$anchor}?">
+              <set_value name="$onBl" exact="true"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <do_all exact="$bl.count" counter="$bli2">
+              <set_value name="$bObj2" exact="$bl.{$bli2}"/>
+              <do_if value="not $bObj2? or not @$bObj2.exists">
+                <continue/>
+              </do_if>
+              <set_value name="$bAnchor2" exact="$bObj2"/>
+              <do_if value="$bObj2.isclass.buildstorage and $bObj2.base? and @$bObj2.base.exists">
+                <set_value name="$bAnchor2" exact="@$bObj2.base"/>
+              </do_if>
+              <do_if value="$bAnchor2 == $anchor">
+                <set_value name="$onBl" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_else>
+          <do_if value="$onBl">
+            <return value="table[$Allowed = false, $Reason = 'blacklist', $Anchor = $anchor]"/>
+          </do_if>
+        </do_if>
+        <do_if value="$wlSupActive">
+          <set_value name="$onWl" exact="false"/>
+          <do_if value="$wlSupTable? and $wlSupTable != null">
+            <do_if value="$wlSupTable.{$anchor}?">
+              <set_value name="$onWl" exact="true"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <do_all exact="$wl.count" counter="$wli2">
+              <set_value name="$wObj2" exact="$wl.{$wli2}"/>
+              <do_if value="not $wObj2? or not @$wObj2.exists">
+                <continue/>
+              </do_if>
+              <set_value name="$wAnchor2" exact="$wObj2"/>
+              <do_if value="$wObj2.isclass.buildstorage and $wObj2.base? and @$wObj2.base.exists">
+                <set_value name="$wAnchor2" exact="@$wObj2.base"/>
+              </do_if>
+              <do_if value="$wAnchor2 == $anchor">
+                <set_value name="$onWl" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_else>
+          <do_if value="not $onWl">
+            <return value="table[$Allowed = false, $Reason = 'whitelist', $Anchor = $anchor]"/>
+          </do_if>
+        </do_if>
+      </do_if>
+      <do_else>
+        <!-- customer role -->
+        <do_if value="$blCustActive">
+          <set_value name="$onBl" exact="false"/>
+          <do_if value="$blCustTable? and $blCustTable != null">
+            <do_if value="$blCustTable.{$anchor}?">
+              <set_value name="$onBl" exact="true"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <do_all exact="$bl.count" counter="$bli2c">
+              <set_value name="$bObj2c" exact="$bl.{$bli2c}"/>
+              <do_if value="not $bObj2c? or not @$bObj2c.exists">
+                <continue/>
+              </do_if>
+              <set_value name="$bAnchor2c" exact="$bObj2c"/>
+              <do_if value="$bObj2c.isclass.buildstorage and $bObj2c.base? and @$bObj2c.base.exists">
+                <set_value name="$bAnchor2c" exact="@$bObj2c.base"/>
+              </do_if>
+              <do_if value="$bAnchor2c == $anchor and @$bAnchor2c.isplayerowned">
+                <set_value name="$onBl" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_else>
+          <do_if value="$onBl">
+            <return value="table[$Allowed = false, $Reason = 'blacklist', $Anchor = $anchor]"/>
+          </do_if>
+        </do_if>
+        <do_if value="$wlCustActive">
+          <set_value name="$onWl" exact="false"/>
+          <do_if value="$wlCustTable? and $wlCustTable != null">
+            <do_if value="$wlCustTable.{$anchor}?">
+              <set_value name="$onWl" exact="true"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <do_all exact="$wl.count" counter="$wli2c">
+              <set_value name="$wObj2c" exact="$wl.{$wli2c}"/>
+              <do_if value="not $wObj2c? or not @$wObj2c.exists">
+                <continue/>
+              </do_if>
+              <set_value name="$wAnchor2c" exact="$wObj2c"/>
+              <do_if value="$wObj2c.isclass.buildstorage and $wObj2c.base? and @$wObj2c.base.exists">
+                <set_value name="$wAnchor2c" exact="@$wObj2c.base"/>
+              </do_if>
+              <do_if value="$wAnchor2c == $anchor and @$wAnchor2c.isplayerowned">
+                <set_value name="$onWl" exact="true"/>
+                <break/>
+              </do_if>
+            </do_all>
+          </do_else>
+          <do_if value="not $onWl">
+            <return value="table[$Allowed = false, $Reason = 'whitelist', $Anchor = $anchor]"/>
+          </do_if>
+        </do_if>
+      </do_else>
+
+      <return value="table[$Allowed = true, $Reason = 'ok', $Anchor = $anchor]"/>
+    </actions>
+  </attention>
+</aiscript>

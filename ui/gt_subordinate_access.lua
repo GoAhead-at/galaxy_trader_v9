@@ -17,7 +17,6 @@ local GT_OrderIDs = {
     ["GalaxyTraderMK2"] = true,
     ["GalaxyTraderMK3"] = true,
     ["GalaxyTraderMK4Supply"] = true,
-    ["GalaxyTraderMK4Supply2"] = true,
     ["GalaxyMiner"] = true,
 }
 

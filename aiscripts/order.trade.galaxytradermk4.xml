@@ -4028,7 +4028,7 @@
             <param name="ignoreBlacklist" value="if $searchMode? and $searchMode == 'sell_only' then false else true"/>
             <param name="blacklistGroup" value="if this.$blacklistgroup? then this.$blacklistgroup else blacklistgroup.civilian"/>
           </run_script>
-          <!-- lib.gt.mk4.live.search yields, and X4 re-evaluates these params when the order resumes -
+          <!-- lib.gt.live.search yields, and X4 re-evaluates these params when the order resumes -
                by then $pathResult is gone. Persist the spaces on the order so the re-run searches
                the same sectors instead of failing the lookup and scanning nothing. -->
           <set_value name="this.$searchBuySpaces" exact="if @$pathResult.$BuySpaces != null then $pathResult.$BuySpaces else []"/>
@@ -4045,7 +4045,7 @@
           <set_value name="$searchSellPriceMax" exact="1.0"/>
           <set_value name="$searchBuyPriceMin" exact="-1.0"/>
           <debug_text text="'[GT-AI] ' + this.ship.idcode + ': PriceRange: SellPriceMax=' + $searchSellPriceMax + ' BuyPriceMin=' + $searchBuyPriceMin" chance="@this.$debugchance"/>
-          <run_script name="'lib.gt.mk4.live.search'" result="$liveResult">
+          <run_script name="'lib.gt.live.search'" result="$liveResult">
             <param name="ship" value="this.ship"/>
             <param name="searchMode" value="$searchMode"/>
             <param name="buySpaces" value="if this.$searchBuySpaces? then this.$searchBuySpaces else []"/>
@@ -4071,6 +4071,7 @@
             <param name="mk4AnchorHome" value="if this.$effectiveHome? then this.$effectiveHome else $searchHome"/>
             <param name="maxDistanceSell" value="$searchMaxSell"/>
             <param name="stationwhitelist" value="if this.$effectiveStationWhitelist? and this.$effectiveStationWhitelist != null then this.$effectiveStationWhitelist else (if $effectiveStationWhitelist? and $effectiveStationWhitelist != null then $effectiveStationWhitelist else [])"/>
+            <param name="enableVolumeThresholds" value="false"/>
             <param name="debugchance" value="@this.$debugchance"/>
           </run_script>
           <!-- SAVEGAME GUARD -->
@@ -5437,24 +5438,37 @@
                     <continue/>
                   </do_if>
 
-                  <!-- MK4 class-at-0 gate (validation-time). Root cause: cache.write stamps the
-                       delivery class while the build-storage offer is fresh, but build-storage offers
-                       churn; by validation time the trade can re-resolve to the base station, so a
-                       cached Buildstorage entry is queued as a Stations delivery even when the player
-                       set that class slider to 0 (observed: ODE-762 -> 'Asteroid Belt Wharf I' with
-                       priorityStations=0). Re-classify the LIVE sell station here and skip the trade
-                       when its class priority is 0. Mirrors the classify precedence in
-                       lib.gt.mk4.classify / tradematch. Build-storage deliveries (the common case)
-                       keep their Buildstorage class and pass. -->
-                  <do_if value="this.$mk4Priorities?">
-                    <run_script name="'lib.gt.mk4.classify'" result="$valDelivCls">
-                      <param name="customer" value="$sellStation"/>
-                      <param name="priorities" value="this.$mk4Priorities"/>
-                      <param name="mode" value="'both'"/>
-                    </run_script>
-                    <do_if value="$valDelivCls? and $valDelivCls != null and not @$valDelivCls.$Eligible">
+                  <!-- MK4 class-at-0 gate (validation-time). Inline lib.gt.mk4.classify logic —
+                       mid-loop run_script of an instant-return lib wake-storms AIDirector
+                       (mask=0001) when many candidates fail before validate.reach/dockcheck yields.
+                       Precedence: Buildstorage > Stations > Aux (same as lib.gt.mk4.classify). -->
+                  <do_if value="this.$mk4Priorities? and $sellStation? and @$sellStation.exists">
+                    <set_value name="$valDelivClass" exact="'None'"/>
+                    <do_if value="@$sellStation.isclass.buildstorage and @$sellStation.isplayerowned">
+                      <set_value name="$valDelivClass" exact="'Buildstorage'"/>
+                    </do_if>
+                    <do_elseif value="@$sellStation.isclass.station and @$sellStation.isplayerowned">
+                      <set_value name="$valDelivClass" exact="'Stations'"/>
+                    </do_elseif>
+                    <do_elseif value="@$sellStation.isclass.ship and @$sellStation.isplayerowned and @$sellStation.primarypurpose == purpose.auxiliary">
+                      <set_value name="$valDelivClass" exact="'Aux'"/>
+                    </do_elseif>
+                    <do_elseif value="@$sellStation.isclass.buildstorage and $sellStation.base? and @$sellStation.base.isplayerowned">
+                      <set_value name="$valDelivClass" exact="'Buildstorage'"/>
+                    </do_elseif>
+                    <set_value name="$valDelivMult" exact="0"/>
+                    <do_if value="$valDelivClass == 'Buildstorage'">
+                      <set_value name="$valDelivMult" exact="if this.$mk4Priorities.$Buildstorage? then this.$mk4Priorities.$Buildstorage else 0"/>
+                    </do_if>
+                    <do_elseif value="$valDelivClass == 'Stations'">
+                      <set_value name="$valDelivMult" exact="if this.$mk4Priorities.$Stations? then this.$mk4Priorities.$Stations else 0"/>
+                    </do_elseif>
+                    <do_elseif value="$valDelivClass == 'Aux'">
+                      <set_value name="$valDelivMult" exact="if this.$mk4Priorities.$Aux? then this.$mk4Priorities.$Aux else 0"/>
+                    </do_elseif>
+                    <do_if value="$valDelivClass == 'None' or $valDelivMult le 0">
                       <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade REJECTED — delivery class ' + (if $valDelivCls.$Class? then $valDelivCls.$Class else 'None') + ' is disabled (priority 0): ' + @$sellStation.knownname" chance="100"/>
+                        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade REJECTED - delivery class ' + $valDelivClass + ' is disabled (priority 0): ' + @$sellStation.knownname" chance="100"/>
                       </do_if>
                       <set_value name="$tradesRejectedRestriction" operation="add"/>
                       <continue/>

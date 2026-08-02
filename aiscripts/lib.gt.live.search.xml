@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<aiscript name="lib.gt.live.search" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="6">
+<aiscript name="lib.gt.live.search" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="7">
   <params>
     <param name="ship" default="this.ship"/>
     <param name="searchMode" default="'buy_and_sell'"/>
@@ -19,8 +19,9 @@
     <!-- MK4 compatibility params (accepted for call-site compatibility) -->
     <param name="ignoreTradeRulesPlayerBuyOffersRequireCargoNeed" default="false"/>
     <param name="includePlayerBuyOffers" default="true"/>
-    <param name="includePlayerSellOffers" default="true"/>
-    <param name="requirePlayerBuyOfferOwner" default="false" comment="When true, collected buy offers must be player-owned buyers (MK4 customer policy prefilter)."/>
+    <param name="includePlayerSellOffers" default="true" comment="When false, supplier scan excludes player-owned sell offers (MK4 buyFromPlayer=0 early cut)."/>
+    <param name="includeNpcSellOffers" default="true" comment="When false, supplier scan excludes non-player sell offers (MK4 buyFromFaction=0 early cut)."/>
+    <param name="requirePlayerBuyOfferOwner" default="false" comment="When true, collected buy offers must be player-owned buyers (MK4 customer policy). Also uses engine-level owner=faction.player on find_buy_offer to skip NPC delivery scan."/>
     <param name="priorityWares" default="[]" comment="Optional: MK3 priority wares to explicitly search for (ensures they enter the tradeable set for scoring)"/>
     <!-- MK3 'Ignore Player Pricing' option: include player sell offers unconditionally, and drop player buyers. -->
     <param name="bypassPlayerSellerPricing" default="false" comment="When true, run a supplemental player-only sell scan without relativeprice filter so player stations are purchased from regardless of price."/>
@@ -31,15 +32,21 @@
     <param name="retainCheapestSellPerWare" default="false" comment="When true, after sell collection keep cheapest player-owned and cheapest NPC sell offers per ware under maxOffersPerWare budget."/>
     <param name="distancePenalty" default="0.1" comment="Order UI/50 (0..2). ScoreAwareBuyCap uses Tater scale: profit × ((1 - p/100)^hops), p=penalty×5."/>
     <param name="demandLedSupplierScan" default="false" comment="MK4: collect buy offers first, then limit supplier scan to demand wares only (S4)."/>
-    <param name="mk4BuildStorageOnlyMode" default="false" comment="MK4: implicit BS-on + all ware-category toggles off — in-scope build storage buyers only."/>
+    <param name="mk4BuildStorageOnlyMode" default="false" comment="Legacy MK4 v1 — prefer mk4Priorities for MK4; kept as explicit override."/>
+    <param name="mk4Priorities" default="table[]" comment="MK4 class sliders — bitmask + classify-at-ingest"/>
     <param name="mk4AnchorHome" default="null" comment="MK4 home anchor for build-storage-only scope (station or sector)."/>
     <param name="maxDistanceSell" default="0" comment="MK4 jumpDistanceCoverage — max gate distance from home for BS delivery buyers (0 = use maxDistance)."/>
+    <param name="stationwhitelist" default="[]" comment="MK4: direct-probe these NPC stations as suppliers (sector scan can miss them via per-ware fill order / range edge)."/>
+    <param name="enableVolumeThresholds" default="true" comment="When false (MK4), force totalvolume floors to 1 / no meaningful max. MK3 default true keeps fleet-min / cargotarget floors."/>
     <param name="searchPurpose" default="'direct_live'" comment="cache_refresh = fleet-min totalvolume for shared cache; direct_live = this ship min/max"/>
     <param name="cargoTargetPercent" default="0" comment="Override cargotarget percent (0 = resolve from ship/order)"/>
     <param name="debugchance" default="0"/>
   </params>
   <patch sinceversion="5">
     <debug_text text="'[GT-LiveSearch] lib.gt.live.search v6: global scratch + gtls_ensure_state resume guards'" chance="100" filter="savegame"/>
+  </patch>
+  <patch sinceversion="6">
+    <debug_text text="'[GT-LiveSearch] lib.gt.live.search v7: MK4 live.search merge (optional params; no mid-flight this.$ backfill)'" chance="100" filter="savegame"/>
   </patch>
   <attention min="unknown">
     <actions>
@@ -80,6 +87,9 @@
       <set_value name="$gtlsBuyPriceMin" exact="$buyPriceMin"/>
       <set_value name="$gtlsIncludePlayerBuyOffers" exact="$includePlayerBuyOffers"/>
       <set_value name="$gtlsIncludePlayerSellOffers" exact="$includePlayerSellOffers"/>
+      <!-- @$x != null: declared-null list/bool params must not rely on X4 ? (declared, not non-null). -->
+      <set_value name="$gtlsIncludeNpcSellOffers" exact="if @$includeNpcSellOffers != null then $includeNpcSellOffers else true"/>
+      <set_value name="$gtlsSkipSupplierScan" exact="not $gtlsIncludePlayerSellOffers and not $gtlsIncludeNpcSellOffers"/>
       <set_value name="$gtlsRequirePlayerBuyOfferOwner" exact="$requirePlayerBuyOfferOwner"/>
       <set_value name="$gtlsIgnoreTradeRulesPlayerBuyOffersRequireCargoNeed" exact="$ignoreTradeRulesPlayerBuyOffersRequireCargoNeed"/>
       <set_value name="$gtlsBypassPlayerSellerPricing" exact="$bypassPlayerSellerPricing"/>
@@ -89,18 +99,32 @@
         <set_value name="$gtlsSellCollectCap" exact="[$gtlsMaxOffersPerWare * 4, 40].max"/>
       </do_if>
       <set_value name="$gtlsExcludePlayerBuyers" exact="$excludePlayerBuyers"/>
-      <!-- Clearance (sell_only): IPP excludes player buyers during normal search only. -->
+      <!-- Clearance (sell_only): IPP excludes player buyers during normal search only.
+           MK4 supply player-delivery policy does not apply to clearance. -->
       <do_if value="$gtlsSearchMode == 'sell_only'">
         <set_value name="$gtlsExcludePlayerBuyers" exact="false"/>
+        <set_value name="$gtlsRequirePlayerBuyOfferOwner" exact="false"/>
+      </do_if>
+      <!-- Reserve only under MK4 require-player so MK3 both-include defaults keep identical caps. -->
+      <set_value name="$gtlsPlayerSupplierReservePerWare" exact="0"/>
+      <do_if value="$gtlsRequirePlayerBuyOfferOwner and $gtlsIncludePlayerSellOffers and $gtlsIncludeNpcSellOffers">
+        <set_value name="$gtlsPlayerSupplierReservePerWare" exact="[1, [4, $maxOffersPerWare].min].max"/>
       </do_if>
       <set_value name="$gtlsPriorityWares" exact="if $priorityWares? then $priorityWares else []"/>
+      <set_value name="$gtlsStationWhitelist" exact="if @$stationwhitelist != null then $stationwhitelist else []"/>
       <set_value name="$gtlsDebugchance" exact="$debugchance"/>
       <set_value name="this.$gtlsDemandLedSupplierScan" exact="if $demandLedSupplierScan? then $demandLedSupplierScan else false"/>
       <do_if value="this.$gtlsDemandLedSupplierScan">
         <set_value name="this.$gtlsDemandLedSellDone" exact="false"/>
       </do_if>
       <set_value name="$gtlsMk4BuildStorageOnlyMode" exact="if $mk4BuildStorageOnlyMode? then $mk4BuildStorageOnlyMode else false"/>
+      <set_value name="$gtlsMk4Priorities" exact="if @$mk4Priorities != null then $mk4Priorities else table[]"/>
+      <!-- Derive BS-only from priorities when present; keep explicit mk4BuildStorageOnlyMode override. -->
+      <do_if value="@$gtlsMk4Priorities != null and $gtlsMk4Priorities.$Buildstorage? and $gtlsMk4Priorities.$Buildstorage gt 0 and (not $gtlsMk4Priorities.$Stations? or $gtlsMk4Priorities.$Stations == 0) and (not $gtlsMk4Priorities.$Aux? or $gtlsMk4Priorities.$Aux == 0)">
+        <set_value name="$gtlsMk4BuildStorageOnlyMode" exact="true"/>
+      </do_if>
       <set_value name="$gtlsMk4AnchorHome" exact="if $mk4AnchorHome? then $mk4AnchorHome else null"/>
+      <set_value name="$gtlsEnableVolumeThresholds" exact="if @$enableVolumeThresholds != null then $enableVolumeThresholds else true"/>
       <set_value name="$gtlsDistancePenalty" exact="if $distancePenalty? then $distancePenalty else 0.1"/>
       <set_value name="$gtlsSourceSellByWare" exact="table[]"/>
       <set_value name="$gtlsUseScoreAwareBuyCap" exact="false"/>
@@ -166,6 +190,15 @@
         <set_value name="this.$gtlsTvMaxSolid" exact="999999999"/>
         <set_value name="this.$gtlsTvMaxLiquid" exact="999999999"/>
       </do_if>
+      <!-- MK4: disable volume floors (enableVolumeThresholds=false) — no meaningful min/max. -->
+      <do_if value="not $gtlsEnableVolumeThresholds">
+        <set_value name="this.$gtlsTvMinContainer" exact="1"/>
+        <set_value name="this.$gtlsTvMinSolid" exact="1"/>
+        <set_value name="this.$gtlsTvMinLiquid" exact="1"/>
+        <set_value name="this.$gtlsTvMaxContainer" exact="999999999"/>
+        <set_value name="this.$gtlsTvMaxSolid" exact="999999999"/>
+        <set_value name="this.$gtlsTvMaxLiquid" exact="999999999"/>
+      </do_if>
       <set_value name="$gtlsUseAllWares" exact="(not $gtlsWareBasket? or $gtlsWareBasket.count == 0)"/>
       <!-- Phase 5: home-scoped offer index (MK3 cache_refresh, all-wares only).
            Atomic per-sector upsert after find; reuse fresh buckets to skip find_*_offer.
@@ -179,7 +212,7 @@
       </do_if>
       <do_if value="this.$gtlsSearchPurpose == 'cache_refresh' and $gtlsSearchMode == 'buy_and_sell' and $gtlsUseAllWares and $gtlsHomeSector? and @$gtlsHomeSector.exists and not $gtlsRetainCheapestSellPerWare and not $gtlsUseScoreAwareBuyCap and not $gtlsRequirePlayerBuyOfferOwner and (not this.$gtlsDemandLedSupplierScan? or not this.$gtlsDemandLedSupplierScan)">
         <set_value name="this.$gtlsOfferIndexEnabled" exact="true"/>
-        <set_value name="this.$gtlsOfferIndexProfile" exact="'cr|' + $gtlsMaxDistance + '|' + $gtlsSellPriceMax + '|' + $gtlsBuyPriceMin + '|' + $gtlsOwnerFilter + '|' + (if $gtlsIgnoreTradeRules then 1 else 0) + '|' + (if $gtlsIncludePlayerSellOffers then 1 else 0) + '|' + (if $gtlsIncludePlayerBuyOffers then 1 else 0) + '|' + (if $gtlsBypassPlayerSellerPricing then 1 else 0) + '|' + (if $gtlsExcludePlayerBuyers then 1 else 0) + '|' + (if $gtlsAllowIllegal then 1 else 0) + '|' + $gtlsMaxOffersPerWare"/>
+        <set_value name="this.$gtlsOfferIndexProfile" exact="'cr|' + $gtlsMaxDistance + '|' + $gtlsSellPriceMax + '|' + $gtlsBuyPriceMin + '|' + $gtlsOwnerFilter + '|' + (if $gtlsIgnoreTradeRules then 1 else 0) + '|' + (if $gtlsIncludePlayerSellOffers then 1 else 0) + '|' + (if $gtlsIncludeNpcSellOffers then 1 else 0) + '|' + (if $gtlsIncludePlayerBuyOffers then 1 else 0) + '|' + (if $gtlsBypassPlayerSellerPricing then 1 else 0) + '|' + (if $gtlsExcludePlayerBuyers then 1 else 0) + '|' + (if $gtlsAllowIllegal then 1 else 0) + '|' + $gtlsMaxOffersPerWare"/>
         <do_if value="not global.$GT_OfferIndex?">
           <set_value name="global.$GT_OfferIndex" exact="table[]"/>
         </do_if>
@@ -207,6 +240,7 @@
             $SellSpaces = $gtlsSellSpaces,
             $HomeSector = $gtlsHomeSector,
             $MaxDistance = $gtlsMaxDistance,
+            $MaxDistanceSell = $gtlsMaxDistanceSell,
             $WareBasket = $gtlsWareBasket,
             $AllowIllegal = $gtlsAllowIllegal,
             $OwnerFilter = $gtlsOwnerFilter,
@@ -218,12 +252,16 @@
             $BuyPriceMin = $gtlsBuyPriceMin,
             $IncludePlayerBuyOffers = $gtlsIncludePlayerBuyOffers,
             $IncludePlayerSellOffers = $gtlsIncludePlayerSellOffers,
+            $IncludeNpcSellOffers = $gtlsIncludeNpcSellOffers,
+            $SkipSupplierScan = $gtlsSkipSupplierScan,
             $RequirePlayerBuyOfferOwner = $gtlsRequirePlayerBuyOfferOwner,
             $IgnoreTradeRulesPlayerBuyOffersRequireCargoNeed = $gtlsIgnoreTradeRulesPlayerBuyOffersRequireCargoNeed,
             $BypassPlayerSellerPricing = $gtlsBypassPlayerSellerPricing,
             $RetainCheapestSellPerWare = $gtlsRetainCheapestSellPerWare,
             $ExcludePlayerBuyers = $gtlsExcludePlayerBuyers,
             $PriorityWares = $gtlsPriorityWares,
+            $StationWhitelist = if @$gtlsStationWhitelist != null then $gtlsStationWhitelist else [],
+            $Mk4Priorities = if @$gtlsMk4Priorities != null then $gtlsMk4Priorities else table[],
             $Debugchance = $gtlsDebugchance,
             $UseAllWares = $gtlsUseAllWares,
             $DistancePenalty = $gtlsDistancePenalty,
@@ -243,7 +281,12 @@
             $DemandLedSupplierScan = if this.$gtlsDemandLedSupplierScan? then this.$gtlsDemandLedSupplierScan else false,
             $DemandLedSellDone = if this.$gtlsDemandLedSellDone? then this.$gtlsDemandLedSellDone else false,
             $Mk4BuildStorageOnlyMode = if $gtlsMk4BuildStorageOnlyMode? then $gtlsMk4BuildStorageOnlyMode else false,
-            $Mk4AnchorHome = if $gtlsMk4AnchorHome? then $gtlsMk4AnchorHome else null
+            $Mk4AnchorHome = if $gtlsMk4AnchorHome? then $gtlsMk4AnchorHome else null,
+            $PlayerStationDiscoveryDone = if $gtlsPlayerStationDiscoveryDone? then $gtlsPlayerStationDiscoveryDone else false,
+            $PlayerBuyersInRange = if @$gtlsPlayerBuyersInRange != null then $gtlsPlayerBuyersInRange else [],
+            $PlayerSuppliersInRange = if @$gtlsPlayerSuppliersInRange != null then $gtlsPlayerSuppliersInRange else [],
+            $DeliveryCoverageMax = if $gtlsDeliveryCoverageMax? then $gtlsDeliveryCoverageMax else 0,
+            $SupplierCoverageMax = if $gtlsSupplierCoverageMax? then $gtlsSupplierCoverageMax else 0
           ]"/>
           <set_value name="global.$GT_LiveSearchActiveShip" exact="$gtlsShip"/>
       <!-- Rebuild locals after save/load resume or cooperative wait (lib.gt.tradematch pattern). -->
@@ -276,6 +319,12 @@
         <set_value name="$gtlsSellSpaces" exact="if @$gtlsSnap.$SellSpaces != null then $gtlsSnap.$SellSpaces else []"/>
         <set_value name="$gtlsHomeSector" exact="$gtlsSnap.$HomeSector"/>
         <set_value name="$gtlsMaxDistance" exact="$gtlsSnap.$MaxDistance"/>
+        <do_if value="$gtlsSnap.$MaxDistanceSell?">
+          <set_value name="$gtlsMaxDistanceSell" exact="$gtlsSnap.$MaxDistanceSell"/>
+        </do_if>
+        <do_elseif value="not $gtlsMaxDistanceSell?">
+          <set_value name="$gtlsMaxDistanceSell" exact="0"/>
+        </do_elseif>
         <set_value name="$gtlsWareBasket" exact="$gtlsSnap.$WareBasket"/>
         <set_value name="$gtlsAllowIllegal" exact="$gtlsSnap.$AllowIllegal"/>
         <set_value name="$gtlsOwnerFilter" exact="$gtlsSnap.$OwnerFilter"/>
@@ -287,7 +336,22 @@
         <set_value name="$gtlsBuyPriceMin" exact="$gtlsSnap.$BuyPriceMin"/>
         <set_value name="$gtlsIncludePlayerBuyOffers" exact="$gtlsSnap.$IncludePlayerBuyOffers"/>
         <set_value name="$gtlsIncludePlayerSellOffers" exact="$gtlsSnap.$IncludePlayerSellOffers"/>
+        <do_if value="$gtlsSnap.$IncludeNpcSellOffers?">
+          <set_value name="$gtlsIncludeNpcSellOffers" exact="$gtlsSnap.$IncludeNpcSellOffers"/>
+        </do_if>
+        <do_else>
+          <set_value name="$gtlsIncludeNpcSellOffers" exact="true"/>
+        </do_else>
+        <set_value name="$gtlsSkipSupplierScan" exact="if $gtlsSnap.$SkipSupplierScan? then $gtlsSnap.$SkipSupplierScan else (not $gtlsIncludePlayerSellOffers and not $gtlsIncludeNpcSellOffers)"/>
         <set_value name="$gtlsRequirePlayerBuyOfferOwner" exact="$gtlsSnap.$RequirePlayerBuyOfferOwner"/>
+        <do_if value="$gtlsSearchMode == 'sell_only'">
+          <set_value name="$gtlsRequirePlayerBuyOfferOwner" exact="false"/>
+        </do_if>
+        <!-- Reserve only under MK4 require-player so MK3 both-include defaults keep identical caps. -->
+        <set_value name="$gtlsPlayerSupplierReservePerWare" exact="0"/>
+        <do_if value="$gtlsRequirePlayerBuyOfferOwner and $gtlsIncludePlayerSellOffers and $gtlsIncludeNpcSellOffers">
+          <set_value name="$gtlsPlayerSupplierReservePerWare" exact="[1, [4, $gtlsMaxOffersPerWare].min].max"/>
+        </do_if>
         <set_value name="$gtlsIgnoreTradeRulesPlayerBuyOffersRequireCargoNeed" exact="$gtlsSnap.$IgnoreTradeRulesPlayerBuyOffersRequireCargoNeed"/>
         <set_value name="$gtlsBypassPlayerSellerPricing" exact="$gtlsSnap.$BypassPlayerSellerPricing"/>
         <set_value name="$gtlsRetainCheapestSellPerWare" exact="if $gtlsSnap.$RetainCheapestSellPerWare? then $gtlsSnap.$RetainCheapestSellPerWare else false"/>
@@ -300,6 +364,19 @@
           <set_value name="$gtlsExcludePlayerBuyers" exact="false"/>
         </do_if>
         <set_value name="$gtlsPriorityWares" exact="$gtlsSnap.$PriorityWares"/>
+        <!-- Key may exist with null after a prior yield save of a declared-null list/table. -->
+        <do_if value="$gtlsSnap.$StationWhitelist? and @$gtlsSnap.$StationWhitelist != null">
+          <set_value name="$gtlsStationWhitelist" exact="$gtlsSnap.$StationWhitelist"/>
+        </do_if>
+        <do_else>
+          <set_value name="$gtlsStationWhitelist" exact="[]"/>
+        </do_else>
+        <do_if value="$gtlsSnap.$Mk4Priorities? and @$gtlsSnap.$Mk4Priorities != null">
+          <set_value name="$gtlsMk4Priorities" exact="$gtlsSnap.$Mk4Priorities"/>
+        </do_if>
+        <do_else>
+          <set_value name="$gtlsMk4Priorities" exact="table[]"/>
+        </do_else>
         <set_value name="$gtlsDebugchance" exact="$gtlsSnap.$Debugchance"/>
         <set_value name="$gtlsUseAllWares" exact="$gtlsSnap.$UseAllWares"/>
         <do_if value="$gtlsSnap.$DemandLedSupplierScan?">
@@ -373,6 +450,7 @@
           <set_value name="$gtlsSellSpaces" exact="if $sellSpaces? then $sellSpaces else []"/>
           <set_value name="$gtlsHomeSector" exact="$homeSector"/>
           <set_value name="$gtlsMaxDistance" exact="$maxDistance"/>
+          <set_value name="$gtlsMaxDistanceSell" exact="if $maxDistanceSell? then $maxDistanceSell else 0"/>
           <set_value name="$gtlsWareBasket" exact="$wareBasket"/>
           <set_value name="$gtlsAllowIllegal" exact="$allowIllegal"/>
           <set_value name="$gtlsOwnerFilter" exact="$ownerFilter"/>
@@ -384,7 +462,16 @@
           <set_value name="$gtlsBuyPriceMin" exact="$buyPriceMin"/>
           <set_value name="$gtlsIncludePlayerBuyOffers" exact="$includePlayerBuyOffers"/>
           <set_value name="$gtlsIncludePlayerSellOffers" exact="$includePlayerSellOffers"/>
+          <set_value name="$gtlsIncludeNpcSellOffers" exact="if @$includeNpcSellOffers != null then $includeNpcSellOffers else true"/>
+          <set_value name="$gtlsSkipSupplierScan" exact="not $gtlsIncludePlayerSellOffers and not $gtlsIncludeNpcSellOffers"/>
           <set_value name="$gtlsRequirePlayerBuyOfferOwner" exact="$requirePlayerBuyOfferOwner"/>
+          <do_if value="$gtlsSearchMode == 'sell_only'">
+            <set_value name="$gtlsRequirePlayerBuyOfferOwner" exact="false"/>
+          </do_if>
+          <set_value name="$gtlsPlayerSupplierReservePerWare" exact="0"/>
+          <do_if value="$gtlsRequirePlayerBuyOfferOwner and $gtlsIncludePlayerSellOffers and $gtlsIncludeNpcSellOffers">
+            <set_value name="$gtlsPlayerSupplierReservePerWare" exact="[1, [4, $maxOffersPerWare].min].max"/>
+          </do_if>
           <set_value name="$gtlsIgnoreTradeRulesPlayerBuyOffersRequireCargoNeed" exact="$ignoreTradeRulesPlayerBuyOffersRequireCargoNeed"/>
           <set_value name="$gtlsBypassPlayerSellerPricing" exact="$bypassPlayerSellerPricing"/>
           <set_value name="$gtlsRetainCheapestSellPerWare" exact="if $retainCheapestSellPerWare? then $retainCheapestSellPerWare else false"/>
@@ -397,8 +484,13 @@
             <set_value name="$gtlsExcludePlayerBuyers" exact="false"/>
           </do_if>
           <set_value name="$gtlsPriorityWares" exact="if $priorityWares? then $priorityWares else []"/>
+          <set_value name="$gtlsStationWhitelist" exact="if @$stationwhitelist != null then $stationwhitelist else []"/>
           <set_value name="$gtlsDebugchance" exact="$debugchance"/>
           <set_value name="$gtlsMk4BuildStorageOnlyMode" exact="if $mk4BuildStorageOnlyMode? then $mk4BuildStorageOnlyMode else false"/>
+          <set_value name="$gtlsMk4Priorities" exact="if @$mk4Priorities != null then $mk4Priorities else table[]"/>
+          <do_if value="@$gtlsMk4Priorities != null and $gtlsMk4Priorities.$Buildstorage? and $gtlsMk4Priorities.$Buildstorage gt 0 and (not $gtlsMk4Priorities.$Stations? or $gtlsMk4Priorities.$Stations == 0) and (not $gtlsMk4Priorities.$Aux? or $gtlsMk4Priorities.$Aux == 0)">
+            <set_value name="$gtlsMk4BuildStorageOnlyMode" exact="true"/>
+          </do_if>
           <set_value name="$gtlsMk4AnchorHome" exact="if $mk4AnchorHome? then $mk4AnchorHome else null"/>
           <do_if value="not this.$gtlsDemandLedSupplierScan?">
             <set_value name="this.$gtlsDemandLedSupplierScan" exact="if $demandLedSupplierScan? then $demandLedSupplierScan else false"/>
@@ -435,11 +527,73 @@
           $BuyOfferCount = 0,
           $SellWaresFound = 0,
           $BuyWaresFound = 0,
+          $BuyByClass = table[],
           $OfferIndexHits = 0,
           $OfferIndexMisses = 0
         ]"/>
       </do_if>
       <debug_text text="'[GT-LiveSearch] ' + $gtlsShip.idcode + ': params: sellPriceMax=' + $gtlsSellPriceMax + ' buyPriceMin=' + $gtlsBuyPriceMin + ' mode=' + $gtlsSearchMode + ' buySpaces=' + $gtlsBuySpaces.count + ' sellSpaces=' + $gtlsSellSpaces.count + (if this.$gtlsDemandLedSupplierScan? and this.$gtlsDemandLedSupplierScan then ' demandLed=true' else '')" chance="$gtlsDebugchance"/>
+      <!-- MK4: one-shot player-station discovery (gate distance from home) replaces per-sector
+           find_station for delivery/supplier scans. MK3 (requirePlayerBuyOfferOwner=false) skips it. -->
+      <set_value name="$gtlsUsePlayerStationDiscovery" exact="false"/>
+      <create_list name="$gtlsPlayerBuyersInRange"/>
+      <create_list name="$gtlsPlayerSuppliersInRange"/>
+      <set_value name="$gtlsDeliveryCoverageMax" exact="if $gtlsMaxDistanceSell? and $gtlsMaxDistanceSell gt 0 then $gtlsMaxDistanceSell else $gtlsMaxDistance"/>
+      <set_value name="$gtlsSupplierCoverageMax" exact="$gtlsMaxDistance"/>
+      <set_value name="$gtlsSectorSupplierNpcOnly" exact="false"/>
+      <do_if value="not $gtlsPlayerStationDiscoveryDone?">
+        <set_value name="$gtlsPlayerStationDiscoveryDone" exact="false"/>
+      </do_if>
+      <do_if value="$gtlsRequirePlayerBuyOfferOwner and $gtlsHomeSector? and @$gtlsHomeSector.exists">
+        <set_value name="$gtlsUsePlayerStationDiscovery" exact="true"/>
+        <set_value name="$gtlsSectorSupplierNpcOnly" exact="$gtlsIncludeNpcSellOffers"/>
+        <!-- $PlayerStationDiscoveryDone gates the cache: the scratch table always carries the
+             keys, so a plain `?` probe would return the pre-discovery empty lists. -->
+        <set_value name="$gtlsDiscoveryCached" exact="false"/>
+        <do_if value="global.$GT_LiveSearchScratch? and @$gtlsShip != null">
+          <do_if value="global.$GT_LiveSearchScratch.{$gtlsShip}?">
+            <do_if value="global.$GT_LiveSearchScratch.{$gtlsShip}.$PlayerStationDiscoveryDone? and global.$GT_LiveSearchScratch.{$gtlsShip}.$PlayerStationDiscoveryDone">
+              <set_value name="$gtlsDiscoveryCached" exact="true"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        <do_if value="$gtlsDiscoveryCached">
+          <set_value name="$gtlsPlayerBuyersInRange" exact="if @global.$GT_LiveSearchScratch.{$gtlsShip}.$PlayerBuyersInRange != null then global.$GT_LiveSearchScratch.{$gtlsShip}.$PlayerBuyersInRange else []"/>
+          <set_value name="$gtlsPlayerSuppliersInRange" exact="if @global.$GT_LiveSearchScratch.{$gtlsShip}.$PlayerSuppliersInRange != null then global.$GT_LiveSearchScratch.{$gtlsShip}.$PlayerSuppliersInRange else []"/>
+          <do_if value="global.$GT_LiveSearchScratch.{$gtlsShip}.$DeliveryCoverageMax?">
+            <set_value name="$gtlsDeliveryCoverageMax" exact="global.$GT_LiveSearchScratch.{$gtlsShip}.$DeliveryCoverageMax"/>
+          </do_if>
+          <do_if value="global.$GT_LiveSearchScratch.{$gtlsShip}.$SupplierCoverageMax?">
+            <set_value name="$gtlsSupplierCoverageMax" exact="global.$GT_LiveSearchScratch.{$gtlsShip}.$SupplierCoverageMax"/>
+          </do_if>
+          <set_value name="$gtlsPlayerStationDiscoveryDone" exact="true"/>
+        </do_if>
+        <do_else>
+          <run_script name="'lib.gt.mk4.player.stations'" result="$gtlsPsd">
+            <param name="homeSector" value="$gtlsHomeSector"/>
+            <param name="maxDistance" value="$gtlsMaxDistance"/>
+            <param name="maxDistanceSell" value="$gtlsMaxDistanceSell"/>
+            <param name="includePlayerSuppliers" value="$gtlsIncludePlayerSellOffers"/>
+            <param name="debugchance" value="$gtlsDebugchance"/>
+            <param name="ship" value="$gtlsShip"/>
+          </run_script>
+          <set_value name="$gtlsPlayerBuyersInRange" exact="if @$gtlsPsd.$BuyersInRange != null then $gtlsPsd.$BuyersInRange else []"/>
+          <set_value name="$gtlsPlayerSuppliersInRange" exact="if @$gtlsPsd.$SuppliersInRange != null then $gtlsPsd.$SuppliersInRange else []"/>
+          <set_value name="$gtlsDeliveryCoverageMax" exact="$gtlsPsd.$DeliveryCoverageMax"/>
+          <set_value name="$gtlsSupplierCoverageMax" exact="$gtlsPsd.$SupplierCoverageMax"/>
+          <set_value name="$gtlsPlayerStationDiscoveryDone" exact="true"/>
+          <do_if value="not global.$GT_LiveSearchScratch?">
+            <set_value name="global.$GT_LiveSearchScratch" exact="table[]"/>
+          </do_if>
+          <do_if value="global.$GT_LiveSearchScratch.{$gtlsShip}?">
+            <set_value name="global.$GT_LiveSearchScratch.{$gtlsShip}.$PlayerStationDiscoveryDone" exact="true"/>
+            <set_value name="global.$GT_LiveSearchScratch.{$gtlsShip}.$PlayerBuyersInRange" exact="$gtlsPlayerBuyersInRange"/>
+            <set_value name="global.$GT_LiveSearchScratch.{$gtlsShip}.$PlayerSuppliersInRange" exact="$gtlsPlayerSuppliersInRange"/>
+            <set_value name="global.$GT_LiveSearchScratch.{$gtlsShip}.$DeliveryCoverageMax" exact="$gtlsDeliveryCoverageMax"/>
+            <set_value name="global.$GT_LiveSearchScratch.{$gtlsShip}.$SupplierCoverageMax" exact="$gtlsSupplierCoverageMax"/>
+          </do_if>
+        </do_else>
+      </do_if>
       <!-- ══════════════════════════════════════════════════════════════════
            Collect seller offers (ship buys from seller)
            Per-ware cap applied: each ware gets up to $maxOffersPerWare offers.
@@ -453,17 +607,171 @@
       <do_if value="$gtlsRetainCheapestSellPerWare">
         <set_value name="$gtlsSellCollectCap" exact="[$gtlsMaxOffersPerWare * 4, 40].max"/>
       </do_if>
-      <!-- MK4 supply: max customer buy unitprice per ware — prefilter suppliers before clamp (mirrors tradematch price cap). -->
+      <!-- MK4 supply: max customer buy unitprice per ware — prefilter NPC suppliers before clamp
+           (mirrors tradematch price cap). Player-owned suppliers are free virtualmoney and are
+           exempt at each apply site below.
+           Station customers: live offer.unitprice.
+           Build Storage: vanilla container willingness (scriptproperties buypriceoverride /
+           buyprice) plus ware.maxprice — same ceiling as order.restock.getsupplies pricethreshold.
+           Live BS offer.unitprice alone often sits mid-band even when the UI is at max. -->
       <set_value name="this.$gtlsMaxBuyUnitPriceByWare" exact="table[]"/>
+      <set_value name="this.$gtlsMaxBuyUnitPriceBuyerByWare" exact="table[]"/>
       <set_value name="this.$gtlsMk4PriceCapPrefilterSkipped" exact="0"/>
       <do_if value="$gtlsRequirePlayerBuyOfferOwner and $buyOffers? and $buyOffers.count gt 0">
         <do_all exact="$buyOffers.count" counter="$gtlsMbpIdx">
           <set_value name="$gtlsMbpOffer" exact="$buyOffers.{$gtlsMbpIdx}"/>
           <set_value name="$gtlsMbpWare" exact="@$gtlsMbpOffer.ware"/>
-          <do_if value="$gtlsMbpWare? and $gtlsMbpOffer.unitprice?">
-            <do_if value="not this.$gtlsMaxBuyUnitPriceByWare.{$gtlsMbpWare}? or $gtlsMbpOffer.unitprice gt this.$gtlsMaxBuyUnitPriceByWare.{$gtlsMbpWare}">
-              <set_value name="this.$gtlsMaxBuyUnitPriceByWare.{$gtlsMbpWare}" exact="$gtlsMbpOffer.unitprice"/>
+          <do_if value="not $gtlsMbpWare? or not $gtlsMbpOffer.unitprice?">
+            <continue/>
+          </do_if>
+          <!-- Customer = buyer if set (vanilla trade.find.*), else owner. -->
+          <set_value name="$gtlsMbpBuyer" exact="if $gtlsMbpOffer.buyer? and @$gtlsMbpOffer.buyer.exists then @$gtlsMbpOffer.buyer else (if $gtlsMbpOffer.owner? then @$gtlsMbpOffer.owner else null)"/>
+          <set_value name="$gtlsMbpCapPrice" exact="$gtlsMbpOffer.unitprice"/>
+          <do_if value="$gtlsMbpBuyer? and @$gtlsMbpBuyer.exists and @$gtlsMbpBuyer.isclass.buildstorage">
+            <set_value name="$gtlsMbpCapPrice" exact="[$gtlsMbpOffer.unitprice, $gtlsMbpBuyer.buypriceoverride.{$gtlsMbpWare}, $gtlsMbpBuyer.buyprice.{$gtlsMbpWare}, $gtlsMbpWare.maxprice].max"/>
+          </do_if>
+          <do_if value="not this.$gtlsMaxBuyUnitPriceByWare.{$gtlsMbpWare}? or $gtlsMbpCapPrice gt this.$gtlsMaxBuyUnitPriceByWare.{$gtlsMbpWare}">
+            <set_value name="this.$gtlsMaxBuyUnitPriceByWare.{$gtlsMbpWare}" exact="$gtlsMbpCapPrice"/>
+            <set_value name="$gtlsMbpBuyerLabel" exact="'?'"/>
+            <do_if value="$gtlsMbpBuyer? and @$gtlsMbpBuyer.exists">
+              <set_value name="$gtlsMbpBuyerLabel" exact="(if $gtlsMbpBuyer.idcode? then @$gtlsMbpBuyer.idcode else '?') + (if @$gtlsMbpBuyer.isclass.buildstorage then ':BS' else ':ST')"/>
             </do_if>
+            <set_value name="this.$gtlsMaxBuyUnitPriceBuyerByWare.{$gtlsMbpWare}" exact="$gtlsMbpBuyerLabel"/>
+          </do_if>
+        </do_all>
+      </do_if>
+      <!-- MK4 player supplier scan: station-centric find_sell_offer (skips the buySpaces sector loop
+           for player suppliers when the sector scan is NPC-only).
+           Ware-basket / demand-led: per-station per-ware queries (UseAllWares=false after S4 demand pass). -->
+      <do_if value="$gtlsSearchMode != 'sell_only' and not $gtlsSkipSupplierScan and (not this.$gtlsDemandLedSupplierScan? or not this.$gtlsDemandLedSupplierScan or (this.$gtlsDemandLedSellDone? and this.$gtlsDemandLedSellDone)) and $gtlsUsePlayerStationDiscovery and $gtlsIncludePlayerSellOffers and ($gtlsUseAllWares or ($gtlsWareBasket? and $gtlsWareBasket.count gt 0)) and $gtlsPlayerSuppliersInRange.count gt 0">
+        <do_all exact="$gtlsPlayerSuppliersInRange.count" counter="$gtlsPssi">
+          <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+            <resume label="gtls_ensure_state"/>
+          </do_if>
+          <set_value name="$gtlsPst" exact="$gtlsPlayerSuppliersInRange.{$gtlsPssi}"/>
+          <set_value name="$space" exact="if $gtlsPst.sector? then @$gtlsPst.sector else null"/>
+          <do_if value="not $space? or not @$space.exists">
+            <continue/>
+          </do_if>
+          <do_if value="$gtlsUseAllWares">
+            <find_sell_offer seller="$gtlsPst" tradepartner="$gtlsShip" space="$space" result="$foundSellOffers" multiple="true">
+              <match_seller tradesknownto="$gtlsShip.owner">
+                <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+              </match_seller>
+              <amount min="1"/>
+              <relativeprice max="$gtlsSellPriceMax" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
+            </find_sell_offer>
+          </do_if>
+          <do_else>
+            <create_list name="$foundSellOffers"/>
+            <do_all exact="$gtlsWareBasket.count" counter="$gtlsPwi">
+              <set_value name="$ware" exact="$gtlsWareBasket.{$gtlsPwi}"/>
+              <do_if value="not $ware? or $ware == null">
+                <continue/>
+              </do_if>
+              <set_value name="$gtlsPstWareSkipCap" exact="$gtlsSellCollectCap + $gtlsPlayerSupplierReservePerWare"/>
+              <do_if value="$sellOffersPerWare.{$ware}? and $sellOffersPerWare.{$ware} ge $gtlsPstWareSkipCap">
+                <continue/>
+              </do_if>
+              <find_sell_offer seller="$gtlsPst" wares="$ware" tradepartner="$gtlsShip" space="$space" result="$gtlsPstWareOffers" multiple="true">
+                <match_seller tradesknownto="$gtlsShip.owner">
+                  <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+                </match_seller>
+                <amount min="1"/>
+                <relativeprice max="$gtlsSellPriceMax" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
+              </find_sell_offer>
+              <do_if value="$gtlsPstWareOffers? and $gtlsPstWareOffers.count gt 0">
+                <do_all exact="$gtlsPstWareOffers.count" counter="$gtlsPwoi">
+                  <append_to_list name="$foundSellOffers" exact="$gtlsPstWareOffers.{$gtlsPwoi}"/>
+                </do_all>
+              </do_if>
+            </do_all>
+          </do_else>
+          <do_if value="$foundSellOffers? and $foundSellOffers.count gt 0">
+            <do_all exact="$foundSellOffers.count" counter="$oi">
+              <set_value name="$offer" exact="$foundSellOffers.{$oi}"/>
+              <do_if value="not $gtlsAllowIllegal and $offer.ware? and @$offer.ware.illegal">
+                <continue/>
+              </do_if>
+              <do_if value="$gtlsOwnerFilter == 'npc_only' and $offer.owner.isplayerowned">
+                <continue/>
+              </do_if>
+              <do_if value="$gtlsOwnerFilter == 'player_only' and not $offer.owner.isplayerowned">
+                <continue/>
+              </do_if>
+              <do_if value="not $gtlsIncludePlayerSellOffers and $offer.owner? and @$offer.owner.isplayerowned">
+                <continue/>
+              </do_if>
+              <do_if value="not $gtlsIncludeNpcSellOffers and (not $offer.owner? or not @$offer.owner.isplayerowned)">
+                <continue/>
+              </do_if>
+              <!-- Price cap is for paid NPC pickup only; player suppliers execute free. -->
+              <do_if value="$gtlsRequirePlayerBuyOfferOwner and not $gtlsBypassPlayerSellerPricing and $offer.ware? and (not $offer.owner? or not @$offer.owner.isplayerowned)">
+                <set_value name="$gtlsMbpWareCheck" exact="@$offer.ware"/>
+                <do_if value="this.$gtlsMaxBuyUnitPriceByWare? and this.$gtlsMaxBuyUnitPriceByWare.{$gtlsMbpWareCheck}? and $offer.unitprice gt this.$gtlsMaxBuyUnitPriceByWare.{$gtlsMbpWareCheck}">
+                  <set_value name="this.$gtlsMk4PriceCapPrefilterSkipped" operation="add"/>
+                  <continue/>
+                </do_if>
+              </do_if>
+              <set_value name="$gtlsSellClampSeller" exact="null"/>
+              <do_if value="$offer.seller?">
+                <set_value name="$gtlsSellClampSeller" exact="@$offer.seller"/>
+              </do_if>
+              <do_if value="$gtlsSellClampSeller == null and $offer.owner?">
+                <set_value name="$gtlsSellClampSeller" exact="@$offer.owner"/>
+              </do_if>
+              <do_if value="$gtlsSellClampSeller != null">
+                <set_value name="$gtlsSellClampAmt" exact="0"/>
+                <do_if value="$offer.offeramount.{$gtlsShip}? and $offer.offeramount.{$gtlsShip} gt 0">
+                  <set_value name="$gtlsSellClampAmt" exact="$offer.offeramount.{$gtlsShip}"/>
+                </do_if>
+                <do_elseif value="$offer.amount? and $offer.amount gt 0">
+                  <set_value name="$gtlsSellClampAmt" exact="$offer.amount"/>
+                </do_elseif>
+                <do_else>
+                  <set_value name="$gtlsSellClampAmt" exact="1"/>
+                </do_else>
+                <set_value name="$gtlsSellClampReason" exact="null"/>
+                <clamp_trade_amount trade="$offer" amount="$gtlsSellClampAmt" buyer="$gtlsShip" seller="$gtlsSellClampSeller" result="$gtlsSellClampAmt" reason="$gtlsSellClampReason"/>
+                <do_if value="not $gtlsSellClampAmt? or $gtlsSellClampAmt le 0">
+                  <continue/>
+                </do_if>
+              </do_if>
+              <do_else>
+                <continue/>
+              </do_else>
+              <set_value name="$offerWare" exact="@$offer.ware"/>
+              <do_if value="$offerWare? and $offerWare != null">
+                <do_if value="not $sellOffersPerWare.{$offerWare}?">
+                  <set_value name="$sellOffersPerWare.{$offerWare}" exact="0"/>
+                </do_if>
+                <set_value name="$isBuildStorageSellSupplier" exact="$offer.owner? and @$offer.owner.isclass.buildstorage"/>
+                <set_value name="$isPlayerSellSupplier" exact="$offer.owner? and @$offer.owner.isplayerowned and not $isBuildStorageSellSupplier"/>
+                <do_if value="$isBuildStorageSellSupplier">
+                  <do_if value="$sellOffersPerWare.{$offerWare} ge ($gtlsSellCollectCap + $gtlsBuildStorageReservePerWare)">
+                    <continue/>
+                  </do_if>
+                </do_if>
+                <do_elseif value="$isPlayerSellSupplier and $gtlsPlayerSupplierReservePerWare gt 0">
+                  <do_if value="$sellOffersPerWare.{$offerWare} ge ($gtlsSellCollectCap + $gtlsPlayerSupplierReservePerWare)">
+                    <continue/>
+                  </do_if>
+                </do_elseif>
+                <do_else>
+                  <do_if value="$sellOffersPerWare.{$offerWare} ge $gtlsSellCollectCap">
+                    <continue/>
+                  </do_if>
+                </do_else>
+                <set_value name="$sellOffersPerWare.{$offerWare}" operation="add"/>
+              </do_if>
+              <append_to_list name="$sellOffers" exact="$offer"/>
+            </do_all>
+          </do_if>
+          <wait exact="if global.$GT_LiveSearchScratch? and $ship? and global.$GT_LiveSearchScratch.{$ship}.$YieldMs? then global.$GT_LiveSearchScratch.{$ship}.$YieldMs * 1ms else 1ms" comment="Yield after player-supplier station"/>
+          <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+            <resume label="gtls_ensure_state"/>
           </do_if>
         </do_all>
       </do_if>
@@ -475,7 +783,7 @@
           <set_value name="$gtlsBuySpacesNonEmpty" exact="true"/>
         </do_if>
       </do_if>
-      <do_if value="$gtlsSearchMode != 'sell_only' and $gtlsBuySpacesNonEmpty and (not this.$gtlsDemandLedSupplierScan? or not this.$gtlsDemandLedSupplierScan or (this.$gtlsDemandLedSellDone? and this.$gtlsDemandLedSellDone))">
+      <do_if value="$gtlsSearchMode != 'sell_only' and $gtlsBuySpacesNonEmpty and not $gtlsSkipSupplierScan and not ($gtlsUsePlayerStationDiscovery and not $gtlsIncludeNpcSellOffers) and (not this.$gtlsDemandLedSupplierScan? or not this.$gtlsDemandLedSupplierScan or (this.$gtlsDemandLedSellDone? and this.$gtlsDemandLedSellDone))">
         <do_all exact="$gtlsBuySpaces.count" counter="$si">
           <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
             <resume label="gtls_ensure_state"/>
@@ -566,7 +874,19 @@
               <set_value name="this.$gtlsOfferIndexMisses" operation="add"/>
             </do_if>
           <do_if value="$gtlsUseAllWares">
-            <do_if value="$gtlsIncludePlayerSellOffers">
+            <!-- MK4 discovery mode already collected player suppliers station-by-station, so the
+                 sector sweep is NPC-only there. MK3 both-include keeps the unscoped find. -->
+            <do_if value="$gtlsSectorSupplierNpcOnly">
+              <find_sell_offer tradepartner="$gtlsShip" space="$space" result="$foundSellOffers" multiple="true">
+                <match_seller tradesknownto="$gtlsShip.owner" owner="faction.player" negateownerfilter="true">
+                  <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+                </match_seller>
+                <amount min="1"/>
+                <relativeprice max="$gtlsSellPriceMax" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
+              </find_sell_offer>
+            </do_if>
+            <do_elseif value="$gtlsIncludePlayerSellOffers and $gtlsIncludeNpcSellOffers">
               <find_sell_offer tradepartner="$gtlsShip" space="$space" result="$foundSellOffers" multiple="true">
                 <match_seller tradesknownto="$gtlsShip.owner">
                   <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
@@ -575,10 +895,20 @@
                 <amount min="1"/>
                 <relativeprice max="$gtlsSellPriceMax" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
               </find_sell_offer>
-            </do_if>
-            <do_else>
+            </do_elseif>
+            <do_elseif value="$gtlsIncludeNpcSellOffers">
               <find_sell_offer tradepartner="$gtlsShip" space="$space" result="$foundSellOffers" multiple="true">
                 <match_seller tradesknownto="$gtlsShip.owner" owner="faction.player" negateownerfilter="true">
+                  <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+                </match_seller>
+                <amount min="1"/>
+                <relativeprice max="$gtlsSellPriceMax" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
+              </find_sell_offer>
+            </do_elseif>
+            <do_else>
+              <find_sell_offer tradepartner="$gtlsShip" space="$space" result="$foundSellOffers" multiple="true">
+                <match_seller tradesknownto="$gtlsShip.owner" owner="faction.player">
                   <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
                   <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
                 </match_seller>
@@ -598,8 +928,15 @@
                 <do_if value="$gtlsOwnerFilter == 'player_only' and not $offer.owner.isplayerowned">
                   <continue/>
                 </do_if>
-                <!-- MK4 supply: supplier unitprice must not exceed max customer buy price for this ware. -->
-                <do_if value="$gtlsRequirePlayerBuyOfferOwner and not $gtlsBypassPlayerSellerPricing and $offer.ware?">
+                <do_if value="not $gtlsIncludePlayerSellOffers and $offer.owner? and @$offer.owner.isplayerowned">
+                  <continue/>
+                </do_if>
+                <do_if value="not $gtlsIncludeNpcSellOffers and (not $offer.owner? or not @$offer.owner.isplayerowned)">
+                  <continue/>
+                </do_if>
+                <!-- MK4 supply: NPC supplier unitprice must not exceed max customer buy price.
+                     Player-owned suppliers are free virtualmoney — do not drop them here. -->
+                <do_if value="$gtlsRequirePlayerBuyOfferOwner and not $gtlsBypassPlayerSellerPricing and $offer.ware? and (not $offer.owner? or not @$offer.owner.isplayerowned)">
                   <set_value name="$gtlsMbpWareCheck" exact="@$offer.ware"/>
                   <do_if value="this.$gtlsMaxBuyUnitPriceByWare? and this.$gtlsMaxBuyUnitPriceByWare.{$gtlsMbpWareCheck}? and $offer.unitprice gt this.$gtlsMaxBuyUnitPriceByWare.{$gtlsMbpWareCheck}">
                     <set_value name="this.$gtlsMk4PriceCapPrefilterSkipped" operation="add"/>
@@ -645,6 +982,7 @@
                     <set_value name="$sellOffersPerWare.{$offerWare}" exact="0"/>
                   </do_if>
                   <set_value name="$isBuildStorageSellSupplier" exact="$offer.owner? and @$offer.owner.isclass.buildstorage"/>
+                  <set_value name="$isPlayerSellSupplier" exact="$offer.owner? and @$offer.owner.isplayerowned and not $isBuildStorageSellSupplier"/>
                   <do_if value="$isBuildStorageSellSupplier">
                     <do_if value="not $gtlsBuildStorageReservePerWare?">
                       <set_value name="$gtlsBuildStorageReservePerWare" exact="[1, [4, $gtlsMaxOffersPerWare].min].max"/>
@@ -653,6 +991,11 @@
                       <continue/>
                     </do_if>
                   </do_if>
+                  <do_elseif value="$isPlayerSellSupplier and $gtlsPlayerSupplierReservePerWare gt 0">
+                    <do_if value="$sellOffersPerWare.{$offerWare} ge ($gtlsSellCollectCap + $gtlsPlayerSupplierReservePerWare)">
+                      <continue/>
+                    </do_if>
+                  </do_elseif>
                   <do_else>
                     <do_if value="$sellOffersPerWare.{$offerWare} ge $gtlsSellCollectCap">
                       <continue/>
@@ -669,27 +1012,39 @@
           <do_all exact="$gtlsWareBasket.count" counter="$wi">
             <set_value name="$ware" exact="$gtlsWareBasket.{$wi}"/>
             <!-- Skip this ware entirely if we already have enough sell offers for it -->
-            <do_if value="$sellOffersPerWare.{$ware}? and $sellOffersPerWare.{$ware} ge $gtlsSellCollectCap">
+            <do_if value="$sellOffersPerWare.{$ware}? and $sellOffersPerWare.{$ware} ge ($gtlsSellCollectCap + $gtlsPlayerSupplierReservePerWare)">
               <continue/>
             </do_if>
-            <do_if value="$gtlsIncludePlayerSellOffers">
-              <set_value name="$gtlsWareTvMin" exact="if this.$gtlsTvMinContainer? then this.$gtlsTvMinContainer else 1"/>
-              <set_value name="$gtlsWareTvMax" exact="999999999"/>
+            <set_value name="$gtlsWareTvMin" exact="if this.$gtlsTvMinContainer? then this.$gtlsTvMinContainer else 1"/>
+            <set_value name="$gtlsWareTvMax" exact="999999999"/>
+            <do_if value="$ware.waretransport == waretransport.solid">
+              <set_value name="$gtlsWareTvMin" exact="if this.$gtlsTvMinSolid? then this.$gtlsTvMinSolid else 1"/>
+            </do_if>
+            <do_elseif value="$ware.waretransport == waretransport.liquid">
+              <set_value name="$gtlsWareTvMin" exact="if this.$gtlsTvMinLiquid? then this.$gtlsTvMinLiquid else 1"/>
+            </do_elseif>
+            <do_if value="this.$gtlsSearchPurpose == 'direct_live'">
+              <set_value name="$gtlsWareTvMax" exact="if this.$gtlsTvMaxContainer? then this.$gtlsTvMaxContainer else 0"/>
               <do_if value="$ware.waretransport == waretransport.solid">
-                <set_value name="$gtlsWareTvMin" exact="if this.$gtlsTvMinSolid? then this.$gtlsTvMinSolid else 1"/>
+                <set_value name="$gtlsWareTvMax" exact="if this.$gtlsTvMaxSolid? then this.$gtlsTvMaxSolid else 0"/>
               </do_if>
               <do_elseif value="$ware.waretransport == waretransport.liquid">
-                <set_value name="$gtlsWareTvMin" exact="if this.$gtlsTvMinLiquid? then this.$gtlsTvMinLiquid else 1"/>
+                <set_value name="$gtlsWareTvMax" exact="if this.$gtlsTvMaxLiquid? then this.$gtlsTvMaxLiquid else 0"/>
               </do_elseif>
-              <do_if value="this.$gtlsSearchPurpose == 'direct_live'">
-                <set_value name="$gtlsWareTvMax" exact="if this.$gtlsTvMaxContainer? then this.$gtlsTvMaxContainer else 0"/>
-                <do_if value="$ware.waretransport == waretransport.solid">
-                  <set_value name="$gtlsWareTvMax" exact="if this.$gtlsTvMaxSolid? then this.$gtlsTvMaxSolid else 0"/>
-                </do_if>
-                <do_elseif value="$ware.waretransport == waretransport.liquid">
-                  <set_value name="$gtlsWareTvMax" exact="if this.$gtlsTvMaxLiquid? then this.$gtlsTvMaxLiquid else 0"/>
-                </do_elseif>
-              </do_if>
+            </do_if>
+            <do_if value="$gtlsSectorSupplierNpcOnly">
+              <find_sell_offer wares="$ware" tradepartner="$gtlsShip" space="$space" result="$foundSellOffers" multiple="true">
+                <match_seller tradesknownto="$gtlsShip.owner" owner="faction.player" negateownerfilter="true">
+                  <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+                </match_seller>
+                <amount min="1"/>
+                <totalvolume min="$gtlsWareTvMin"/>
+                <mintotalvolume max="$gtlsWareTvMax"/>
+                <relativeprice max="$gtlsSellPriceMax" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
+              </find_sell_offer>
+            </do_if>
+            <do_elseif value="$gtlsIncludePlayerSellOffers and $gtlsIncludeNpcSellOffers">
               <find_sell_offer wares="$ware" tradepartner="$gtlsShip" space="$space" result="$foundSellOffers" multiple="true">
                 <match_seller tradesknownto="$gtlsShip.owner">
                   <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
@@ -700,27 +1055,22 @@
                 <mintotalvolume max="$gtlsWareTvMax"/>
                 <relativeprice max="$gtlsSellPriceMax" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
               </find_sell_offer>
-            </do_if>
-            <do_else>
-              <set_value name="$gtlsWareTvMin" exact="if this.$gtlsTvMinContainer? then this.$gtlsTvMinContainer else 1"/>
-              <set_value name="$gtlsWareTvMax" exact="999999999"/>
-              <do_if value="$ware.waretransport == waretransport.solid">
-                <set_value name="$gtlsWareTvMin" exact="if this.$gtlsTvMinSolid? then this.$gtlsTvMinSolid else 1"/>
-              </do_if>
-              <do_elseif value="$ware.waretransport == waretransport.liquid">
-                <set_value name="$gtlsWareTvMin" exact="if this.$gtlsTvMinLiquid? then this.$gtlsTvMinLiquid else 1"/>
-              </do_elseif>
-              <do_if value="this.$gtlsSearchPurpose == 'direct_live'">
-                <set_value name="$gtlsWareTvMax" exact="if this.$gtlsTvMaxContainer? then this.$gtlsTvMaxContainer else 0"/>
-                <do_if value="$ware.waretransport == waretransport.solid">
-                  <set_value name="$gtlsWareTvMax" exact="if this.$gtlsTvMaxSolid? then this.$gtlsTvMaxSolid else 0"/>
-                </do_if>
-                <do_elseif value="$ware.waretransport == waretransport.liquid">
-                  <set_value name="$gtlsWareTvMax" exact="if this.$gtlsTvMaxLiquid? then this.$gtlsTvMaxLiquid else 0"/>
-                </do_elseif>
-              </do_if>
+            </do_elseif>
+            <do_elseif value="$gtlsIncludeNpcSellOffers">
               <find_sell_offer wares="$ware" tradepartner="$gtlsShip" space="$space" result="$foundSellOffers" multiple="true">
                 <match_seller tradesknownto="$gtlsShip.owner" owner="faction.player" negateownerfilter="true">
+                  <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+                </match_seller>
+                <amount min="1"/>
+                <totalvolume min="$gtlsWareTvMin"/>
+                <mintotalvolume max="$gtlsWareTvMax"/>
+                <relativeprice max="$gtlsSellPriceMax" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
+              </find_sell_offer>
+            </do_elseif>
+            <do_else>
+              <find_sell_offer wares="$ware" tradepartner="$gtlsShip" space="$space" result="$foundSellOffers" multiple="true">
+                <match_seller tradesknownto="$gtlsShip.owner" owner="faction.player">
                   <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
                   <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
                 </match_seller>
@@ -737,6 +1087,7 @@
               <do_all exact="$foundSellOffers.count" counter="$oi">
                 <set_value name="$offer" exact="$foundSellOffers.{$oi}"/>
                 <set_value name="$isBuildStorageSellSupplier" exact="$offer.owner? and @$offer.owner.isclass.buildstorage"/>
+                <set_value name="$isPlayerSellSupplier" exact="$offer.owner? and @$offer.owner.isplayerowned and not $isBuildStorageSellSupplier"/>
                 <do_if value="$isBuildStorageSellSupplier">
                   <do_if value="not $gtlsBuildStorageReservePerWare?">
                     <set_value name="$gtlsBuildStorageReservePerWare" exact="[1, [4, $gtlsMaxOffersPerWare].min].max"/>
@@ -745,6 +1096,11 @@
                     <continue/>
                   </do_if>
                 </do_if>
+                <do_elseif value="$isPlayerSellSupplier and $gtlsPlayerSupplierReservePerWare gt 0">
+                  <do_if value="$sellOffersPerWare.{$ware} ge ($gtlsSellCollectCap + $gtlsPlayerSupplierReservePerWare)">
+                    <continue/>
+                  </do_if>
+                </do_elseif>
                 <do_else>
                   <do_if value="$sellOffersPerWare.{$ware} ge $gtlsSellCollectCap">
                     <break/>
@@ -756,8 +1112,15 @@
                 <do_if value="$gtlsOwnerFilter == 'player_only' and not $offer.owner.isplayerowned">
                   <continue/>
                 </do_if>
-                <!-- MK4 supply: supplier unitprice must not exceed max customer buy price for this ware. -->
-                <do_if value="$gtlsRequirePlayerBuyOfferOwner and not $gtlsBypassPlayerSellerPricing">
+                <do_if value="not $gtlsIncludePlayerSellOffers and $offer.owner? and @$offer.owner.isplayerowned">
+                  <continue/>
+                </do_if>
+                <do_if value="not $gtlsIncludeNpcSellOffers and (not $offer.owner? or not @$offer.owner.isplayerowned)">
+                  <continue/>
+                </do_if>
+                <!-- MK4 supply: NPC supplier unitprice must not exceed max customer buy price.
+                     Player-owned suppliers are free virtualmoney — do not drop them here. -->
+                <do_if value="$gtlsRequirePlayerBuyOfferOwner and not $gtlsBypassPlayerSellerPricing and (not $offer.owner? or not @$offer.owner.isplayerowned)">
                   <do_if value="this.$gtlsMaxBuyUnitPriceByWare? and this.$gtlsMaxBuyUnitPriceByWare.{$ware}? and $offer.unitprice gt this.$gtlsMaxBuyUnitPriceByWare.{$ware}">
                     <set_value name="this.$gtlsMk4PriceCapPrefilterSkipped" operation="add"/>
                     <continue/>
@@ -817,6 +1180,7 @@
             $SellSpaces = $gtlsSellSpaces,
             $HomeSector = $gtlsHomeSector,
             $MaxDistance = $gtlsMaxDistance,
+            $MaxDistanceSell = $gtlsMaxDistanceSell,
             $WareBasket = $gtlsWareBasket,
             $AllowIllegal = $gtlsAllowIllegal,
             $OwnerFilter = $gtlsOwnerFilter,
@@ -828,12 +1192,16 @@
             $BuyPriceMin = $gtlsBuyPriceMin,
             $IncludePlayerBuyOffers = $gtlsIncludePlayerBuyOffers,
             $IncludePlayerSellOffers = $gtlsIncludePlayerSellOffers,
+            $IncludeNpcSellOffers = $gtlsIncludeNpcSellOffers,
+            $SkipSupplierScan = $gtlsSkipSupplierScan,
             $RequirePlayerBuyOfferOwner = $gtlsRequirePlayerBuyOfferOwner,
             $IgnoreTradeRulesPlayerBuyOffersRequireCargoNeed = $gtlsIgnoreTradeRulesPlayerBuyOffersRequireCargoNeed,
             $BypassPlayerSellerPricing = $gtlsBypassPlayerSellerPricing,
             $RetainCheapestSellPerWare = $gtlsRetainCheapestSellPerWare,
             $ExcludePlayerBuyers = $gtlsExcludePlayerBuyers,
             $PriorityWares = $gtlsPriorityWares,
+            $StationWhitelist = if @$gtlsStationWhitelist != null then $gtlsStationWhitelist else [],
+            $Mk4Priorities = if @$gtlsMk4Priorities != null then $gtlsMk4Priorities else table[],
             $Debugchance = $gtlsDebugchance,
             $UseAllWares = $gtlsUseAllWares,
             $DistancePenalty = $gtlsDistancePenalty,
@@ -853,7 +1221,12 @@
             $DemandLedSupplierScan = if this.$gtlsDemandLedSupplierScan? then this.$gtlsDemandLedSupplierScan else false,
             $DemandLedSellDone = if this.$gtlsDemandLedSellDone? then this.$gtlsDemandLedSellDone else false,
             $Mk4BuildStorageOnlyMode = if $gtlsMk4BuildStorageOnlyMode? then $gtlsMk4BuildStorageOnlyMode else false,
-            $Mk4AnchorHome = if $gtlsMk4AnchorHome? then $gtlsMk4AnchorHome else null
+            $Mk4AnchorHome = if $gtlsMk4AnchorHome? then $gtlsMk4AnchorHome else null,
+            $PlayerStationDiscoveryDone = if $gtlsPlayerStationDiscoveryDone? then $gtlsPlayerStationDiscoveryDone else false,
+            $PlayerBuyersInRange = if @$gtlsPlayerBuyersInRange != null then $gtlsPlayerBuyersInRange else [],
+            $PlayerSuppliersInRange = if @$gtlsPlayerSuppliersInRange != null then $gtlsPlayerSuppliersInRange else [],
+            $DeliveryCoverageMax = if $gtlsDeliveryCoverageMax? then $gtlsDeliveryCoverageMax else 0,
+            $SupplierCoverageMax = if $gtlsSupplierCoverageMax? then $gtlsSupplierCoverageMax else 0
           ]"/>
           <set_value name="global.$GT_LiveSearchActiveShip" exact="$gtlsShip"/>
           <wait exact="if global.$GT_LiveSearchScratch? and $ship? and global.$GT_LiveSearchScratch.{$ship}.$YieldMs? then global.$GT_LiveSearchScratch.{$ship}.$YieldMs * 1ms else 1ms" comment="Yield after sell-offer sector"/>
@@ -862,6 +1235,151 @@
       </do_if>
 
         </do_all>
+      </do_if>
+      <!-- MK4 station whitelist: direct seller probe. Sector scan can miss an explicit WL
+           NPC (per-ware fill order, MaxBuy edge) even when the player can buy manually.
+           @$ == null: declared-null after yield restore must not reach .count (X4 ? = declared). -->
+      <do_if value="@$gtlsStationWhitelist == null">
+        <set_value name="$gtlsStationWhitelist" exact="[]"/>
+      </do_if>
+      <do_if value="$gtlsSearchMode != 'sell_only' and not $gtlsSkipSupplierScan and $gtlsIncludeNpcSellOffers and $gtlsStationWhitelist.count gt 0 and $gtlsOwnerFilter != 'player_only' and (not this.$gtlsDemandLedSupplierScan? or not this.$gtlsDemandLedSupplierScan or (this.$gtlsDemandLedSellDone? and this.$gtlsDemandLedSellDone))">
+        <set_value name="$gtlsWlSeenSell" exact="table[]"/>
+        <do_all exact="$sellOffers.count" counter="$gtlsWlSeenI">
+          <set_value name="$gtlsWlSeenSell.{$sellOffers.{$gtlsWlSeenI}}" exact="true"/>
+        </do_all>
+        <set_value name="$gtlsWlAdded" exact="0"/>
+        <set_value name="$gtlsWlSkipDist" exact="0"/>
+        <set_value name="$gtlsWlSkipPrice" exact="0"/>
+        <set_value name="$gtlsWlSkipNone" exact="0"/>
+        <set_value name="$gtlsWlSkipClamp" exact="0"/>
+        <set_value name="$gtlsWlSkipDup" exact="0"/>
+        <set_value name="$gtlsWlDetail" exact="''"/>
+        <do_all exact="$gtlsStationWhitelist.count" counter="$gtlsWlSi">
+          <set_value name="$gtlsWlSta" exact="$gtlsStationWhitelist.{$gtlsWlSi}"/>
+          <do_if value="not $gtlsWlSta? or not @$gtlsWlSta.exists or not $gtlsWlSta.isclass.station">
+            <continue/>
+          </do_if>
+          <do_if value="@$gtlsWlSta.isplayerowned">
+            <continue/>
+          </do_if>
+          <set_value name="$gtlsWlId" exact="if $gtlsWlSta.idcode? then @$gtlsWlSta.idcode else '?'"/>
+          <set_value name="$space" exact="if $gtlsWlSta.sector? then @$gtlsWlSta.sector else null"/>
+          <do_if value="not $space? or not @$space.exists">
+            <set_value name="$gtlsWlSkipNone" operation="add"/>
+            <set_value name="$gtlsWlDetail" exact="$gtlsWlDetail + (if $gtlsWlDetail != '' then '; ' else '') + $gtlsWlId + '=no_sector'"/>
+            <continue/>
+          </do_if>
+          <do_if value="$gtlsHomeSector? and $gtlsMaxDistance? and $gtlsMaxDistance gt 0">
+            <set_value name="$gtlsWlJumps" exact="$gtlsHomeSector.gatedistance.{$space}"/>
+            <do_if value="$gtlsWlJumps gt $gtlsMaxDistance">
+              <set_value name="$gtlsWlSkipDist" operation="add"/>
+              <set_value name="$gtlsWlDetail" exact="$gtlsWlDetail + (if $gtlsWlDetail != '' then '; ' else '') + $gtlsWlId + '=jumps:' + $gtlsWlJumps + ' maxBuy=' + $gtlsMaxDistance"/>
+              <continue/>
+            </do_if>
+          </do_if>
+          <create_list name="$foundSellOffers"/>
+          <do_if value="$gtlsUseAllWares">
+            <find_sell_offer seller="$gtlsWlSta" tradepartner="$gtlsShip" space="$space" result="$foundSellOffers" multiple="true">
+              <match_seller tradesknownto="$gtlsShip.owner">
+                <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+              </match_seller>
+              <amount min="1"/>
+              <relativeprice max="$gtlsSellPriceMax" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
+            </find_sell_offer>
+          </do_if>
+          <do_elseif value="$gtlsWareBasket? and $gtlsWareBasket.count gt 0">
+            <do_all exact="$gtlsWareBasket.count" counter="$gtlsWlWi">
+              <set_value name="$ware" exact="$gtlsWareBasket.{$gtlsWlWi}"/>
+              <do_if value="not $ware? or $ware == null">
+                <continue/>
+              </do_if>
+              <find_sell_offer seller="$gtlsWlSta" wares="$ware" tradepartner="$gtlsShip" space="$space" result="$gtlsWlWareOffers" multiple="true">
+                <match_seller tradesknownto="$gtlsShip.owner">
+                  <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+                </match_seller>
+                <amount min="1"/>
+                <relativeprice max="$gtlsSellPriceMax" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
+              </find_sell_offer>
+              <do_if value="$gtlsWlWareOffers? and $gtlsWlWareOffers.count gt 0">
+                <do_all exact="$gtlsWlWareOffers.count" counter="$gtlsWlWoi">
+                  <append_to_list name="$foundSellOffers" exact="$gtlsWlWareOffers.{$gtlsWlWoi}"/>
+                </do_all>
+              </do_if>
+            </do_all>
+          </do_elseif>
+          <do_if value="not $foundSellOffers? or $foundSellOffers.count le 0">
+            <set_value name="$gtlsWlSkipNone" operation="add"/>
+            <set_value name="$gtlsWlDetail" exact="$gtlsWlDetail + (if $gtlsWlDetail != '' then '; ' else '') + $gtlsWlId + '=no_offer'"/>
+            <continue/>
+          </do_if>
+          <set_value name="$gtlsWlStaAdded" exact="0"/>
+          <do_all exact="$foundSellOffers.count" counter="$gtlsWlOi">
+            <set_value name="$offer" exact="$foundSellOffers.{$gtlsWlOi}"/>
+            <do_if value="$gtlsWlSeenSell.{$offer}?">
+              <set_value name="$gtlsWlSkipDup" operation="add"/>
+              <continue/>
+            </do_if>
+            <do_if value="not $gtlsAllowIllegal and $offer.ware? and @$offer.ware.illegal">
+              <continue/>
+            </do_if>
+            <do_if value="$gtlsRequirePlayerBuyOfferOwner and not $gtlsBypassPlayerSellerPricing and $offer.ware? and (not $offer.owner? or not @$offer.owner.isplayerowned)">
+              <set_value name="$gtlsMbpWareCheck" exact="@$offer.ware"/>
+              <do_if value="this.$gtlsMaxBuyUnitPriceByWare? and this.$gtlsMaxBuyUnitPriceByWare.{$gtlsMbpWareCheck}? and $offer.unitprice gt this.$gtlsMaxBuyUnitPriceByWare.{$gtlsMbpWareCheck}">
+                <set_value name="this.$gtlsMk4PriceCapPrefilterSkipped" operation="add"/>
+                <set_value name="$gtlsWlSkipPrice" operation="add"/>
+                <set_value name="$gtlsWlCap" exact="this.$gtlsMaxBuyUnitPriceByWare.{$gtlsMbpWareCheck}"/>
+                <set_value name="$gtlsWlCapSrc" exact="if this.$gtlsMaxBuyUnitPriceBuyerByWare? and this.$gtlsMaxBuyUnitPriceBuyerByWare.{$gtlsMbpWareCheck}? then this.$gtlsMaxBuyUnitPriceBuyerByWare.{$gtlsMbpWareCheck} else '?'"/>
+                <set_value name="$gtlsWlOfferU" exact="$offer.unitprice"/>
+                <set_value name="$gtlsWlDetail" exact="$gtlsWlDetail + (if $gtlsWlDetail != '' then '; ' else '') + $gtlsWlId + ':' + (if $offer.ware.name? then @$offer.ware.name else '?') + '=priceCap sell=' + $gtlsWlOfferU + ' cap=' + $gtlsWlCap + ' via=' + $gtlsWlCapSrc"/>
+                <continue/>
+              </do_if>
+            </do_if>
+            <set_value name="$gtlsSellClampSeller" exact="null"/>
+            <do_if value="$offer.seller?">
+              <set_value name="$gtlsSellClampSeller" exact="@$offer.seller"/>
+            </do_if>
+            <do_if value="$gtlsSellClampSeller == null and $offer.owner?">
+              <set_value name="$gtlsSellClampSeller" exact="@$offer.owner"/>
+            </do_if>
+            <do_if value="$gtlsSellClampSeller == null">
+              <set_value name="$gtlsWlSkipClamp" operation="add"/>
+              <continue/>
+            </do_if>
+            <set_value name="$gtlsSellClampAmt" exact="0"/>
+            <do_if value="$offer.offeramount.{$gtlsShip}? and $offer.offeramount.{$gtlsShip} gt 0">
+              <set_value name="$gtlsSellClampAmt" exact="$offer.offeramount.{$gtlsShip}"/>
+            </do_if>
+            <do_elseif value="$offer.amount? and $offer.amount gt 0">
+              <set_value name="$gtlsSellClampAmt" exact="$offer.amount"/>
+            </do_elseif>
+            <do_else>
+              <set_value name="$gtlsSellClampAmt" exact="1"/>
+            </do_else>
+            <set_value name="$gtlsSellClampReason" exact="null"/>
+            <clamp_trade_amount trade="$offer" amount="$gtlsSellClampAmt" buyer="$gtlsShip" seller="$gtlsSellClampSeller" result="$gtlsSellClampAmt" reason="$gtlsSellClampReason"/>
+            <do_if value="not $gtlsSellClampAmt? or $gtlsSellClampAmt le 0">
+              <set_value name="$gtlsWlSkipClamp" operation="add"/>
+              <continue/>
+            </do_if>
+            <set_value name="$gtlsWlSeenSell.{$offer}" exact="true"/>
+            <append_to_list name="$sellOffers" exact="$offer"/>
+            <set_value name="$offerWare" exact="@$offer.ware"/>
+            <do_if value="$offerWare? and $offerWare != null">
+              <do_if value="not $sellOffersPerWare.{$offerWare}?">
+                <set_value name="$sellOffersPerWare.{$offerWare}" exact="0"/>
+              </do_if>
+              <set_value name="$sellOffersPerWare.{$offerWare}" operation="add"/>
+            </do_if>
+            <set_value name="$gtlsWlAdded" operation="add"/>
+            <set_value name="$gtlsWlStaAdded" operation="add"/>
+          </do_all>
+          <do_if value="$gtlsWlStaAdded gt 0">
+            <set_value name="$gtlsWlDetail" exact="$gtlsWlDetail + (if $gtlsWlDetail != '' then '; ' else '') + $gtlsWlId + '=+' + $gtlsWlStaAdded"/>
+          </do_if>
+        </do_all>
+        <debug_text text="'[GT-LiveSearch] ' + $gtlsShip.idcode + ': WL supplier probe added=' + $gtlsWlAdded + ' skip(dist/price/none/clamp/dup)=' + $gtlsWlSkipDist + '/' + $gtlsWlSkipPrice + '/' + $gtlsWlSkipNone + '/' + $gtlsWlSkipClamp + '/' + $gtlsWlSkipDup + (if $gtlsWlDetail != '' then ' [' + $gtlsWlDetail + ']' else '')" chance="100"/>
       </do_if>
       <debug_text text="'[GT-LiveSearch] ' + $gtlsShip.idcode + ': sell-offers collected=' + $sellOffers.count + ' (sellPriceMax=' + $gtlsSellPriceMax + (if $gtlsRequirePlayerBuyOfferOwner and this.$gtlsMk4PriceCapPrefilterSkipped? and this.$gtlsMk4PriceCapPrefilterSkipped gt 0 then ', mk4PriceCapPrefilterSkipped=' + this.$gtlsMk4PriceCapPrefilterSkipped else '') + ')'" chance="$gtlsDebugchance"/>
       <!-- ══════════════════════════════════════════════════════════════════
@@ -876,13 +1394,15 @@
           <set_value name="$gtlsBuySpacesNonEmpty" exact="true"/>
         </do_if>
       </do_if>
-      <do_if value="$gtlsBypassPlayerSellerPricing and $gtlsSearchMode != 'sell_only' and $gtlsBuySpacesNonEmpty and $gtlsOwnerFilter != 'npc_only' and (not this.$gtlsDemandLedSupplierScan? or not this.$gtlsDemandLedSupplierScan or (this.$gtlsDemandLedSellDone? and this.$gtlsDemandLedSellDone))">
+      <set_value name="$gtlsBpScanUseStations" exact="$gtlsUsePlayerStationDiscovery and $gtlsPlayerSuppliersInRange.count gt 0"/>
+      <do_if value="$gtlsBypassPlayerSellerPricing and $gtlsIncludePlayerSellOffers and $gtlsSearchMode != 'sell_only' and ($gtlsBpScanUseStations or $gtlsBuySpacesNonEmpty) and $gtlsOwnerFilter != 'npc_only' and (not this.$gtlsDemandLedSupplierScan? or not this.$gtlsDemandLedSupplierScan or (this.$gtlsDemandLedSellDone? and this.$gtlsDemandLedSellDone))">
         <set_value name="$gtlsSeenSellOffers" exact="table[]"/>
         <do_all exact="$sellOffers.count" counter="$bpInit">
           <set_value name="$gtlsSeenSellOffers.{$sellOffers.{$bpInit}}" exact="true"/>
         </do_all>
         <set_value name="$playerSellOffersAdded" exact="0"/>
-        <do_all exact="$gtlsBuySpaces.count" counter="$bpSi">
+        <set_value name="$gtlsBpScanCount" exact="if $gtlsBpScanUseStations then $gtlsPlayerSuppliersInRange.count else $gtlsBuySpaces.count"/>
+        <do_all exact="$gtlsBpScanCount" counter="$bpSi">
           <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
             <resume label="gtls_ensure_state"/>
           </do_if>
@@ -892,15 +1412,34 @@
               <set_value name="$gtlsSellCollectCap" exact="[$gtlsMaxOffersPerWare * 4, 40].max"/>
             </do_if>
           </do_if>
-
-          <set_value name="$space" exact="$gtlsBuySpaces.{$bpSi}"/>
+          <do_if value="$gtlsBpScanUseStations">
+            <set_value name="$gtlsPst" exact="$gtlsPlayerSuppliersInRange.{$bpSi}"/>
+            <set_value name="$space" exact="if $gtlsPst.sector? then @$gtlsPst.sector else null"/>
+            <do_if value="not $space? or not @$space.exists">
+              <continue/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <set_value name="$gtlsPst" exact="null"/>
+            <set_value name="$space" exact="$gtlsBuySpaces.{$bpSi}"/>
+          </do_else>
           <do_if value="$gtlsUseAllWares">
-            <find_sell_offer tradepartner="$gtlsShip" space="$space" result="$bpSellOffers" multiple="true">
-              <match_seller tradesknownto="$gtlsShip.owner" owner="faction.player">
-                <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
-              </match_seller>
-              <amount min="1"/>
-            </find_sell_offer>
+            <do_if value="$gtlsPst? and @$gtlsPst.exists">
+              <find_sell_offer seller="$gtlsPst" tradepartner="$gtlsShip" space="$space" result="$bpSellOffers" multiple="true">
+                <match_seller tradesknownto="$gtlsShip.owner">
+                  <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                </match_seller>
+                <amount min="1"/>
+              </find_sell_offer>
+            </do_if>
+            <do_else>
+              <find_sell_offer tradepartner="$gtlsShip" space="$space" result="$bpSellOffers" multiple="true">
+                <match_seller tradesknownto="$gtlsShip.owner" owner="faction.player">
+                  <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                </match_seller>
+                <amount min="1"/>
+              </find_sell_offer>
+            </do_else>
             <do_if value="$bpSellOffers? and $bpSellOffers.count gt 0">
               <do_all exact="$bpSellOffers.count" counter="$bpOi">
                 <set_value name="$offer" exact="$bpSellOffers.{$bpOi}"/>
@@ -918,7 +1457,7 @@
                   <do_if value="not $sellOffersPerWare.{$offerWare}?">
                     <set_value name="$sellOffersPerWare.{$offerWare}" exact="0"/>
                   </do_if>
-                  <do_if value="$sellOffersPerWare.{$offerWare} ge $gtlsSellCollectCap">
+                  <do_if value="$sellOffersPerWare.{$offerWare} ge ($gtlsSellCollectCap + $gtlsPlayerSupplierReservePerWare)">
                     <continue/>
                   </do_if>
                   <set_value name="$sellOffersPerWare.{$offerWare}" operation="add"/>
@@ -932,22 +1471,33 @@
           <do_else>
             <do_all exact="$gtlsWareBasket.count" counter="$bpWi">
               <set_value name="$ware" exact="$gtlsWareBasket.{$bpWi}"/>
-              <do_if value="$sellOffersPerWare.{$ware}? and $sellOffersPerWare.{$ware} ge $gtlsSellCollectCap">
+              <do_if value="$sellOffersPerWare.{$ware}? and $sellOffersPerWare.{$ware} ge ($gtlsSellCollectCap + $gtlsPlayerSupplierReservePerWare)">
                 <continue/>
               </do_if>
-              <find_sell_offer wares="$ware" tradepartner="$gtlsShip" space="$space" result="$bpSellOffers" multiple="true">
-                <match_seller tradesknownto="$gtlsShip.owner" owner="faction.player">
-                  <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
-                </match_seller>
-                <amount min="1"/>
-                <totalvolume min="if this.$gtlsTvMinContainer? then this.$gtlsTvMinContainer else 1"/>
-              </find_sell_offer>
+              <do_if value="$gtlsPst? and @$gtlsPst.exists">
+                <find_sell_offer seller="$gtlsPst" wares="$ware" tradepartner="$gtlsShip" space="$space" result="$bpSellOffers" multiple="true">
+                  <match_seller tradesknownto="$gtlsShip.owner" owner="faction.player">
+                    <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                  </match_seller>
+                  <amount min="1"/>
+                  <totalvolume min="if this.$gtlsTvMinContainer? then this.$gtlsTvMinContainer else 1"/>
+                </find_sell_offer>
+              </do_if>
+              <do_else>
+                <find_sell_offer wares="$ware" tradepartner="$gtlsShip" space="$space" result="$bpSellOffers" multiple="true">
+                  <match_seller tradesknownto="$gtlsShip.owner" owner="faction.player">
+                    <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                  </match_seller>
+                  <amount min="1"/>
+                  <totalvolume min="if this.$gtlsTvMinContainer? then this.$gtlsTvMinContainer else 1"/>
+                </find_sell_offer>
+              </do_else>
               <do_if value="$bpSellOffers? and $bpSellOffers.count gt 0">
                 <do_if value="not $sellOffersPerWare.{$ware}?">
                   <set_value name="$sellOffersPerWare.{$ware}" exact="0"/>
                 </do_if>
                 <do_all exact="$bpSellOffers.count" counter="$bpOi">
-                  <do_if value="$sellOffersPerWare.{$ware} ge $gtlsSellCollectCap">
+                  <do_if value="$sellOffersPerWare.{$ware} ge ($gtlsSellCollectCap + $gtlsPlayerSupplierReservePerWare)">
                     <break/>
                   </do_if>
                   <set_value name="$offer" exact="$bpSellOffers.{$bpOi}"/>
@@ -1107,7 +1657,9 @@
           <set_value name="$gtlsSellSpacesNonEmpty" exact="true"/>
         </do_if>
       </do_if>
-      <do_if value="$gtlsRequirePlayerBuyOfferOwner and $gtlsUseAllWares and $gtlsSearchMode != 'buy_only' and $gtlsSellSpacesNonEmpty">
+      <!-- Discovery mode does the same completion check inline (B1) on the per-buyer scan below,
+           so this extra sector sweep would only duplicate work. -->
+      <do_if value="$gtlsRequirePlayerBuyOfferOwner and $gtlsUseAllWares and $gtlsSearchMode != 'buy_only' and $gtlsSellSpacesNonEmpty and not $gtlsUsePlayerStationDiscovery">
         <set_value name="$completionBuyOffersAdded" exact="0"/>
         <do_all exact="$gtlsSellSpaces.count" counter="$cpsi">
           <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
@@ -1176,6 +1728,7 @@
             $SellSpaces = $gtlsSellSpaces,
             $HomeSector = $gtlsHomeSector,
             $MaxDistance = $gtlsMaxDistance,
+            $MaxDistanceSell = $gtlsMaxDistanceSell,
             $WareBasket = $gtlsWareBasket,
             $AllowIllegal = $gtlsAllowIllegal,
             $OwnerFilter = $gtlsOwnerFilter,
@@ -1187,12 +1740,16 @@
             $BuyPriceMin = $gtlsBuyPriceMin,
             $IncludePlayerBuyOffers = $gtlsIncludePlayerBuyOffers,
             $IncludePlayerSellOffers = $gtlsIncludePlayerSellOffers,
+            $IncludeNpcSellOffers = $gtlsIncludeNpcSellOffers,
+            $SkipSupplierScan = $gtlsSkipSupplierScan,
             $RequirePlayerBuyOfferOwner = $gtlsRequirePlayerBuyOfferOwner,
             $IgnoreTradeRulesPlayerBuyOffersRequireCargoNeed = $gtlsIgnoreTradeRulesPlayerBuyOffersRequireCargoNeed,
             $BypassPlayerSellerPricing = $gtlsBypassPlayerSellerPricing,
             $RetainCheapestSellPerWare = $gtlsRetainCheapestSellPerWare,
             $ExcludePlayerBuyers = $gtlsExcludePlayerBuyers,
             $PriorityWares = $gtlsPriorityWares,
+            $StationWhitelist = if @$gtlsStationWhitelist != null then $gtlsStationWhitelist else [],
+            $Mk4Priorities = if @$gtlsMk4Priorities != null then $gtlsMk4Priorities else table[],
             $Debugchance = $gtlsDebugchance,
             $UseAllWares = $gtlsUseAllWares,
             $DistancePenalty = $gtlsDistancePenalty,
@@ -1212,7 +1769,12 @@
             $DemandLedSupplierScan = if this.$gtlsDemandLedSupplierScan? then this.$gtlsDemandLedSupplierScan else false,
             $DemandLedSellDone = if this.$gtlsDemandLedSellDone? then this.$gtlsDemandLedSellDone else false,
             $Mk4BuildStorageOnlyMode = if $gtlsMk4BuildStorageOnlyMode? then $gtlsMk4BuildStorageOnlyMode else false,
-            $Mk4AnchorHome = if $gtlsMk4AnchorHome? then $gtlsMk4AnchorHome else null
+            $Mk4AnchorHome = if $gtlsMk4AnchorHome? then $gtlsMk4AnchorHome else null,
+            $PlayerStationDiscoveryDone = if $gtlsPlayerStationDiscoveryDone? then $gtlsPlayerStationDiscoveryDone else false,
+            $PlayerBuyersInRange = if @$gtlsPlayerBuyersInRange != null then $gtlsPlayerBuyersInRange else [],
+            $PlayerSuppliersInRange = if @$gtlsPlayerSuppliersInRange != null then $gtlsPlayerSuppliersInRange else [],
+            $DeliveryCoverageMax = if $gtlsDeliveryCoverageMax? then $gtlsDeliveryCoverageMax else 0,
+            $SupplierCoverageMax = if $gtlsSupplierCoverageMax? then $gtlsSupplierCoverageMax else 0
           ]"/>
           <set_value name="global.$GT_LiveSearchActiveShip" exact="$gtlsShip"/>
           <wait exact="if global.$GT_LiveSearchScratch? and $ship? and global.$GT_LiveSearchScratch.{$ship}.$YieldMs? then global.$GT_LiveSearchScratch.{$ship}.$YieldMs * 1ms else 1ms" comment="Yield after MK4 completion buy-offer sector"/>
@@ -1228,22 +1790,39 @@
            Per-ware cap applied: each ware gets up to $maxOffersPerWare offers.
            ══════════════════════════════════════════════════════════════════ -->
       <do_if value="$gtlsSearchMode != 'buy_only'">
+        <do_if value="not $completionBuyOffersAdded?">
+          <set_value name="$completionBuyOffersAdded" exact="0"/>
+        </do_if>
         <set_value name="$gtlsSellSpacesNonEmpty" exact="false"/>
         <do_if value="@$gtlsSellSpaces != null">
           <do_if value="$gtlsSellSpaces.count gt 0">
             <set_value name="$gtlsSellSpacesNonEmpty" exact="true"/>
           </do_if>
         </do_if>
-        <do_if value="$gtlsSellSpacesNonEmpty">
-        <do_all exact="$gtlsSellSpaces.count" counter="$si">
+        <!-- Discovery mode iterates the pre-scanned player buyers directly instead of whole sectors. -->
+        <set_value name="$gtlsBuyScanUseBuyers" exact="$gtlsUsePlayerStationDiscovery and $gtlsPlayerBuyersInRange.count gt 0"/>
+        <do_if value="$gtlsBuyScanUseBuyers or $gtlsSellSpacesNonEmpty">
+        <set_value name="$gtlsBuyScanCount" exact="if $gtlsBuyScanUseBuyers then $gtlsPlayerBuyersInRange.count else $gtlsSellSpaces.count"/>
+        <do_all exact="$gtlsBuyScanCount" counter="$si">
           <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
             <resume label="gtls_ensure_state"/>
           </do_if>
-          <set_value name="$space" exact="$gtlsSellSpaces.{$si}"/>
+          <do_if value="$gtlsBuyScanUseBuyers">
+            <set_value name="$gtlsScanBuyer" exact="$gtlsPlayerBuyersInRange.{$si}"/>
+            <set_value name="$space" exact="if $gtlsScanBuyer.sector? then @$gtlsScanBuyer.sector else null"/>
+            <do_if value="not $space? or not @$space.exists">
+              <continue/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <set_value name="$gtlsScanBuyer" exact="null"/>
+            <set_value name="$space" exact="$gtlsSellSpaces.{$si}"/>
+          </do_else>
           <create_list name="$gtlsSectorBuySnap"/>
           <set_value name="$gtlsBuyFromIndex" exact="false"/>
-          <!-- Offer index hit: reuse fresh sector buy snapshot. -->
-          <do_if value="this.$gtlsOfferIndexEnabled? and this.$gtlsOfferIndexEnabled and $gtlsUseAllWares and global.$GT_OfferIndex? and global.$GT_OfferIndex.{$gtlsHomeSector}? and global.$GT_OfferIndex.{$gtlsHomeSector}.$Buys? and global.$GT_OfferIndex.{$gtlsHomeSector}.$Buys.{$space}?">
+          <!-- Offer index hit: reuse fresh sector buy snapshot. Per-buyer scans only see one
+               station of the sector, so they must neither read nor write the sector-wide index. -->
+          <do_if value="this.$gtlsOfferIndexEnabled? and this.$gtlsOfferIndexEnabled and $gtlsUseAllWares and not $gtlsBuyScanUseBuyers and global.$GT_OfferIndex? and global.$GT_OfferIndex.{$gtlsHomeSector}? and global.$GT_OfferIndex.{$gtlsHomeSector}.$Buys? and global.$GT_OfferIndex.{$gtlsHomeSector}.$Buys.{$space}?">
             <set_value name="$gtlsIdxBucket" exact="global.$GT_OfferIndex.{$gtlsHomeSector}.$Buys.{$space}"/>
             <do_if value="$gtlsIdxBucket.$ScannedAt? and (player.age - $gtlsIdxBucket.$ScannedAt) le this.$gtlsOfferIndexTTL and $gtlsIdxBucket.$Offers?">
               <set_value name="$gtlsBuyFromIndex" exact="true"/>
@@ -1310,25 +1889,54 @@
               <set_value name="this.$gtlsOfferIndexMisses" operation="add"/>
             </do_if>
           <do_if value="$gtlsUseAllWares">
-            <!-- Always start with partner-filtered offers so normal execution constraints stay intact. -->
-            <find_buy_offer tradepartner="$gtlsShip" space="$space" result="$foundBuyOffers" multiple="true">
-              <match_buyer tradesknownto="$gtlsShip.owner">
-                <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
-                <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
-              </match_buyer>
-              <offeramount min="1" tradepartner="$gtlsShip"/>
-              <relativeprice min="$gtlsBuyPriceMin" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
-            </find_buy_offer>
-            <do_if value="$gtlsIgnoreTradeRules">
-              <!-- ignoreTradeRules scope: only bypass player-station trade rules.
-                   Do not broaden to non-player stations or bypass other partner checks. -->
-              <find_buy_offer space="$space" result="$ignoreRulesBuyOffers" multiple="true">
-                <match_buyer tradesknownto="$gtlsShip.owner" owner="faction.player">
+            <!-- Always start with partner-filtered offers so normal execution constraints stay intact.
+                 requirePlayerBuyOfferOwner scopes the engine query to player buyers so the NPC
+                 delivery scan is skipped entirely. -->
+            <do_if value="$gtlsRequirePlayerBuyOfferOwner">
+              <do_if value="$gtlsScanBuyer? and @$gtlsScanBuyer.exists">
+                <find_buy_offer buyer="$gtlsScanBuyer" tradepartner="$gtlsShip" space="$space" result="$foundBuyOffers" multiple="true">
+                  <offeramount min="1" tradepartner="$gtlsShip"/>
+                  <relativeprice min="$gtlsBuyPriceMin" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
+                </find_buy_offer>
+              </do_if>
+              <do_else>
+                <find_buy_offer tradepartner="$gtlsShip" space="$space" result="$foundBuyOffers" multiple="true">
+                  <match_buyer tradesknownto="$gtlsShip.owner" owner="faction.player">
+                    <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                    <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+                  </match_buyer>
+                  <offeramount min="1" tradepartner="$gtlsShip"/>
+                  <relativeprice min="$gtlsBuyPriceMin" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
+                </find_buy_offer>
+              </do_else>
+            </do_if>
+            <do_else>
+              <find_buy_offer tradepartner="$gtlsShip" space="$space" result="$foundBuyOffers" multiple="true">
+                <match_buyer tradesknownto="$gtlsShip.owner">
                   <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
                   <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
                 </match_buyer>
-                <amount min="1"/>
+                <offeramount min="1" tradepartner="$gtlsShip"/>
+                <relativeprice min="$gtlsBuyPriceMin" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
               </find_buy_offer>
+            </do_else>
+            <do_if value="$gtlsIgnoreTradeRules">
+              <!-- ignoreTradeRules scope: only bypass player-station trade rules.
+                   Do not broaden to non-player stations or bypass other partner checks. -->
+              <do_if value="$gtlsScanBuyer? and @$gtlsScanBuyer.exists">
+                <find_buy_offer buyer="$gtlsScanBuyer" space="$space" result="$ignoreRulesBuyOffers" multiple="true">
+                  <amount min="1"/>
+                </find_buy_offer>
+              </do_if>
+              <do_else>
+                <find_buy_offer space="$space" result="$ignoreRulesBuyOffers" multiple="true">
+                  <match_buyer tradesknownto="$gtlsShip.owner" owner="faction.player">
+                    <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                    <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+                  </match_buyer>
+                  <amount min="1"/>
+                </find_buy_offer>
+              </do_else>
               <do_if value="not $foundBuyOffers?">
                 <create_list name="$foundBuyOffers"/>
               </do_if>
@@ -1379,7 +1987,43 @@
                   <set_value name="$capWare" exact="$offerWare"/>
                   <set_value name="$capAccepted" exact="false"/>
                   <set_value name="$capScoreAwareCandidate" exact="false"/>
-                  <do_if value="$gtlsUseScoreAwareBuyCap and $gtlsSourceSellByWare.{$capWare}?">
+                  <!-- B1: single-trip completion bypass — a remainder that fits one load skips the
+                       per-ware cap here, so no second sector pass is needed. -->
+                  <do_if value="$gtlsRequirePlayerBuyOfferOwner and $gtlsUseAllWares">
+                    <set_value name="$offerCustomer" exact="if $offer.buyer? and @$offer.buyer.exists then @$offer.buyer else (if $offer.owner? then @$offer.owner else null)"/>
+                    <do_if value="$offerCustomer? and @$offerCustomer.exists">
+                      <set_value name="$gtlsCompletionEligible" exact="true"/>
+                      <do_if value="if $gtlsMk4BuildStorageOnlyMode? then $gtlsMk4BuildStorageOnlyMode else false">
+                        <do_if value="not @$offerCustomer.isclass.buildstorage">
+                          <set_value name="$gtlsCompletionEligible" exact="false"/>
+                        </do_if>
+                      </do_if>
+                      <do_elseif value="$offerCustomer.isclass.buildstorage">
+                        <set_value name="$gtlsCompletionEligible" exact="false"/>
+                      </do_elseif>
+                      <do_if value="$gtlsCompletionEligible">
+                        <set_value name="$cpTarget" exact="$offerCustomer.cargo.{$offerWare}.target"/>
+                        <set_value name="$cpCount" exact="$offerCustomer.cargo.{$offerWare}.count"/>
+                        <set_value name="$cpDeficit" exact="[$cpTarget - $cpCount, 0].max"/>
+                        <do_if value="$cpDeficit le 0">
+                          <set_value name="$gtlsCompletionEligible" exact="false"/>
+                        </do_if>
+                      </do_if>
+                      <do_if value="$gtlsCompletionEligible">
+                        <set_value name="$cpVolPerUnit" exact="if $offerWare.volume? and $offerWare.volume gt 0 then $offerWare.volume else 1"/>
+                        <set_value name="$cpOneTripUnits" exact="($gtlsShip.cargo.free.all / $cpVolPerUnit)i"/>
+                        <do_if value="$cpOneTripUnits le 0 or $cpDeficit gt $cpOneTripUnits">
+                          <set_value name="$gtlsCompletionEligible" exact="false"/>
+                        </do_if>
+                      </do_if>
+                      <do_if value="$gtlsCompletionEligible">
+                        <append_to_list name="$buyOffers" exact="$offer"/>
+                        <set_value name="$capAccepted" exact="true"/>
+                        <set_value name="$completionBuyOffersAdded" operation="add"/>
+                      </do_if>
+                    </do_if>
+                  </do_if>
+                  <do_if value="not $capAccepted and $gtlsUseScoreAwareBuyCap and $gtlsSourceSellByWare.{$capWare}?">
                     <set_value name="$homeSellOffer" exact="$gtlsSourceSellByWare.{$capWare}"/>
                     <do_if value="$homeSellOffer? and @$homeSellOffer.exists and $homeSellOffer.available">
                       <set_value name="$unitProfit" exact="$offer.unitprice - $homeSellOffer.unitprice"/>
@@ -1446,7 +2090,7 @@
                       </do_if>
                     </do_if>
                   </do_if>
-                  <do_else>
+                  <do_elseif value="not $capAccepted">
                     <do_if value="not $buyOffersPerWare.{$capWare}?">
                       <set_value name="$buyOffersPerWare.{$capWare}" exact="0"/>
                     </do_if>
@@ -1475,7 +2119,7 @@
                       <set_value name="$buyOffersPerWare.{$capWare}" operation="add"/>
                       <set_value name="$capAccepted" exact="true"/>
                     </do_if>
-                  </do_else>
+                  </do_elseif>
                   <do_if value="$capAccepted">
                     <set_value name="$gtlsSeenBuyOffers.{$offer}" exact="true"/>
                     <do_if value="$capScoreAwareCandidate">
@@ -1514,28 +2158,61 @@
                 <set_value name="$gtlsWareTvMax" exact="if this.$gtlsTvMaxLiquid? then this.$gtlsTvMaxLiquid else 0"/>
               </do_elseif>
             </do_if>
-            <find_buy_offer wares="$ware" tradepartner="$gtlsShip" space="$space" result="$foundBuyOffers" multiple="true">
-              <match_buyer tradesknownto="$gtlsShip.owner">
-                <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
-                <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
-              </match_buyer>
-              <offeramount min="1" tradepartner="$gtlsShip"/>
-              <totalvolume min="$gtlsWareTvMin"/>
-              <mintotalvolume max="$gtlsWareTvMax"/>
-              <relativeprice min="$gtlsBuyPriceMin" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
-            </find_buy_offer>
-            <do_if value="$gtlsIgnoreTradeRules">
-              <!-- ignoreTradeRules scope: only bypass player-station trade rules.
-                   Do not broaden to non-player stations or bypass other partner checks. -->
-              <find_buy_offer wares="$ware" space="$space" result="$ignoreRulesBuyOffers" multiple="true">
-                <match_buyer tradesknownto="$gtlsShip.owner" owner="faction.player">
+            <do_if value="$gtlsRequirePlayerBuyOfferOwner">
+              <do_if value="$gtlsScanBuyer? and @$gtlsScanBuyer.exists">
+                <find_buy_offer wares="$ware" buyer="$gtlsScanBuyer" tradepartner="$gtlsShip" space="$space" result="$foundBuyOffers" multiple="true">
+                  <offeramount min="1" tradepartner="$gtlsShip"/>
+                  <totalvolume min="$gtlsWareTvMin"/>
+                  <mintotalvolume max="$gtlsWareTvMax"/>
+                  <relativeprice min="$gtlsBuyPriceMin" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
+                </find_buy_offer>
+              </do_if>
+              <do_else>
+                <find_buy_offer wares="$ware" tradepartner="$gtlsShip" space="$space" result="$foundBuyOffers" multiple="true">
+                  <match_buyer tradesknownto="$gtlsShip.owner" owner="faction.player">
+                    <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                    <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+                  </match_buyer>
+                  <offeramount min="1" tradepartner="$gtlsShip"/>
+                  <totalvolume min="$gtlsWareTvMin"/>
+                  <mintotalvolume max="$gtlsWareTvMax"/>
+                  <relativeprice min="$gtlsBuyPriceMin" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
+                </find_buy_offer>
+              </do_else>
+            </do_if>
+            <do_else>
+              <find_buy_offer wares="$ware" tradepartner="$gtlsShip" space="$space" result="$foundBuyOffers" multiple="true">
+                <match_buyer tradesknownto="$gtlsShip.owner">
                   <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
                   <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
                 </match_buyer>
-                <amount min="1"/>
+                <offeramount min="1" tradepartner="$gtlsShip"/>
                 <totalvolume min="$gtlsWareTvMin"/>
                 <mintotalvolume max="$gtlsWareTvMax"/>
+                <relativeprice min="$gtlsBuyPriceMin" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
               </find_buy_offer>
+            </do_else>
+            <do_if value="$gtlsIgnoreTradeRules">
+              <!-- ignoreTradeRules scope: only bypass player-station trade rules.
+                   Do not broaden to non-player stations or bypass other partner checks. -->
+              <do_if value="$gtlsScanBuyer? and @$gtlsScanBuyer.exists">
+                <find_buy_offer wares="$ware" buyer="$gtlsScanBuyer" space="$space" result="$ignoreRulesBuyOffers" multiple="true">
+                  <amount min="1"/>
+                  <totalvolume min="$gtlsWareTvMin"/>
+                  <mintotalvolume max="$gtlsWareTvMax"/>
+                </find_buy_offer>
+              </do_if>
+              <do_else>
+                <find_buy_offer wares="$ware" space="$space" result="$ignoreRulesBuyOffers" multiple="true">
+                  <match_buyer tradesknownto="$gtlsShip.owner" owner="faction.player">
+                    <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                    <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+                  </match_buyer>
+                  <amount min="1"/>
+                  <totalvolume min="$gtlsWareTvMin"/>
+                  <mintotalvolume max="$gtlsWareTvMax"/>
+                </find_buy_offer>
+              </do_else>
               <do_if value="not $foundBuyOffers?">
                 <create_list name="$foundBuyOffers"/>
               </do_if>
@@ -1715,7 +2392,7 @@
           </do_else>
           </do_if>
           <!-- Atomic sector buy upsert after live find (skip when reused from index). -->
-          <do_if value="this.$gtlsOfferIndexEnabled? and this.$gtlsOfferIndexEnabled and $gtlsUseAllWares and not $gtlsBuyFromIndex and $gtlsHomeSector? and global.$GT_OfferIndex? and global.$GT_OfferIndex.{$gtlsHomeSector}?">
+          <do_if value="this.$gtlsOfferIndexEnabled? and this.$gtlsOfferIndexEnabled and $gtlsUseAllWares and not $gtlsBuyFromIndex and not $gtlsBuyScanUseBuyers and $gtlsHomeSector? and global.$GT_OfferIndex? and global.$GT_OfferIndex.{$gtlsHomeSector}?">
             <do_if value="not global.$GT_OfferIndex.{$gtlsHomeSector}.$Buys?">
               <set_value name="global.$GT_OfferIndex.{$gtlsHomeSector}.$Buys" exact="table[]"/>
             </do_if>
@@ -1734,6 +2411,7 @@
             $SellSpaces = $gtlsSellSpaces,
             $HomeSector = $gtlsHomeSector,
             $MaxDistance = $gtlsMaxDistance,
+            $MaxDistanceSell = $gtlsMaxDistanceSell,
             $WareBasket = $gtlsWareBasket,
             $AllowIllegal = $gtlsAllowIllegal,
             $OwnerFilter = $gtlsOwnerFilter,
@@ -1745,12 +2423,16 @@
             $BuyPriceMin = $gtlsBuyPriceMin,
             $IncludePlayerBuyOffers = $gtlsIncludePlayerBuyOffers,
             $IncludePlayerSellOffers = $gtlsIncludePlayerSellOffers,
+            $IncludeNpcSellOffers = $gtlsIncludeNpcSellOffers,
+            $SkipSupplierScan = $gtlsSkipSupplierScan,
             $RequirePlayerBuyOfferOwner = $gtlsRequirePlayerBuyOfferOwner,
             $IgnoreTradeRulesPlayerBuyOffersRequireCargoNeed = $gtlsIgnoreTradeRulesPlayerBuyOffersRequireCargoNeed,
             $BypassPlayerSellerPricing = $gtlsBypassPlayerSellerPricing,
             $RetainCheapestSellPerWare = $gtlsRetainCheapestSellPerWare,
             $ExcludePlayerBuyers = $gtlsExcludePlayerBuyers,
             $PriorityWares = $gtlsPriorityWares,
+            $StationWhitelist = if @$gtlsStationWhitelist != null then $gtlsStationWhitelist else [],
+            $Mk4Priorities = if @$gtlsMk4Priorities != null then $gtlsMk4Priorities else table[],
             $Debugchance = $gtlsDebugchance,
             $UseAllWares = $gtlsUseAllWares,
             $DistancePenalty = $gtlsDistancePenalty,
@@ -1770,7 +2452,12 @@
             $DemandLedSupplierScan = if this.$gtlsDemandLedSupplierScan? then this.$gtlsDemandLedSupplierScan else false,
             $DemandLedSellDone = if this.$gtlsDemandLedSellDone? then this.$gtlsDemandLedSellDone else false,
             $Mk4BuildStorageOnlyMode = if $gtlsMk4BuildStorageOnlyMode? then $gtlsMk4BuildStorageOnlyMode else false,
-            $Mk4AnchorHome = if $gtlsMk4AnchorHome? then $gtlsMk4AnchorHome else null
+            $Mk4AnchorHome = if $gtlsMk4AnchorHome? then $gtlsMk4AnchorHome else null,
+            $PlayerStationDiscoveryDone = if $gtlsPlayerStationDiscoveryDone? then $gtlsPlayerStationDiscoveryDone else false,
+            $PlayerBuyersInRange = if @$gtlsPlayerBuyersInRange != null then $gtlsPlayerBuyersInRange else [],
+            $PlayerSuppliersInRange = if @$gtlsPlayerSuppliersInRange != null then $gtlsPlayerSuppliersInRange else [],
+            $DeliveryCoverageMax = if $gtlsDeliveryCoverageMax? then $gtlsDeliveryCoverageMax else 0,
+            $SupplierCoverageMax = if $gtlsSupplierCoverageMax? then $gtlsSupplierCoverageMax else 0
           ]"/>
           <set_value name="global.$GT_LiveSearchActiveShip" exact="$gtlsShip"/>
           <wait exact="if global.$GT_LiveSearchScratch? and $ship? and global.$GT_LiveSearchScratch.{$ship}.$YieldMs? then global.$GT_LiveSearchScratch.{$ship}.$YieldMs * 1ms else 1ms" comment="Yield after buy-offer sector"/>
@@ -1791,7 +2478,8 @@
           <set_value name="$gtlsSellSpacesNonEmpty" exact="true"/>
         </do_if>
       </do_if>
-      <do_if value="not $gtlsExcludePlayerBuyers and $gtlsIncludePlayerBuyOffers and $gtlsOwnerFilter != 'npc_only' and ($gtlsIgnoreTradeRules or $gtlsIgnoreTradeRulesPlayerBuyOffersRequireCargoNeed) and $gtlsSearchMode != 'buy_only' and $gtlsSellSpacesNonEmpty">
+      <set_value name="$gtlsSuppScanUseBuyers" exact="$gtlsUsePlayerStationDiscovery and $gtlsPlayerBuyersInRange.count gt 0"/>
+      <do_if value="not $gtlsExcludePlayerBuyers and $gtlsIncludePlayerBuyOffers and $gtlsOwnerFilter != 'npc_only' and ($gtlsIgnoreTradeRules or $gtlsIgnoreTradeRulesPlayerBuyOffersRequireCargoNeed) and $gtlsSearchMode != 'buy_only' and ($gtlsSuppScanUseBuyers or $gtlsSellSpacesNonEmpty)">
         <set_value name="$playerBuyOffersAdded" exact="0"/>
         <set_value name="$suppHasWareBasket" exact="false"/>
         <do_if value="$gtlsWareBasket?">
@@ -1799,19 +2487,37 @@
             <set_value name="$suppHasWareBasket" exact="true"/>
           </do_if>
         </do_if>
-        <do_all exact="$gtlsSellSpaces.count" counter="$si">
+        <set_value name="$gtlsSuppScanCount" exact="if $gtlsSuppScanUseBuyers then $gtlsPlayerBuyersInRange.count else $gtlsSellSpaces.count"/>
+        <do_all exact="$gtlsSuppScanCount" counter="$si">
           <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
             <resume label="gtls_ensure_state"/>
           </do_if>
-          <set_value name="$space" exact="$gtlsSellSpaces.{$si}"/>
+          <do_if value="$gtlsSuppScanUseBuyers">
+            <set_value name="$gtlsScanBuyer" exact="$gtlsPlayerBuyersInRange.{$si}"/>
+            <set_value name="$space" exact="if $gtlsScanBuyer.sector? then @$gtlsScanBuyer.sector else null"/>
+            <do_if value="not $space? or not @$space.exists">
+              <continue/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <set_value name="$gtlsScanBuyer" exact="null"/>
+            <set_value name="$space" exact="$gtlsSellSpaces.{$si}"/>
+          </do_else>
           <do_if value="$gtlsUseAllWares">
-            <find_buy_offer space="$space" result="$playerBuyOffers" multiple="true">
-              <match_buyer tradesknownto="$gtlsShip.owner" owner="faction.player">
-                <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
-                <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
-              </match_buyer>
-              <offeramount min="1"/>
-            </find_buy_offer>
+            <do_if value="$gtlsScanBuyer? and @$gtlsScanBuyer.exists">
+              <find_buy_offer buyer="$gtlsScanBuyer" space="$space" result="$playerBuyOffers" multiple="true">
+                <offeramount min="1"/>
+              </find_buy_offer>
+            </do_if>
+            <do_else>
+              <find_buy_offer space="$space" result="$playerBuyOffers" multiple="true">
+                <match_buyer tradesknownto="$gtlsShip.owner" owner="faction.player">
+                  <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                  <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+                </match_buyer>
+                <offeramount min="1"/>
+              </find_buy_offer>
+            </do_else>
             <do_if value="$playerBuyOffers? and $playerBuyOffers.count gt 0">
               <do_all exact="$playerBuyOffers.count" counter="$oi">
                 <set_value name="$offer" exact="$playerBuyOffers.{$oi}"/>
@@ -1872,23 +2578,59 @@
                   <do_if value="not $gtlsBuyBuildStorageOffersPerWare.{$offerWare}?">
                     <set_value name="$gtlsBuyBuildStorageOffersPerWare.{$offerWare}" exact="0"/>
                   </do_if>
-                  <set_value name="$isBuildStorageBuyer" exact="$offer.owner? and @$offer.owner.isplayerowned and @$offer.owner.isclass.buildstorage"/>
-                  <do_if value="$isBuildStorageBuyer">
-                    <do_if value="not $gtlsBuildStorageReservePerWare?">
-                      <set_value name="$gtlsBuildStorageReservePerWare" exact="[1, [4, $gtlsMaxOffersPerWare].min].max"/>
+                  <!-- B1: single-trip completion bypass on the player-buy supplement scan -->
+                  <set_value name="$gtlsCompletionEligible" exact="false"/>
+                  <do_if value="$gtlsRequirePlayerBuyOfferOwner and $gtlsUseAllWares">
+                    <set_value name="$offerCustomer" exact="if $offer.buyer? and @$offer.buyer.exists then @$offer.buyer else (if $offer.owner? then @$offer.owner else null)"/>
+                    <do_if value="$offerCustomer? and @$offerCustomer.exists">
+                      <set_value name="$gtlsCompletionEligible" exact="true"/>
+                      <do_if value="if $gtlsMk4BuildStorageOnlyMode? then $gtlsMk4BuildStorageOnlyMode else false">
+                        <do_if value="not @$offerCustomer.isclass.buildstorage">
+                          <set_value name="$gtlsCompletionEligible" exact="false"/>
+                        </do_if>
+                      </do_if>
+                      <do_elseif value="$offerCustomer.isclass.buildstorage">
+                        <set_value name="$gtlsCompletionEligible" exact="false"/>
+                      </do_elseif>
+                      <do_if value="$gtlsCompletionEligible">
+                        <set_value name="$cpTarget" exact="$offerCustomer.cargo.{$offerWare}.target"/>
+                        <set_value name="$cpCount" exact="$offerCustomer.cargo.{$offerWare}.count"/>
+                        <set_value name="$cpDeficit" exact="[$cpTarget - $cpCount, 0].max"/>
+                        <do_if value="$cpDeficit le 0">
+                          <set_value name="$gtlsCompletionEligible" exact="false"/>
+                        </do_if>
+                      </do_if>
+                      <do_if value="$gtlsCompletionEligible">
+                        <set_value name="$cpVolPerUnit" exact="if $offerWare.volume? and $offerWare.volume gt 0 then $offerWare.volume else 1"/>
+                        <set_value name="$cpOneTripUnits" exact="($gtlsShip.cargo.free.all / $cpVolPerUnit)i"/>
+                        <do_if value="$cpOneTripUnits le 0 or $cpDeficit gt $cpOneTripUnits">
+                          <set_value name="$gtlsCompletionEligible" exact="false"/>
+                        </do_if>
+                      </do_if>
                     </do_if>
-                    <do_if value="$buyOffersPerWare.{$offerWare} ge ($gtlsMaxOffersPerWare + $gtlsBuildStorageReservePerWare)">
-                      <continue/>
-                    </do_if>
-                    <set_value name="$gtlsBuyBuildStorageOffersPerWare.{$offerWare}" operation="add"/>
-                    <set_value name="$gtlsBuildStorageBuyOffersAdded" operation="add"/>
+                  </do_if>
+                  <do_if value="$gtlsCompletionEligible">
+                    <set_value name="$completionBuyOffersAdded" operation="add"/>
                   </do_if>
                   <do_else>
-                    <do_if value="$buyOffersPerWare.{$offerWare} ge $gtlsMaxOffersPerWare">
-                      <continue/>
+                    <set_value name="$isBuildStorageBuyer" exact="$offer.owner? and @$offer.owner.isplayerowned and @$offer.owner.isclass.buildstorage"/>
+                    <do_if value="$isBuildStorageBuyer">
+                      <do_if value="not $gtlsBuildStorageReservePerWare?">
+                        <set_value name="$gtlsBuildStorageReservePerWare" exact="[1, [4, $gtlsMaxOffersPerWare].min].max"/>
+                      </do_if>
+                      <do_if value="$buyOffersPerWare.{$offerWare} ge ($gtlsMaxOffersPerWare + $gtlsBuildStorageReservePerWare)">
+                        <continue/>
+                      </do_if>
+                      <set_value name="$gtlsBuyBuildStorageOffersPerWare.{$offerWare}" operation="add"/>
+                      <set_value name="$gtlsBuildStorageBuyOffersAdded" operation="add"/>
                     </do_if>
+                    <do_else>
+                      <do_if value="$buyOffersPerWare.{$offerWare} ge $gtlsMaxOffersPerWare">
+                        <continue/>
+                      </do_if>
+                    </do_else>
+                    <set_value name="$buyOffersPerWare.{$offerWare}" operation="add"/>
                   </do_else>
-                  <set_value name="$buyOffersPerWare.{$offerWare}" operation="add"/>
                 </do_if>
                 <set_value name="$gtlsSeenBuyOffers.{$offer}" exact="true"/>
                 <append_to_list name="$buyOffers" exact="$offer"/>
@@ -1922,15 +2664,24 @@
                   <set_value name="$gtlsWareTvMax" exact="if this.$gtlsTvMaxLiquid? then this.$gtlsTvMaxLiquid else 0"/>
                 </do_elseif>
               </do_if>
-              <find_buy_offer wares="$ware" space="$space" result="$playerBuyOffers" multiple="true">
-                <match_buyer tradesknownto="$gtlsShip.owner" owner="faction.player">
-                  <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
-                  <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
-                </match_buyer>
-                <offeramount min="1"/>
-                <totalvolume min="$gtlsWareTvMin"/>
-                <mintotalvolume max="$gtlsWareTvMax"/>
-              </find_buy_offer>
+              <do_if value="$gtlsScanBuyer? and @$gtlsScanBuyer.exists">
+                <find_buy_offer wares="$ware" buyer="$gtlsScanBuyer" space="$space" result="$playerBuyOffers" multiple="true">
+                  <offeramount min="1"/>
+                  <totalvolume min="$gtlsWareTvMin"/>
+                  <mintotalvolume max="$gtlsWareTvMax"/>
+                </find_buy_offer>
+              </do_if>
+              <do_else>
+                <find_buy_offer wares="$ware" space="$space" result="$playerBuyOffers" multiple="true">
+                  <match_buyer tradesknownto="$gtlsShip.owner" owner="faction.player">
+                    <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                    <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+                  </match_buyer>
+                  <offeramount min="1"/>
+                  <totalvolume min="$gtlsWareTvMin"/>
+                  <mintotalvolume max="$gtlsWareTvMax"/>
+                </find_buy_offer>
+              </do_else>
               <do_if value="$playerBuyOffers? and $playerBuyOffers.count gt 0">
                 <do_if value="not $gtlsBuyBuildStorageOffersPerWare?">
                   <set_value name="$gtlsBuyBuildStorageOffersPerWare" exact="table[]"/>
@@ -2107,9 +2858,16 @@
               </do_if>
             </do_if>
           </do_if>
-          <do_if value="@$gtlsBuySpaces != null">
+          <do_if value="@$gtlsBuySpaces != null and not $gtlsSkipSupplierScan">
             <do_if value="$gtlsBuySpaces.count gt 0">
-            <do_if value="not $sellOffersPerWare.{$pw}? or $sellOffersPerWare.{$pw} lt $gtlsMaxOffersPerWare">
+            <set_value name="$gtlsPwSellSkipCap" exact="$gtlsMaxOffersPerWare"/>
+            <do_if value="$gtlsIncludePlayerSellOffers and $gtlsIncludeNpcSellOffers and $gtlsPlayerSupplierReservePerWare gt 0">
+              <do_if value="not $gtlsBuildStorageReservePerWare?">
+                <set_value name="$gtlsBuildStorageReservePerWare" exact="[1, [4, $gtlsMaxOffersPerWare].min].max"/>
+              </do_if>
+              <set_value name="$gtlsPwSellSkipCap" exact="$gtlsMaxOffersPerWare + $gtlsPlayerSupplierReservePerWare + $gtlsBuildStorageReservePerWare"/>
+            </do_if>
+            <do_if value="not $sellOffersPerWare.{$pw}? or $sellOffersPerWare.{$pw} lt $gtlsPwSellSkipCap">
               <do_all exact="$gtlsBuySpaces.count" counter="$psi">
                 <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
                   <resume label="gtls_ensure_state"/>
@@ -2132,7 +2890,7 @@
                     <set_value name="$gtlsWareTvMax" exact="if this.$gtlsTvMaxLiquid? then this.$gtlsTvMaxLiquid else 0"/>
                   </do_elseif>
                 </do_if>
-                <do_if value="$gtlsIncludePlayerSellOffers">
+                <do_if value="$gtlsIncludePlayerSellOffers and $gtlsIncludeNpcSellOffers">
                   <find_sell_offer wares="$pw" tradepartner="$gtlsShip" space="$space" result="$foundSellOffers" multiple="true">
                     <match_seller tradesknownto="$gtlsShip.owner">
                       <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
@@ -2144,9 +2902,21 @@
                     <relativeprice max="$gtlsSellPriceMax" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
                   </find_sell_offer>
                 </do_if>
-                <do_else>
+                <do_elseif value="$gtlsIncludeNpcSellOffers">
                   <find_sell_offer wares="$pw" tradepartner="$gtlsShip" space="$space" result="$foundSellOffers" multiple="true">
                     <match_seller tradesknownto="$gtlsShip.owner" owner="faction.player" negateownerfilter="true">
+                      <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                      <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+                    </match_seller>
+                    <amount min="1"/>
+                    <totalvolume min="$gtlsWareTvMin"/>
+                    <mintotalvolume max="$gtlsWareTvMax"/>
+                    <relativeprice max="$gtlsSellPriceMax" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
+                  </find_sell_offer>
+                </do_elseif>
+                <do_else>
+                  <find_sell_offer wares="$pw" tradepartner="$gtlsShip" space="$space" result="$foundSellOffers" multiple="true">
+                    <match_seller tradesknownto="$gtlsShip.owner" owner="faction.player">
                       <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
                       <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
                     </match_seller>
@@ -2161,18 +2931,42 @@
                     <set_value name="$sellOffersPerWare.{$pw}" exact="0"/>
                   </do_if>
                   <do_all exact="$foundSellOffers.count" counter="$oi">
-                    <do_if value="$sellOffersPerWare.{$pw} ge $gtlsMaxOffersPerWare">
-                      <break/>
-                    </do_if>
                     <set_value name="$offer" exact="$foundSellOffers.{$oi}"/>
+                    <set_value name="$isBuildStorageSellSupplier" exact="$offer.owner? and @$offer.owner.isclass.buildstorage"/>
+                    <set_value name="$isPlayerSellSupplier" exact="$offer.owner? and @$offer.owner.isplayerowned and not $isBuildStorageSellSupplier"/>
+                    <do_if value="$isBuildStorageSellSupplier">
+                      <do_if value="not $gtlsBuildStorageReservePerWare?">
+                        <set_value name="$gtlsBuildStorageReservePerWare" exact="[1, [4, $gtlsMaxOffersPerWare].min].max"/>
+                      </do_if>
+                      <do_if value="$sellOffersPerWare.{$pw} ge ($gtlsMaxOffersPerWare + $gtlsBuildStorageReservePerWare)">
+                        <continue/>
+                      </do_if>
+                    </do_if>
+                    <do_elseif value="$isPlayerSellSupplier and $gtlsPlayerSupplierReservePerWare gt 0">
+                      <do_if value="$sellOffersPerWare.{$pw} ge ($gtlsMaxOffersPerWare + $gtlsPlayerSupplierReservePerWare)">
+                        <continue/>
+                      </do_if>
+                    </do_elseif>
+                    <do_else>
+                      <do_if value="$sellOffersPerWare.{$pw} ge $gtlsMaxOffersPerWare">
+                        <break/>
+                      </do_if>
+                    </do_else>
                     <do_if value="$gtlsOwnerFilter == 'npc_only' and $offer.owner.isplayerowned">
                       <continue/>
                     </do_if>
                     <do_if value="$gtlsOwnerFilter == 'player_only' and not $offer.owner.isplayerowned">
                       <continue/>
                     </do_if>
-                    <!-- MK4 supply: supplier unitprice must not exceed max customer buy price for this ware. -->
-                    <do_if value="$gtlsRequirePlayerBuyOfferOwner and not $gtlsBypassPlayerSellerPricing">
+                    <do_if value="not $gtlsIncludePlayerSellOffers and $offer.owner? and @$offer.owner.isplayerowned">
+                      <continue/>
+                    </do_if>
+                    <do_if value="not $gtlsIncludeNpcSellOffers and (not $offer.owner? or not @$offer.owner.isplayerowned)">
+                      <continue/>
+                    </do_if>
+                    <!-- MK4 supply: NPC supplier unitprice must not exceed max customer buy price.
+                         Player-owned suppliers are free virtualmoney - do not drop them here. -->
+                    <do_if value="$gtlsRequirePlayerBuyOfferOwner and not $gtlsBypassPlayerSellerPricing and (not $offer.owner? or not @$offer.owner.isplayerowned)">
                       <do_if value="this.$gtlsMaxBuyUnitPriceByWare? and this.$gtlsMaxBuyUnitPriceByWare.{$pw}? and $offer.unitprice gt this.$gtlsMaxBuyUnitPriceByWare.{$pw}">
                         <set_value name="this.$gtlsMk4PriceCapPrefilterSkipped" operation="add"/>
                         <continue/>
@@ -2232,16 +3026,30 @@
                     <set_value name="$gtlsWareTvMax" exact="if this.$gtlsTvMaxLiquid? then this.$gtlsTvMaxLiquid else 0"/>
                   </do_elseif>
                 </do_if>
-                <find_buy_offer wares="$pw" tradepartner="$gtlsShip" space="$space" result="$foundBuyOffers" multiple="true">
-                  <match_buyer tradesknownto="$gtlsShip.owner">
-                    <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
-                    <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
-                  </match_buyer>
-                  <offeramount min="1" tradepartner="$gtlsShip"/>
-                  <totalvolume min="$gtlsWareTvMin"/>
-                  <mintotalvolume max="$gtlsWareTvMax"/>
-                  <relativeprice min="$gtlsBuyPriceMin" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
-                </find_buy_offer>
+                <do_if value="$gtlsRequirePlayerBuyOfferOwner">
+                  <find_buy_offer wares="$pw" tradepartner="$gtlsShip" space="$space" result="$foundBuyOffers" multiple="true">
+                    <match_buyer tradesknownto="$gtlsShip.owner" owner="faction.player">
+                      <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                      <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+                    </match_buyer>
+                    <offeramount min="1" tradepartner="$gtlsShip"/>
+                    <totalvolume min="$gtlsWareTvMin"/>
+                    <mintotalvolume max="$gtlsWareTvMax"/>
+                    <relativeprice min="$gtlsBuyPriceMin" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
+                  </find_buy_offer>
+                </do_if>
+                <do_else>
+                  <find_buy_offer wares="$pw" tradepartner="$gtlsShip" space="$space" result="$foundBuyOffers" multiple="true">
+                    <match_buyer tradesknownto="$gtlsShip.owner">
+                      <match_relation_to object="$gtlsShip" relation="dock" comparison="ge"/>
+                      <match_relation_to faction="$gtlsShip.owner" relation="enemy" comparison="not"/>
+                    </match_buyer>
+                    <offeramount min="1" tradepartner="$gtlsShip"/>
+                    <totalvolume min="$gtlsWareTvMin"/>
+                    <mintotalvolume max="$gtlsWareTvMax"/>
+                    <relativeprice min="$gtlsBuyPriceMin" tradepartner="if $gtlsShip.isplayerowned then $gtlsShip else null"/>
+                  </find_buy_offer>
+                </do_else>
                 <do_if value="$foundBuyOffers? and $foundBuyOffers.count gt 0">
                   <do_if value="not $gtlsBuyBuildStorageOffersPerWare?">
                     <set_value name="$gtlsBuyBuildStorageOffersPerWare" exact="table[]"/>
@@ -2338,7 +3146,7 @@
            buy-offer scans return station owners; construction demand is on buyer=buildstorage).
            Enumerate via player station.buildstorage (vanilla trade.station.xml pattern) plus
            standalone class.buildstorage objects; BS demand may exist without credits (excludeempty=false). -->
-      <do_if value="if $gtlsMk4BuildStorageOnlyMode? then $gtlsMk4BuildStorageOnlyMode else false">
+      <do_if value="(if $gtlsMk4BuildStorageOnlyMode? then $gtlsMk4BuildStorageOnlyMode else false) and not $gtlsUsePlayerStationDiscovery">
         <set_value name="$gtlsBsoDirectBuyAdded" exact="0"/>
         <set_value name="$gtlsBsoHasWareBasket" exact="false"/>
         <do_if value="$gtlsWareBasket?">
@@ -2507,8 +3315,9 @@
         </do_if>
         <debug_text text="'[GT-LiveSearch] ' + $gtlsShip.idcode + ': buildStorageOnly direct BS buy scan added=' + $gtlsBsoDirectBuyAdded + ' buyers=' + $gtlsBsoBuyersFound + ' stationsScanned=' + $gtlsBsoStationsScanned + ' coverageMax=' + $gtlsBsoCoverageMax + 'j'" chance="100"/>
       </do_if>
-      <!-- MK4 build-storage-only: drop non-BS buyers, out-of-coverage BS buyers, and BS supplier sell offers. -->
-      <do_if value="if $gtlsMk4BuildStorageOnlyMode? then $gtlsMk4BuildStorageOnlyMode else false">
+      <!-- MK4 build-storage-only: drop non-BS buyers, out-of-coverage BS buyers, and BS supplier sell offers.
+           Clearance (sell_only) keeps every willing buyer. -->
+      <do_if value="$gtlsSearchMode != 'sell_only' and (if $gtlsMk4BuildStorageOnlyMode? then $gtlsMk4BuildStorageOnlyMode else false)">
         <set_value name="$gtlsBsoCoverageMax" exact="if $gtlsMaxDistanceSell? and $gtlsMaxDistanceSell gt 0 then $gtlsMaxDistanceSell else $gtlsMaxDistance"/>
         <create_list name="$sellOffersBsoFiltered"/>
         <do_all exact="$sellOffers.count" counter="$gtlsBsoSi">
@@ -2587,6 +3396,80 @@
       <set_value name="$buyOffers" exact="$buyOffersCargoFiltered"/>
       <set_value name="$buyOffersPerWare" exact="$buyOffersPerWareCargo"/>
       <debug_text text="'[GT-LiveSearch] ' + $gtlsShip.idcode + ': buy-offers after cargo.free filter=' + $buyOffers.count" chance="$gtlsDebugchance"/>
+      <!-- MK4 7.2: classify-at-ingest - keep only buyers whose class slider is enabled and bucket them.
+           Only MK4 delivery policy (requirePlayerBuyOfferOwner + class sliders) applies this; MK3 and
+           clearance (sell_only) keep every willing buyer. -->
+      <set_value name="$buyByClass" exact="table[]"/>
+      <do_if value="$gtlsSearchMode != 'sell_only' and $gtlsRequirePlayerBuyOfferOwner and @$gtlsMk4Priorities != null">
+        <create_list name="$buyOffersMk4Filtered"/>
+        <do_all exact="$buyOffers.count" counter="$mk4bi">
+          <set_value name="$mk4BuyOffer" exact="$buyOffers.{$mk4bi}"/>
+          <set_value name="$mk4Buyer" exact="if $mk4BuyOffer.buyer? then @$mk4BuyOffer.buyer else (if $mk4BuyOffer.owner? then @$mk4BuyOffer.owner else null)"/>
+          <do_if value="$mk4Buyer? and $mk4Buyer.exists">
+            <set_value name="$mk4LiveClass" exact="'None'"/>
+            <set_value name="$mk4LiveMult" exact="0"/>
+            <do_if value="@$mk4Buyer.isclass.buildstorage and @$mk4Buyer.isplayerowned">
+              <set_value name="$mk4LiveClass" exact="'Buildstorage'"/>
+            </do_if>
+            <do_elseif value="@$mk4Buyer.isclass.station and @$mk4Buyer.isplayerowned">
+              <set_value name="$mk4LiveClass" exact="'Stations'"/>
+            </do_elseif>
+            <do_elseif value="@$mk4Buyer.isclass.ship and @$mk4Buyer.isplayerowned and @$mk4Buyer.primarypurpose == purpose.auxiliary">
+              <set_value name="$mk4LiveClass" exact="'Aux'"/>
+            </do_elseif>
+            <do_elseif value="@$mk4Buyer.isclass.buildstorage and $mk4Buyer.base? and @$mk4Buyer.base.isplayerowned">
+              <set_value name="$mk4LiveClass" exact="'Buildstorage'"/>
+            </do_elseif>
+            <do_if value="$mk4LiveClass == 'Buildstorage'">
+              <set_value name="$mk4LiveMult" exact="if $gtlsMk4Priorities.$Buildstorage? then $gtlsMk4Priorities.$Buildstorage else 0"/>
+            </do_if>
+            <do_elseif value="$mk4LiveClass == 'Stations'">
+              <set_value name="$mk4LiveMult" exact="if $gtlsMk4Priorities.$Stations? then $gtlsMk4Priorities.$Stations else 0"/>
+            </do_elseif>
+            <do_elseif value="$mk4LiveClass == 'Aux'">
+              <set_value name="$mk4LiveMult" exact="if $gtlsMk4Priorities.$Aux? then $gtlsMk4Priorities.$Aux else 0"/>
+            </do_elseif>
+            <do_if value="$mk4LiveClass != 'None' and $mk4LiveMult gt 0">
+              <append_to_list name="$buyOffersMk4Filtered" exact="$mk4BuyOffer"/>
+              <do_if value="$mk4LiveClass == 'Buildstorage'">
+                <do_if value="not $buyByClass.$Buildstorage?">
+                  <create_list name="$buyByClass.$Buildstorage"/>
+                </do_if>
+                <append_to_list name="$buyByClass.$Buildstorage" exact="$mk4BuyOffer"/>
+              </do_if>
+              <do_elseif value="$mk4LiveClass == 'Stations'">
+                <do_if value="not $buyByClass.$Stations?">
+                  <create_list name="$buyByClass.$Stations"/>
+                </do_if>
+                <append_to_list name="$buyByClass.$Stations" exact="$mk4BuyOffer"/>
+              </do_elseif>
+              <do_elseif value="$mk4LiveClass == 'Aux'">
+                <do_if value="not $buyByClass.$Aux?">
+                  <create_list name="$buyByClass.$Aux"/>
+                </do_if>
+                <append_to_list name="$buyByClass.$Aux" exact="$mk4BuyOffer"/>
+              </do_elseif>
+            </do_if>
+          </do_if>
+        </do_all>
+        <set_value name="$buyOffers" exact="$buyOffersMk4Filtered"/>
+        <set_value name="$buyOffersPerWare" exact="table[]"/>
+        <do_all exact="$buyOffers.count" counter="$mk4pwIdx">
+          <set_value name="$mk4pwOffer" exact="$buyOffers.{$mk4pwIdx}"/>
+          <set_value name="$mk4pwWare" exact="if $mk4pwOffer.ware? then @$mk4pwOffer.ware else null"/>
+          <do_if value="$mk4pwWare?">
+            <do_if value="not $buyOffersPerWare.{$mk4pwWare}?">
+              <set_value name="$buyOffersPerWare.{$mk4pwWare}" exact="0"/>
+            </do_if>
+            <set_value name="$buyOffersPerWare.{$mk4pwWare}" operation="add"/>
+          </do_if>
+        </do_all>
+        <set_value name="$mk4BuyBucketCount" exact="0"/>
+        <do_if value="$buyByClass.$Buildstorage?"><set_value name="$mk4BuyBucketCount" exact="$mk4BuyBucketCount + $buyByClass.$Buildstorage.count"/></do_if>
+        <do_if value="$buyByClass.$Stations?"><set_value name="$mk4BuyBucketCount" exact="$mk4BuyBucketCount + $buyByClass.$Stations.count"/></do_if>
+        <do_if value="$buyByClass.$Aux?"><set_value name="$mk4BuyBucketCount" exact="$mk4BuyBucketCount + $buyByClass.$Aux.count"/></do_if>
+        <debug_text text="'[GT-LiveSearch] ' + $gtlsShip.idcode + ': MK4 class filter buy=' + $buyOffers.count + ' bucketOffers=' + $mk4BuyBucketCount" chance="$gtlsDebugchance"/>
+      </do_if>
       <do_if value="this.$gtlsOfferIndexEnabled? and this.$gtlsOfferIndexEnabled">
         <debug_text text="'[GT-LiveSearch] ' + $gtlsShip.idcode + ': offer-index hits=' + this.$gtlsOfferIndexHits + ' misses=' + this.$gtlsOfferIndexMisses" chance="$gtlsDebugchance"/>
       </do_if>
@@ -2600,6 +3483,7 @@
         $BuyOfferCount = $buyOffers.count,
         $SellWaresFound = $sellOffersPerWare.keys.count,
         $BuyWaresFound = $buyOffersPerWare.keys.count,
+        $BuyByClass = if $buyByClass? then $buyByClass else table[],
         $OfferIndexHits = if this.$gtlsOfferIndexHits? then this.$gtlsOfferIndexHits else 0,
         $OfferIndexMisses = if this.$gtlsOfferIndexMisses? then this.$gtlsOfferIndexMisses else 0
       ]"/>

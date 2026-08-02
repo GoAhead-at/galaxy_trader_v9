@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<aiscript name="lib.gt.live.search" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="7">
+<aiscript name="lib.gt.live.search" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="8">
   <params>
     <param name="ship" default="this.ship"/>
     <param name="searchMode" default="'buy_and_sell'"/>
@@ -47,6 +47,9 @@
   </patch>
   <patch sinceversion="6">
     <debug_text text="'[GT-LiveSearch] lib.gt.live.search v7: MK4 live.search merge (optional params; no mid-flight this.$ backfill)'" chance="100" filter="savegame"/>
+  </patch>
+  <patch sinceversion="7">
+    <debug_text text="'[GT-LiveSearch] lib.gt.live.search v8: save/load resume detects missing Phase 5 locals and rebuilds via gtls_ensure_state'" chance="100" filter="savegame"/>
   </patch>
   <attention min="unknown">
     <actions>
@@ -125,6 +128,7 @@
       </do_if>
       <set_value name="$gtlsMk4AnchorHome" exact="if $mk4AnchorHome? then $mk4AnchorHome else null"/>
       <set_value name="$gtlsEnableVolumeThresholds" exact="if @$enableVolumeThresholds != null then $enableVolumeThresholds else true"/>
+      <set_value name="$gtlsPhase5LocalsReady" exact="true"/>
       <set_value name="$gtlsDistancePenalty" exact="if $distancePenalty? then $distancePenalty else 0.1"/>
       <set_value name="$gtlsSourceSellByWare" exact="table[]"/>
       <set_value name="$gtlsUseScoreAwareBuyCap" exact="false"/>
@@ -255,6 +259,7 @@
             $IncludeNpcSellOffers = $gtlsIncludeNpcSellOffers,
             $SkipSupplierScan = $gtlsSkipSupplierScan,
             $RequirePlayerBuyOfferOwner = $gtlsRequirePlayerBuyOfferOwner,
+            $EnableVolumeThresholds = if $gtlsEnableVolumeThresholds? then $gtlsEnableVolumeThresholds else true,
             $IgnoreTradeRulesPlayerBuyOffersRequireCargoNeed = $gtlsIgnoreTradeRulesPlayerBuyOffersRequireCargoNeed,
             $BypassPlayerSellerPricing = $gtlsBypassPlayerSellerPricing,
             $RetainCheapestSellPerWare = $gtlsRetainCheapestSellPerWare,
@@ -344,6 +349,12 @@
         </do_else>
         <set_value name="$gtlsSkipSupplierScan" exact="if $gtlsSnap.$SkipSupplierScan? then $gtlsSnap.$SkipSupplierScan else (not $gtlsIncludePlayerSellOffers and not $gtlsIncludeNpcSellOffers)"/>
         <set_value name="$gtlsRequirePlayerBuyOfferOwner" exact="$gtlsSnap.$RequirePlayerBuyOfferOwner"/>
+        <do_if value="$gtlsSnap.$EnableVolumeThresholds?">
+          <set_value name="$gtlsEnableVolumeThresholds" exact="$gtlsSnap.$EnableVolumeThresholds"/>
+        </do_if>
+        <do_elseif value="not $gtlsEnableVolumeThresholds?">
+          <set_value name="$gtlsEnableVolumeThresholds" exact="if $gtlsRequirePlayerBuyOfferOwner then false else true"/>
+        </do_elseif>
         <do_if value="$gtlsSearchMode == 'sell_only'">
           <set_value name="$gtlsRequirePlayerBuyOfferOwner" exact="false"/>
         </do_if>
@@ -517,6 +528,30 @@
       <do_if value="not this.$gtlsDemandLedSupplierScan?">
         <set_value name="this.$gtlsDemandLedSupplierScan" exact="false"/>
       </do_if>
+      <!-- Phase 5 save migration: always declare MK4-merge locals (old scratch / restored v6 locals omit them). -->
+      <do_if value="not $gtlsIncludeNpcSellOffers?">
+        <set_value name="$gtlsIncludeNpcSellOffers" exact="true"/>
+      </do_if>
+      <do_if value="not $gtlsSkipSupplierScan?">
+        <set_value name="$gtlsSkipSupplierScan" exact="not $gtlsIncludePlayerSellOffers and not $gtlsIncludeNpcSellOffers"/>
+      </do_if>
+      <do_if value="not $gtlsPlayerSupplierReservePerWare?">
+        <set_value name="$gtlsPlayerSupplierReservePerWare" exact="0"/>
+        <do_if value="$gtlsRequirePlayerBuyOfferOwner? and $gtlsRequirePlayerBuyOfferOwner and $gtlsIncludePlayerSellOffers? and $gtlsIncludePlayerSellOffers and $gtlsIncludeNpcSellOffers">
+          <set_value name="$gtlsPlayerSupplierReservePerWare" exact="[1, [4, (if $gtlsMaxOffersPerWare? then $gtlsMaxOffersPerWare else 20)].min].max"/>
+        </do_if>
+      </do_if>
+      <do_if value="not $gtlsStationWhitelist? or @$gtlsStationWhitelist == null">
+        <set_value name="$gtlsStationWhitelist" exact="[]"/>
+      </do_if>
+      <do_if value="not $gtlsMk4Priorities? or @$gtlsMk4Priorities == null">
+        <set_value name="$gtlsMk4Priorities" exact="table[]"/>
+      </do_if>
+      <do_if value="not $gtlsEnableVolumeThresholds?">
+        <!-- MK4 supply always disables floors; MK3 keeps them. Heuristic when scratch predates the param. -->
+        <set_value name="$gtlsEnableVolumeThresholds" exact="if $gtlsRequirePlayerBuyOfferOwner? and $gtlsRequirePlayerBuyOfferOwner then false else true"/>
+      </do_if>
+      <set_value name="$gtlsPhase5LocalsReady" exact="true"/>
       <!-- Stop condition for the resume guards: with neither a scratch snapshot nor a live $ship
            the state cannot be rebuilt, so return empty instead of resuming into this label again. -->
       <do_if value="@$gtlsShip == null">
@@ -645,7 +680,10 @@
            Ware-basket / demand-led: per-station per-ware queries (UseAllWares=false after S4 demand pass). -->
       <do_if value="$gtlsSearchMode != 'sell_only' and not $gtlsSkipSupplierScan and (not this.$gtlsDemandLedSupplierScan? or not this.$gtlsDemandLedSupplierScan or (this.$gtlsDemandLedSellDone? and this.$gtlsDemandLedSellDone)) and $gtlsUsePlayerStationDiscovery and $gtlsIncludePlayerSellOffers and ($gtlsUseAllWares or ($gtlsWareBasket? and $gtlsWareBasket.count gt 0)) and $gtlsPlayerSuppliersInRange.count gt 0">
         <do_all exact="$gtlsPlayerSuppliersInRange.count" counter="$gtlsPssi">
-          <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+          <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+                 Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+                 must not force a full-scan restart every yield. -->
+          <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
             <resume label="gtls_ensure_state"/>
           </do_if>
           <set_value name="$gtlsPst" exact="$gtlsPlayerSuppliersInRange.{$gtlsPssi}"/>
@@ -770,7 +808,10 @@
             </do_all>
           </do_if>
           <wait exact="if global.$GT_LiveSearchScratch? and $ship? and global.$GT_LiveSearchScratch.{$ship}.$YieldMs? then global.$GT_LiveSearchScratch.{$ship}.$YieldMs * 1ms else 1ms" comment="Yield after player-supplier station"/>
-          <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+          <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+                 Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+                 must not force a full-scan restart every yield. -->
+          <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
             <resume label="gtls_ensure_state"/>
           </do_if>
         </do_all>
@@ -785,7 +826,10 @@
       </do_if>
       <do_if value="$gtlsSearchMode != 'sell_only' and $gtlsBuySpacesNonEmpty and not $gtlsSkipSupplierScan and not ($gtlsUsePlayerStationDiscovery and not $gtlsIncludeNpcSellOffers) and (not this.$gtlsDemandLedSupplierScan? or not this.$gtlsDemandLedSupplierScan or (this.$gtlsDemandLedSellDone? and this.$gtlsDemandLedSellDone))">
         <do_all exact="$gtlsBuySpaces.count" counter="$si">
-          <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+          <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+                 Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+                 must not force a full-scan restart every yield. -->
+          <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
             <resume label="gtls_ensure_state"/>
           </do_if>
           <do_if value="not $gtlsSellCollectCap?">
@@ -1167,7 +1211,10 @@
             </do_if>
             <set_value name="global.$GT_OfferIndex.{$gtlsHomeSector}.$Sells.{$space}" exact="table[$ScannedAt = player.age, $Offers = $gtlsSectorSellSnap]"/>
           </do_if>
-          <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+          <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+                 Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+                 must not force a full-scan restart every yield. -->
+          <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
             <resume label="gtls_ensure_state"/>
           </do_if>
           <do_if value="not global.$GT_LiveSearchScratch?">
@@ -1195,6 +1242,7 @@
             $IncludeNpcSellOffers = $gtlsIncludeNpcSellOffers,
             $SkipSupplierScan = $gtlsSkipSupplierScan,
             $RequirePlayerBuyOfferOwner = $gtlsRequirePlayerBuyOfferOwner,
+            $EnableVolumeThresholds = if $gtlsEnableVolumeThresholds? then $gtlsEnableVolumeThresholds else true,
             $IgnoreTradeRulesPlayerBuyOffersRequireCargoNeed = $gtlsIgnoreTradeRulesPlayerBuyOffersRequireCargoNeed,
             $BypassPlayerSellerPricing = $gtlsBypassPlayerSellerPricing,
             $RetainCheapestSellPerWare = $gtlsRetainCheapestSellPerWare,
@@ -1230,7 +1278,10 @@
           ]"/>
           <set_value name="global.$GT_LiveSearchActiveShip" exact="$gtlsShip"/>
           <wait exact="if global.$GT_LiveSearchScratch? and $ship? and global.$GT_LiveSearchScratch.{$ship}.$YieldMs? then global.$GT_LiveSearchScratch.{$ship}.$YieldMs * 1ms else 1ms" comment="Yield after sell-offer sector"/>
-      <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+      <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+           Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+           must not force a full-scan restart every yield. -->
+      <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
         <resume label="gtls_ensure_state"/>
       </do_if>
 
@@ -1403,7 +1454,10 @@
         <set_value name="$playerSellOffersAdded" exact="0"/>
         <set_value name="$gtlsBpScanCount" exact="if $gtlsBpScanUseStations then $gtlsPlayerSuppliersInRange.count else $gtlsBuySpaces.count"/>
         <do_all exact="$gtlsBpScanCount" counter="$bpSi">
-          <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+          <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+                 Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+                 must not force a full-scan restart every yield. -->
+          <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
             <resume label="gtls_ensure_state"/>
           </do_if>
           <do_if value="not $gtlsSellCollectCap?">
@@ -1516,7 +1570,10 @@
             </do_all>
           </do_else>
           <wait exact="if global.$GT_LiveSearchScratch? and $ship? and global.$GT_LiveSearchScratch.{$ship}.$YieldMs? then global.$GT_LiveSearchScratch.{$ship}.$YieldMs * 1ms else 1ms" comment="Yield after player-seller supplement sector"/>
-      <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+      <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+           Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+           must not force a full-scan restart every yield. -->
+      <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
         <resume label="gtls_ensure_state"/>
       </do_if>
 
@@ -1648,7 +1705,10 @@
            remainder deliveries (e.g. 54 Quantum Tubes) are not crowded out. Gate uses only
            station target/count and ship cargo — no fixed unit or percent thresholds.
            ══════════════════════════════════════════════════════════════════ -->
-      <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+      <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+           Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+           must not force a full-scan restart every yield. -->
+      <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
         <resume label="gtls_ensure_state"/>
       </do_if>
       <set_value name="$gtlsSellSpacesNonEmpty" exact="false"/>
@@ -1662,7 +1722,10 @@
       <do_if value="$gtlsRequirePlayerBuyOfferOwner and $gtlsUseAllWares and $gtlsSearchMode != 'buy_only' and $gtlsSellSpacesNonEmpty and not $gtlsUsePlayerStationDiscovery">
         <set_value name="$completionBuyOffersAdded" exact="0"/>
         <do_all exact="$gtlsSellSpaces.count" counter="$cpsi">
-          <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+          <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+                 Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+                 must not force a full-scan restart every yield. -->
+          <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
             <resume label="gtls_ensure_state"/>
           </do_if>
 
@@ -1715,7 +1778,10 @@
               <set_value name="$completionBuyOffersAdded" operation="add"/>
             </do_all>
           </do_if>
-          <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+          <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+                 Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+                 must not force a full-scan restart every yield. -->
+          <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
             <resume label="gtls_ensure_state"/>
           </do_if>
           <do_if value="not global.$GT_LiveSearchScratch?">
@@ -1743,6 +1809,7 @@
             $IncludeNpcSellOffers = $gtlsIncludeNpcSellOffers,
             $SkipSupplierScan = $gtlsSkipSupplierScan,
             $RequirePlayerBuyOfferOwner = $gtlsRequirePlayerBuyOfferOwner,
+            $EnableVolumeThresholds = if $gtlsEnableVolumeThresholds? then $gtlsEnableVolumeThresholds else true,
             $IgnoreTradeRulesPlayerBuyOffersRequireCargoNeed = $gtlsIgnoreTradeRulesPlayerBuyOffersRequireCargoNeed,
             $BypassPlayerSellerPricing = $gtlsBypassPlayerSellerPricing,
             $RetainCheapestSellPerWare = $gtlsRetainCheapestSellPerWare,
@@ -1778,7 +1845,10 @@
           ]"/>
           <set_value name="global.$GT_LiveSearchActiveShip" exact="$gtlsShip"/>
           <wait exact="if global.$GT_LiveSearchScratch? and $ship? and global.$GT_LiveSearchScratch.{$ship}.$YieldMs? then global.$GT_LiveSearchScratch.{$ship}.$YieldMs * 1ms else 1ms" comment="Yield after MK4 completion buy-offer sector"/>
-      <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+      <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+           Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+           must not force a full-scan restart every yield. -->
+      <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
         <resume label="gtls_ensure_state"/>
       </do_if>
 
@@ -1804,7 +1874,10 @@
         <do_if value="$gtlsBuyScanUseBuyers or $gtlsSellSpacesNonEmpty">
         <set_value name="$gtlsBuyScanCount" exact="if $gtlsBuyScanUseBuyers then $gtlsPlayerBuyersInRange.count else $gtlsSellSpaces.count"/>
         <do_all exact="$gtlsBuyScanCount" counter="$si">
-          <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+          <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+                 Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+                 must not force a full-scan restart every yield. -->
+          <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
             <resume label="gtls_ensure_state"/>
           </do_if>
           <do_if value="$gtlsBuyScanUseBuyers">
@@ -2398,7 +2471,10 @@
             </do_if>
             <set_value name="global.$GT_OfferIndex.{$gtlsHomeSector}.$Buys.{$space}" exact="table[$ScannedAt = player.age, $Offers = $gtlsSectorBuySnap]"/>
           </do_if>
-          <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+          <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+                 Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+                 must not force a full-scan restart every yield. -->
+          <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
             <resume label="gtls_ensure_state"/>
           </do_if>
           <do_if value="not global.$GT_LiveSearchScratch?">
@@ -2426,6 +2502,7 @@
             $IncludeNpcSellOffers = $gtlsIncludeNpcSellOffers,
             $SkipSupplierScan = $gtlsSkipSupplierScan,
             $RequirePlayerBuyOfferOwner = $gtlsRequirePlayerBuyOfferOwner,
+            $EnableVolumeThresholds = if $gtlsEnableVolumeThresholds? then $gtlsEnableVolumeThresholds else true,
             $IgnoreTradeRulesPlayerBuyOffersRequireCargoNeed = $gtlsIgnoreTradeRulesPlayerBuyOffersRequireCargoNeed,
             $BypassPlayerSellerPricing = $gtlsBypassPlayerSellerPricing,
             $RetainCheapestSellPerWare = $gtlsRetainCheapestSellPerWare,
@@ -2461,7 +2538,10 @@
           ]"/>
           <set_value name="global.$GT_LiveSearchActiveShip" exact="$gtlsShip"/>
           <wait exact="if global.$GT_LiveSearchScratch? and $ship? and global.$GT_LiveSearchScratch.{$ship}.$YieldMs? then global.$GT_LiveSearchScratch.{$ship}.$YieldMs * 1ms else 1ms" comment="Yield after buy-offer sector"/>
-      <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+      <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+           Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+           must not force a full-scan restart every yield. -->
+      <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
         <resume label="gtls_ensure_state"/>
       </do_if>
 
@@ -2489,7 +2569,10 @@
         </do_if>
         <set_value name="$gtlsSuppScanCount" exact="if $gtlsSuppScanUseBuyers then $gtlsPlayerBuyersInRange.count else $gtlsSellSpaces.count"/>
         <do_all exact="$gtlsSuppScanCount" counter="$si">
-          <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+          <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+                 Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+                 must not force a full-scan restart every yield. -->
+          <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
             <resume label="gtls_ensure_state"/>
           </do_if>
           <do_if value="$gtlsSuppScanUseBuyers">
@@ -2748,14 +2831,20 @@
             </do_all>
           </do_else>
           <wait exact="if global.$GT_LiveSearchScratch? and $ship? and global.$GT_LiveSearchScratch.{$ship}.$YieldMs? then global.$GT_LiveSearchScratch.{$ship}.$YieldMs * 1ms else 1ms" comment="Yield after player buy-offer supplement"/>
-      <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+      <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+           Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+           must not force a full-scan restart every yield. -->
+      <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
         <resume label="gtls_ensure_state"/>
       </do_if>
 
         </do_all>
         <debug_text text="'[GT-LiveSearch] ' + $gtlsShip.idcode + ': player buy-offer supplement added=' + $playerBuyOffersAdded + ' (ignoreTradeRules=' + $gtlsIgnoreTradeRules + ', ignoreCargoNeed=' + $gtlsIgnoreTradeRulesPlayerBuyOffersRequireCargoNeed + ')'" chance="$gtlsDebugchance"/>
       </do_if>
-      <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+      <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+           Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+           must not force a full-scan restart every yield. -->
+      <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
         <resume label="gtls_ensure_state"/>
       </do_if>
       <do_if value="not $gtlsBuildStorageBuyOffersAdded?">
@@ -2869,7 +2958,7 @@
             </do_if>
             <do_if value="not $sellOffersPerWare.{$pw}? or $sellOffersPerWare.{$pw} lt $gtlsPwSellSkipCap">
               <do_all exact="$gtlsBuySpaces.count" counter="$psi">
-                <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+                <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
                   <resume label="gtls_ensure_state"/>
                 </do_if>
                 <set_value name="$space" exact="$gtlsBuySpaces.{$psi}"/>
@@ -2977,7 +3066,10 @@
                   </do_all>
                 </do_if>
                 <wait exact="if global.$GT_LiveSearchScratch? and $ship? and global.$GT_LiveSearchScratch.{$ship}.$YieldMs? then global.$GT_LiveSearchScratch.{$ship}.$YieldMs * 1ms else 1ms" comment="Yield priority-ware sell sector"/>
-      <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+      <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+           Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+           must not force a full-scan restart every yield. -->
+      <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
         <resume label="gtls_ensure_state"/>
       </do_if>
 
@@ -3005,7 +3097,7 @@
             </do_if>
             <do_if value="not $buyOffersPerWare.{$pw}? or $buyOffersPerWare.{$pw} lt ($gtlsMaxOffersPerWare + $gtlsBuildStorageReservePerWare)">
               <do_all exact="$gtlsSellSpaces.count" counter="$psi">
-                <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+                <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
                   <resume label="gtls_ensure_state"/>
                 </do_if>
                 <set_value name="$space" exact="$gtlsSellSpaces.{$psi}"/>
@@ -3119,7 +3211,10 @@
                   </do_all>
                 </do_if>
                 <wait exact="if global.$GT_LiveSearchScratch? and $ship? and global.$GT_LiveSearchScratch.{$ship}.$YieldMs? then global.$GT_LiveSearchScratch.{$ship}.$YieldMs * 1ms else 1ms" comment="Yield priority-ware buy sector"/>
-      <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+      <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+           Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+           must not force a full-scan restart every yield. -->
+      <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
         <resume label="gtls_ensure_state"/>
       </do_if>
 
@@ -3133,7 +3228,10 @@
             <debug_text text="'[GT-LiveSearch] ' + $gtlsShip.idcode + ': priority ware ' + (if $pw? and $pw != null then @$pw.name else '?') + ': sellOffers=' + $pwSellCount + ' buyOffers=' + $pwBuyCount" chance="100"/>
           </do_if>
           <wait exact="if global.$GT_LiveSearchScratch? and $ship? and global.$GT_LiveSearchScratch.{$ship}.$YieldMs? then global.$GT_LiveSearchScratch.{$ship}.$YieldMs * 1ms else 1ms" comment="Yield priority-ware"/>
-      <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+      <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
+           Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
+           must not force a full-scan restart every yield. -->
+      <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
         <resume label="gtls_ensure_state"/>
       </do_if>
 
@@ -3172,7 +3270,7 @@
         <do_if value="$gtlsSearchMode != 'buy_only' and $gtlsBsoScanSpacesNonEmpty">
           <set_value name="$gtlsBsoSeenBuyers" exact="table[]"/>
           <do_all exact="$gtlsBsoScanSpaces.count" counter="$gtlsBsoPsi">
-            <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+            <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
               <resume label="gtls_ensure_state"/>
             </do_if>
             <set_value name="$gtlsBsoSpace" exact="$gtlsBsoScanSpaces.{$gtlsBsoPsi}"/>
@@ -3308,7 +3406,7 @@
                 </do_if>
               </do_all>
             </do_if>
-            <do_if value="@$gtYieldMs == null or @$gtlsShip == null">
+            <do_if value="@$gtYieldMs == null or @$gtlsShip == null or not $gtlsPhase5LocalsReady?">
               <resume label="gtls_ensure_state"/>
             </do_if>
           </do_all>

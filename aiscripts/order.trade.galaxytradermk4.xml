@@ -2386,36 +2386,13 @@
       <!-- ======================================= -->
       
       <label name="check_maintenance"/>
-      <run_script name="'lib.gt.maintenance.execute'">
+      <run_script name="'lib.gt.order.maintenance'" result="$maintNext">
         <param name="ship" value="this.ship"/>
         <param name="logPrefix" value="'GT-AI'"/>
       </run_script>
-      <!-- CRITICAL: Check for signal that arrived during maintenance wait -->
-      <!-- This must happen AFTER maintenance completes but BEFORE proceeding to start_trading -->
-      <!-- Signals can arrive during the maintenance wait block (line 2118), so we check here -->
-      <do_if value="this.$tradeFoundViaInterrupt? and this.$tradeFoundViaInterrupt">
-        <set_value name="this.$tradeFoundViaInterrupt" exact="false"/>
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': GT_Trade_Found signal received during maintenance wait - processing from param2 data'" chance="100"/>
-        </do_if>
-        
-        <!-- Reset retry counter on successful trade -->
-        <set_value name="this.$searchFailed" exact="0"/>
-        
-        <!-- Clear per-ship no-trade attempt history on success -->
-        <do_if value="global.$GT_NoTradeHistory? and global.$GT_NoTradeHistory.{this.ship}?">
-          <remove_value name="global.$GT_NoTradeHistory.{this.ship}"/>
-        </do_if>
-        
-        <!-- CARGO DISPOSAL: Reset cargo disposal failure counter on successful trade -->
-        <do_if value="this.$cargoDisposalFailed?">
-          <set_value name="this.$cargoDisposalFailed" exact="0"/>
-        </do_if>
-        
+      <do_if value="$maintNext? and $maintNext.$Next == 'trade_found'">
         <resume label="trade_found"/>
       </do_if>
-      
-      <!-- Proceed to trading -->
       <resume label="start_trading"/>
       
       <!-- ======================================= -->
@@ -2427,157 +2404,16 @@
       <!-- ========================================= -->
       
       <label name="handle_mandatory_training"/>
-      
-      <!-- Check if ship has an active DockAndTrain order -->
-      <set_value name="$hasActiveTrainingOrder" exact="false"/>
-      <do_if value="this.ship.orders.count gt 0">
-        <do_all exact="this.ship.orders.count" counter="$i">
-          <do_if value="this.ship.orders.{$i}.id == 'DockAndTrain'">
-            <set_value name="$hasActiveTrainingOrder" exact="true"/>
-            <break/>
-          </do_if>
-        </do_all>
+      <run_script name="'lib.gt.order.mandatory_training'" result="$trainNext">
+        <param name="ship" value="this.ship"/>
+        <param name="autotraining" value="if $gt_autotraining? then $gt_autotraining else true"/>
+        <param name="logPrefix" value="'GT-AI'"/>
+      </run_script>
+      <do_if value="$trainNext? and $trainNext.$Next == 'check_maintenance'">
+        <resume label="check_maintenance"/>
       </do_if>
-      
-      <!-- ENHANCED LOGIC: Auto-restart training if it was previously interrupted -->
-      <!-- Conditions for starting/restarting training:
-           1. Auto-training is enabled
-           2. Ship has a pilot with GT pilot data
-           3. Either: training not in progress OR no active training order (interrupted training)
-      -->
-      <set_value name="$manualTrainingRequested" exact="false"/>
-      <do_if value="this.ship.pilot and global.$GT_Pilots.{this.ship.pilot}? and global.$GT_Pilots.{this.ship.pilot}.$ManualTrainingRequested? and global.$GT_Pilots.{this.ship.pilot}.$ManualTrainingRequested">
-        <set_value name="$manualTrainingRequested" exact="true"/>
-      </do_if>
-      <set_value name="$academyEnrollmentPending" exact="false"/>
-      <do_if value="this.ship.pilot and global.$GT_Pilots.{this.ship.pilot}? and global.$GT_Pilots.{this.ship.pilot}.$AcademyEnrollment?">
-        <set_value name="$academyEnrollmentPending" exact="true"/>
-      </do_if>
-      <do_if value="($gt_autotraining or $manualTrainingRequested or $academyEnrollmentPending) and this.ship.pilot and global.$GT_Pilots.{this.ship.pilot}">
-        <set_value name="$shouldStartTraining" exact="false"/>
-        <set_value name="$mdTrainingInProgress" exact="global.$GT_Pilots.{this.ship.pilot}.$TrainingState? and global.$GT_Pilots.{this.ship.pilot}.$TrainingState == 'training_in_progress'"/>
-        
-        <!-- Case 0: Active DockAndTrain or MD timer (save/load) - wait, do not re-dispatch -->
-        <do_if value="$hasActiveTrainingOrder or $mdTrainingInProgress">
-          <do_if value="not this.$training_in_progress?">
-            <set_value name="this.$training_in_progress" exact="true"/>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Restored in-flight training session after save/load (DockAndTrain=' + $hasActiveTrainingOrder + ', MD timer=' + $mdTrainingInProgress + ')'" chance="100"/>
-            </do_if>
-          </do_if>
-        </do_if>
-        <!-- Case 1: Training not currently in progress -->
-        <do_elseif value="not this.$training_in_progress?">
-          <set_value name="$shouldStartTraining" exact="true"/>
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Training not in progress - can start training'" chance="100"/>
-          </do_if>
-        </do_elseif>
-        <!-- Case 2: Training was marked as in progress but no active training order (interrupted) -->
-        <do_elseif value="this.$training_in_progress? and not $hasActiveTrainingOrder">
-          <set_value name="$shouldStartTraining" exact="true"/>
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': TRAINING INTERRUPTED: Previous training was aborted - restarting automatically'" chance="100"/>
-          </do_if>
-          <!-- Clear the stale flag -->
-          <remove_value name="this.$training_in_progress"/>
-        </do_elseif>
-        
-        <do_if value="$shouldStartTraining">
-          <!-- Inline training gate evaluation (AI scripts cannot call MD libraries) -->
-          <set_value name="$hardForceTraining" exact="true"/>
-          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$XP? and global.$GT_GlobalSettings.$XP.$HardForceTraining?">
-            <set_value name="$hardForceTraining" exact="global.$GT_GlobalSettings.$XP.$HardForceTraining"/>
-          </do_if>
-          <set_value name="$blockedLevel" exact="1"/>
-          <do_if value="global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel? and global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel gt 0">
-            <set_value name="$blockedLevel" exact="global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel"/>
-          </do_if>
-          <set_value name="$mustTrainNow" exact="if (global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$XP? and global.$GT_GlobalSettings.$XP.$UseVanillaXPOnly? and global.$GT_GlobalSettings.$XP.$UseVanillaXPOnly) then false else (global.$GT_Pilots.{this.ship.pilot}.$XPBlocked? or global.$GT_Pilots.{this.ship.pilot}.$PausedWithTrainingNeeded? or ($hardForceTraining and $blockedLevel gt 1))"/>
-          <set_value name="$shouldRetryTraining" exact="if (global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$XP? and global.$GT_GlobalSettings.$XP.$UseVanillaXPOnly? and global.$GT_GlobalSettings.$XP.$UseVanillaXPOnly) then false else ($mustTrainNow or ((not $hardForceTraining) and $blockedLevel gt 1) or ($manualTrainingRequested and $blockedLevel gt 1))"/>
-          <set_value name="$trainingGateReason" exact="'none'"/>
-          <do_if value="global.$GT_Pilots.{this.ship.pilot}.$PausedWithTrainingNeeded?">
-            <set_value name="$trainingGateReason" exact="'paused_training_needed'"/>
-          </do_if>
-          <do_elseif value="global.$GT_Pilots.{this.ship.pilot}.$XPBlocked?">
-            <set_value name="$trainingGateReason" exact="'xp_blocked'"/>
-          </do_elseif>
-          <do_elseif value="$hardForceTraining and $blockedLevel gt 1">
-            <set_value name="$trainingGateReason" exact="'hard_force_blocked_level'"/>
-          </do_elseif>
-          <do_elseif value="$blockedLevel gt 1">
-            <set_value name="$trainingGateReason" exact="'soft_force_blocked_level'"/>
-          </do_elseif>
-          
-          <do_if value="$shouldRetryTraining">
-            <!-- Get blocked level with safety check -->
-            <do_if value="not (global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel? and global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel gt 0)">
-              <!-- Calculate current skill level as fallback -->
-              <do_if value="global.$GT_Pilots.{this.ship.pilot}.$XP?">
-                <set_value name="$currentXP" exact="global.$GT_Pilots.{this.ship.pilot}.$XP"/>
-                <do_all exact="15" counter="$skillLevel">
-                  <do_if value="$currentXP ge global.$GT_Config.$XP.$SkillThresholds.{$skillLevel}">
-                    <set_value name="$blockedLevel" exact="$skillLevel"/>
-                  </do_if>
-                </do_all>
-              </do_if>
-            </do_if>
-            
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': 🎓 Initiating mandatory training for pilot ' + $pilotNameForDebug + ' (Level ' + $blockedLevel + ', reason=' + $trainingGateReason + ', hardforce=' + $hardForceTraining + ')'" chance="100"/>
-            </do_if>
-            
-            <!-- Respect $NextTrainingRetryAt for all training modes (dock-fail / no-station / funds). -->
-            <set_value name="$retryReady" exact="true"/>
-            <do_if value="global.$GT_Pilots.{this.ship.pilot}.$NextTrainingRetryAt? and player.age lt global.$GT_Pilots.{this.ship.pilot}.$NextTrainingRetryAt">
-              <set_value name="$retryReady" exact="false"/>
-            </do_if>
-            
-            <do_if value="$retryReady">
-              <!-- Signal MD system to handle training -->
-              <signal_objects object="player.galaxy" param="'GT_Training_Needed'" param2="table[
-                $Ship = this.ship,
-                $Pilot = this.ship.pilot,
-                $RequiredLevel = $blockedLevel
-              ]"/>
-              
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Training signal sent to MD system for pilot ' + $pilotNameForDebug" chance="100"/>
-              </do_if>
-            </do_if>
-            <do_else>
-              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <set_value name="$retryRemaining" exact="(global.$GT_Pilots.{this.ship.pilot}.$NextTrainingRetryAt - player.age) / 1s"/>
-                <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Training retry backoff active (' + $retryRemaining + 's remaining)'" chance="100"/>
-              </do_if>
-            </do_else>
-          </do_if>
-          <do_else>
-            <!-- Training is not mandatory under current gate policy -->
-            <set_value name="$blockedLevelForDebug" exact="'none'"/>
-            <do_if value="global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel?">
-              <set_value name="$blockedLevelForDebug" exact="global.$GT_Pilots.{this.ship.pilot}.$BlockedLevel"/>
-            </do_if>
-            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Training gate allows trading in mandatory handler (reason=' + $trainingGateReason + ', blockedLevel=' + $blockedLevelForDebug + ', hardforce=' + $hardForceTraining + ')'" chance="100"/>
-            </do_if>
-            <!-- Break out of training handler and continue to trading -->
-            <resume label="check_maintenance"/>
-          </do_else>
-        </do_if>
-        <do_else>
-          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': ⏳ Training already in progress (active order: ' + $hasActiveTrainingOrder + ') - waiting'" chance="100"/>
-          </do_if>
-        </do_else>
-      </do_if>
-      <do_else>
-        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-          <debug_text text="'[GT-AI] ' + this.ship.idcode + ':  Auto-training disabled or no pilot data - waiting'" chance="100"/>
-        </do_if>
-      </do_else>
-      
-      <!-- Wait and check again - training is mandatory -->
+
+      <!-- Wait and check again - training is mandatory (interrupt stays in order) -->
       <wait max="10s">
         <interrupt>
           <conditions>

@@ -6,8 +6,6 @@
 local ffi = require("ffi")
 local C = ffi.C
 ffi.cdef[[
-    typedef uint64_t UniverseID;
-    UniverseID GetPlayerID(void);
     bool CopyToClipboard(const char*const text);
 ]]
 
@@ -19,6 +17,11 @@ end
 
 if not GT_UI then
     DebugError("[GT SectorBL] ERROR: GT_UI library not loaded - check ui.xml load order")
+    return
+end
+
+if not (_G.GT_PlayerBridge and _G.GT_PlayerBridge.GetPlayerBlackboardId and _G.GT_PlayerBridge.GetPlayerSignalId) then
+    DebugError("[GT SectorBL] ERROR: GT_PlayerBridge not loaded - check ui.xml load order")
     return
 end
 
@@ -35,7 +38,7 @@ local gtSectorBL = {
 }
 
 function gtSectorBL.parseReport()
-    local playerId = ConvertStringTo64Bit(tostring(C.GetPlayerID()))
+    local playerId = GT_PlayerBridge.GetPlayerBlackboardId()
 
     local reportStr = GetNPCBlackboard(playerId, "$GT_SectorBL_Report")
     gtSectorBL.sectorId   = GetNPCBlackboard(playerId, "$GT_SectorBL_SectorId") or "???"
@@ -293,8 +296,8 @@ function gtSectorBL.populateFrame(frame)
 end
 
 function gtSectorBL.requestClearOrphans()
-    local playerSignalId = ConvertStringTo64Bit(tostring(C.GetPlayerID()))
-    local playerBbId = ConvertStringTo64Bit(tostring(C.GetPlayerID()))
+    local playerSignalId = GT_PlayerBridge.GetPlayerSignalId()
+    local playerBbId = GT_PlayerBridge.GetPlayerBlackboardId()
     local macro = gtSectorBL.sectorId or GetNPCBlackboard(playerBbId, "$GT_SectorBL_SectorId") or ""
     SetNPCBlackboard(playerBbId, "$GT_SectorBL_ClearOrphansMacro", tostring(macro))
     DebugError(string.format("[GT SectorBL] Clear Orphans + Resync requested for macro=%s", tostring(macro)))

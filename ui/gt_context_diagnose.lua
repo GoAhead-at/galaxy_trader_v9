@@ -16,8 +16,6 @@
 local ffi = require("ffi")
 local C = ffi.C
 ffi.cdef[[
-    typedef uint64_t UniverseID;
-    UniverseID GetPlayerID(void);
     bool CopyToClipboard(const char*const text);
 ]]
 
@@ -30,6 +28,11 @@ end
 -- Verify GT_UI library is loaded
 if not GT_UI then
     DebugError("[GT Diagnose] ERROR: GT_UI library not loaded - check ui.xml load order")
+    return
+end
+
+if not (_G.GT_PlayerBridge and _G.GT_PlayerBridge.GetPlayerBlackboardId) then
+    DebugError("[GT Diagnose] ERROR: GT_PlayerBridge not loaded - check ui.xml load order")
     return
 end
 
@@ -50,7 +53,7 @@ local gtDiagnose = {
 -- =============================================================================
 
 function gtDiagnose.parseReport()
-    local playerId = ConvertStringTo64Bit(tostring(C.GetPlayerID()))
+    local playerId = GT_PlayerBridge.GetPlayerBlackboardId()
 
     local reportStr   = GetNPCBlackboard(playerId, "$GT_DiagReport")
     gtDiagnose.shipId   = GetNPCBlackboard(playerId, "$GT_DiagShipId") or "???"

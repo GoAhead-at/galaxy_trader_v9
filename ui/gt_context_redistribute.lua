@@ -53,6 +53,11 @@ local GT_ORDER_IDS = {
     GalaxyMiner = true,
 }
 
+if not (_G.GT_PlayerBridge and _G.GT_PlayerBridge.GetPlayerBlackboardId) then
+    DebugError("[GT Redistribute] ERROR: GT_PlayerBridge not loaded - check ui.xml load order")
+    return
+end
+
 local function isRedistributeDebugEnabled()
     if _G.GT_PlayerBridge and _G.GT_PlayerBridge.IsDebugLoggingEnabled then
         return _G.GT_PlayerBridge.IsDebugLoggingEnabled()

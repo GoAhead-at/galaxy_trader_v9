@@ -36,6 +36,11 @@ if not menu then
     return
 end
 
+if not (_G.GT_PlayerBridge and _G.GT_PlayerBridge.GetPlayerBlackboardId and _G.GT_PlayerBridge.GetPlayerSignalId) then
+    DebugError("[GT Academy] ERROR: GT_PlayerBridge not loaded - check ui.xml load order")
+    return
+end
+
 -- ---------------------------------------------------------------------------
 -- Constants
 -- ---------------------------------------------------------------------------
@@ -60,17 +65,11 @@ local function debugLog(msg)
 end
 
 local function getPlayerBlackboardId()
-    if _G.GT_PlayerBridge and _G.GT_PlayerBridge.GetPlayerBlackboardId then
-        return _G.GT_PlayerBridge.GetPlayerBlackboardId()
-    end
-    return ConvertStringToLuaID(tostring(C.GetPlayerID()))
+    return GT_PlayerBridge.GetPlayerBlackboardId()
 end
 
 local function getPlayerSignalId()
-    if _G.GT_PlayerBridge and _G.GT_PlayerBridge.GetPlayerSignalId then
-        return _G.GT_PlayerBridge.GetPlayerSignalId()
-    end
-    return ConvertStringTo64Bit(tostring(C.GetPlayerID()))
+    return GT_PlayerBridge.GetPlayerSignalId()
 end
 
 local function readBlackboardList(playerId, key)

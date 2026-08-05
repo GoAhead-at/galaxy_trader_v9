@@ -87,7 +87,7 @@ local function formatTextId(textId, ...)
     return template
 end
 
-local function showPlayerNotification(text, timeoutSec, priority)
+local function showPlayerNotification(text, timeoutSec)
     local msg = tostring(text or "")
     if msg == "" then
         return
@@ -96,18 +96,17 @@ local function showPlayerNotification(text, timeoutSec, priority)
         AddUITriggeredEvent("GT_Redistribute", "Notification", {
             text = msg,
             timeout = tonumber(timeoutSec) or 12,
-            priority = tonumber(priority) or 5,
         })
     end
     debugLog(msg)
 end
 
-local function notify(msg, priority)
-    showPlayerNotification(msg, 8, priority)
+local function notify(msg)
+    showPlayerNotification(msg, 8)
 end
 
 local function notifyText(textId, ...)
-    notify(formatTextId(textId, ...), 5)
+    notify(formatTextId(textId, ...))
 end
 
 local function logPilotExchangeMenu(msg)

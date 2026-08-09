@@ -59,14 +59,25 @@
             <set_value name="$home" exact="$homes.{$sectorIdx}"/>
             <set_value name="$sectorCache" exact="null"/>
             <do_if value="$isMk4Pool">
+              <!-- MK4 is nested home -> fleetKey -> list (CONTEXT-009); sum every fleet bucket.
+                   A flat legacy list here is a pre-fleet-key save row - discard, don't count. -->
               <set_value name="$sectorCache" exact="@global.$GT_TradeCacheMK4.{$home}"/>
+              <do_if value="$sectorCache != null and typeof $sectorCache == datatype.table">
+                <set_value name="$fleetKeys" exact="@$sectorCache.keys"/>
+                <do_all exact="$fleetKeys.count" counter="$fleetIdx">
+                  <set_value name="$fleetBucket" exact="$sectorCache.{$fleetKeys.{$fleetIdx}}"/>
+                  <do_if value="$fleetBucket?">
+                    <set_value name="$totalCount" exact="$totalCount + $fleetBucket.count"/>
+                  </do_if>
+                </do_all>
+              </do_if>
             </do_if>
             <do_else>
               <set_value name="$sectorCache" exact="@global.$GT_TradeCache.{$home}"/>
+              <do_if value="$sectorCache != null">
+                <set_value name="$totalCount" exact="$totalCount + $sectorCache.count"/>
+              </do_if>
             </do_else>
-            <do_if value="$sectorCache != null">
-              <set_value name="$totalCount" exact="$totalCount + $sectorCache.count"/>
-            </do_if>
           </do_all>
         </do_if>
         <return value="$totalCount"/>
@@ -104,14 +115,87 @@
           <do_if value="$cacheKeysCount gt 0">
             <do_all exact="$cacheKeysCount" counter="$sectorIdx">
               <set_value name="$homeSector" exact="@$cacheKeys.{$sectorIdx}"/>
-              <do_if value="$homeSector != null">
-                <set_value name="$sectorCache" exact="[]"/>
-                <do_if value="$isMk4Pool">
-                  <set_value name="$sectorCache" exact="@global.$GT_TradeCacheMK4.{$homeSector}"/>
+              <do_if value="$homeSector != null and $isMk4Pool">
+                <!-- MK4 nested home -> fleetKey -> list (CONTEXT-009): sweep every fleet bucket
+                     under this home. A flat legacy list here predates fleet keys - discard it,
+                     do not migrate. -->
+                <set_value name="$sectorBucket" exact="@global.$GT_TradeCacheMK4.{$homeSector}"/>
+                <do_if value="$sectorBucket != null and typeof $sectorBucket == datatype.list">
+                  <remove_value name="global.$GT_TradeCacheMK4.{$homeSector}"/>
+                  <do_if value="global.$GT_TradeCacheMK4ByWare? and global.$GT_TradeCacheMK4ByWare.{$homeSector}?">
+                    <remove_value name="global.$GT_TradeCacheMK4ByWare.{$homeSector}"/>
+                  </do_if>
                 </do_if>
-                <do_else>
-                  <set_value name="$sectorCache" exact="@global.$GT_TradeCache.{$homeSector}"/>
-                </do_else>
+                <do_elseif value="$sectorBucket != null and typeof $sectorBucket == datatype.table">
+                  <set_value name="$fleetKeys" exact="@$sectorBucket.keys"/>
+                  <do_all exact="$fleetKeys.count" counter="$fleetIdx">
+                    <set_value name="$fleetKey" exact="$fleetKeys.{$fleetIdx}"/>
+                    <set_value name="$sectorCache" exact="$sectorBucket.{$fleetKey}"/>
+                    <do_if value="$sectorCache == null">
+                      <set_value name="$sectorCache" exact="[]"/>
+                    </do_if>
+                    <do_if value="$sectorCache.count gt 0">
+                      <set_value name="$cleanSectorCache" exact="[]"/>
+                      <do_all exact="$sectorCache.count" counter="$i">
+                        <set_value name="$entry" exact="$sectorCache.{$i}"/>
+                        <set_value name="$isExpired" exact="false"/>
+                        <set_value name="$entryTimestamp" exact="@$entry.$CachedAt"/>
+                        <do_if value="$entryTimestamp == null">
+                          <set_value name="$entryTimestamp" exact="@$entry.$Timestamp"/>
+                        </do_if>
+                        <do_if value="$entryTimestamp != null">
+                          <do_if value="(player.age - $entryTimestamp) gt $cacheMaxAge">
+                            <set_value name="$isExpired" exact="true"/>
+                            <set_value name="$cleanedEntries" operation="add"/>
+                          </do_if>
+                        </do_if>
+                        <do_if value="not $isExpired and @$entry.$BuyOffer != null and @$entry.$SellOffer != null">
+                          <do_if value="@$entry.$BuyOffer.exists and @$entry.$SellOffer.exists">
+                            <append_to_list name="$cleanSectorCache" exact="$entry"/>
+                          </do_if>
+                          <do_else>
+                            <set_value name="$cleanedEntries" operation="add"/>
+                          </do_else>
+                        </do_if>
+                      </do_all>
+                      <set_value name="global.$GT_TradeCacheMK4.{$homeSector}.{$fleetKey}" exact="$cleanSectorCache"/>
+                      <do_if value="$cleanSectorCache.count == 0">
+                        <remove_value name="global.$GT_TradeCacheMK4.{$homeSector}.{$fleetKey}"/>
+                        <do_if value="global.$GT_TradeCacheMK4ByWare? and global.$GT_TradeCacheMK4ByWare.{$homeSector}? and global.$GT_TradeCacheMK4ByWare.{$homeSector}.{$fleetKey}?">
+                          <remove_value name="global.$GT_TradeCacheMK4ByWare.{$homeSector}.{$fleetKey}"/>
+                        </do_if>
+                      </do_if>
+                      <do_else>
+                        <do_if value="not global.$GT_TradeCacheMK4ByWare?">
+                          <set_value name="global.$GT_TradeCacheMK4ByWare" exact="table[]"/>
+                        </do_if>
+                        <do_if value="not global.$GT_TradeCacheMK4ByWare.{$homeSector}?">
+                          <set_value name="global.$GT_TradeCacheMK4ByWare.{$homeSector}" exact="table[]"/>
+                        </do_if>
+                        <set_value name="global.$GT_TradeCacheMK4ByWare.{$homeSector}.{$fleetKey}" exact="table[]"/>
+                        <do_all exact="$cleanSectorCache.count" counter="$i">
+                          <set_value name="$entry" exact="$cleanSectorCache.{$i}"/>
+                          <set_value name="$entryWare" exact="@$entry.$BuyOffer.ware"/>
+                          <do_if value="$entryWare?">
+                            <do_if value="not global.$GT_TradeCacheMK4ByWare.{$homeSector}.{$fleetKey}.{$entryWare}?">
+                              <set_value name="global.$GT_TradeCacheMK4ByWare.{$homeSector}.{$fleetKey}.{$entryWare}" exact="[]"/>
+                            </do_if>
+                            <append_to_list name="global.$GT_TradeCacheMK4ByWare.{$homeSector}.{$fleetKey}.{$entryWare}" exact="$entry"/>
+                          </do_if>
+                        </do_all>
+                      </do_else>
+                    </do_if>
+                  </do_all>
+                  <do_if value="global.$GT_TradeCacheMK4.{$homeSector}? and global.$GT_TradeCacheMK4.{$homeSector}.keys.count == 0">
+                    <remove_value name="global.$GT_TradeCacheMK4.{$homeSector}"/>
+                    <do_if value="global.$GT_TradeCacheMK4ByWare? and global.$GT_TradeCacheMK4ByWare.{$homeSector}?">
+                      <remove_value name="global.$GT_TradeCacheMK4ByWare.{$homeSector}"/>
+                    </do_if>
+                  </do_if>
+                </do_elseif>
+              </do_if>
+              <do_elseif value="$homeSector != null">
+                <set_value name="$sectorCache" exact="@global.$GT_TradeCache.{$homeSector}"/>
                 <do_if value="$sectorCache == null">
                   <set_value name="$sectorCache" exact="[]"/>
                 </do_if>
@@ -139,58 +223,31 @@
                       </do_else>
                     </do_if>
                   </do_all>
-                  <do_if value="$isMk4Pool">
-                    <set_value name="global.$GT_TradeCacheMK4.{$homeSector}" exact="$cleanSectorCache"/>
-                    <do_if value="$cleanSectorCache.count == 0">
-                      <remove_value name="global.$GT_TradeCacheMK4.{$homeSector}"/>
-                      <do_if value="global.$GT_TradeCacheMK4ByWare? and global.$GT_TradeCacheMK4ByWare.{$homeSector}?">
-                        <remove_value name="global.$GT_TradeCacheMK4ByWare.{$homeSector}"/>
-                      </do_if>
+                  <set_value name="global.$GT_TradeCache.{$homeSector}" exact="$cleanSectorCache"/>
+                  <do_if value="$cleanSectorCache.count == 0">
+                    <remove_value name="global.$GT_TradeCache.{$homeSector}"/>
+                    <do_if value="global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$homeSector}?">
+                      <remove_value name="global.$GT_TradeCacheByWare.{$homeSector}"/>
                     </do_if>
-                    <do_else>
-                      <do_if value="not global.$GT_TradeCacheMK4ByWare?">
-                        <set_value name="global.$GT_TradeCacheMK4ByWare" exact="table[]"/>
-                      </do_if>
-                      <set_value name="global.$GT_TradeCacheMK4ByWare.{$homeSector}" exact="table[]"/>
-                      <do_all exact="$cleanSectorCache.count" counter="$i">
-                        <set_value name="$entry" exact="$cleanSectorCache.{$i}"/>
-                        <set_value name="$entryWare" exact="@$entry.$BuyOffer.ware"/>
-                        <do_if value="$entryWare?">
-                          <do_if value="not global.$GT_TradeCacheMK4ByWare.{$homeSector}.{$entryWare}?">
-                            <set_value name="global.$GT_TradeCacheMK4ByWare.{$homeSector}.{$entryWare}" exact="[]"/>
-                          </do_if>
-                          <append_to_list name="global.$GT_TradeCacheMK4ByWare.{$homeSector}.{$entryWare}" exact="$entry"/>
-                        </do_if>
-                      </do_all>
-                    </do_else>
                   </do_if>
                   <do_else>
-                    <set_value name="global.$GT_TradeCache.{$homeSector}" exact="$cleanSectorCache"/>
-                    <do_if value="$cleanSectorCache.count == 0">
-                      <remove_value name="global.$GT_TradeCache.{$homeSector}"/>
-                      <do_if value="global.$GT_TradeCacheByWare? and global.$GT_TradeCacheByWare.{$homeSector}?">
-                        <remove_value name="global.$GT_TradeCacheByWare.{$homeSector}"/>
-                      </do_if>
+                    <do_if value="not global.$GT_TradeCacheByWare?">
+                      <set_value name="global.$GT_TradeCacheByWare" exact="table[]"/>
                     </do_if>
-                    <do_else>
-                      <do_if value="not global.$GT_TradeCacheByWare?">
-                        <set_value name="global.$GT_TradeCacheByWare" exact="table[]"/>
-                      </do_if>
-                      <set_value name="global.$GT_TradeCacheByWare.{$homeSector}" exact="table[]"/>
-                      <do_all exact="$cleanSectorCache.count" counter="$i">
-                        <set_value name="$entry" exact="$cleanSectorCache.{$i}"/>
-                        <set_value name="$entryWare" exact="@$entry.$BuyOffer.ware"/>
-                        <do_if value="$entryWare?">
-                          <do_if value="not global.$GT_TradeCacheByWare.{$homeSector}.{$entryWare}?">
-                            <set_value name="global.$GT_TradeCacheByWare.{$homeSector}.{$entryWare}" exact="[]"/>
-                          </do_if>
-                          <append_to_list name="global.$GT_TradeCacheByWare.{$homeSector}.{$entryWare}" exact="$entry"/>
+                    <set_value name="global.$GT_TradeCacheByWare.{$homeSector}" exact="table[]"/>
+                    <do_all exact="$cleanSectorCache.count" counter="$i">
+                      <set_value name="$entry" exact="$cleanSectorCache.{$i}"/>
+                      <set_value name="$entryWare" exact="@$entry.$BuyOffer.ware"/>
+                      <do_if value="$entryWare?">
+                        <do_if value="not global.$GT_TradeCacheByWare.{$homeSector}.{$entryWare}?">
+                          <set_value name="global.$GT_TradeCacheByWare.{$homeSector}.{$entryWare}" exact="[]"/>
                         </do_if>
-                      </do_all>
-                    </do_else>
+                        <append_to_list name="global.$GT_TradeCacheByWare.{$homeSector}.{$entryWare}" exact="$entry"/>
+                      </do_if>
+                    </do_all>
                   </do_else>
                 </do_if>
-              </do_if>
+              </do_elseif>
             </do_all>
           </do_if>
         </do_if>
@@ -233,14 +290,24 @@
           <do_if value="$keysCount? and $keysCount gt 0">
             <do_all exact="$keysCount" counter="$sectorIdx">
               <set_value name="$homeSector" exact="@$keys.{$sectorIdx}"/>
-              <do_if value="$homeSector?">
-                <set_value name="$sectorCache" exact="null"/>
-                <do_if value="$isMk4Pool">
-                  <set_value name="$sectorCache" exact="@global.$GT_TradeCacheMK4.{$homeSector}"/>
+              <set_value name="$statsLists" exact="[]"/>
+              <do_if value="$homeSector? and $isMk4Pool">
+                <!-- MK4 nested home -> fleetKey -> list (CONTEXT-009): collect every fleet bucket
+                     under this home as a flat list-of-lists to walk below. A flat legacy list here
+                     predates fleet keys - skip it (init discards it on next load, not here). -->
+                <set_value name="$sectorBucket" exact="@global.$GT_TradeCacheMK4.{$homeSector}"/>
+                <do_if value="$sectorBucket? and typeof $sectorBucket == datatype.table">
+                  <set_value name="$fleetKeys" exact="@$sectorBucket.keys"/>
+                  <do_all exact="$fleetKeys.count" counter="$fleetIdx">
+                    <append_to_list name="$statsLists" exact="$sectorBucket.{$fleetKeys.{$fleetIdx}}"/>
+                  </do_all>
                 </do_if>
-                <do_else>
-                  <set_value name="$sectorCache" exact="@global.$GT_TradeCache.{$homeSector}"/>
-                </do_else>
+              </do_if>
+              <do_elseif value="$homeSector?">
+                <append_to_list name="$statsLists" exact="@global.$GT_TradeCache.{$homeSector}"/>
+              </do_elseif>
+              <do_all exact="$statsLists.count" counter="$listIdx">
+                <set_value name="$sectorCache" exact="$statsLists.{$listIdx}"/>
                 <do_if value="$sectorCache?">
                   <set_value name="$sectorCacheCount" exact="@$sectorCache.count"/>
                   <do_if value="$sectorCacheCount? and $sectorCacheCount gt 0">
@@ -279,7 +346,7 @@
                     </do_all>
                   </do_if>
                 </do_if>
-              </do_if>
+              </do_all>
             </do_all>
           </do_if>
           <set_value name="$poolStats.$TotalWares" exact="$uniqueWares.count"/>
@@ -431,9 +498,28 @@
 
         <do_all exact="$homes.count" counter="$hi">
           <set_value name="$home" exact="$homes.{$hi}"/>
+          <set_value name="$purgeFleetKeys" exact="['']"/>
+          <do_if value="$isMk4Pool">
+            <!-- MK4 nested home -> fleetKey -> list (CONTEXT-009): the same offer pair may be
+                 cached under several fleets' buckets at this home, so purge every bucket, not
+                 just one. A flat legacy list here predates fleet keys - drop it whole. -->
+            <set_value name="$purgeFleetKeys" exact="[]"/>
+            <set_value name="$mk4HomeBucket" exact="if $home? then @global.$GT_TradeCacheMK4.{$home} else null"/>
+            <do_if value="$mk4HomeBucket != null and typeof $mk4HomeBucket == datatype.list">
+              <remove_value name="global.$GT_TradeCacheMK4.{$home}"/>
+              <do_if value="global.$GT_TradeCacheMK4ByWare? and global.$GT_TradeCacheMK4ByWare.{$home}?">
+                <remove_value name="global.$GT_TradeCacheMK4ByWare.{$home}"/>
+              </do_if>
+            </do_if>
+            <do_elseif value="$mk4HomeBucket != null and typeof $mk4HomeBucket == datatype.table">
+              <set_value name="$purgeFleetKeys" exact="@$mk4HomeBucket.keys"/>
+            </do_elseif>
+          </do_if>
+          <do_all exact="$purgeFleetKeys.count" counter="$pfki">
+          <set_value name="$purgeFleetKey" exact="$purgeFleetKeys.{$pfki}"/>
           <set_value name="$homeHasCache" exact="false"/>
           <do_if value="$isMk4Pool">
-            <set_value name="$homeHasCache" exact="$home? and global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$home}?"/>
+            <set_value name="$homeHasCache" exact="$home? and global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$home}? and global.$GT_TradeCacheMK4.{$home}.{$purgeFleetKey}?"/>
           </do_if>
           <do_else>
             <set_value name="$homeHasCache" exact="$home? and global.$GT_TradeCache? and global.$GT_TradeCache.{$home}?"/>
@@ -441,7 +527,7 @@
           <do_if value="$homeHasCache">
             <set_value name="$sectorCache" exact="[]"/>
             <do_if value="$isMk4Pool">
-              <set_value name="$sectorCache" exact="global.$GT_TradeCacheMK4.{$home}"/>
+              <set_value name="$sectorCache" exact="global.$GT_TradeCacheMK4.{$home}.{$purgeFleetKey}"/>
             </do_if>
             <do_else>
               <set_value name="$sectorCache" exact="global.$GT_TradeCache.{$home}"/>
@@ -471,7 +557,7 @@
                 <do_if value="$buyOfferMatches and $sellOfferMatches">
                   <!-- Remove from main cache -->
                   <do_if value="$isMk4Pool">
-                    <remove_value name="global.$GT_TradeCacheMK4.{$home}.{$i}"/>
+                    <remove_value name="global.$GT_TradeCacheMK4.{$home}.{$purgeFleetKey}.{$i}"/>
                   </do_if>
                   <do_else>
                     <remove_value name="global.$GT_TradeCache.{$home}.{$i}"/>
@@ -480,7 +566,7 @@
 
                   <!-- Best-effort: remove from per-ware index -->
                   <do_if value="$isMk4Pool">
-                    <do_if value="global.$GT_TradeCacheMK4ByWare? and global.$GT_TradeCacheMK4ByWare.{$home}?">
+                    <do_if value="global.$GT_TradeCacheMK4ByWare? and global.$GT_TradeCacheMK4ByWare.{$home}? and global.$GT_TradeCacheMK4ByWare.{$home}.{$purgeFleetKey}?">
                       <set_value name="$wareObj" exact="null"/>
                       <set_value name="$wareIdKey" exact="null"/>
                       <do_if value="$entry.$BuyOffer?">
@@ -492,11 +578,11 @@
                       <do_elseif value="$entry.$WareId?">
                         <set_value name="$wareIdKey" exact="@$entry.$WareId"/>
                       </do_elseif>
-                      <do_if value="$wareObj? and global.$GT_TradeCacheMK4ByWare.{$home}.{$wareObj}?">
-                        <remove_from_list name="global.$GT_TradeCacheMK4ByWare.{$home}.{$wareObj}" exact="$entry"/>
+                      <do_if value="$wareObj? and global.$GT_TradeCacheMK4ByWare.{$home}.{$purgeFleetKey}.{$wareObj}?">
+                        <remove_from_list name="global.$GT_TradeCacheMK4ByWare.{$home}.{$purgeFleetKey}.{$wareObj}" exact="$entry"/>
                       </do_if>
-                      <do_if value="$wareIdKey? and global.$GT_TradeCacheMK4ByWare.{$home}.{$wareIdKey}?">
-                        <remove_from_list name="global.$GT_TradeCacheMK4ByWare.{$home}.{$wareIdKey}" exact="$entry"/>
+                      <do_if value="$wareIdKey? and global.$GT_TradeCacheMK4ByWare.{$home}.{$purgeFleetKey}.{$wareIdKey}?">
+                        <remove_from_list name="global.$GT_TradeCacheMK4ByWare.{$home}.{$purgeFleetKey}.{$wareIdKey}" exact="$entry"/>
                       </do_if>
                     </do_if>
                   </do_if>
@@ -528,9 +614,15 @@
               </do_if>
             </do_all>
 
-            <!-- Clean up empty home cache lists -->
+            <!-- Clean up empty fleet/home cache lists -->
             <do_if value="$isMk4Pool">
-              <do_if value="global.$GT_TradeCacheMK4.{$home}? and global.$GT_TradeCacheMK4.{$home}.count == 0">
+              <do_if value="global.$GT_TradeCacheMK4.{$home}.{$purgeFleetKey}? and global.$GT_TradeCacheMK4.{$home}.{$purgeFleetKey}.count == 0">
+                <remove_value name="global.$GT_TradeCacheMK4.{$home}.{$purgeFleetKey}"/>
+                <do_if value="global.$GT_TradeCacheMK4ByWare? and global.$GT_TradeCacheMK4ByWare.{$home}? and global.$GT_TradeCacheMK4ByWare.{$home}.{$purgeFleetKey}?">
+                  <remove_value name="global.$GT_TradeCacheMK4ByWare.{$home}.{$purgeFleetKey}"/>
+                </do_if>
+              </do_if>
+              <do_if value="global.$GT_TradeCacheMK4.{$home}? and global.$GT_TradeCacheMK4.{$home}.keys.count == 0">
                 <remove_value name="global.$GT_TradeCacheMK4.{$home}"/>
                 <do_if value="global.$GT_TradeCacheMK4ByWare? and global.$GT_TradeCacheMK4ByWare.{$home}?">
                   <remove_value name="global.$GT_TradeCacheMK4ByWare.{$home}"/>
@@ -546,6 +638,7 @@
               </do_if>
             </do_else>
           </do_if>
+          </do_all>
         </do_all>
 
         <!-- PHASE 1: Remove from index after invalidation -->

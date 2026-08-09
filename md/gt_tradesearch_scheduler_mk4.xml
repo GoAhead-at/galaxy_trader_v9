@@ -27,6 +27,23 @@
         <set_value name="global.$GT_SearchSemaphore.$MK4LiveWaiterTickScheduled" exact="false"/>
       </actions>
     </cue>
+
+    <!-- MK4 fleet slot key (CONTEXT-009): sectors have no idcode, so the composite key uses
+         homeSector.macro.id. All MK4Live queue/active/waiter tables that used to be keyed by
+         home sector alone are keyed by this composite string so fleets sharing a home do not
+         share dispatch/waiter state. -->
+    <library name="GT_Mk4SlotKey" purpose="run_actions">
+      <params>
+        <param name="homeSector" default="null"/>
+        <param name="fleetKey" default="''"/>
+      </params>
+      <actions>
+        <set_value name="$slotHomeId" exact="if $homeSector? and $homeSector.exists and $homeSector.macro? and $homeSector.macro.id? then @$homeSector.macro.id else 'nohome'"/>
+        <set_value name="$slotFleetKey" exact="if $fleetKey? and $fleetKey != '' then $fleetKey else 'nofleet'"/>
+        <return value="'$' + $slotHomeId + '|' + $slotFleetKey"/>
+      </actions>
+    </library>
+
 <cue name="DispatchMK4LiveSearchGoDelayed" instantiate="true">
       <conditions>
         <event_cue_signalled/>
@@ -69,8 +86,15 @@
               <do_if value="global.$GT_SearchSemaphore.$MK4LiveActive gt 0">
                 <set_value name="global.$GT_SearchSemaphore.$MK4LiveActive" operation="subtract"/>
               </do_if>
-              <do_if value="$mk4ActiveEntry? and $mk4ActiveEntry.$HomeSector? and global.$GT_SearchSemaphore.$MK4LiveHomeActive? and global.$GT_SearchSemaphore.$MK4LiveHomeActive.{$mk4ActiveEntry.$HomeSector}? and @global.$GT_SearchSemaphore.$MK4LiveHomeActive.{$mk4ActiveEntry.$HomeSector} == $mk4ActiveShip">
-                <remove_value name="global.$GT_SearchSemaphore.$MK4LiveHomeActive.{$mk4ActiveEntry.$HomeSector}"/>
+              <do_if value="$mk4ActiveEntry? and $mk4ActiveEntry.$HomeSector?">
+                <set_value name="$mk4ActiveFleetKey" exact="if $mk4ActiveEntry.$FleetKey? then @$mk4ActiveEntry.$FleetKey else ''"/>
+                <run_actions ref="md.GT_TradeSearch_Scheduler_MK4.GT_Mk4SlotKey" result="$mk4ActiveSlotKey">
+                  <param name="homeSector" value="$mk4ActiveEntry.$HomeSector"/>
+                  <param name="fleetKey" value="$mk4ActiveFleetKey"/>
+                </run_actions>
+                <do_if value="global.$GT_SearchSemaphore.$MK4LiveHomeActive? and global.$GT_SearchSemaphore.$MK4LiveHomeActive.{$mk4ActiveSlotKey}? and @global.$GT_SearchSemaphore.$MK4LiveHomeActive.{$mk4ActiveSlotKey} == $mk4ActiveShip">
+                  <remove_value name="global.$GT_SearchSemaphore.$MK4LiveHomeActive.{$mk4ActiveSlotKey}"/>
+                </do_if>
               </do_if>
               <do_if value="$mk4ActiveShip? and global.$GT_SearchSemaphore.$PhaseStateByShip? and global.$GT_SearchSemaphore.$PhaseStateByShip.{$mk4ActiveShip}? and @global.$GT_SearchSemaphore.$PhaseStateByShip.{$mk4ActiveShip} == 'mk4live_active'">
                 <remove_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$mk4ActiveShip}"/>
@@ -88,6 +112,8 @@
           <set_value name="$mk4LiveStaleThreshold" exact="@global.$GT_GlobalSettings.$Performance.$StaleThresholdSeconds"/>
         </do_if>
         <do_if value="global.$GT_SearchSemaphore.$MK4LiveHomeActive? and global.$GT_SearchSemaphore.$MK4LiveHomeActive.keys.count gt 0">
+          <!-- Keys are composite fleet slot strings (CONTEXT-009), not sector objects - do not
+               call sector-only properties (.knownname) on them. -->
           <set_value name="$mk4OrphanHomeKeys" exact="global.$GT_SearchSemaphore.$MK4LiveHomeActive.keys.list"/>
           <do_all exact="$mk4OrphanHomeKeys.count" counter="$mk4ohi">
             <set_value name="$mk4OrphanHome" exact="$mk4OrphanHomeKeys.{$mk4ohi}"/>
@@ -109,7 +135,7 @@
             <do_if value="$mk4OrphanHomeStale">
               <remove_value name="global.$GT_SearchSemaphore.$MK4LiveHomeActive.{$mk4OrphanHome}"/>
               <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                <debug_text text="'[GT-Scheduler] DispatchMK4LiveSearchGo: Cleared orphaned MK4LiveHomeActive home=' + (if $mk4OrphanHome? and $mk4OrphanHome.knownname? then @$mk4OrphanHome.knownname else '?') + ' owner=' + (if $mk4OrphanOwner? then $mk4OrphanOwner.idcode else 'null')" chance="100"/>
+                <debug_text text="'[GT-Scheduler] DispatchMK4LiveSearchGo: Cleared orphaned MK4LiveHomeActive slot=' + (if $mk4OrphanHome? then $mk4OrphanHome else '?') + ' owner=' + (if $mk4OrphanOwner? then $mk4OrphanOwner.idcode else 'null')" chance="100"/>
               </do_if>
             </do_if>
           </do_all>
@@ -130,8 +156,22 @@
             <remove_value name="global.$GT_SearchSemaphore.$MK4LiveHomesQueued.{$homeSector}"/>
             <set_value name="$mk4HomeScanBudget" operation="subtract"/>
 
-            <!-- Skip homes that are currently active; requeue to tail -->
-            <do_if value="global.$GT_SearchSemaphore.$MK4LiveHomeActive? and global.$GT_SearchSemaphore.$MK4LiveHomeActive.{$homeSector}?">
+            <do_if value="not global.$GT_SearchSemaphore.$MK4LiveQueueByHome? or not global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}? or global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}.count le 0">
+              <continue/>
+            </do_if>
+
+            <!-- Peek (do not pop) the head entry to learn which fleet slot it needs. Active-slot
+                 gating is per (home, fleetKey) so a different fleet homed in the same sector is not
+                 blocked by another fleet's in-flight live search (CONTEXT-009). -->
+            <set_value name="$entry" exact="@global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}.{1}"/>
+            <set_value name="$entryFleetKey" exact="if $entry? and $entry.$FleetKey? then @$entry.$FleetKey else ''"/>
+            <run_actions ref="md.GT_TradeSearch_Scheduler_MK4.GT_Mk4SlotKey" result="$mk4SlotKey">
+              <param name="homeSector" value="$homeSector"/>
+              <param name="fleetKey" value="$entryFleetKey"/>
+            </run_actions>
+
+            <!-- Skip fleet slots that are currently active; requeue home to tail -->
+            <do_if value="global.$GT_SearchSemaphore.$MK4LiveHomeActive? and global.$GT_SearchSemaphore.$MK4LiveHomeActive.{$mk4SlotKey}?">
               <do_if value="not global.$GT_SearchSemaphore.$MK4LiveHomesQueued.{$homeSector}?">
                 <append_to_list name="global.$GT_SearchSemaphore.$MK4LiveHomesQueue" exact="$homeSector"/>
                 <set_value name="global.$GT_SearchSemaphore.$MK4LiveHomesQueued.{$homeSector}" exact="true"/>
@@ -139,11 +179,6 @@
               <continue/>
             </do_if>
 
-            <do_if value="not global.$GT_SearchSemaphore.$MK4LiveQueueByHome? or not global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}? or global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}.count le 0">
-              <continue/>
-            </do_if>
-
-            <set_value name="$entry" exact="global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}.{1}"/>
             <remove_value name="global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}.{1}"/>
 
             <set_value name="$ship" exact="@$entry.$Ship"/>
@@ -151,6 +186,7 @@
             <set_value name="$dispatchParams" exact="if $params? then $params else table[]"/>
             <set_value name="$dispatchParams.$Phase" exact="'mk4live'"/>
             <set_value name="$dispatchParams.$HomeSector" exact="$homeSector"/>
+            <set_value name="$dispatchParams.$FleetKey" exact="$entryFleetKey"/>
             <set_value name="$dispatchParams.$SearchPool" exact="'mk4_supply'"/>
             <!-- Honor an explicit ship request for a live search. A ship raises ForceLiveSearch=true only
                  after its cache attempt already failed (every cached candidate rejected for THIS ship). If we
@@ -161,7 +197,7 @@
                  force live. -->
             <set_value name="$shipForcedLive" exact="$params? and $params.$ForceLiveSearch? and @$params.$ForceLiveSearch"/>
             <set_value name="$dispatchForceLive" exact="true"/>
-            <do_if value="not $shipForcedLive and $homeSector? and $homeSector.exists and global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$homeSector}? and global.$GT_TradeCacheMK4.{$homeSector}.count gt 0">
+            <do_if value="not $shipForcedLive and $homeSector? and $homeSector.exists and global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$homeSector}? and typeof global.$GT_TradeCacheMK4.{$homeSector} == datatype.table and global.$GT_TradeCacheMK4.{$homeSector}.{$entryFleetKey}? and global.$GT_TradeCacheMK4.{$homeSector}.{$entryFleetKey}.count gt 0">
               <set_value name="$dispatchForceLive" exact="false"/>
             </do_if>
             <set_value name="$dispatchParams.$ForceLiveSearch" exact="$dispatchForceLive"/>
@@ -171,9 +207,10 @@
               <set_value name="global.$GT_SearchSemaphore.$MK4LiveActiveShips.{$ship}" exact="table[
                 $StartedAt = player.age,
                 $Params = $dispatchParams,
-                $HomeSector = $homeSector
+                $HomeSector = $homeSector,
+                $FleetKey = $entryFleetKey
               ]"/>
-              <set_value name="global.$GT_SearchSemaphore.$MK4LiveHomeActive.{$homeSector}" exact="$ship"/>
+              <set_value name="global.$GT_SearchSemaphore.$MK4LiveHomeActive.{$mk4SlotKey}" exact="$ship"/>
               <remove_value name="global.$GT_SearchSemaphore.$MK4LiveQueued.{$ship}"/>
               <set_value name="global.$GT_SearchSemaphore.$PhaseStateByShip.{$ship}" exact="'mk4live_active'"/>
               <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -212,6 +249,9 @@
         <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$StaleThresholdSeconds?">
           <set_value name="$mk4WaiterStaleThreshold" exact="@global.$GT_GlobalSettings.$Performance.$StaleThresholdSeconds"/>
         </do_if>
+        <!-- $MK4LiveWaitersByHome/$MK4LiveWaiterStartedAt/$MK4LiveHomeActive are keyed by the
+             composite fleet slot string (CONTEXT-009), not a sector object - $mk4HomeSector below
+             is that slot key and must not call sector-only properties (.knownname) on it. -->
         <do_if value="global.$GT_SearchSemaphore? and global.$GT_SearchSemaphore.$MK4LiveWaitersByHome? and global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.keys.count gt 0">
           <set_value name="$mk4HomeKeys" exact="global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.keys.list"/>
           <do_all exact="$mk4HomeKeys.count" counter="$mk4hki">
@@ -267,7 +307,7 @@
                   <set_value name="global.$GT_SearchSemaphore.$LiveWaiterWakePending.{$mk4wShip}" exact="true"/>
                   <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.SignalTradeSearchResetStaggered" param="$mk4wShip"/>
                   <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                    <debug_text text="'[GT-Scheduler] NotifyMK4LiveWaitersTick: Promoted starved MK4Live waiter ' + $mk4wShip.idcode + ' home=' + (if $mk4HomeSector.knownname? then @$mk4HomeSector.knownname else '?') + ' waiterAge=' + $mk4WaiterAge + ' homeOwnerStale=' + $mk4HomeOwnerStale" chance="100"/>
+                    <debug_text text="'[GT-Scheduler] NotifyMK4LiveWaitersTick: Promoted starved MK4Live waiter ' + $mk4wShip.idcode + ' slot=' + $mk4HomeSector + ' waiterAge=' + $mk4WaiterAge + ' homeOwnerStale=' + $mk4HomeOwnerStale" chance="100"/>
                   </do_if>
                 </do_if>
               </do_all>
@@ -297,39 +337,50 @@
       <actions>
         <set_value name="$data" exact="event.param2"/>
         <set_value name="$homeSector" exact="@$data.$HomeSector"/>
+        <!-- Fleet-scoped wake (CONTEXT-009): the cache write only touched one fleet's bucket at
+             this home, so only that fleet's queue/waiter entries are woken and only that fleet's
+             FailedShips markers are cleared. A write without a fleet key (MK3 writer, or a stale
+             pre-fleet-key caller) is not an MK4 wake source. -->
+        <set_value name="$mk4EventFleetKey" exact="if $data? and $data.$FleetKey? then @$data.$FleetKey else ''"/>
         <set_value name="$updatedMaxDistance" exact="if $data? and $data.$MaxDistance != null then @$data.$MaxDistance else 0"/>
         <do_if value="not global.$GT_SearchSemaphore?">
           <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK4.InitSearchSemaphore"/>
         </do_if>
-        <do_if value="$homeSector? and $homeSector.exists and global.$GT_SearchSemaphore?">
+        <do_if value="$homeSector? and $homeSector.exists and $mk4EventFleetKey != '' and global.$GT_SearchSemaphore?">
+          <run_actions ref="md.GT_TradeSearch_Scheduler_MK4.GT_Mk4SlotKey" result="$mk4CacheSlotKey">
+            <param name="homeSector" value="$homeSector"/>
+            <param name="fleetKey" value="$mk4EventFleetKey"/>
+          </run_actions>
           <set_value name="$mk4CacheEntryCount" exact="0"/>
-          <do_if value="global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$homeSector}?">
-            <set_value name="$mk4CacheEntryCount" exact="@global.$GT_TradeCacheMK4.{$homeSector}.count"/>
+          <do_if value="global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$homeSector}? and typeof global.$GT_TradeCacheMK4.{$homeSector} == datatype.table and global.$GT_TradeCacheMK4.{$homeSector}.{$mk4EventFleetKey}?">
+            <set_value name="$mk4CacheEntryCount" exact="@global.$GT_TradeCacheMK4.{$homeSector}.{$mk4EventFleetKey}.count"/>
           </do_if>
           <do_if value="$mk4CacheEntryCount gt 0 and $data? and $data.$Written? and $data.$Written gt 0">
-            <!-- Fresh cache writes supersede prior per-ship skip markers on all entries. -->
-            <do_all exact="global.$GT_TradeCacheMK4.{$homeSector}.count" counter="$mk4clrCi">
-              <set_value name="$mk4clrEntry" exact="global.$GT_TradeCacheMK4.{$homeSector}.{$mk4clrCi}"/>
+            <!-- Fresh cache writes supersede prior per-ship skip markers, scoped to this fleet's bucket only. -->
+            <do_all exact="global.$GT_TradeCacheMK4.{$homeSector}.{$mk4EventFleetKey}.count" counter="$mk4clrCi">
+              <set_value name="$mk4clrEntry" exact="global.$GT_TradeCacheMK4.{$homeSector}.{$mk4EventFleetKey}.{$mk4clrCi}"/>
               <do_if value="$mk4clrEntry? and $mk4clrEntry.$FailedShips? and $mk4clrEntry.$FailedShips.count gt 0">
                 <set_value name="$mk4clrEntry.$FailedShips" exact="[]"/>
                 <set_value name="$mk4clrEntry.$FailedShipIdcodes" exact="[]"/>
-                <set_value name="global.$GT_TradeCacheMK4.{$homeSector}.{$mk4clrCi}" exact="$mk4clrEntry"/>
+                <set_value name="global.$GT_TradeCacheMK4.{$homeSector}.{$mk4EventFleetKey}.{$mk4clrCi}" exact="$mk4clrEntry"/>
               </do_if>
             </do_all>
             <set_value name="$mk4WakeShips" exact="[]"/>
             <set_value name="$mk4WakeShipSeen" exact="table[]"/>
-            <!-- MK4Live live queue waiters -->
+            <!-- MK4Live live queue waiters for THIS fleet only ($MK4LiveQueueByHome stays keyed by
+                 home and mixes fleets in one FIFO list - filter by each entry's own $FleetKey). -->
             <do_if value="global.$GT_SearchSemaphore.$MK4LiveQueueByHome? and global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}? and global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}.count gt 0">
               <do_all exact="global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}.count" counter="$mk4cwi">
                 <set_value name="$mk4cwEntry" exact="@global.$GT_SearchSemaphore.$MK4LiveQueueByHome.{$homeSector}.{$mk4cwi}"/>
                 <set_value name="$mk4cwShip" exact="if $mk4cwEntry? and $mk4cwEntry.$Ship? then @$mk4cwEntry.$Ship else null"/>
-                <do_if value="$mk4cwShip? and $mk4cwShip.exists and not $mk4WakeShipSeen.{$mk4cwShip}?">
+                <set_value name="$mk4cwFleetKey" exact="if $mk4cwEntry? and $mk4cwEntry.$FleetKey? then @$mk4cwEntry.$FleetKey else ''"/>
+                <do_if value="$mk4cwShip? and $mk4cwShip.exists and $mk4cwFleetKey == $mk4EventFleetKey and not $mk4WakeShipSeen.{$mk4cwShip}?">
                   <append_to_list name="$mk4WakeShips" exact="$mk4cwShip"/>
                   <set_value name="$mk4WakeShipSeen.{$mk4cwShip}" exact="true"/>
                 </do_if>
               </do_all>
             </do_if>
-            <!-- Legacy live queue (mk4PolicyNeedsLiveSearch path) -->
+            <!-- Legacy live queue (mk4PolicyNeedsLiveSearch path; pre-fleet-key, home-scoped only) -->
             <do_if value="global.$GT_SearchSemaphore.$LiveQueueByHome? and global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}? and global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.count gt 0">
               <do_all exact="global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.count" counter="$lcwi">
                 <set_value name="$lcwEntry" exact="@global.$GT_SearchSemaphore.$LiveQueueByHome.{$homeSector}.{$lcwi}"/>
@@ -340,17 +391,18 @@
                 </do_if>
               </do_all>
             </do_if>
-            <!-- MK4Live live refresh waiters (blocked on same-home active slot) -->
-            <do_if value="global.$GT_SearchSemaphore.$MK4LiveWaitersByHome? and global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.{$homeSector}? and global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.{$homeSector}.count gt 0">
-              <do_all exact="global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.{$homeSector}.count" counter="$mk4wwi">
-                <set_value name="$mk4wwShip" exact="@global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.{$homeSector}.{$mk4wwi}"/>
+            <!-- MK4Live live refresh waiters blocked on THIS fleet's slot ($MK4LiveWaitersByHome is
+                 keyed by composite slot key, so this is a direct lookup, not a home-wide scan). -->
+            <do_if value="global.$GT_SearchSemaphore.$MK4LiveWaitersByHome? and global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.{$mk4CacheSlotKey}? and global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.{$mk4CacheSlotKey}.count gt 0">
+              <do_all exact="global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.{$mk4CacheSlotKey}.count" counter="$mk4wwi">
+                <set_value name="$mk4wwShip" exact="@global.$GT_SearchSemaphore.$MK4LiveWaitersByHome.{$mk4CacheSlotKey}.{$mk4wwi}"/>
                 <do_if value="$mk4wwShip? and $mk4wwShip.exists and not $mk4WakeShipSeen.{$mk4wwShip}?">
                   <append_to_list name="$mk4WakeShips" exact="$mk4wwShip"/>
                   <set_value name="$mk4WakeShipSeen.{$mk4wwShip}" exact="true"/>
                 </do_if>
               </do_all>
             </do_if>
-            <!-- Cache-phase queue for same home -->
+            <!-- Cache-phase queue for same home (pre-fleet-key cache phase, home-scoped only) -->
             <do_if value="global.$GT_SearchSemaphore.$CacheQueue? and global.$GT_SearchSemaphore.$CacheQueue.count gt 0">
               <do_all exact="global.$GT_SearchSemaphore.$CacheQueue.count" counter="$ccwi">
                 <set_value name="$ccwEntry" exact="@global.$GT_SearchSemaphore.$CacheQueue.{$ccwi}"/>
@@ -366,7 +418,7 @@
               <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler.SignalCacheUpdatedWakeStaggered" param="table[$Ships = $mk4WakeShips, $Index = 1]"/>
             </do_if>
             <do_if value="$mk4WakeShips.count gt 0 and global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-Scheduler] HandleMK4CacheUpdated: Woke ' + $mk4WakeShips.count + ' waiting ships to retry cache home=' + (if $homeSector.knownname? then @$homeSector.knownname else '?') + ' pool=' + $mk4CacheEntryCount + ' maxDist=' + $updatedMaxDistance" chance="100"/>
+              <debug_text text="'[GT-Scheduler] HandleMK4CacheUpdated: Woke ' + $mk4WakeShips.count + ' waiting ships to retry cache home=' + (if $homeSector.knownname? then @$homeSector.knownname else '?') + ' fleetKey=' + $mk4EventFleetKey + ' pool=' + $mk4CacheEntryCount + ' maxDist=' + $updatedMaxDistance" chance="100"/>
             </do_if>
           </do_if>
         </do_if>

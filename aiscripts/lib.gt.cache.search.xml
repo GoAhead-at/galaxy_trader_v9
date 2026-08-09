@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<aiscript name="lib.gt.cache.search" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="6">
+<aiscript name="lib.gt.cache.search" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="7">
   <params>
     <param name="cachePool" default="'mk3'" comment="Trade cache pool: mk3 (traders) or mk4 (supply)"/>
     <param name="ship" default="this.ship"/>
@@ -43,8 +43,14 @@
     <param name="distancePenalty" default="0.1" comment="MK3 ship-route score (matches lib.gt.tradematch Tater scale; order UI/50)."/>
     <param name="blacklistGroup" default="blacklistgroup.civilian" comment="Blacklist-aware ship→buy and buy→sell for lib.gt.cache.score_for_ship."/>
     <param name="skipReadTimePurge" default="false" comment="When true, skip universal TTL/dead-ref purge (post-refresh right after cache.write already cleaned the pool)."/>
+    <param name="fleetKey" default="''" comment="MK4 fleet bucket key (e.g. $MK4F_...). Required when cachePool=mk4."/>
     <param name="debugchance" default="0"/>
   </params>
+  <patch sinceversion="6">
+    <do_if value="not $fleetKey?">
+      <set_value name="$fleetKey" exact="''"/>
+    </do_if>
+  </patch>
   <patch sinceversion="3">
     <do_if value="not this.$gt_yieldMs?">
       <set_value name="this.$gt_yieldMs" exact="1"/>
@@ -87,10 +93,29 @@
       </do_if>
 
       <set_value name="this.$gt_cachePoolIsMk4" exact="$cachePool == 'mk4'"/>
+      <do_if value="this.$gt_cachePoolIsMk4">
+        <do_if value="not $fleetKey? or $fleetKey == '' or $fleetKey == null">
+          <return value="table[
+            $Found = false,
+            $BestTrade = null,
+            $BestScore = 0,
+            $TradeList = $tradeList,
+            $PurgedStale = 0,
+            $PoolSizeAfter = 0
+          ]"/>
+        </do_if>
+        <set_value name="this.$gt_mk4FleetKey" exact="$fleetKey"/>
+      </do_if>
       <set_value name="$cacheHomeKey" exact="$homeSector"/>
       <set_value name="$homeCache" exact="null"/>
       <do_if value="this.$gt_cachePoolIsMk4">
-        <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$homeSector}"/>
+        <do_if value="not global.$GT_TradeCacheMK4?">
+          <set_value name="global.$GT_TradeCacheMK4" exact="table[]"/>
+        </do_if>
+        <do_if value="global.$GT_TradeCacheMK4.{$homeSector}? and typeof global.$GT_TradeCacheMK4.{$homeSector} == datatype.list">
+          <remove_value name="global.$GT_TradeCacheMK4.{$homeSector}"/>
+        </do_if>
+        <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$homeSector}.{this.$gt_mk4FleetKey}"/>
       </do_if>
       <do_else>
         <set_value name="$homeCache" exact="@global.$GT_TradeCache.{$homeSector}"/>
@@ -128,25 +153,40 @@
                 <set_value name="$ckiMatched" exact="true"/>
               </do_if>
               <do_if value="$ckiMatched">
-                <set_value name="$homeCache" exact="@$reconPool.{$ckiSector}"/>
-                <do_if value="$ckiSector != $homeSector and $homeCache?">
-                  <create_list name="$reconMigratedCache"/>
-                  <do_all exact="$homeCache.count" counter="$mgi">
-                    <append_to_list name="$reconMigratedCache" exact="$homeCache.{$mgi}"/>
-                  </do_all>
-                  <do_if value="this.$gt_cachePoolIsMk4">
-                    <set_value name="global.$GT_TradeCacheMK4.{$homeSector}" exact="$reconMigratedCache"/>
+                <do_if value="this.$gt_cachePoolIsMk4">
+                  <set_value name="$reconSectorVal" exact="@$reconPool.{$ckiSector}"/>
+                  <do_if value="$reconSectorVal != null and typeof $reconSectorVal == datatype.list">
                     <remove_value name="global.$GT_TradeCacheMK4.{$ckiSector}"/>
+                    <set_value name="$reconSectorVal" exact="null"/>
                   </do_if>
+                  <do_if value="$ckiSector != $homeSector and $reconSectorVal != null and typeof $reconSectorVal == datatype.table">
+                    <set_value name="global.$GT_TradeCacheMK4.{$homeSector}" exact="$reconSectorVal"/>
+                    <remove_value name="global.$GT_TradeCacheMK4.{$ckiSector}"/>
+                    <set_value name="$cacheHomeKey" exact="$homeSector"/>
+                  </do_if>
+                  <do_elseif value="$ckiSector != $homeSector">
+                    <set_value name="$cacheHomeKey" exact="$ckiSector"/>
+                  </do_elseif>
                   <do_else>
-                    <set_value name="global.$GT_TradeCache.{$homeSector}" exact="$reconMigratedCache"/>
-                    <remove_value name="global.$GT_TradeCache.{$ckiSector}"/>
+                    <set_value name="$cacheHomeKey" exact="$homeSector"/>
                   </do_else>
-                  <set_value name="$cacheHomeKey" exact="$homeSector"/>
-                  <set_value name="$homeCache" exact="$reconMigratedCache"/>
+                  <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}.{this.$gt_mk4FleetKey}"/>
                 </do_if>
                 <do_else>
-                  <set_value name="$cacheHomeKey" exact="$ckiSector"/>
+                  <set_value name="$homeCache" exact="@$reconPool.{$ckiSector}"/>
+                  <do_if value="$ckiSector != $homeSector and $homeCache?">
+                    <create_list name="$reconMigratedCache"/>
+                    <do_all exact="$homeCache.count" counter="$mgi">
+                      <append_to_list name="$reconMigratedCache" exact="$homeCache.{$mgi}"/>
+                    </do_all>
+                    <set_value name="global.$GT_TradeCache.{$homeSector}" exact="$reconMigratedCache"/>
+                    <remove_value name="global.$GT_TradeCache.{$ckiSector}"/>
+                    <set_value name="$cacheHomeKey" exact="$homeSector"/>
+                    <set_value name="$homeCache" exact="$reconMigratedCache"/>
+                  </do_if>
+                  <do_else>
+                    <set_value name="$cacheHomeKey" exact="$ckiSector"/>
+                  </do_else>
                 </do_else>
                 <break/>
               </do_if>
@@ -224,7 +264,7 @@
       <set_value name="$cacheHomeKey" exact="this.$gt_cs_cacheHomeKey"/>
       <set_value name="$homeCache" exact="null"/>
       <do_if value="this.$gt_cachePoolIsMk4">
-        <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}"/>
+        <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}.{this.$gt_mk4FleetKey}"/>
       </do_if>
       <do_else>
         <set_value name="$homeCache" exact="@global.$GT_TradeCache.{$cacheHomeKey}"/>
@@ -240,7 +280,7 @@
         <set_value name="$purgedStaleCount" exact="this.$gt_cs_purgedStaleCount"/>
         <set_value name="$livePurgeCount" exact="0"/>
         <do_if value="this.$gt_cachePoolIsMk4">
-          <set_value name="$livePurgeCount" exact="if @global.$GT_TradeCacheMK4.{$cacheHomeKey}.count != null then @global.$GT_TradeCacheMK4.{$cacheHomeKey}.count else 0"/>
+          <set_value name="$livePurgeCount" exact="if @global.$GT_TradeCacheMK4.{$cacheHomeKey}.{this.$gt_mk4FleetKey}.count != null then @global.$GT_TradeCacheMK4.{$cacheHomeKey}.{this.$gt_mk4FleetKey}.count else 0"/>
         </do_if>
         <do_else>
           <set_value name="$livePurgeCount" exact="if @global.$GT_TradeCache.{$cacheHomeKey}.count != null then @global.$GT_TradeCache.{$cacheHomeKey}.count else 0"/>
@@ -250,7 +290,7 @@
         </do_if>
         <set_value name="$purgeEntry" exact="null"/>
         <do_if value="this.$gt_cachePoolIsMk4">
-          <set_value name="$purgeEntry" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}.{$pci}"/>
+          <set_value name="$purgeEntry" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}.{this.$gt_mk4FleetKey}.{$pci}"/>
         </do_if>
         <do_else>
           <set_value name="$purgeEntry" exact="@global.$GT_TradeCache.{$cacheHomeKey}.{$pci}"/>
@@ -319,14 +359,14 @@
         <do_if value="$purgeRemove">
           <set_value name="$liveBeforeRemove" exact="0"/>
           <do_if value="this.$gt_cachePoolIsMk4">
-            <set_value name="$liveBeforeRemove" exact="if @global.$GT_TradeCacheMK4.{$cacheHomeKey}.count != null then @global.$GT_TradeCacheMK4.{$cacheHomeKey}.count else 0"/>
+            <set_value name="$liveBeforeRemove" exact="if @global.$GT_TradeCacheMK4.{$cacheHomeKey}.{this.$gt_mk4FleetKey}.count != null then @global.$GT_TradeCacheMK4.{$cacheHomeKey}.{this.$gt_mk4FleetKey}.count else 0"/>
           </do_if>
           <do_else>
             <set_value name="$liveBeforeRemove" exact="if @global.$GT_TradeCache.{$cacheHomeKey}.count != null then @global.$GT_TradeCache.{$cacheHomeKey}.count else 0"/>
           </do_else>
           <do_if value="$pci le $liveBeforeRemove">
             <do_if value="this.$gt_cachePoolIsMk4">
-              <remove_value name="global.$GT_TradeCacheMK4.{$cacheHomeKey}.{$pci}"/>
+              <remove_value name="global.$GT_TradeCacheMK4.{$cacheHomeKey}.{this.$gt_mk4FleetKey}.{$pci}"/>
             </do_if>
             <do_else>
               <remove_value name="global.$GT_TradeCache.{$cacheHomeKey}.{$pci}"/>
@@ -354,7 +394,7 @@
       <set_value name="$purgedStaleCount" exact="if this.$gt_cs_purgedStaleCount? then this.$gt_cs_purgedStaleCount else 0"/>
       <set_value name="$homeCache" exact="null"/>
       <do_if value="$cacheHomeKey? and this.$gt_cachePoolIsMk4">
-        <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}"/>
+        <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}.{this.$gt_mk4FleetKey}"/>
       </do_if>
       <do_elseif value="$cacheHomeKey?">
         <set_value name="$homeCache" exact="@global.$GT_TradeCache.{$cacheHomeKey}"/>
@@ -1885,7 +1925,7 @@
           <set_value name="$csStationBLSupActive" exact="this.$gt_cs_stationBLSupActive"/>
           <set_value name="$homeCache" exact="null"/>
           <do_if value="this.$gt_cachePoolIsMk4">
-            <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}"/>
+            <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}.{this.$gt_mk4FleetKey}"/>
           </do_if>
           <do_else>
             <set_value name="$homeCache" exact="@global.$GT_TradeCache.{$cacheHomeKey}"/>
@@ -1908,7 +1948,7 @@
           <set_value name="$cacheHomeKey" exact="this.$gt_cs_cacheHomeKey"/>
           <set_value name="$homeCache" exact="null"/>
           <do_if value="this.$gt_cachePoolIsMk4">
-            <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}"/>
+            <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}.{this.$gt_mk4FleetKey}"/>
           </do_if>
           <do_else>
             <set_value name="$homeCache" exact="@global.$GT_TradeCache.{$cacheHomeKey}"/>
@@ -1984,7 +2024,7 @@
 
           <do_if value="$deadRemove">
             <do_if value="this.$gt_cachePoolIsMk4">
-              <remove_value name="global.$GT_TradeCacheMK4.{$cacheHomeKey}.{$ddi}"/>
+              <remove_value name="global.$GT_TradeCacheMK4.{$cacheHomeKey}.{this.$gt_mk4FleetKey}.{$ddi}"/>
             </do_if>
             <do_else>
               <remove_value name="global.$GT_TradeCache.{$cacheHomeKey}.{$ddi}"/>
@@ -1995,7 +2035,7 @@
         <do_if value="$purgedDeadCount gt 0">
           <set_value name="$homeCache" exact="null"/>
           <do_if value="this.$gt_cachePoolIsMk4">
-            <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}"/>
+            <set_value name="$homeCache" exact="@global.$GT_TradeCacheMK4.{$cacheHomeKey}.{this.$gt_mk4FleetKey}"/>
           </do_if>
           <do_else>
             <set_value name="$homeCache" exact="@global.$GT_TradeCache.{$cacheHomeKey}"/>

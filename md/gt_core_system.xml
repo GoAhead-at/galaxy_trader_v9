@@ -634,14 +634,15 @@
                   <set_value name="$reactivatedSubs" operation="add"/>
                 </do_else>
 
-                <!-- Restart Assist only when not already inheriting this commander's current GT order.
-                     Avoids N× AI cold-starts when fleet Assist is already correct. -->
+                <!-- Restart Assist when inherit target is wrong OR ship is missing from $GT_Ships.
+                     Missing registry after academy/mass-assign must force inherit so the ship can trade. -->
                 <do_if value="$sub.defaultorder? and @$sub.defaultorder.id == 'Assist' and $commander.defaultorder?">
                   <set_value name="$assistAlreadyOk" exact="false"/>
                   <do_if value="$sub.defaultorder.$baseorder? and $sub.defaultorder.$baseorder == $commander.defaultorder and $sub.defaultorder.$orderobject? and $sub.defaultorder.$orderobject == $commander">
                     <set_value name="$assistAlreadyOk" exact="true"/>
                   </do_if>
-                  <do_if value="not $assistAlreadyOk">
+                  <set_value name="$assistMissingRegistry" exact="not global.$GT_Ships? or not global.$GT_Ships.{$sub}?"/>
+                  <do_if value="not $assistAlreadyOk or $assistMissingRegistry">
                     <cancel_order order="$sub.defaultorder"/>
                     <create_order id="'Assist'" object="$sub" default="true">
                       <param name="baseorder" value="$commander.defaultorder"/>
@@ -649,7 +650,7 @@
                     </create_order>
                     <set_value name="$assistNudgedSubs" operation="add"/>
                     <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                      <debug_text text="'[GT-Core] Restarted Assist inheritance for ' + $sub.idcode + ' under commander ' + $commander.idcode + ' (order=' + @$commander.defaultorder.id + ')'" chance="100"/>
+                      <debug_text text="'[GT-Core] Restarted Assist inheritance for ' + $sub.idcode + ' under commander ' + $commander.idcode + ' (order=' + @$commander.defaultorder.id + ', missingRegistry=' + $assistMissingRegistry + ')'" chance="100"/>
                     </do_if>
                   </do_if>
                   <do_else>
@@ -694,6 +695,12 @@
               <param name="yieldContinue" value="false"/>
             </run_actions>
           </do_elseif>
+          <do_else>
+            <!-- Wave finished (no yield/retry). Allow a later fleet-growth event to queue again. -->
+            <do_if value="global.$GT_CommanderGTState? and global.$GT_CommanderGTState.{$commander}?">
+              <set_value name="global.$GT_CommanderGTState.{$commander}.$ReactivationPending" exact="false"/>
+            </do_if>
+          </do_else>
         </do_if>
       </actions>
     </library>
@@ -724,7 +731,9 @@
             <set_value name="global.$GT_CommanderGTState.{$commander}" exact="table[
               $IsGTActive = false,
               $WasCommander = false,
-              $LastUpdate = 0s
+              $LastUpdate = 0s,
+              $LastSubordinateCount = 0,
+              $ReactivationPending = false
             ]"/>
           </do_if>
           
@@ -732,6 +741,10 @@
           <set_value name="$prevActive" exact="false"/>
           <do_if value="$state.$IsGTActive? and $state.$IsGTActive">
             <set_value name="$prevActive" exact="true"/>
+          </do_if>
+          <set_value name="$prevSubCount" exact="0"/>
+          <do_if value="$state.$LastSubordinateCount?">
+            <set_value name="$prevSubCount" exact="$state.$LastSubordinateCount"/>
           </do_if>
           
           <!-- Commander role memory avoids missing reassignment transitions when subordinate list
@@ -750,6 +763,7 @@
           <!-- Process transitions for known commanders (current or historical). -->
           <do_if value="$isCommanderNow or $wasCommanderKnown">
             <do_if value="$isGTActive and not $prevActive">
+              <set_value name="$state.$ReactivationPending" exact="true"/>
               <run_actions ref="md.GT_CoreSystem.QueueProcessCommanderGTReactivation">
                 <param name="commander" value="$commander"/>
                 <param name="attempt" value="1"/>
@@ -758,7 +772,22 @@
                 <debug_text text="'[GT-Core] Commander GT state transition: ACTIVE for ' + $commander.idcode + ' (source=' + (if $payload.$Source? then $payload.$Source else 'unknown') + ', subCount=' + $reportedSubCount + ')'" chance="100"/>
               </do_if>
             </do_if>
+            <do_elseif value="$isGTActive and $prevActive and $reportedSubCount gt $prevSubCount">
+              <!-- Late fleet joins under an already-active GT commander (e.g. post-academy mass assign).
+                   Debounce: one pending wave covers ships that arrive during the 1s settle delay. -->
+              <do_if value="not $state.$ReactivationPending? or not $state.$ReactivationPending">
+                <set_value name="$state.$ReactivationPending" exact="true"/>
+                <run_actions ref="md.GT_CoreSystem.QueueProcessCommanderGTReactivation">
+                  <param name="commander" value="$commander"/>
+                  <param name="attempt" value="1"/>
+                </run_actions>
+                <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                  <debug_text text="'[GT-Core] Commander GT fleet grew under active order: ' + $commander.idcode + ' (prevSubs=' + $prevSubCount + ', now=' + $reportedSubCount + ', source=' + (if $payload.$Source? then $payload.$Source else 'unknown') + ') - queued subordinate reactivation'" chance="100"/>
+                </do_if>
+              </do_if>
+            </do_elseif>
             <do_elseif value="not $isGTActive and $prevActive">
+              <set_value name="$state.$ReactivationPending" exact="false"/>
               <run_actions ref="md.GT_CoreSystem.QueueVerifyCommanderSubordinateCleanup">
                 <param name="commander" value="$commander"/>
               </run_actions>
@@ -769,6 +798,7 @@
           </do_if>
           
           <set_value name="$state.$IsGTActive" exact="$isGTActive"/>
+          <set_value name="$state.$LastSubordinateCount" exact="$reportedSubCount"/>
           <set_value name="$state.$LastUpdate" exact="player.age"/>
         </do_if>
       </actions>

@@ -795,6 +795,13 @@
         <set_value name="$range" exact="this.sector"/>
       </do_else>
 
+      <!-- Idle-cycle waits below draw from [interval, interval + jitter] instead of a fixed interval.
+           A fleet ordered in one action would otherwise stay phase-locked forever and run all of its
+           demand rebuilds in the same frame, once per interval. Re-drawn every cycle, so the fleet
+           spreads itself out within a few cycles, and never waits less than the configured interval.
+           Set here rather than in init so orders resumed from an older save also have it. -->
+      <set_value name="this.$minerCycleJitter" exact="this.$demandRecheckInterval / 4"/>
+
       <!-- Cooperative yield for demand/station/ware chunk loops (same knob as resource locate). -->
       <set_value name="this.$minerChunkYieldMs" exact="15"/>
       <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$ResourceSearchYieldMs?">
@@ -804,8 +811,12 @@
         <set_value name="this.$minerChunkYieldMs" exact="100"/>
       </do_if>
 
-      <!-- Resolve target stations -->
+      <!-- Resolve target stations.
+           Membership table beside the list: the de-dup below used list.indexof per candidate, which
+           is a linear scan and made collecting S stations cost O(S^2). Persisted because the
+           collection loops yield between chunks. -->
       <create_list name="$targetStations"/>
+      <set_value name="this.$minerTargetSeen" exact="table[]"/>
       <do_if value="this.$stationList? and this.$stationList.count gt 0">
         <do_all exact="this.$stationList.count" counter="$si">
           <set_value name="$stationCandidate" exact="this.$stationList.{$si}"/>
@@ -825,8 +836,9 @@
                 <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': stationList drop ' + $stationCandidate.idcode + ' sector=' + $stationCandidate.sector.knownname + ' dist=' + $stationListGateDistance + ' maxSell=' + this.$maxSellDistance" chance="this.$debugchance"/>
               </do_if>
             </do_if>
-            <do_if value="$allowStation and not $targetStations.indexof.{$stationCandidate}">
+            <do_if value="$allowStation and not this.$minerTargetSeen.{$stationCandidate}?">
               <append_to_list name="$targetStations" exact="$stationCandidate"/>
+              <set_value name="this.$minerTargetSeen.{$stationCandidate}" exact="true"/>
             </do_if>
           </do_if>
         </do_all>
@@ -834,6 +846,7 @@
       <do_else>
         <do_if value="this.$homeStation? and this.$homeStation.exists and this.$homeStation.isoperational and ((not this.$playerStationsOnly) or (this.$homeStation.owner == this.owner))">
           <append_to_list name="$targetStations" exact="this.$homeStation"/>
+          <set_value name="this.$minerTargetSeen.{this.$homeStation}" exact="true"/>
         </do_if>
         <do_elseif value="this.$homeSector? and this.$homeSector.exists">
           <!-- No home station: derive demand stations by sell radius around home sector. -->
@@ -852,8 +865,9 @@
               <find_station name="$sectorStations" space="$demandSector" checkoperational="true" multiple="true"/>
               <do_all exact="$sectorStations.count" counter="$ssi">
                 <set_value name="$sectorStation" exact="$sectorStations.{$ssi}"/>
-                <do_if value="$sectorStation? and $sectorStation.exists and $sectorStation.isclass.station and $sectorStation.isoperational and ((not this.$playerStationsOnly) or ($sectorStation.owner == this.owner)) and not $targetStations.indexof.{$sectorStation}">
+                <do_if value="$sectorStation? and $sectorStation.exists and $sectorStation.isclass.station and $sectorStation.isoperational and ((not this.$playerStationsOnly) or ($sectorStation.owner == this.owner)) and not this.$minerTargetSeen.{$sectorStation}?">
                   <append_to_list name="$targetStations" exact="$sectorStation"/>
+                  <set_value name="this.$minerTargetSeen.{$sectorStation}" exact="true"/>
                 </do_if>
               </do_all>
             </do_all>
@@ -874,8 +888,9 @@
             <do_all exact="$chunkEnd - this.$minerSectorStationsScanIndex + 1" counter="$chunkOffset">
               <set_value name="$ssi" exact="this.$minerSectorStationsScanIndex + $chunkOffset - 1"/>
               <set_value name="$sectorStation" exact="this.$minerSectorStationsScanList.{$ssi}"/>
-              <do_if value="$sectorStation? and $sectorStation.exists and $sectorStation.isclass.station and $sectorStation.isoperational and ((not this.$playerStationsOnly) or ($sectorStation.owner == this.owner)) and not $targetStations.indexof.{$sectorStation}">
+              <do_if value="$sectorStation? and $sectorStation.exists and $sectorStation.isclass.station and $sectorStation.isoperational and ((not this.$playerStationsOnly) or ($sectorStation.owner == this.owner)) and not this.$minerTargetSeen.{$sectorStation}?">
                 <append_to_list name="$targetStations" exact="$sectorStation"/>
+                <set_value name="this.$minerTargetSeen.{$sectorStation}" exact="true"/>
               </do_if>
             </do_all>
             <set_value name="this.$minerSectorStationsScanIndex" exact="$chunkEnd + 1"/>
@@ -890,17 +905,18 @@
 
       <do_if value="$minerBlockedStations? and $minerBlockedStations.count gt 0 and $targetStations.count gt 0">
         <set_value name="$targetStationsBeforeBlockedFilter" exact="$targetStations.count"/>
+        <!-- Index the blocked set once instead of rescanning it per target station. -->
+        <set_value name="$blockedSet" exact="table[]"/>
+        <do_all exact="$minerBlockedStations.count" counter="$blockedStationIdx">
+          <set_value name="$blockedEntry" exact="$minerBlockedStations.{$blockedStationIdx}"/>
+          <do_if value="@$blockedEntry != null">
+            <set_value name="$blockedSet.{$blockedEntry}" exact="true"/>
+          </do_if>
+        </do_all>
         <create_list name="$targetStationsFiltered"/>
         <do_all exact="$targetStations.count" counter="$blockedTargetIdx">
           <set_value name="$targetStationCandidate" exact="$targetStations.{$blockedTargetIdx}"/>
-          <set_value name="$targetStationBlocked" exact="false"/>
-          <do_all exact="$minerBlockedStations.count" counter="$blockedStationIdx">
-            <do_if value="$minerBlockedStations.{$blockedStationIdx}? and $targetStationCandidate == $minerBlockedStations.{$blockedStationIdx}">
-              <set_value name="$targetStationBlocked" exact="true"/>
-              <break/>
-            </do_if>
-          </do_all>
-          <do_if value="not $targetStationBlocked">
+          <do_if value="not $blockedSet.{$targetStationCandidate}?">
             <append_to_list name="$targetStationsFiltered" exact="$targetStationCandidate"/>
           </do_if>
         </do_all>
@@ -910,6 +926,7 @@
 
       <!-- Demand is derived from the actively served station set. -->
       <create_list name="$demandStations"/>
+      <set_value name="this.$minerDemandSeen" exact="table[]"/>
       <set_value name="this.$minerDemandStationsBuildTargetStations" exact="$targetStations"/>
       <set_value name="this.$minerDemandStationsBuildIndex" exact="1"/>
       <do_while value="this.$minerDemandStationsBuildIndex? and this.$minerDemandStationsBuildTargetStations? and this.$minerDemandStationsBuildIndex le this.$minerDemandStationsBuildTargetStations.count">
@@ -917,8 +934,9 @@
         <do_all exact="$chunkEnd - this.$minerDemandStationsBuildIndex + 1" counter="$chunkOffset">
           <set_value name="$dsi" exact="this.$minerDemandStationsBuildIndex + $chunkOffset - 1"/>
           <set_value name="$demandStation" exact="this.$minerDemandStationsBuildTargetStations.{$dsi}"/>
-          <do_if value="$demandStation? and $demandStation.exists and ((not this.$playerStationsOnly) or ($demandStation.owner == this.owner)) and not $demandStations.indexof.{$demandStation}">
+          <do_if value="$demandStation? and $demandStation.exists and ((not this.$playerStationsOnly) or ($demandStation.owner == this.owner)) and not this.$minerDemandSeen.{$demandStation}?">
             <append_to_list name="$demandStations" exact="$demandStation"/>
+            <set_value name="this.$minerDemandSeen.{$demandStation}" exact="true"/>
           </do_if>
         </do_all>
         <set_value name="this.$minerDemandStationsBuildIndex" exact="$chunkEnd + 1"/>
@@ -928,6 +946,8 @@
       </do_while>
       <remove_value name="this.$minerDemandStationsBuildTargetStations"/>
       <remove_value name="this.$minerDemandStationsBuildIndex"/>
+      <remove_value name="this.$minerDemandSeen"/>
+      <remove_value name="this.$minerTargetSeen"/>
 
       <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Loop anchor=' + (if @$range != null then $range.knownname else 'null') + ', homeStation=' + (if this.$homeStation? and this.$homeStation.exists then this.$homeStation.idcode else 'NONE') + ', homeSector=' + (if this.$homeSector? and this.$homeSector.exists then this.$homeSector.knownname else 'NONE') + ', playerStationsOnly=' + this.$playerStationsOnly + ', commander=' + (if this.ship.commander? and this.ship.commander.exists then this.ship.commander.idcode else 'NONE') + ', default=' + (if this.ship.defaultorder? then @this.ship.defaultorder.id else 'NONE') + ', targetStations=' + $targetStations.count + ', demandStations=' + $demandStations.count" chance="this.$debugchance"/>
 
@@ -941,6 +961,10 @@
       <!-- Demand-first: live buy offers are the only demand signal (vanilla-aligned). Resource Basket /
            ship basket only filter the buy-offer pass below. Storage targets and cargo.list alone must
            not admit a ware - the station manager posts demand via buy offers. -->
+      <!-- {station -> {ware -> offeramount}} snapshot of this station scan. The ware-scoring pass
+           below needs the same buyer/tradepartner offers per ware; re-asking the engine there costs
+           wares x stations find_buy_offer calls for data already in hand. -->
+      <set_value name="this.$minerBuyOfferAmounts" exact="table[]"/>
       <do_if value="this.$checkDemandFirst">
         <do_if value="$demandStations.count gt 0">
           <set_value name="this.$minerBuyOfferScanDemandStations" exact="$demandStations"/>
@@ -951,9 +975,17 @@
               <set_value name="$tsi" exact="this.$minerBuyOfferScanIndex + $chunkOffset - 1"/>
               <set_value name="$stationCandidate" exact="this.$minerBuyOfferScanDemandStations.{$tsi}"/>
               <find_buy_offer buyer="$stationCandidate" tradepartner="this.ship" result="$stationBuyOffers" multiple="true"/>
+              <do_if value="$stationBuyOffers.count gt 0">
+                <set_value name="this.$minerBuyOfferAmounts.{$stationCandidate}" exact="table[]"/>
+              </do_if>
               <do_all exact="$stationBuyOffers.count" counter="$boi">
                 <set_value name="$buyOffer" exact="$stationBuyOffers.{$boi}"/>
                 <set_value name="$candidateWare" exact="$buyOffer.ware"/>
+                <!-- Record every offer, not just scoring candidates: the cargo-first pass can inject
+                     wares that the candidate filters below reject. -->
+                <do_if value="$candidateWare?">
+                  <set_value name="this.$minerBuyOfferAmounts.{$stationCandidate}.{$candidateWare}" exact="if @$buyOffer.offeramount.{this.ship} != null then @$buyOffer.offeramount.{this.ship} else 0"/>
+                </do_if>
                 <do_if value="$candidateWare? and $candidateWare.hastag.minable and this.ship.cargo.{$candidateWare}.max gt 0 and (($restrictToShipBasket and $shipMineableBasket.indexof.{$candidateWare}) or (not $restrictToShipBasket)) and (not this.$resourceBasket? or this.$resourceBasket.count == 0 or this.$resourceBasket.indexof.{$candidateWare}) and not $candidateWares.indexof.{$candidateWare}">
                   <append_to_list name="$candidateWares" exact="$candidateWare"/>
                 </do_if>
@@ -1265,7 +1297,7 @@
             </run_script>
           </do_if>
         </do_if>
-        <wait exact="this.$demandRecheckInterval"/>
+        <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$minerCycleJitter"/>
         <resume label="main_loop"/>
       </do_if>
 
@@ -1404,7 +1436,11 @@
       <set_value name="this.$minerScoreBestWares" exact="[]"/>
       <set_value name="this.$minerScoreIndex" exact="1"/>
       <do_while value="this.$minerScoreIndex? and this.$minerScoreCandidateWares? and this.$minerScoreIndex le this.$minerScoreCandidateWares.count">
-        <set_value name="$chunkEnd" exact="[this.$minerScoreIndex + 9, this.$minerScoreCandidateWares.count].min"/>
+        <!-- One ware per chunk. The per-ware body sweeps every demand station and every fleet intent
+             on those stations, and none of that inner work can yield (locals would not survive), so a
+             wider chunk puts wares x stations x intents into a single frame. A typical basket is
+             under the old chunk size of 10, which meant the whole nest ran without ever yielding. -->
+        <set_value name="$chunkEnd" exact="[this.$minerScoreIndex + 0, this.$minerScoreCandidateWares.count].min"/>
         <do_all exact="$chunkEnd - this.$minerScoreIndex + 1" counter="$chunkOffset">
           <set_value name="$wi" exact="this.$minerScoreIndex + $chunkOffset - 1"/>
           <set_value name="$wareEval" exact="this.$minerScoreCandidateWares.{$wi}"/>
@@ -1523,10 +1559,11 @@
           <do_if value="this.$checkDemandFirst and $wareHasResourceInRange">
             <do_all exact="this.$minerScoreDemandStations.count" counter="$tsi">
               <set_value name="$stationEval" exact="this.$minerScoreDemandStations.{$tsi}"/>
-              <!-- No buy offer = no demand (station manager). Storage target alone must not score. -->
-              <find_buy_offer buyer="$stationEval" wares="$wareEval" tradepartner="this.ship" result="$stationWareBuyOffer"/>
-              <do_if value="$stationWareBuyOffer">
-                <set_value name="$buyOfferAmount" exact="$stationWareBuyOffer.offeramount.{this.ship}"/>
+              <!-- No buy offer = no demand (station manager). Storage target alone must not score.
+                   Offers come from the station scan snapshot above; an amount of 0 scores like no
+                   offer did before (needed amount clamps to 0). -->
+              <set_value name="$buyOfferAmount" exact="if this.$minerBuyOfferAmounts.{$stationEval}? and this.$minerBuyOfferAmounts.{$stationEval}.{$wareEval}? then @this.$minerBuyOfferAmounts.{$stationEval}.{$wareEval} else 0"/>
+              <do_if value="$buyOfferAmount gt 0">
                 <set_value name="$projectedIncoming" exact="0"/>
                 <do_if value="this.$fleetBalancing and global.$GT_MinerIntents? and global.$GT_MinerIntents.{$stationEval}? and global.$GT_MinerIntents.{$stationEval}.{$wareEval}?">
                   <set_value name="$intentShips" exact="global.$GT_MinerIntents.{$stationEval}.{$wareEval}.keys.list"/>
@@ -1567,7 +1604,6 @@
                 <remove_value name="$reservedIncoming"/>
                 <remove_value name="$projectedIncoming"/>
               </do_if>
-              <remove_value name="$stationWareBuyOffer"/>
             </do_all>
           </do_if>
           <do_if value="$wareEval?">
@@ -1610,6 +1646,7 @@
       <remove_value name="this.$minerScoreBestUrgency"/>
       <remove_value name="this.$minerScoreBestWares"/>
       <remove_value name="this.$minerScoreIndex"/>
+      <remove_value name="this.$minerBuyOfferAmounts"/>
       <do_if value="this.$checkDemandFirst">
         <!-- Prefer highest-urgency ware that still has primary delivery headroom (below
              overflow threshold). Raw urgency alone can pick a capped ware (e.g. Silicon
@@ -1941,7 +1978,7 @@
             </run_script>
           </do_if>
         </do_if>
-        <wait exact="this.$demandRecheckInterval"/>
+        <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$minerCycleJitter"/>
         <resume label="main_loop"/>
       </do_if>
       <set_value name="this.$activeMiningWare" exact="$selectedWare"/>
@@ -2038,7 +2075,7 @@
             </run_script>
           </do_if>
         </do_if>
-        <wait exact="this.$demandRecheckInterval"/>
+        <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$minerCycleJitter"/>
         <resume label="main_loop"/>
       </do_if>
       <do_if value="$demandOffCargoHasWillingBuyer?"><remove_value name="$demandOffCargoHasWillingBuyer"/></do_if>
@@ -2152,7 +2189,7 @@
               </run_script>
             </do_if>
           </do_if>
-          <wait exact="this.$demandRecheckInterval"/>
+          <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$minerCycleJitter"/>
           <resume label="main_loop"/>
         </do_else>
       </do_if>
@@ -2223,7 +2260,7 @@
             </run_script>
           </do_if>
         </do_if>
-        <wait exact="this.$demandRecheckInterval"/>
+        <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$minerCycleJitter"/>
         <resume label="main_loop"/>
       </do_if>
 
@@ -2241,7 +2278,8 @@
         <set_value name="this.$minerPrimaryDeliveryStation" exact="null"/>
         <set_value name="this.$minerPrimaryIndex" exact="1"/>
         <do_while value="this.$minerPrimaryIndex? and this.$minerPrimaryDemandStations? and this.$minerPrimaryIndex le this.$minerPrimaryDemandStations.count">
-          <set_value name="$chunkEnd" exact="[this.$minerPrimaryIndex + 9, this.$minerPrimaryDemandStations.count].min"/>
+          <!-- Small chunk: each station also walks every fleet intent registered on it. -->
+          <set_value name="$chunkEnd" exact="[this.$minerPrimaryIndex + 4, this.$minerPrimaryDemandStations.count].min"/>
           <do_all exact="$chunkEnd - this.$minerPrimaryIndex + 1" counter="$chunkOffset">
             <set_value name="$tsi" exact="this.$minerPrimaryIndex + $chunkOffset - 1"/>
             <set_value name="$stationEval" exact="this.$minerPrimaryDemandStations.{$tsi}"/>
@@ -2345,7 +2383,8 @@
           <set_value name="this.$minerIntentBuildSelectedWare" exact="$selectedWare"/>
           <set_value name="this.$minerIntentBuildIndex" exact="1"/>
           <do_while value="this.$minerIntentBuildIndex? and this.$minerIntentBuildDemandStations? and this.$minerIntentBuildIndex le this.$minerIntentBuildDemandStations.count">
-            <set_value name="$chunkEnd" exact="[this.$minerIntentBuildIndex + 9, this.$minerIntentBuildDemandStations.count].min"/>
+            <!-- Small chunk: each station also walks every fleet intent registered on it. -->
+            <set_value name="$chunkEnd" exact="[this.$minerIntentBuildIndex + 4, this.$minerIntentBuildDemandStations.count].min"/>
             <do_all exact="$chunkEnd - this.$minerIntentBuildIndex + 1" counter="$chunkOffset">
               <set_value name="$tsi" exact="this.$minerIntentBuildIndex + $chunkOffset - 1"/>
               <set_value name="$stationEval" exact="this.$minerIntentBuildDemandStations.{$tsi}"/>
@@ -2644,7 +2683,7 @@
           <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': COLLECTOR PRE-CHECK FAILED - missing ' + $collectorMissing + ' drones for ' + $selectedWare.name + '. AutoResupply is DISABLED in GT settings - cannot auto-buy. Standing by ' + this.$demandRecheckInterval + 's. Enable Settings -> Maintenance -> AutoResupply, or manually equip the missing collector drones at any wharf, to allow this miner to mine.'" chance="100"/>
         </do_else>
         <set_command_action commandaction="commandaction.standingby"/>
-        <wait exact="this.$demandRecheckInterval"/>
+        <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$minerCycleJitter"/>
         <resume label="main_loop"/>
       </do_if>
 
@@ -2687,7 +2726,7 @@
         <do_if value="this.ship.cargo.{$selectedWare}.count le 0">
           <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Physical storage gate blocked ware=' + $selectedWare.name + ' with empty bay and no alternate open projection. Waiting ' + this.$demandRecheckInterval + ' for demand to drain.'" chance="this.$debugchance"/>
           <set_command_action commandaction="commandaction.standingby"/>
-          <wait exact="this.$demandRecheckInterval"/>
+          <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$minerCycleJitter"/>
           <resume label="main_loop"/>
         </do_if>
         <do_else>
@@ -2756,7 +2795,7 @@
           <do_if value="$blacklistgroup?">
             <remove_value name="$blacklistgroup"/>
           </do_if>
-          <wait exact="this.$demandRecheckInterval"/>
+          <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$minerCycleJitter"/>
           <resume label="main_loop"/>
         </do_elseif>
         <remove_value name="$locateResult"/>
@@ -3077,6 +3116,9 @@
     <do_if value="this.$minerScoreBestUrgency?"><remove_value name="this.$minerScoreBestUrgency"/></do_if>
     <do_if value="this.$minerScoreBestWares?"><remove_value name="this.$minerScoreBestWares"/></do_if>
     <do_if value="this.$minerScoreIndex?"><remove_value name="this.$minerScoreIndex"/></do_if>
+    <do_if value="this.$minerBuyOfferAmounts?"><remove_value name="this.$minerBuyOfferAmounts"/></do_if>
+    <do_if value="this.$minerTargetSeen?"><remove_value name="this.$minerTargetSeen"/></do_if>
+    <do_if value="this.$minerDemandSeen?"><remove_value name="this.$minerDemandSeen"/></do_if>
     <do_if value="this.$minerOverflowCandidateWares?"><remove_value name="this.$minerOverflowCandidateWares"/></do_if>
     <do_if value="this.$minerOverflowBestWare?"><remove_value name="this.$minerOverflowBestWare"/></do_if>
     <do_if value="this.$minerOverflowBestOffers?"><remove_value name="this.$minerOverflowBestOffers"/></do_if>

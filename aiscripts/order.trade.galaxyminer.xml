@@ -837,9 +837,8 @@
         </do_if>
         <do_elseif value="this.$homeSector? and this.$homeSector.exists">
           <!-- No home station: derive demand stations by sell radius around home sector. -->
-          <run_script name="'lib.find.sectors.inrange'" result="$demandSectors">
+          <run_script name="'lib.gt.miner_sectors_inrange'" result="$demandSectors">
             <param name="refobject" value="this.$homeSector"/>
-            <param name="mingatedistance" value="0"/>
             <param name="maxgatedistance" value="this.$maxSellDistance"/>
             <param name="debugchance" value="this.$debugchance"/>
           </run_script>
@@ -1322,15 +1321,12 @@
         <set_value name="$wareReachabilityGatherSpaces" exact="[this.$minerStayHomeSector]"/>
       </do_if>
       <do_else>
-        <run_script name="'lib.find.sectors.inrange'" result="$wareReachabilityGatherSpaces">
+        <!-- Cached BFS: invalidates on discovery / BL epoch / range / ref / 300s TTL. -->
+        <run_script name="'lib.gt.miner_sectors_inrange'" result="$wareReachabilityGatherSpaces">
           <param name="refobject" value="$wareReachabilityRefSector"/>
-          <param name="mingatedistance" value="0"/>
           <param name="maxgatedistance" value="this.$maxGatherDistance"/>
           <param name="debugchance" value="this.$debugchance"/>
         </run_script>
-        <do_if value="this.ship.isplayerowned and this.$maxGatherDistance le 0 and $wareReachabilityRefSector.isclass.sector and not $wareReachabilityGatherSpaces.indexof.{$wareReachabilityRefSector}">
-          <append_to_list name="$wareReachabilityGatherSpaces" exact="$wareReachabilityRefSector"/>
-        </do_if>
       </do_else>
       <!-- A4: Pre-filter gather sectors so wares whose only reachable resource sector is hostile, hazardous,
            contested-by-attackers, or sector-activity-blacklisted are not promoted to "reachable".
@@ -2060,15 +2056,11 @@
              counter never produced usable telemetry and aborted the slice mid-run as soon as the
              overflow-sell path actually fired. -->
         <set_value name="$overflowSearchRefSector" exact="if @$range != null and $range.isclass.sector then $range else (if @$range != null and $range.sector? then @$range.sector else this.sector)"/>
-        <run_script name="'lib.find.sectors.inrange'" result="$overflowSellSpaces">
+        <run_script name="'lib.gt.miner_sectors_inrange'" result="$overflowSellSpaces">
           <param name="refobject" value="$overflowSearchRefSector"/>
-          <param name="mingatedistance" value="0"/>
           <param name="maxgatedistance" value="this.$maxSellDistance"/>
           <param name="debugchance" value="this.$debugchance"/>
         </run_script>
-        <do_if value="this.ship.isplayerowned and this.$maxSellDistance le 0 and $overflowSearchRefSector.isclass.sector and not $overflowSellSpaces.indexof.{$overflowSearchRefSector}">
-          <append_to_list name="$overflowSellSpaces" exact="$overflowSearchRefSector"/>
-        </do_if>
         <set_value name="$overflowSearchHomeSector" exact="if this.$homeStation? and this.$homeStation.exists and this.$homeStation.sector? then @$this.$homeStation.sector else $overflowSearchRefSector"/>
         <set_value name="this.$minerOverflowCandidateWares" exact="$candidateWares"/>
         <set_value name="this.$minerOverflowBestWare" exact="null"/>
@@ -2782,11 +2774,27 @@
 
       <!-- Run GT mining routine fork in time slices so GT maintenance/training can run between cycles -->
       <set_value name="$strictGatherSector" exact="if this.$minerStayHomeSector? and this.$minerStayHomeSector.exists then this.$minerStayHomeSector else null"/>
+      <!-- Sell-side BFS only when sell range differs from gather; otherwise routine clones gather.
+           Persist on this.$ and do NOT use result= on the run_script immediately before the
+           long-running mining.routine (engine then expects a return into that result slot). -->
+      <set_value name="this.$minerPrecomputedSellSpaces" exact="[]"/>
+      <do_if value="$maxbuy != $maxsell">
+        <set_value name="$sellCacheRef" exact="if @$range != null and $range.isclass.sector then $range else (if @$range != null and $range.sector? then @$range.sector else this.sector)"/>
+        <run_script name="'lib.gt.miner_sectors_inrange'">
+          <param name="refobject" value="$sellCacheRef"/>
+          <param name="maxgatedistance" value="$maxsell"/>
+          <param name="debugchance" value="this.$debugchance"/>
+        </run_script>
+        <do_if value="this.$gtMinerSectorsResult?">
+          <set_value name="this.$minerPrecomputedSellSpaces" exact="this.$gtMinerSectorsResult"/>
+        </do_if>
+      </do_if>
       <run_script name="'order.mining.routine.gt'">
         <param name="warebasket" value="$runWareBasket"/>
         <param name="range" value="$range"/>
         <param name="strictgathersector" value="$strictGatherSector"/>
         <param name="precomputedgatherspaces" value="if this.$minerStayHomeSector? and this.$minerStayHomeSector.exists then [] else (if this.$minerSliceGatherSpaces? then this.$minerSliceGatherSpaces else [])"/>
+        <param name="precomputedsellspaces" value="if this.$minerPrecomputedSellSpaces? then this.$minerPrecomputedSellSpaces else []"/>
         <param name="resolvedsector" value="$resolvedSector"/>
         <param name="resolvedpos" value="$resolvedPos"/>
         <param name="deliveryonly" value="if this.$minerDeliveryOnlySlice? then this.$minerDeliveryOnlySlice else false"/>
@@ -2811,6 +2819,8 @@
       </run_script>
       <remove_value name="this.$minerDeliveryOnlySlice"/>
       <remove_value name="this.$minerSliceGatherSpaces"/>
+      <do_if value="this.$minerPrecomputedSellSpaces?"><remove_value name="this.$minerPrecomputedSellSpaces"/></do_if>
+      <do_if value="this.$gtMinerSectorsResult?"><remove_value name="this.$gtMinerSectorsResult"/></do_if>
       <remove_value name="$resolvedSector"/>
       <remove_value name="$resolvedPos"/>
 
@@ -3056,6 +3066,8 @@
     <do_if value="this.$minerScoreGatherSpaces?"><remove_value name="this.$minerScoreGatherSpaces"/></do_if>
     <do_if value="this.$minerStayHomeSector?"><remove_value name="this.$minerStayHomeSector"/></do_if>
     <do_if value="this.$minerSliceGatherSpaces?"><remove_value name="this.$minerSliceGatherSpaces"/></do_if>
+    <do_if value="this.$minerPrecomputedSellSpaces?"><remove_value name="this.$minerPrecomputedSellSpaces"/></do_if>
+    <do_if value="this.$gtMinerSectorsResult?"><remove_value name="this.$gtMinerSectorsResult"/></do_if>
     <do_if value="this.$minerDeliveryOnlySlice?"><remove_value name="this.$minerDeliveryOnlySlice"/></do_if>
     <do_if value="this.$minerScoreDemandStations?"><remove_value name="this.$minerScoreDemandStations"/></do_if>
     <do_if value="this.$minerScoreWareUrgency?"><remove_value name="this.$minerScoreWareUrgency"/></do_if>

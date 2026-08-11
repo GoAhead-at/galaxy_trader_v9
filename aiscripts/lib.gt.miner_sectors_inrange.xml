@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="utf-8"?>
+<aiscript name="lib.gt.miner_sectors_inrange" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="3">
+  <!--
+    Cached wrapper around vanilla lib.find.sectors.inrange for Galaxy Miner.
+
+    Storage: global.$GT_MinerSectorCache keyed by fingerprint
+      ref sector macro id + maxgate + stat.sectors_discovered + GT_BlacklistEpoch
+    Shared across all ships. Soft TTL 300s.
+
+    On MISS for maxgate=N: one vanilla BFS with returndistancetable, then backfill
+    cache entries for every k=0..N from the distance table (avoids repeat BFS for
+    the same ref at lower maxgates). Vanilla debugchance forced to 0 (our HIT/MISS
+    line is enough; per-sector debug_text was dominating hitch density).
+
+    Single-flight: if another ship is filling the same key, wait and reuse.
+    Writes this.$gtMinerSectorsResult for callers that must avoid result=.
+  -->
+  <params>
+    <param name="refobject" default="null" comment="Sector or object with .sector used as BFS center"/>
+    <param name="maxgatedistance" default="0" comment="Max gate distance (mingate always 0 for GT Miner)"/>
+    <param name="ttl" default="300s" comment="Soft max age of a cache entry"/>
+    <param name="debugchance" default="0"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <set_value name="$ship" exact="this.assignedcontrolled"/>
+      <create_list name="$emptyResult"/>
+      <set_value name="this.$gtMinerSectorsResult" exact="$emptyResult"/>
+      <do_if value="not $ship? or not $ship.exists">
+        <return value="$emptyResult"/>
+      </do_if>
+
+      <set_value name="$refsector" exact="null"/>
+      <do_if value="$refobject? and $refobject.exists and $refobject.isclass.sector">
+        <set_value name="$refsector" exact="$refobject"/>
+      </do_if>
+      <do_elseif value="$refobject? and $refobject.exists and $refobject.sector?">
+        <set_value name="$refsector" exact="@$refobject.sector"/>
+      </do_elseif>
+      <do_if value="not $refsector? or not $refsector.exists">
+        <debug_text text="'[GT-Miner] ' + $ship.idcode + ': sector-cache abort (no ref sector)'" chance="$debugchance"/>
+        <return value="$emptyResult"/>
+      </do_if>
+
+      <do_if value="not global.$GT_MinerSectorCache? or typeof global.$GT_MinerSectorCache != datatype.table">
+        <set_value name="global.$GT_MinerSectorCache" exact="table[]"/>
+      </do_if>
+
+      <set_value name="$refId" exact="'$' + $refsector.macro.id"/>
+      <set_value name="$maxGate" exact="$maxgatedistance"/>
+      <set_value name="$disc" exact="0"/>
+      <do_if value="@stat.sectors_discovered != null">
+        <set_value name="$disc" exact="stat.sectors_discovered"/>
+      </do_if>
+      <set_value name="$blEpoch" exact="0"/>
+      <do_if value="global.$GT_BlacklistEpoch?">
+        <set_value name="$blEpoch" exact="global.$GT_BlacklistEpoch"/>
+      </do_if>
+      <set_value name="$ttlSafe" exact="if $ttl? and $ttl gt 0s then $ttl else 300s"/>
+      <set_value name="$cacheKey" exact="$refId + '.' + $maxGate + '.' + $disc + '.' + $blEpoch"/>
+
+      <!-- Fast HIT path (no yield). -->
+      <do_if value="global.$GT_MinerSectorCache.{$cacheKey}? and typeof global.$GT_MinerSectorCache.{$cacheKey} == datatype.table">
+        <set_value name="$entry" exact="global.$GT_MinerSectorCache.{$cacheKey}"/>
+        <do_if value="$entry.$Spaces? and $entry.$At? and (player.age - $entry.$At) le $ttlSafe">
+          <set_value name="$result" exact="$entry.$Spaces.clone"/>
+          <set_value name="this.$gtMinerSectorsResult" exact="$result"/>
+          <debug_text text="'[GT-Miner] ' + $ship.idcode + ': sector-cache HIT count=' + $result.count + ' maxgate=' + $maxGate + ' disc=' + $disc + ' key=' + $cacheKey" chance="$debugchance"/>
+          <return value="$result"/>
+        </do_if>
+      </do_if>
+
+      <!-- Persist across single-flight waits (locals die on yield). -->
+      <set_value name="this.$gtMscKey" exact="$cacheKey"/>
+      <set_value name="this.$gtMscRef" exact="$refsector"/>
+      <set_value name="this.$gtMscRefId" exact="$refId"/>
+      <set_value name="this.$gtMscMax" exact="$maxGate"/>
+      <set_value name="this.$gtMscDisc" exact="$disc"/>
+      <set_value name="this.$gtMscBL" exact="$blEpoch"/>
+      <set_value name="this.$gtMscTtl" exact="$ttlSafe"/>
+      <set_value name="this.$gtMscWaitLeft" exact="40"/>
+
+      <!-- Single-flight: wait while another ship fills this exact key (stale lock >2s is ignored). -->
+      <do_while value="this.$gtMscWaitLeft gt 0 and global.$GT_MinerSectorBfsKey? and global.$GT_MinerSectorBfsKey == this.$gtMscKey and global.$GT_MinerSectorBfsAt? and (player.age - global.$GT_MinerSectorBfsAt) lt 2s">
+        <wait exact="1ms"/>
+        <set_value name="this.$gtMscWaitLeft" exact="this.$gtMscWaitLeft - 1"/>
+        <do_if value="global.$GT_MinerSectorCache.{this.$gtMscKey}? and typeof global.$GT_MinerSectorCache.{this.$gtMscKey} == datatype.table">
+          <set_value name="$entry" exact="global.$GT_MinerSectorCache.{this.$gtMscKey}"/>
+          <do_if value="$entry.$Spaces? and $entry.$At? and (player.age - $entry.$At) le this.$gtMscTtl">
+            <set_value name="$result" exact="$entry.$Spaces.clone"/>
+            <set_value name="this.$gtMinerSectorsResult" exact="$result"/>
+            <debug_text text="'[GT-Miner] ' + this.assignedcontrolled.idcode + ': sector-cache HIT-after-wait count=' + $result.count + ' key=' + this.$gtMscKey" chance="$debugchance"/>
+            <remove_value name="this.$gtMscKey"/>
+            <remove_value name="this.$gtMscRef"/>
+            <remove_value name="this.$gtMscRefId"/>
+            <remove_value name="this.$gtMscMax"/>
+            <remove_value name="this.$gtMscDisc"/>
+            <remove_value name="this.$gtMscBL"/>
+            <remove_value name="this.$gtMscTtl"/>
+            <remove_value name="this.$gtMscWaitLeft"/>
+            <return value="$result"/>
+          </do_if>
+        </do_if>
+      </do_while>
+
+      <!-- Re-check after wait (another ship may have backfilled this key from a higher maxgate). -->
+      <do_if value="global.$GT_MinerSectorCache.{this.$gtMscKey}? and typeof global.$GT_MinerSectorCache.{this.$gtMscKey} == datatype.table">
+        <set_value name="$entry" exact="global.$GT_MinerSectorCache.{this.$gtMscKey}"/>
+        <do_if value="$entry.$Spaces? and $entry.$At? and (player.age - $entry.$At) le this.$gtMscTtl">
+          <set_value name="$result" exact="$entry.$Spaces.clone"/>
+          <set_value name="this.$gtMinerSectorsResult" exact="$result"/>
+          <debug_text text="'[GT-Miner] ' + this.assignedcontrolled.idcode + ': sector-cache HIT count=' + $result.count + ' maxgate=' + this.$gtMscMax + ' key=' + this.$gtMscKey" chance="$debugchance"/>
+          <remove_value name="this.$gtMscKey"/>
+          <remove_value name="this.$gtMscRef"/>
+          <remove_value name="this.$gtMscRefId"/>
+          <remove_value name="this.$gtMscMax"/>
+          <remove_value name="this.$gtMscDisc"/>
+          <remove_value name="this.$gtMscBL"/>
+          <remove_value name="this.$gtMscTtl"/>
+          <remove_value name="this.$gtMscWaitLeft"/>
+          <return value="$result"/>
+        </do_if>
+      </do_if>
+
+      <!-- Claim single-flight lock for this key. -->
+      <set_value name="global.$GT_MinerSectorBfsKey" exact="this.$gtMscKey"/>
+      <set_value name="global.$GT_MinerSectorBfsAt" exact="player.age"/>
+
+      <!-- Distance table: one BFS, then backfill all lower maxgates for this ref. No vanilla debug spam. -->
+      <run_script name="'lib.find.sectors.inrange'" result="$sectorTable">
+        <param name="refobject" value="this.$gtMscRef"/>
+        <param name="mingatedistance" value="0"/>
+        <param name="maxgatedistance" value="this.$gtMscMax"/>
+        <param name="returndistancetable" value="true"/>
+        <param name="debugchance" value="0"/>
+      </run_script>
+      <do_if value="not $sectorTable? or typeof $sectorTable != datatype.table">
+        <set_value name="$sectorTable" exact="table[]"/>
+      </do_if>
+      <do_if value="this.assignedcontrolled.isplayerowned and this.$gtMscMax le 0 and this.$gtMscRef.isclass.sector and not $sectorTable.{this.$gtMscRef}?">
+        <set_value name="$sectorTable.{this.$gtMscRef}" exact="0"/>
+      </do_if>
+
+      <set_value name="this.$gtMscFillGate" exact="0"/>
+      <set_value name="$requestedSpaces" exact="null"/>
+      <do_while value="this.$gtMscFillGate le this.$gtMscMax">
+        <create_list name="$listK"/>
+        <do_for_each name="$sec" valuename="$dist" in="$sectorTable">
+          <do_if value="$sec? and $sec.exists and $dist? and $dist ge 0 and $dist le this.$gtMscFillGate">
+            <append_to_list name="$listK" exact="$sec"/>
+          </do_if>
+        </do_for_each>
+        <set_value name="$keyK" exact="this.$gtMscRefId + '.' + this.$gtMscFillGate + '.' + this.$gtMscDisc + '.' + this.$gtMscBL"/>
+        <set_value name="$entryK" exact="table[]"/>
+        <set_value name="$entryK.$Spaces" exact="$listK.clone"/>
+        <set_value name="$entryK.$At" exact="player.age"/>
+        <set_value name="global.$GT_MinerSectorCache.{$keyK}" exact="$entryK"/>
+        <do_if value="this.$gtMscFillGate == this.$gtMscMax">
+          <set_value name="$requestedSpaces" exact="$listK"/>
+        </do_if>
+        <set_value name="this.$gtMscFillGate" exact="this.$gtMscFillGate + 1"/>
+      </do_while>
+
+      <do_if value="not $requestedSpaces?">
+        <create_list name="$requestedSpaces"/>
+      </do_if>
+      <set_value name="this.$gtMinerSectorsResult" exact="$requestedSpaces"/>
+
+      <do_if value="global.$GT_MinerSectorBfsKey? and global.$GT_MinerSectorBfsKey == this.$gtMscKey">
+        <remove_value name="global.$GT_MinerSectorBfsKey"/>
+        <do_if value="global.$GT_MinerSectorBfsAt?"><remove_value name="global.$GT_MinerSectorBfsAt"/></do_if>
+      </do_if>
+
+      <debug_text text="'[GT-Miner] ' + this.assignedcontrolled.idcode + ': sector-cache MISS count=' + $requestedSpaces.count + ' maxgate=' + this.$gtMscMax + ' disc=' + this.$gtMscDisc + ' bl=' + this.$gtMscBL + ' key=' + this.$gtMscKey + ' backfilled=0..' + this.$gtMscMax" chance="$debugchance"/>
+
+      <remove_value name="this.$gtMscKey"/>
+      <remove_value name="this.$gtMscRef"/>
+      <remove_value name="this.$gtMscRefId"/>
+      <remove_value name="this.$gtMscMax"/>
+      <remove_value name="this.$gtMscDisc"/>
+      <remove_value name="this.$gtMscBL"/>
+      <remove_value name="this.$gtMscTtl"/>
+      <remove_value name="this.$gtMscWaitLeft"/>
+      <remove_value name="this.$gtMscFillGate"/>
+
+      <return value="$requestedSpaces"/>
+    </actions>
+  </attention>
+</aiscript>

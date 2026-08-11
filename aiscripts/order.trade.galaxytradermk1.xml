@@ -363,6 +363,15 @@
       <!-- ================================================================ -->
       <label name="main_loop"/>
 
+      <!-- Safety net for the live slot: a new cycle never starts holding one. Both search phases
+           re-enter at their own label, so reaching main_loop with a slot means the cycle escaped
+           the search region (clearance, dock skip, return home) and the slot must go back now
+           rather than waiting for the scheduler's 60s reap. -->
+      <do_if value="@this.$mk1SlotHeld == true">
+        <signal_objects object="player.galaxy" param="'GT_MK1Live_Abort'" param2="table[$Ship = this.ship]"/>
+        <set_value name="this.$mk1SlotHeld" exact="false"/>
+      </do_if>
+
       <!-- Fleet growth under live MK1: notify commander-reactivation (same as MK3/MK4). -->
       <set_value name="$currentSubordinateCount" exact="0"/>
       <do_if value="this.ship.subordinates?">
@@ -772,6 +781,10 @@
       <!-- ============================================================== -->
       <!-- STEP 2b: Supply mode — affordability + threshold check         -->
       <!-- ============================================================== -->
+      <!-- Re-entry point once a supply live slot is granted. Labels are only valid at action top
+           level, so re-entry restarts at the threshold check; everything from here to the cache
+           read is station arithmetic, which is why no local has to survive the slot wait. -->
+      <label name="mk1_supply_search"/>
       <do_if value="this.ship.cargo.count == 0">
       <set_value name="this.$supplyPriority" exact="false"/>
       <set_value name="this.$supplySkipped" exact="false"/>
@@ -821,14 +834,18 @@
         <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': === SUPPLY PHASE START (priority) ==='" chance="this.$debugchance"/>
         <set_command_action commandaction="commandaction.searchingtrades"/>
 
-        <!-- Build list of under-threshold resources -->
+        <!-- Two baskets. $supplyWares is what this ship wants right now (moves every cycle as
+             storage fills). $mk1SupplyCoverWares is every configured home resource, which does not
+             move, so it is what a fill searches and what the shared pool is matched against. -->
         <create_list name="$supplyWares"/>
+        <create_list name="$mk1SupplyCoverWares"/>
         <set_value name="$stationResources" exact="this.$homeStation.resources.list"/>
         <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Station resources count: ' + $stationResources.count + ', station money: ' + this.$homeStation.money" chance="this.$debugchance"/>
         <do_all exact="$stationResources.count" counter="$ri">
           <set_value name="$res" exact="$stationResources.{$ri}"/>
           <set_value name="$resTarget" exact="this.$homeStation.cargo.{$res}.target"/>
           <do_if value="$resTarget gt 0">
+            <append_to_list name="$mk1SupplyCoverWares" exact="$res"/>
             <set_value name="$resCurrent" exact="this.$homeStation.cargo.{$res}.count"/>
             <set_value name="$resPercent" exact="($resCurrent * 100) / $resTarget"/>
             <do_if value="$resPercent lt this.$minstorage and this.ship.cargo.{$res}.max gt 0">
@@ -838,49 +855,130 @@
           </do_if>
         </do_all>
 
-        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply wares to find: ' + $supplyWares.count" chance="this.$debugchance"/>
-        <!-- Small stagger to reduce same-tick herd selection across many subordinates. -->
-        <wait min="200ms" max="900ms"/>
-
-        <!-- Shared pipeline: pathfinding + live search + trade match -->
-        <run_script name="'lib.gt.pathfinding'" result="$supplySpaces">
-          <param name="ship" value="this.ship"/>
-          <param name="homeSector" value="this.$homeStation.sector"/>
-          <param name="maxDistance" value="this.$maxsell"/>
-        </run_script>
-        <set_value name="$mk1ResolvedBuySpaces" exact="[]"/>
-        <do_if value="$supplySpaces?">
-          <do_if value="$supplySpaces.$BuySpaces?">
-            <set_value name="$mk1ResolvedBuySpaces" exact="@$supplySpaces.$BuySpaces"/>
-          </do_if>
-        </do_if>
-
-        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Searching ' + $mk1ResolvedBuySpaces.count + ' sectors (maxsell=' + this.$maxsell + ')'" chance="this.$debugchance"/>
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply wares to find: ' + $supplyWares.count + ' (coverage ' + $mk1SupplyCoverWares.count + ')'" chance="this.$debugchance"/>
 
         <!-- MK1 order price range: UI offset 0-200 (100 = neutral) maps to normalized -1.0..+1.0 -->
         <set_value name="$mk1BuyPriceMin" exact="this.$pricerangeNorm"/>
         <set_value name="$mk1SellPriceMax" exact="0 - this.$pricerangeNorm"/>
-        <!-- Supply sources: any faction. Trade rules still enforced below unless ignoretraderules.
-             (Export sell_only stays npc_only — that path sells products, not supply pickup.) -->
-        <run_script name="'lib.gt.live.search'" result="$supplyLiveResult">
-          <param name="ship" value="this.ship"/>
-          <param name="searchMode" value="'buy_only'"/>
-          <param name="buySpaces" value="$mk1ResolvedBuySpaces"/>
-          <param name="sellSpaces" value="[]"/>
-          <param name="homeSector" value="this.$homeStation.sector"/>
-          <param name="maxDistance" value="this.$maxsell"/>
-          <param name="wareBasket" value="$supplyWares"/>
-          <param name="allowIllegal" value="this.$allowillegal"/>
-          <param name="ownerFilter" value="'any'"/>
-          <param name="ignoreTradeRules" value="this.$ignoretraderules"/>
-          <param name="ignoreMK1Supply" value="false"/>
-          <param name="sellPriceMax" value="$mk1SellPriceMax"/>
+
+        <run_script name="'lib.gt.mk1.cache.search'" result="$mk1SupplyCache">
+          <param name="homeStation" value="this.$homeStation"/>
+          <param name="side" value="'supply'"/>
+          <param name="wares" value="$supplyWares"/>
+          <param name="maxSell" value="this.$maxsell"/>
           <param name="buyPriceMin" value="$mk1BuyPriceMin"/>
+          <param name="sellPriceMax" value="$mk1SellPriceMax"/>
+          <param name="ignoreTradeRules" value="this.$ignoretraderules"/>
+          <param name="allowIllegal" value="this.$allowillegal"/>
+          <param name="basketMode" value="'auto'"/>
           <param name="debugchance" value="this.$debugchance"/>
         </run_script>
-        <set_value name="this.$mk1_supplyLiveResult" exact="$supplyLiveResult"/>
-        <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield after supply live search"/>
-        <set_value name="$supplyLiveResult" exact="this.$mk1_supplyLiveResult"/>
+
+        <set_value name="$mk1SupplySlotHeld" exact="if @this.$mk1SlotHeld == true and @this.$mk1SlotSide == 'supply' then true else false"/>
+
+        <do_if value="@$mk1SupplyCache.$Hit == true">
+          <!-- A peer filled the pool while we queued: hand the slot straight back unused. -->
+          <do_if value="@this.$mk1SlotHeld == true">
+            <signal_objects object="player.galaxy" param="'GT_MK1Live_Done'" param2="table[$Ship = this.ship]"/>
+            <set_value name="this.$mk1SlotHeld" exact="false"/>
+          </do_if>
+          <set_value name="$supplyLiveResult" exact="table[$SellOffers = @$mk1SupplyCache.$Offers, $BuyOffers = []]"/>
+        </do_if>
+        <do_elseif value="not $mk1SupplySlotHeld">
+          <!-- A slot held for the other side cannot fill this pool: release before re-queuing. -->
+          <do_if value="@this.$mk1SlotHeld == true">
+            <signal_objects object="player.galaxy" param="'GT_MK1Live_Done'" param2="table[$Ship = this.ship]"/>
+            <set_value name="this.$mk1SlotHeld" exact="false"/>
+          </do_if>
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply cache MISS (' + (if $mk1SupplyCache.$Reason? then @$mk1SupplyCache.$Reason else '?') + ') - requesting live slot'" chance="this.$debugchance"/>
+          <signal_objects object="player.galaxy" param="'GT_MK1Live_Request'" param2="table[$Ship = this.ship, $HomeStation = this.$homeStation, $Side = 'supply']"/>
+          <wait min="30s" max="30s" comment="Wait for MK1 live slot grant; interrupted immediately on GT_MK1Live_Go">
+            <interrupt>
+              <conditions>
+                <event_object_signalled object="this.ship" param="'GT_MK1Live_Go'"/>
+              </conditions>
+              <actions>
+                <set_value name="this.$mk1SlotHeld" exact="true"/>
+                <set_value name="this.$mk1SlotSide" exact="'supply'"/>
+                <resume label="mk1_supply_search"/>
+              </actions>
+            </interrupt>
+          </wait>
+          <!-- No grant in time: drop the queue entry and treat this cycle as "no supply offers".
+               The main loop retries; nothing is left holding a slot. -->
+          <signal_objects object="player.galaxy" param="'GT_MK1Live_Abort'" param2="table[$Ship = this.ship]"/>
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply live slot wait timed out - skipping supply this cycle'" chance="this.$debugchance"/>
+          <set_value name="$supplyLiveResult" exact="table[$SellOffers = [], $BuyOffers = []]"/>
+        </do_elseif>
+        <do_else>
+          <!-- Slot granted and the pool is still cold: this ship performs the fill for the home.
+               Pool key and coverage go on this.$ before the first yielding call, because the fill
+               basket and the write must agree even though several yields sit between them. -->
+          <set_value name="this.$mk1_supplyPoolKey" exact="@$mk1SupplyCache.$PoolKey"/>
+          <set_value name="this.$mk1_supplyCoverWares" exact="$mk1SupplyCoverWares"/>
+          <run_script name="'lib.gt.pathfinding'" result="$supplySpaces">
+            <param name="ship" value="this.ship"/>
+            <param name="homeSector" value="this.$homeStation.sector"/>
+            <param name="maxDistance" value="this.$maxsell"/>
+          </run_script>
+          <set_value name="$mk1ResolvedBuySpaces" exact="[]"/>
+          <do_if value="$supplySpaces?">
+            <do_if value="$supplySpaces.$BuySpaces?">
+              <set_value name="$mk1ResolvedBuySpaces" exact="@$supplySpaces.$BuySpaces"/>
+            </do_if>
+          </do_if>
+
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Supply live fill over ' + $mk1ResolvedBuySpaces.count + ' sectors (maxsell=' + this.$maxsell + ')'" chance="this.$debugchance"/>
+
+          <!-- Supply sources: any faction. Trade rules still enforced below unless ignoretraderules.
+               (Export sell_only stays npc_only — that path sells products, not supply pickup.) -->
+          <run_script name="'lib.gt.live.search'" result="$supplyLiveResult">
+            <param name="ship" value="this.ship"/>
+            <param name="searchMode" value="'buy_only'"/>
+            <param name="buySpaces" value="$mk1ResolvedBuySpaces"/>
+            <param name="sellSpaces" value="[]"/>
+            <param name="homeSector" value="this.$homeStation.sector"/>
+            <param name="maxDistance" value="this.$maxsell"/>
+            <param name="wareBasket" value="this.$mk1_supplyCoverWares"/>
+            <param name="allowIllegal" value="this.$allowillegal"/>
+            <param name="ownerFilter" value="'any'"/>
+            <param name="ignoreTradeRules" value="this.$ignoretraderules"/>
+            <param name="ignoreMK1Supply" value="false"/>
+            <param name="sellPriceMax" value="$mk1SellPriceMax"/>
+            <param name="buyPriceMin" value="$mk1BuyPriceMin"/>
+            <param name="debugchance" value="this.$debugchance"/>
+          </run_script>
+          <set_value name="this.$mk1_supplyLiveResult" exact="$supplyLiveResult"/>
+          <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield after supply live search"/>
+          <set_value name="$supplyLiveResult" exact="this.$mk1_supplyLiveResult"/>
+
+          <run_script name="'lib.gt.mk1.cache.write'" result="$mk1SupplyWrote">
+            <param name="poolKey" value="this.$mk1_supplyPoolKey"/>
+            <param name="side" value="'supply'"/>
+            <param name="homeStation" value="this.$homeStation"/>
+            <param name="offers" value="@$supplyLiveResult.$SellOffers"/>
+            <param name="coverWares" value="this.$mk1_supplyCoverWares"/>
+            <param name="maxSell" value="this.$maxsell"/>
+            <param name="buyPriceMin" value="$mk1BuyPriceMin"/>
+            <param name="sellPriceMax" value="$mk1SellPriceMax"/>
+            <param name="ignoreTradeRules" value="this.$ignoretraderules"/>
+            <param name="allowIllegal" value="this.$allowillegal"/>
+            <param name="debugchance" value="this.$debugchance"/>
+          </run_script>
+          <signal_objects object="player.galaxy" param="'GT_MK1Live_Done'" param2="table[$Ship = this.ship]"/>
+          <set_value name="this.$mk1SlotHeld" exact="false"/>
+
+          <!-- Narrow the freshly written superset through the same read path, so a filling ship and
+               a cache-hitting peer both act on an identically filtered list. -->
+          <run_script name="'lib.gt.mk1.cache.search'" result="$mk1SupplyCacheFilled">
+            <param name="homeStation" value="this.$homeStation"/>
+            <param name="side" value="'supply'"/>
+            <param name="wares" value="$supplyWares"/>
+            <param name="knownPoolKey" value="this.$mk1_supplyPoolKey"/>
+            <param name="debugchance" value="this.$debugchance"/>
+          </run_script>
+          <set_value name="$supplyLiveResult" exact="table[$SellOffers = @$mk1SupplyCacheFilled.$Offers, $BuyOffers = []]"/>
+        </do_else>
 
         <!-- Safety filter: supply mode must not buy from the same home station.
              This prevents degenerate self-trades (buy+deliver on identical station). -->
@@ -1289,8 +1387,13 @@
       <!-- ============================================================== -->
       <set_command_action commandaction="commandaction.searchingtrades"/>
 
+      <!-- Re-entry point once a live slot is granted. Basket construction below is station
+           bookkeeping only, so re-running it means no local has to survive the slot wait. -->
+      <label name="mk1_export_search"/>
+
       <!-- Inline: Build effective ware basket from station products/tradewares -->
       <create_list name="$effectiveWares"/>
+      <create_list name="$mk1ExportCoverWares"/>
       <create_list name="$candidateWares"/>
       <create_list name="$stationProducts"/>
       <create_list name="$stationTradewares"/>
@@ -1344,16 +1447,20 @@
         </do_all>
       </do_else>
 
-      <!-- Filter candidates: cargo compatibility, processed, illegal -->
+      <!-- Filter candidates: cargo compatibility, processed, illegal.
+           The ship-independent rejects also define the cache coverage set: a fill searches every
+           ware the station could ever export under these settings, and the per-ship cargo filter
+           plus the storage gate below are applied when the pool is read. -->
       <do_all exact="$candidateWares.count" counter="$fi">
         <set_value name="$fw" exact="$candidateWares.{$fi}"/>
-        <do_if value="this.ship.cargo.{$fw}.max le 0">
-          <continue/>
-        </do_if>
         <do_if value="$fw.isprocessed">
           <continue/>
         </do_if>
         <do_if value="not this.$allowillegal and $fw.illegal">
+          <continue/>
+        </do_if>
+        <append_to_list name="$mk1ExportCoverWares" exact="$fw"/>
+        <do_if value="this.ship.cargo.{$fw}.max le 0">
           <continue/>
         </do_if>
         <append_to_list name="$effectiveWares" exact="$fw"/>
@@ -1476,6 +1583,12 @@
       <set_value name="$mk1NoWaresReason" exact="if this.$minsellstorage gt 0 and $mk1PreGateEffectiveCount gt 0 then 'all products below Min Product Storage % (' + this.$minsellstorage + ')' else 'no wares available from station'"/>
 
       <do_if value="$effectiveWares.count == 0">
+        <!-- These branches leave the search region, so give back a slot granted for a fill that
+             is no longer needed. -->
+        <do_if value="@this.$mk1SlotHeld == true">
+          <signal_objects object="player.galaxy" param="'GT_MK1Live_Done'" param2="table[$Ship = this.ship]"/>
+          <set_value name="this.$mk1SlotHeld" exact="false"/>
+        </do_if>
         <do_if value="this.$returnhome">
           <do_if value="this.$mk1_returnhomeReleased? and this.$mk1_returnhomeReleased">
             <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': ' + $mk1NoWaresReason + ' — return-home released state active, staying undocked and waiting ' + this.$waitTimeNoTrades" chance="this.$debugchance"/>
@@ -1503,24 +1616,12 @@
       <!-- ============================================================== -->
       <!-- STEP 5: Find best sale opportunity                             -->
       <!-- ============================================================== -->
-      <!-- Shared pipeline: pathfinding + live search + trade match -->
-      <run_script name="'lib.gt.pathfinding'" result="$sellSpaces">
-        <param name="ship" value="this.ship"/>
-        <param name="homeSector" value="this.$homeStation.sector"/>
-        <param name="maxDistance" value="this.$maxsell"/>
-      </run_script>
-      <set_value name="$mk1ResolvedSellSpaces" exact="[]"/>
-      <do_if value="$sellSpaces?">
-        <do_if value="$sellSpaces.$SellSpaces?">
-          <set_value name="$mk1ResolvedSellSpaces" exact="@$sellSpaces.$SellSpaces"/>
-        </do_if>
-      </do_if>
-
       <!-- Re-read MK1 order price range (may have changed since supply search) -->
       <set_value name="$mk1BuyPriceMin" exact="this.$pricerangeNorm"/>
       <set_value name="$mk1SellPriceMax" exact="0 - this.$pricerangeNorm"/>
 
-      <!-- Resolve home-station sell offers before buyer scan so live search can rank buyers by estimated profit. -->
+      <!-- Home-station sell offers for the wares this ship can actually move. Needed on both the
+           cached and the live path: tradematch pairs buyers against these. -->
       <create_list name="$stationSellOffers"/>
       <do_all exact="$effectiveWares.count" counter="$ewi">
         <set_value name="$ware" exact="$effectiveWares.{$ewi}"/>
@@ -1536,28 +1637,141 @@
         </do_if>
       </do_all>
 
-      <run_script name="'lib.gt.live.search'" result="$sellLiveResult">
-        <param name="ship" value="this.ship"/>
-        <param name="searchMode" value="'sell_only'"/>
-        <param name="buySpaces" value="[]"/>
-        <param name="sellSpaces" value="$mk1ResolvedSellSpaces"/>
-        <param name="homeSector" value="this.$homeStation.sector"/>
-        <param name="maxDistance" value="this.$maxsell"/>
-        <param name="wareBasket" value="$effectiveWares"/>
-        <param name="allowIllegal" value="this.$allowillegal"/>
-        <param name="ownerFilter" value="'npc_only'"/>
-        <param name="ignoreTradeRules" value="this.$ignoretraderules"/>
-        <param name="ignoreMK1Supply" value="false"/>
-        <param name="sellPriceMax" value="$mk1SellPriceMax"/>
+      <set_value name="$mk1ExportBasketMode" exact="if $mk1AutoMode then 'auto' else 'manual'"/>
+      <run_script name="'lib.gt.mk1.cache.search'" result="$mk1ExportCache">
+        <param name="homeStation" value="this.$homeStation"/>
+        <param name="side" value="'export'"/>
+        <param name="wares" value="$effectiveWares"/>
+        <param name="maxSell" value="this.$maxsell"/>
         <param name="buyPriceMin" value="$mk1BuyPriceMin"/>
-        <param name="sourceSellOffers" value="$stationSellOffers"/>
-        <param name="scoreAwareBuyCap" value="true"/>
-        <param name="distancePenalty" value="0.1"/>
+        <param name="sellPriceMax" value="$mk1SellPriceMax"/>
+        <param name="ignoreTradeRules" value="this.$ignoretraderules"/>
+        <param name="allowIllegal" value="this.$allowillegal"/>
+        <param name="basketMode" value="$mk1ExportBasketMode"/>
         <param name="debugchance" value="this.$debugchance"/>
       </run_script>
-      <set_value name="this.$mk1_sellLiveResult" exact="$sellLiveResult"/>
-      <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield after sell live search"/>
-      <set_value name="$sellLiveResult" exact="this.$mk1_sellLiveResult"/>
+
+      <set_value name="$mk1ExportSlotHeld" exact="if @this.$mk1SlotHeld == true and @this.$mk1SlotSide == 'export' then true else false"/>
+
+      <do_if value="@$mk1ExportCache.$Hit == true">
+        <!-- A peer filled the pool while we queued: hand the slot straight back unused. -->
+        <do_if value="@this.$mk1SlotHeld == true">
+          <signal_objects object="player.galaxy" param="'GT_MK1Live_Done'" param2="table[$Ship = this.ship]"/>
+          <set_value name="this.$mk1SlotHeld" exact="false"/>
+        </do_if>
+        <set_value name="$sellLiveResult" exact="table[$SellOffers = [], $BuyOffers = @$mk1ExportCache.$Offers]"/>
+      </do_if>
+      <do_elseif value="not $mk1ExportSlotHeld">
+        <!-- A slot held for the other side cannot fill this pool: release before re-queuing. -->
+        <do_if value="@this.$mk1SlotHeld == true">
+          <signal_objects object="player.galaxy" param="'GT_MK1Live_Done'" param2="table[$Ship = this.ship]"/>
+          <set_value name="this.$mk1SlotHeld" exact="false"/>
+        </do_if>
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Export cache MISS (' + (if $mk1ExportCache.$Reason? then @$mk1ExportCache.$Reason else '?') + ') - requesting live slot'" chance="this.$debugchance"/>
+        <signal_objects object="player.galaxy" param="'GT_MK1Live_Request'" param2="table[$Ship = this.ship, $HomeStation = this.$homeStation, $Side = 'export']"/>
+        <wait min="30s" max="30s" comment="Wait for MK1 live slot grant; interrupted immediately on GT_MK1Live_Go">
+          <interrupt>
+            <conditions>
+              <event_object_signalled object="this.ship" param="'GT_MK1Live_Go'"/>
+            </conditions>
+            <actions>
+              <set_value name="this.$mk1SlotHeld" exact="true"/>
+              <set_value name="this.$mk1SlotSide" exact="'export'"/>
+              <resume label="mk1_export_search"/>
+            </actions>
+          </interrupt>
+        </wait>
+        <!-- No grant in time: drop the queue entry and treat this cycle as "no buyers found".
+             The main loop retries; nothing is left holding a slot. -->
+        <signal_objects object="player.galaxy" param="'GT_MK1Live_Abort'" param2="table[$Ship = this.ship]"/>
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Export live slot wait timed out - skipping export search this cycle'" chance="this.$debugchance"/>
+        <set_value name="$sellLiveResult" exact="table[$SellOffers = [], $BuyOffers = []]"/>
+      </do_elseif>
+      <do_else>
+        <!-- Slot granted and the pool is still cold: this ship performs the fill for the home.
+             Pool key and coverage go on this.$ before the first yielding call, because the fill
+             basket and the write must agree even though several yields sit between them. -->
+        <set_value name="this.$mk1_exportPoolKey" exact="@$mk1ExportCache.$PoolKey"/>
+        <set_value name="this.$mk1_exportCoverWares" exact="$mk1ExportCoverWares"/>
+        <run_script name="'lib.gt.pathfinding'" result="$sellSpaces">
+          <param name="ship" value="this.ship"/>
+          <param name="homeSector" value="this.$homeStation.sector"/>
+          <param name="maxDistance" value="this.$maxsell"/>
+        </run_script>
+        <set_value name="$mk1ResolvedSellSpaces" exact="[]"/>
+        <do_if value="$sellSpaces?">
+          <do_if value="$sellSpaces.$SellSpaces?">
+            <set_value name="$mk1ResolvedSellSpaces" exact="@$sellSpaces.$SellSpaces"/>
+          </do_if>
+        </do_if>
+
+        <!-- Score-aware capping only keeps buyers for wares that have a home sell offer, so the
+             fill needs the offers for the whole coverage set, not just this ship's basket. -->
+        <create_list name="$mk1CoverSellOffers"/>
+        <do_all exact="this.$mk1_exportCoverWares.count" counter="$cwoi">
+          <set_value name="$coverWare" exact="this.$mk1_exportCoverWares.{$cwoi}"/>
+          <set_value name="$coverSellOffer" exact="null"/>
+          <do_if value="this.$ignoretraderules">
+            <find_sell_offer seller="this.$homeStation" wares="$coverWare" result="$coverSellOffer"/>
+          </do_if>
+          <do_else>
+            <find_sell_offer seller="this.$homeStation" wares="$coverWare" tradepartner="this.ship" result="$coverSellOffer"/>
+          </do_else>
+          <do_if value="@$coverSellOffer != null and $coverSellOffer.available and $coverSellOffer.amount gt 0 and $coverSellOffer.ware == $coverWare">
+            <append_to_list name="$mk1CoverSellOffers" exact="$coverSellOffer"/>
+          </do_if>
+        </do_all>
+
+        <run_script name="'lib.gt.live.search'" result="$sellLiveResult">
+          <param name="ship" value="this.ship"/>
+          <param name="searchMode" value="'sell_only'"/>
+          <param name="buySpaces" value="[]"/>
+          <param name="sellSpaces" value="$mk1ResolvedSellSpaces"/>
+          <param name="homeSector" value="this.$homeStation.sector"/>
+          <param name="maxDistance" value="this.$maxsell"/>
+          <param name="wareBasket" value="this.$mk1_exportCoverWares"/>
+          <param name="allowIllegal" value="this.$allowillegal"/>
+          <param name="ownerFilter" value="'npc_only'"/>
+          <param name="ignoreTradeRules" value="this.$ignoretraderules"/>
+          <param name="ignoreMK1Supply" value="false"/>
+          <param name="sellPriceMax" value="$mk1SellPriceMax"/>
+          <param name="buyPriceMin" value="$mk1BuyPriceMin"/>
+          <param name="sourceSellOffers" value="$mk1CoverSellOffers"/>
+          <param name="scoreAwareBuyCap" value="true"/>
+          <param name="distancePenalty" value="0.1"/>
+          <param name="debugchance" value="this.$debugchance"/>
+        </run_script>
+        <set_value name="this.$mk1_sellLiveResult" exact="$sellLiveResult"/>
+        <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield after sell live search"/>
+        <set_value name="$sellLiveResult" exact="this.$mk1_sellLiveResult"/>
+
+        <run_script name="'lib.gt.mk1.cache.write'" result="$mk1ExportWrote">
+          <param name="poolKey" value="this.$mk1_exportPoolKey"/>
+          <param name="side" value="'export'"/>
+          <param name="homeStation" value="this.$homeStation"/>
+          <param name="offers" value="@$sellLiveResult.$BuyOffers"/>
+          <param name="coverWares" value="this.$mk1_exportCoverWares"/>
+          <param name="maxSell" value="this.$maxsell"/>
+          <param name="buyPriceMin" value="$mk1BuyPriceMin"/>
+          <param name="sellPriceMax" value="$mk1SellPriceMax"/>
+          <param name="ignoreTradeRules" value="this.$ignoretraderules"/>
+          <param name="allowIllegal" value="this.$allowillegal"/>
+          <param name="debugchance" value="this.$debugchance"/>
+        </run_script>
+        <signal_objects object="player.galaxy" param="'GT_MK1Live_Done'" param2="table[$Ship = this.ship]"/>
+        <set_value name="this.$mk1SlotHeld" exact="false"/>
+
+        <!-- Narrow the freshly written superset through the same read path, so a filling ship and
+             a cache-hitting peer both act on an identically filtered list. -->
+        <run_script name="'lib.gt.mk1.cache.search'" result="$mk1ExportCacheFilled">
+          <param name="homeStation" value="this.$homeStation"/>
+          <param name="side" value="'export'"/>
+          <param name="wares" value="$effectiveWares"/>
+          <param name="knownPoolKey" value="this.$mk1_exportPoolKey"/>
+          <param name="debugchance" value="this.$debugchance"/>
+        </run_script>
+        <set_value name="$sellLiveResult" exact="table[$SellOffers = [], $BuyOffers = @$mk1ExportCacheFilled.$Offers]"/>
+      </do_else>
 
       <!-- Enforce home-station trade rules when ignoretraderules=false.
            Candidate buyers must be valid with the station as tradepartner,
@@ -2630,6 +2844,12 @@
     </actions>
   </attention>
   <on_abort>
+    <!-- Give back the MK1 live slot first: this runs before the handoff early-returns below,
+         because an abort taken while queued or mid-fill must never leave the pool short.
+         Idempotent - the scheduler ignores a ship it has no queue or active entry for. -->
+    <signal_objects object="player.galaxy" param="'GT_MK1Live_Abort'" param2="table[$Ship = this.ship]"/>
+    <set_value name="this.$mk1SlotHeld" exact="false"/>
+
     <!-- Intentional handoff: MK1 can spawn DockAndReturnHome to get visible queued pathing.
          Do not run GT cleanup/cancel bridge in this case. -->
     <do_if value="global.$GT_MK1ReturnHomeReleased? and global.$GT_MK1ReturnHomeReleased.{this.ship}?">

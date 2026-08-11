@@ -1,0 +1,239 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="GT_TradeSearch_Scheduler_MK1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/md.xsd">
+  <cues>
+    <!-- MK1 live-search slot pool.
+         Slot ticket only: GT_MK1Live_Request -> GT_MK1Live_Go -> GT_MK1Live_Done / _Abort.
+         No trade list is transported - the MK1 order runs its own search under the grant and
+         reads its own results, so it does not join the MK3/MK4 cache/live pipeline.
+
+         Guarantees:
+         1) At most $MaxConcurrentMK1Live fills galaxy-wide.
+         2) At most one fill per (home station, side) slot, so a fleet sharing a home produces
+            one live fill and every peer hits the cache when its own grant arrives.
+         3) A lost Done cannot shrink capacity: stale actives are reaped on every dispatch. -->
+
+    <cue name="InitMK1Semaphore" instantiate="true" version="1">
+      <conditions>
+        <check_any>
+          <event_game_loaded/>
+          <event_player_created/>
+          <event_cue_signalled/>
+        </check_any>
+      </conditions>
+      <actions>
+        <do_if value="not global.$GT_SearchSemaphore?">
+          <set_value name="global.$GT_SearchSemaphore" exact="table[]"/>
+        </do_if>
+        <!-- In-flight and queued bookkeeping cannot be resumed after save/load: always reset. -->
+        <set_value name="global.$GT_SearchSemaphore.$MK1LiveQueue" exact="[]"/>
+        <set_value name="global.$GT_SearchSemaphore.$MK1LiveQueued" exact="table[]"/>
+        <set_value name="global.$GT_SearchSemaphore.$MK1LiveActiveShips" exact="table[]"/>
+        <set_value name="global.$GT_SearchSemaphore.$MK1LiveActive" exact="0"/>
+        <set_value name="global.$GT_SearchSemaphore.$MK1LiveSlotActive" exact="table[]"/>
+        <set_value name="global.$GT_SearchSemaphore.$MaxConcurrentMK1Live" exact="3"/>
+        <set_value name="global.$GT_SearchSemaphore.$MK1LiveDispatchScheduled" exact="false"/>
+      </actions>
+    </cue>
+
+    <cue name="HandleMK1LiveRequest" instantiate="true" namespace="this">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_MK1Live_Request'"/>
+      </conditions>
+      <actions>
+        <do_if value="not global.$GT_SearchSemaphore?">
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK1.InitMK1Semaphore"/>
+        </do_if>
+        <do_elseif value="not global.$GT_SearchSemaphore.$MK1LiveQueue?">
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK1.InitMK1Semaphore"/>
+        </do_elseif>
+        <set_value name="$req" exact="event.param2"/>
+        <set_value name="$ship" exact="@$req.$Ship"/>
+        <set_value name="$homeStation" exact="@$req.$HomeStation"/>
+        <set_value name="$side" exact="if $req? and $req.$Side? then @$req.$Side else 'supply'"/>
+        <do_if value="@$ship != null and $ship.exists">
+          <!-- Already queued or already holding a slot: the ship is still inside its own wait, so a
+               second entry would grant twice and leak a slot when the first Done arrives. -->
+          <set_value name="$alreadyScheduled" exact="false"/>
+          <do_if value="global.$GT_SearchSemaphore.$MK1LiveQueued.{$ship}?">
+            <set_value name="$alreadyScheduled" exact="true"/>
+          </do_if>
+          <do_elseif value="global.$GT_SearchSemaphore.$MK1LiveActiveShips.{$ship}?">
+            <set_value name="$alreadyScheduled" exact="true"/>
+          </do_elseif>
+          <do_if value="not $alreadyScheduled">
+            <set_value name="$slotKey" exact="'$' + (if @$homeStation != null and $homeStation.exists then $homeStation.idcode else 'nohome') + '|' + $side"/>
+            <append_to_list name="global.$GT_SearchSemaphore.$MK1LiveQueue" exact="table[
+              $Ship = $ship,
+              $SlotKey = $slotKey,
+              $Side = $side,
+              $EnqueuedAt = player.age
+            ]"/>
+            <set_value name="global.$GT_SearchSemaphore.$MK1LiveQueued.{$ship}" exact="true"/>
+            <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK1.DispatchMK1LiveGo"/>
+          </do_if>
+          <do_elseif value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-MK1Sched] Duplicate live request ignored ship=' + $ship.idcode + ' side=' + $side" chance="100"/>
+          </do_elseif>
+        </do_if>
+      </actions>
+    </cue>
+
+    <cue name="DispatchMK1LiveGoDelayed" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay min="200ms" max="1s"/>
+      <actions>
+        <do_if value="global.$GT_SearchSemaphore?">
+          <set_value name="global.$GT_SearchSemaphore.$MK1LiveDispatchScheduled" exact="false"/>
+        </do_if>
+        <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK1.DispatchMK1LiveGo"/>
+      </actions>
+    </cue>
+
+    <cue name="DispatchMK1LiveGo" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <do_if value="not global.$GT_SearchSemaphore?">
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK1.InitMK1Semaphore"/>
+        </do_if>
+        <do_elseif value="not global.$GT_SearchSemaphore.$MK1LiveQueue?">
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK1.InitMK1Semaphore"/>
+        </do_elseif>
+
+        <!-- Reap actives whose owner is gone or that outlived any plausible search. The AI releases
+             on every exit path; this only covers ship destruction and order teardown races, and
+             keeps a lost release from capping the pool forever. -->
+        <set_value name="$activeCount" exact="@global.$GT_SearchSemaphore.$MK1LiveActiveShips.keys.count"/>
+        <do_if value="$activeCount != null and $activeCount gt 0">
+          <set_value name="$activeKeys" exact="global.$GT_SearchSemaphore.$MK1LiveActiveShips.keys.list"/>
+          <do_all exact="$activeKeys.count" counter="$mk1ai">
+            <set_value name="$activeShip" exact="$activeKeys.{$mk1ai}"/>
+            <set_value name="$activeEntry" exact="@global.$GT_SearchSemaphore.$MK1LiveActiveShips.{$activeShip}"/>
+            <set_value name="$activeStartedAt" exact="if $activeEntry? and $activeEntry.$StartedAt != null then @$activeEntry.$StartedAt else null"/>
+            <set_value name="$activeStale" exact="false"/>
+            <do_if value="@$activeShip == null or not $activeShip.exists">
+              <set_value name="$activeStale" exact="true"/>
+            </do_if>
+            <do_elseif value="$activeStartedAt == null or (player.age - $activeStartedAt) gt 60s">
+              <set_value name="$activeStale" exact="true"/>
+            </do_elseif>
+            <do_if value="$activeStale">
+              <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-MK1Sched] Reaped stale live slot owner=' + (if @$activeShip != null then $activeShip.idcode else 'gone') + ' startedAt=' + (if $activeStartedAt != null then $activeStartedAt else 'null')" chance="100"/>
+              </do_if>
+              <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK1.ReleaseMK1LiveSlot" param="$activeShip"/>
+            </do_if>
+          </do_all>
+        </do_if>
+
+        <!-- One pass, budget = queue length. Entries whose (home, side) slot is busy rotate to the
+             tail, so a busy home cannot starve another home and the loop always terminates. -->
+        <set_value name="$budget" exact="global.$GT_SearchSemaphore.$MK1LiveQueue.count"/>
+        <do_while value="$budget gt 0 and global.$GT_SearchSemaphore.$MK1LiveQueue.count gt 0 and global.$GT_SearchSemaphore.$MK1LiveActive lt global.$GT_SearchSemaphore.$MaxConcurrentMK1Live">
+          <set_value name="$budget" operation="subtract"/>
+          <set_value name="$entry" exact="global.$GT_SearchSemaphore.$MK1LiveQueue.{1}"/>
+          <remove_value name="global.$GT_SearchSemaphore.$MK1LiveQueue.{1}"/>
+          <set_value name="$entryShip" exact="@$entry.$Ship"/>
+          <set_value name="$entrySlotKey" exact="if $entry? and $entry.$SlotKey? then @$entry.$SlotKey else '$nohome|supply'"/>
+          <set_value name="$entrySide" exact="if $entry? and $entry.$Side? then @$entry.$Side else 'supply'"/>
+
+          <do_if value="@$entryShip == null or not $entryShip.exists">
+            <do_if value="@$entryShip != null and global.$GT_SearchSemaphore.$MK1LiveQueued.{$entryShip}?">
+              <remove_value name="global.$GT_SearchSemaphore.$MK1LiveQueued.{$entryShip}"/>
+            </do_if>
+            <continue/>
+          </do_if>
+
+          <do_if value="global.$GT_SearchSemaphore.$MK1LiveSlotActive.{$entrySlotKey}?">
+            <append_to_list name="global.$GT_SearchSemaphore.$MK1LiveQueue" exact="$entry"/>
+            <continue/>
+          </do_if>
+
+          <set_value name="global.$GT_SearchSemaphore.$MK1LiveActive" operation="add"/>
+          <set_value name="global.$GT_SearchSemaphore.$MK1LiveActiveShips.{$entryShip}" exact="table[
+            $StartedAt = player.age,
+            $SlotKey = $entrySlotKey
+          ]"/>
+          <set_value name="global.$GT_SearchSemaphore.$MK1LiveSlotActive.{$entrySlotKey}" exact="$entryShip"/>
+          <remove_value name="global.$GT_SearchSemaphore.$MK1LiveQueued.{$entryShip}"/>
+          <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Debug? and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-MK1Sched] Go ship=' + $entryShip.idcode + ' slot=' + $entrySlotKey + ' active=' + global.$GT_SearchSemaphore.$MK1LiveActive + '/' + global.$GT_SearchSemaphore.$MaxConcurrentMK1Live + ' queued=' + global.$GT_SearchSemaphore.$MK1LiveQueue.count" chance="100"/>
+          </do_if>
+          <signal_objects object="$entryShip" param="'GT_MK1Live_Go'" param2="table[$Side = $entrySide]" delay="1ms"/>
+        </do_while>
+
+        <!-- Still work left but no capacity: re-arm one delayed pass (debounced). -->
+        <do_if value="global.$GT_SearchSemaphore.$MK1LiveQueue.count gt 0 and not global.$GT_SearchSemaphore.$MK1LiveDispatchScheduled">
+          <set_value name="global.$GT_SearchSemaphore.$MK1LiveDispatchScheduled" exact="true"/>
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK1.DispatchMK1LiveGoDelayed"/>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- Single release path shared by Done, Abort and the stale reaper. param = ship. -->
+    <cue name="ReleaseMK1LiveSlot" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="$relShip" exact="event.param"/>
+        <do_if value="global.$GT_SearchSemaphore? and @$relShip != null">
+          <do_if value="global.$GT_SearchSemaphore.$MK1LiveActiveShips.{$relShip}?">
+            <set_value name="$relEntry" exact="@global.$GT_SearchSemaphore.$MK1LiveActiveShips.{$relShip}"/>
+            <set_value name="$relSlotKey" exact="if $relEntry? and $relEntry.$SlotKey? then @$relEntry.$SlotKey else ''"/>
+            <remove_value name="global.$GT_SearchSemaphore.$MK1LiveActiveShips.{$relShip}"/>
+            <do_if value="global.$GT_SearchSemaphore.$MK1LiveActive gt 0">
+              <set_value name="global.$GT_SearchSemaphore.$MK1LiveActive" operation="subtract"/>
+            </do_if>
+            <do_if value="$relSlotKey != '' and global.$GT_SearchSemaphore.$MK1LiveSlotActive.{$relSlotKey}?">
+              <do_if value="@global.$GT_SearchSemaphore.$MK1LiveSlotActive.{$relSlotKey} == $relShip">
+                <remove_value name="global.$GT_SearchSemaphore.$MK1LiveSlotActive.{$relSlotKey}"/>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+
+    <cue name="HandleMK1LiveDone" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_MK1Live_Done'"/>
+      </conditions>
+      <actions>
+        <set_value name="$doneData" exact="event.param2"/>
+        <set_value name="$doneShip" exact="@$doneData.$Ship"/>
+        <do_if value="@$doneShip != null">
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK1.ReleaseMK1LiveSlot" param="$doneShip"/>
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK1.DispatchMK1LiveGo"/>
+        </do_if>
+      </actions>
+    </cue>
+
+    <!-- Wait timeout or order abort: drop the queue entry as well as any held slot. -->
+    <cue name="HandleMK1LiveAbort" instantiate="true">
+      <conditions>
+        <event_object_signalled object="player.galaxy" param="'GT_MK1Live_Abort'"/>
+      </conditions>
+      <actions>
+        <set_value name="$abortData" exact="event.param2"/>
+        <set_value name="$abortShip" exact="@$abortData.$Ship"/>
+        <do_if value="global.$GT_SearchSemaphore? and @$abortShip != null">
+          <do_if value="global.$GT_SearchSemaphore.$MK1LiveQueued.{$abortShip}?">
+            <do_all exact="global.$GT_SearchSemaphore.$MK1LiveQueue.count" counter="$mk1qi" reverse="true">
+              <set_value name="$abortEntry" exact="@global.$GT_SearchSemaphore.$MK1LiveQueue.{$mk1qi}"/>
+              <do_if value="$abortEntry? and $abortEntry.$Ship? and @$abortEntry.$Ship == $abortShip">
+                <remove_value name="global.$GT_SearchSemaphore.$MK1LiveQueue.{$mk1qi}"/>
+              </do_if>
+            </do_all>
+            <remove_value name="global.$GT_SearchSemaphore.$MK1LiveQueued.{$abortShip}"/>
+          </do_if>
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK1.ReleaseMK1LiveSlot" param="$abortShip"/>
+          <signal_cue_instantly cue="md.GT_TradeSearch_Scheduler_MK1.DispatchMK1LiveGo"/>
+        </do_if>
+      </actions>
+    </cue>
+  </cues>
+</mdscript>

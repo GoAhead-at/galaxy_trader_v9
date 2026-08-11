@@ -1,0 +1,179 @@
+<?xml version="1.0" encoding="utf-8"?>
+<aiscript name="lib.gt.mk1.cache.search" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <!--
+    MK1 offer-cache read. Dedicated pool, never touches GT_TradeCache (MK3) or GT_TradeCacheMK4.
+
+    Storage: global.$GT_TradeCacheMK1.{poolKey}
+      poolKey = '$' + homeIdcode + '|' + side + '|d' + maxSell + '|p' + band
+                + '|t' + ignoreTradeRules + '|i' + allowIllegal + '|' + basketMode
+
+    Everything that would make one ship's offers wrong for another ship is in the key, so two
+    configurations at the same home cannot overwrite each other. Everything volatile (which wares
+    are currently below/above their storage threshold, ship cargo compatibility) is filtered here
+    at read time instead: a fill stores a stable ware superset ($CoveredWares) so cycle-to-cycle
+    basket changes stay HITs.
+
+    A valid pool that yields zero offers for the requested wares is a HIT with an empty list -
+    that is the same answer a live search would give, and escalating it would reintroduce the
+    stampede this cache exists to remove.
+  -->
+  <params>
+    <param name="homeStation" default="null" comment="MK1 home station (pool identity)"/>
+    <param name="side" default="'supply'" comment="'supply' (sell offers) or 'export' (buy offers)"/>
+    <param name="wares" default="[]" comment="Narrow basket wanted this cycle"/>
+    <param name="maxSell" default="0" comment="Jump radius used for the fill"/>
+    <param name="buyPriceMin" default="0" comment="Normalized price band low"/>
+    <param name="sellPriceMax" default="0" comment="Normalized price band high"/>
+    <param name="ignoreTradeRules" default="false"/>
+    <param name="allowIllegal" default="false"/>
+    <param name="basketMode" default="'auto'" comment="'auto' (station lists) or 'manual' (order ware basket)"/>
+    <param name="maxAge" default="0s" comment="0 = take $Fleet.$CacheTTL"/>
+    <param name="knownPoolKey" default="''" comment="Reuse an exact key instead of deriving one (post-write re-read)"/>
+    <param name="debugchance" default="0"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <!-- A re-read straight after a write passes the key it wrote. Deriving it a second time from
+           the same inputs would normally agree, but a disagreement would silently discard the fill,
+           so the caller that already knows the key hands it back instead. -->
+      <do_if value="$knownPoolKey != ''">
+        <set_value name="$poolKey" exact="$knownPoolKey"/>
+      </do_if>
+      <do_else>
+        <set_value name="$homeIdcode" exact="if @$homeStation != null and $homeStation.exists then $homeStation.idcode else 'nohome'"/>
+        <set_value name="$bandKey" exact="'p' + ($buyPriceMin * 100)i + '_' + ($sellPriceMax * 100)i"/>
+        <set_value name="$poolKey" exact="'$' + $homeIdcode + '|' + $side + '|d' + $maxSell + '|' + $bandKey + '|t' + (if $ignoreTradeRules then 1 else 0) + '|i' + (if $allowIllegal then 1 else 0) + '|' + $basketMode"/>
+      </do_else>
+
+      <set_value name="$miss" exact="table[
+        $Hit = false,
+        $Offers = [],
+        $PoolKey = $poolKey,
+        $Reason = 'empty',
+        $Age = 0s,
+        $CoveredWares = []
+      ]"/>
+
+      <do_if value="not global.$GT_TradeCacheMK1?">
+        <return value="$miss"/>
+      </do_if>
+      <do_if value="typeof global.$GT_TradeCacheMK1 != datatype.table">
+        <return value="$miss"/>
+      </do_if>
+      <do_if value="not global.$GT_TradeCacheMK1.{$poolKey}?">
+        <return value="$miss"/>
+      </do_if>
+
+      <set_value name="$pool" exact="global.$GT_TradeCacheMK1.{$poolKey}"/>
+      <do_if value="typeof $pool != datatype.table">
+        <return value="$miss"/>
+      </do_if>
+
+      <set_value name="$ttl" exact="300s"/>
+      <do_if value="$maxAge? and $maxAge gt 0s">
+        <set_value name="$ttl" exact="$maxAge"/>
+      </do_if>
+      <do_elseif value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Fleet?">
+        <do_if value="global.$GT_GlobalSettings.$Fleet.$CacheTTL?">
+          <set_value name="$ttl" exact="@global.$GT_GlobalSettings.$Fleet.$CacheTTL"/>
+        </do_if>
+      </do_elseif>
+
+      <set_value name="$poolAt" exact="if $pool.$At != null then @$pool.$At else null"/>
+      <do_if value="$poolAt == null">
+        <return value="$miss"/>
+      </do_if>
+      <set_value name="$poolAge" exact="player.age - $poolAt"/>
+      <do_if value="$poolAge gt $ttl">
+        <set_value name="$miss.$Reason" exact="'expired'"/>
+        <set_value name="$miss.$Age" exact="$poolAge"/>
+        <return value="$miss"/>
+      </do_if>
+
+      <!-- Coverage: the fill must have searched every ware asked for now. On a coverage miss the
+           caller unions $CoveredWares into its next fill basket so the two baskets converge
+           instead of overwriting each other every cycle. -->
+      <set_value name="$covered" exact="if $pool.$CoveredWares? then @$pool.$CoveredWares else []"/>
+      <set_value name="$miss.$CoveredWares" exact="$covered"/>
+      <set_value name="$coveredSet" exact="table[]"/>
+      <do_all exact="$covered.count" counter="$cwi">
+        <set_value name="$cw" exact="$covered.{$cwi}"/>
+        <do_if value="@$cw != null">
+          <set_value name="$coveredSet.{$cw}" exact="true"/>
+        </do_if>
+      </do_all>
+      <set_value name="$wantedSet" exact="table[]"/>
+      <do_all exact="$wares.count" counter="$wwi">
+        <set_value name="$ww" exact="$wares.{$wwi}"/>
+        <do_if value="@$ww != null">
+          <do_if value="not $coveredSet.{$ww}?">
+            <set_value name="$miss.$Reason" exact="'coverage'"/>
+            <set_value name="$miss.$Age" exact="$poolAge"/>
+            <debug_text text="'[GT-MK1Cache] MISS coverage side=' + $side + ' ware=' + (if $ww.name? then @$ww.name else '?') + ' key=' + $poolKey" chance="$debugchance"/>
+            <return value="$miss"/>
+          </do_if>
+          <set_value name="$wantedSet.{$ww}" exact="true"/>
+        </do_if>
+      </do_all>
+
+      <!-- Blacklisted sectors are dropped here. Live fills inherit that safety from
+           lib.gt.pathfinding spaces; a cache read bypasses pathfinding, so it must re-apply it. -->
+      <set_value name="$blSet" exact="table[]"/>
+      <do_if value="global.$GT_ThreatIntelligence?">
+        <do_if value="global.$GT_ThreatIntelligence.$BlacklistedSectors?">
+          <do_all exact="global.$GT_ThreatIntelligence.$BlacklistedSectors.count" counter="$bli">
+            <set_value name="$blSector" exact="global.$GT_ThreatIntelligence.$BlacklistedSectors.{$bli}"/>
+            <do_if value="@$blSector != null">
+              <set_value name="$blSet.{$blSector}" exact="true"/>
+            </do_if>
+          </do_all>
+        </do_if>
+      </do_if>
+
+      <create_list name="$hitOffers"/>
+      <set_value name="$poolOffers" exact="if $pool.$Offers? then @$pool.$Offers else []"/>
+      <set_value name="$droppedDead" exact="0"/>
+      <set_value name="$droppedBl" exact="0"/>
+      <do_all exact="$poolOffers.count" counter="$poi">
+        <set_value name="$offer" exact="$poolOffers.{$poi}"/>
+        <do_if value="@$offer == null">
+          <set_value name="$droppedDead" operation="add"/>
+          <continue/>
+        </do_if>
+        <do_if value="@$offer.ware == null">
+          <set_value name="$droppedDead" operation="add"/>
+          <continue/>
+        </do_if>
+        <do_if value="not $wantedSet.{$offer.ware}?">
+          <continue/>
+        </do_if>
+        <do_if value="not $offer.available">
+          <set_value name="$droppedDead" operation="add"/>
+          <continue/>
+        </do_if>
+        <set_value name="$offerOwner" exact="@$offer.owner"/>
+        <do_if value="$offerOwner == null or not $offerOwner.exists">
+          <set_value name="$droppedDead" operation="add"/>
+          <continue/>
+        </do_if>
+        <set_value name="$offerSector" exact="@$offerOwner.sector"/>
+        <do_if value="$offerSector != null and $blSet.{$offerSector}?">
+          <set_value name="$droppedBl" operation="add"/>
+          <continue/>
+        </do_if>
+        <append_to_list name="$hitOffers" exact="$offer"/>
+      </do_all>
+
+      <debug_text text="'[GT-MK1Cache] HIT side=' + $side + ' offers=' + $hitOffers.count + '/' + $poolOffers.count + ' wares=' + $wares.count + ' age=' + $poolAge + ' dead=' + $droppedDead + ' blacklisted=' + $droppedBl + ' key=' + $poolKey" chance="$debugchance"/>
+
+      <return value="table[
+        $Hit = true,
+        $Offers = $hitOffers,
+        $PoolKey = $poolKey,
+        $Reason = 'hit',
+        $Age = $poolAge,
+        $CoveredWares = $covered
+      ]"/>
+    </actions>
+  </attention>
+</aiscript>

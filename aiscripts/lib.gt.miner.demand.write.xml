@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="utf-8"?>
+<aiscript name="lib.gt.miner.demand.write" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <!--
+    Galaxy Miner demand-snapshot write. Called only by the ship that took the fill lock from
+    lib.gt.miner.demand.search, so there is never a second writer for the same pool key. The key is
+    handed back in rather than derived again, so read and write cannot disagree about identity.
+
+    Offers are stored as objects, not amounts: offeramount.{$object} is per-ship and each reader
+    evaluates it against itself. Dead offers are dropped here so readers do not have to.
+
+    global.$GT_MinerDemandCacheKeys is a parallel key list, because the pool table is keyed by
+    composite strings which table.keys does not enumerate reliably, and it bounds how many pools a
+    save can accumulate after repeated setting changes.
+  -->
+  <params>
+    <param name="poolKey" default="''" comment="Key returned by lib.gt.miner.demand.search"/>
+    <param name="stations" default="[]" comment="Demand stations this fill resolved"/>
+    <param name="offersByStation" default="table[]" comment="{station -> list of buy offers}"/>
+    <param name="debugchance" default="0"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <do_if value="$poolKey == ''">
+        <return value="false"/>
+      </do_if>
+
+      <!-- A param default only applies when the argument is omitted, so an explicit null from the
+           caller overrides it. That happens after a save/load resume, where the caller's locals are
+           gone. Publishing an empty pool would be worse than publishing nothing: every miner on this
+           key would read an authoritative "no demand stations" until the entry expires. Skip the
+           write and let the next caller take a clean miss - but still fall through to the slot
+           release below, because this ship owns the fill slot either way. -->
+      <set_value name="$payloadMissing" exact="@$stations == null or @$offersByStation == null"/>
+
+      <do_if value="not $payloadMissing">
+        <do_if value="not global.$GT_MinerDemandCache? or typeof global.$GT_MinerDemandCache != datatype.table">
+          <set_value name="global.$GT_MinerDemandCache" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_MinerDemandCacheKeys? or typeof global.$GT_MinerDemandCacheKeys != datatype.list">
+          <set_value name="global.$GT_MinerDemandCacheKeys" exact="[]"/>
+        </do_if>
+
+        <create_list name="$storeStations"/>
+        <set_value name="$storeOffers" exact="table[]"/>
+        <set_value name="$offerCount" exact="0"/>
+        <do_all exact="$stations.count" counter="$wsi">
+          <set_value name="$wStation" exact="$stations.{$wsi}"/>
+          <do_if value="@$wStation != null and $wStation.exists">
+            <append_to_list name="$storeStations" exact="$wStation"/>
+            <do_if value="$offersByStation.{$wStation}?">
+              <set_value name="$stationOffers" exact="@$offersByStation.{$wStation}"/>
+              <create_list name="$keptOffers"/>
+              <do_all exact="$stationOffers.count" counter="$woi">
+                <set_value name="$wOffer" exact="$stationOffers.{$woi}"/>
+                <do_if value="@$wOffer != null and @$wOffer.ware != null and $wOffer.available">
+                  <append_to_list name="$keptOffers" exact="$wOffer"/>
+                </do_if>
+              </do_all>
+              <do_if value="$keptOffers.count gt 0">
+                <set_value name="$storeOffers.{$wStation}" exact="$keptOffers"/>
+                <set_value name="$offerCount" exact="$offerCount + $keptOffers.count"/>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_all>
+
+        <set_value name="$isNewKey" exact="not global.$GT_MinerDemandCache.{$poolKey}?"/>
+        <set_value name="global.$GT_MinerDemandCache.{$poolKey}" exact="table[
+          $At = player.age,
+          $Stations = $storeStations,
+          $OffersByStation = $storeOffers
+        ]"/>
+
+        <do_if value="$isNewKey">
+          <append_to_list name="global.$GT_MinerDemandCacheKeys" exact="$poolKey"/>
+          <!-- Bound pool count: evict the oldest key (and its pool) once past the limit. -->
+          <do_while value="global.$GT_MinerDemandCacheKeys.count gt 32">
+            <set_value name="$evictKey" exact="global.$GT_MinerDemandCacheKeys.{1}"/>
+            <remove_value name="global.$GT_MinerDemandCacheKeys.{1}"/>
+            <do_if value="global.$GT_MinerDemandCache.{$evictKey}?">
+              <remove_value name="global.$GT_MinerDemandCache.{$evictKey}"/>
+            </do_if>
+            <debug_text text="'[GT-MinerCache] Evicted oldest pool key=' + $evictKey" chance="$debugchance"/>
+          </do_while>
+        </do_if>
+
+        <debug_text text="'[GT-MinerCache] WRITE stations=' + $storeStations.count + '/' + $stations.count + ' offers=' + $offerCount + ' pools=' + global.$GT_MinerDemandCacheKeys.count + ' key=' + $poolKey" chance="$debugchance"/>
+      </do_if>
+      <do_else>
+        <debug_text text="'[GT-MinerCache] WRITE skipped - fill result missing (resumed order), key=' + $poolKey" chance="$debugchance"/>
+      </do_else>
+
+      <!-- Release this pool's fill slot so waiters stop polling and the next one can start. Runs on
+           the skipped path too: this ship holds the slot whether or not it had a payload to publish.
+           Only one matching entry is dropped: a saturated waiter may have force-claimed the same key,
+           and that ship still owns its own entry until it writes. -->
+      <do_if value="global.$GT_MinerDemandFills? and typeof global.$GT_MinerDemandFills == datatype.list">
+        <set_value name="$released" exact="false"/>
+        <do_all exact="global.$GT_MinerDemandFills.count" counter="$rfi" reverse="true">
+          <do_if value="not $released">
+            <set_value name="$relEntry" exact="global.$GT_MinerDemandFills.{$rfi}"/>
+            <do_if value="$relEntry? and $relEntry.$Key? and @$relEntry.$Key == $poolKey">
+              <remove_value name="global.$GT_MinerDemandFills.{$rfi}"/>
+              <set_value name="$released" exact="true"/>
+            </do_if>
+          </do_if>
+        </do_all>
+      </do_if>
+
+      <return value="not $payloadMissing"/>
+    </actions>
+  </attention>
+</aiscript>

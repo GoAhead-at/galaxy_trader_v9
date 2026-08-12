@@ -313,6 +313,11 @@
       <set_value name="this.$maxSellDistance" exact="[$maxSellDistance, $pilotMaxParamDistance].min"/>
     </do_else>
     <set_value name="this.$fleetBalancing" exact="$fleetBalancing"/>
+    <!-- Idle-cycle waits draw from [interval, interval + interval/4] rather than a fixed interval: a
+         fleet ordered in one action would otherwise stay phase-locked and run every demand rebuild in
+         the same frame, once per interval. The quarter is derived inline at each wait instead of being
+         cached in a this.$ variable, because an order resumed from a save re-enters at the wait it was
+         parked on and would read a variable that no assignment in that pass had reached. -->
     <set_value name="this.$demandRecheckInterval" exact="[10s, [300s, $demandRecheckInterval].min].max"/>
     <!-- The four switch-gate clamps (`this.$criticalDemandDelta`, `this.$minSwitchCooldown`,
          `this.$minCargoCommitPercent`, `this.$hardEmergencyDelta`) and the `hardEmergencyDelta lt
@@ -795,13 +800,6 @@
         <set_value name="$range" exact="this.sector"/>
       </do_else>
 
-      <!-- Idle-cycle waits below draw from [interval, interval + jitter] instead of a fixed interval.
-           A fleet ordered in one action would otherwise stay phase-locked forever and run all of its
-           demand rebuilds in the same frame, once per interval. Re-drawn every cycle, so the fleet
-           spreads itself out within a few cycles, and never waits less than the configured interval.
-           Set here rather than in init so orders resumed from an older save also have it. -->
-      <set_value name="this.$minerCycleJitter" exact="this.$demandRecheckInterval / 4"/>
-
       <!-- Cooperative yield for demand/station/ware chunk loops (same knob as resource locate). -->
       <set_value name="this.$minerChunkYieldMs" exact="15"/>
       <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance? and global.$GT_GlobalSettings.$Performance.$ResourceSearchYieldMs?">
@@ -811,11 +809,41 @@
         <set_value name="this.$minerChunkYieldMs" exact="100"/>
       </do_if>
 
+      <!-- Shared demand snapshot. Which stations are in range and which offers they post is the
+           same answer for every miner with this configuration, so one ship resolves it per interval
+           and the rest of the fleet reads it. The per-ship half (offer amounts, ware filtering)
+           still runs below for each ship. TTL is the order's own recheck interval, so the snapshot
+           is never older than the player asked demand to be rechecked. -->
+      <run_script name="'lib.gt.miner.demand.search'" result="$minerDemandCacheResult">
+        <param name="ship" value="this.ship"/>
+        <param name="homeStation" value="if this.$homeStation? then this.$homeStation else null"/>
+        <param name="homeSector" value="if this.$homeSector? then this.$homeSector else null"/>
+        <param name="stationList" value="if this.$stationList? then this.$stationList else []"/>
+        <param name="blockedStations" value="if $minerBlockedStations? then $minerBlockedStations else []"/>
+        <param name="maxSellDistance" value="this.$maxSellDistance"/>
+        <param name="playerStationsOnly" value="this.$playerStationsOnly"/>
+        <param name="demandFirst" value="this.$checkDemandFirst"/>
+        <param name="maxAge" value="this.$demandRecheckInterval"/>
+        <param name="debugchance" value="this.$debugchance"/>
+      </run_script>
+      <set_value name="this.$minerDemandCacheHit" exact="if $minerDemandCacheResult? and $minerDemandCacheResult.$Hit? then @$minerDemandCacheResult.$Hit else false"/>
+      <set_value name="this.$minerDemandPoolKey" exact="if $minerDemandCacheResult? and $minerDemandCacheResult.$PoolKey? then @$minerDemandCacheResult.$PoolKey else ''"/>
+      <set_value name="this.$minerDemandCachedOffers" exact="if this.$minerDemandCacheHit and $minerDemandCacheResult.$OffersByStation? then @$minerDemandCacheResult.$OffersByStation else table[]"/>
+      <set_value name="this.$minerDemandFreshOffers" exact="table[]"/>
+
       <!-- Resolve target stations.
            Membership table beside the list: the de-dup below used list.indexof per candidate, which
            is a linear scan and made collecting S stations cost O(S^2). Persisted because the
            collection loops yield between chunks. -->
       <create_list name="$targetStations"/>
+      <create_list name="$demandStations"/>
+      <do_if value="this.$minerDemandCacheHit">
+        <set_value name="$demandStations" exact="if $minerDemandCacheResult.$Stations? then @$minerDemandCacheResult.$Stations else []"/>
+        <set_value name="$targetStations" exact="$demandStations"/>
+      </do_if>
+      <do_else>
+      <!-- Cache miss: this ship holds the fill lock and resolves the station set for the fleet.
+           Everything down to the matching </do_else> is the fill. -->
       <set_value name="this.$minerTargetSeen" exact="table[]"/>
       <do_if value="this.$stationList? and this.$stationList.count gt 0">
         <do_all exact="this.$stationList.count" counter="$si">
@@ -925,7 +953,6 @@
       </do_if>
 
       <!-- Demand is derived from the actively served station set. -->
-      <create_list name="$demandStations"/>
       <set_value name="this.$minerDemandSeen" exact="table[]"/>
       <set_value name="this.$minerDemandStationsBuildTargetStations" exact="$targetStations"/>
       <set_value name="this.$minerDemandStationsBuildIndex" exact="1"/>
@@ -948,6 +975,9 @@
       <remove_value name="this.$minerDemandStationsBuildIndex"/>
       <remove_value name="this.$minerDemandSeen"/>
       <remove_value name="this.$minerTargetSeen"/>
+      </do_else>
+      <!-- end of the cache-miss station fill -->
+
 
       <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Loop anchor=' + (if @$range != null then $range.knownname else 'null') + ', homeStation=' + (if this.$homeStation? and this.$homeStation.exists then this.$homeStation.idcode else 'NONE') + ', homeSector=' + (if this.$homeSector? and this.$homeSector.exists then this.$homeSector.knownname else 'NONE') + ', playerStationsOnly=' + this.$playerStationsOnly + ', commander=' + (if this.ship.commander? and this.ship.commander.exists then this.ship.commander.idcode else 'NONE') + ', default=' + (if this.ship.defaultorder? then @this.ship.defaultorder.id else 'NONE') + ', targetStations=' + $targetStations.count + ', demandStations=' + $demandStations.count" chance="this.$debugchance"/>
 
@@ -974,19 +1004,29 @@
             <do_all exact="$chunkEnd - this.$minerBuyOfferScanIndex + 1" counter="$chunkOffset">
               <set_value name="$tsi" exact="this.$minerBuyOfferScanIndex + $chunkOffset - 1"/>
               <set_value name="$stationCandidate" exact="this.$minerBuyOfferScanDemandStations.{$tsi}"/>
-              <find_buy_offer buyer="$stationCandidate" tradepartner="this.ship" result="$stationBuyOffers" multiple="true"/>
+              <do_if value="this.$minerDemandCacheHit">
+                <set_value name="$stationBuyOffers" exact="if this.$minerDemandCachedOffers.{$stationCandidate}? then @this.$minerDemandCachedOffers.{$stationCandidate} else []"/>
+              </do_if>
+              <do_else>
+                <find_buy_offer buyer="$stationCandidate" tradepartner="this.ship" result="$stationBuyOffers" multiple="true"/>
+                <do_if value="$stationBuyOffers.count gt 0">
+                  <set_value name="this.$minerDemandFreshOffers.{$stationCandidate}" exact="$stationBuyOffers.clone"/>
+                </do_if>
+              </do_else>
               <do_if value="$stationBuyOffers.count gt 0">
                 <set_value name="this.$minerBuyOfferAmounts.{$stationCandidate}" exact="table[]"/>
               </do_if>
               <do_all exact="$stationBuyOffers.count" counter="$boi">
                 <set_value name="$buyOffer" exact="$stationBuyOffers.{$boi}"/>
-                <set_value name="$candidateWare" exact="$buyOffer.ware"/>
+                <!-- Cached offers can die between the fill and this read, so validity is checked
+                     here rather than assumed the way a fresh engine result could be. -->
+                <set_value name="$candidateWare" exact="if @$buyOffer != null and $buyOffer.available then @$buyOffer.ware else null"/>
                 <!-- Record every offer, not just scoring candidates: the cargo-first pass can inject
                      wares that the candidate filters below reject. -->
-                <do_if value="$candidateWare?">
+                <do_if value="@$candidateWare != null">
                   <set_value name="this.$minerBuyOfferAmounts.{$stationCandidate}.{$candidateWare}" exact="if @$buyOffer.offeramount.{this.ship} != null then @$buyOffer.offeramount.{this.ship} else 0"/>
                 </do_if>
-                <do_if value="$candidateWare? and $candidateWare.hastag.minable and this.ship.cargo.{$candidateWare}.max gt 0 and (($restrictToShipBasket and $shipMineableBasket.indexof.{$candidateWare}) or (not $restrictToShipBasket)) and (not this.$resourceBasket? or this.$resourceBasket.count == 0 or this.$resourceBasket.indexof.{$candidateWare}) and not $candidateWares.indexof.{$candidateWare}">
+                <do_if value="@$candidateWare != null and $candidateWare.hastag.minable and this.ship.cargo.{$candidateWare}.max gt 0 and (($restrictToShipBasket and $shipMineableBasket.indexof.{$candidateWare}) or (not $restrictToShipBasket)) and (not this.$resourceBasket? or this.$resourceBasket.count == 0 or this.$resourceBasket.indexof.{$candidateWare}) and not $candidateWares.indexof.{$candidateWare}">
                   <append_to_list name="$candidateWares" exact="$candidateWare"/>
                 </do_if>
               </do_all>
@@ -1070,6 +1110,23 @@
           <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Demand-off empty basket - vanilla seed from station config: ' + $candidateWares.count + ' mineable ware(s)'" chance="this.$debugchance"/>
         </do_else>
       </do_else>
+
+      <!-- Publish the fill for the rest of the fleet. Only the ship that took the lock gets here
+           with a miss, so there is never a second writer for this pool key. -->
+      <do_if value="not this.$minerDemandCacheHit and this.$minerDemandPoolKey != ''">
+        <run_script name="'lib.gt.miner.demand.write'">
+          <param name="poolKey" value="this.$minerDemandPoolKey"/>
+          <!-- Pass null rather than reading a local that a resumed order no longer has: the write
+               then skips publishing an empty pool but still releases this ship's fill slot. -->
+          <param name="stations" value="if $demandStations? then $demandStations else null"/>
+          <param name="offersByStation" value="this.$minerDemandFreshOffers"/>
+          <param name="debugchance" value="this.$debugchance"/>
+        </run_script>
+      </do_if>
+      <remove_value name="this.$minerDemandCachedOffers"/>
+      <remove_value name="this.$minerDemandFreshOffers"/>
+      <remove_value name="this.$minerDemandCacheHit"/>
+      <remove_value name="this.$minerDemandPoolKey"/>
 
       <!-- Defensive normalization: remove null/duplicate ware entries before scoring.
            This prevents null table keys if upstream scans ever produce sparse entries. -->
@@ -1297,7 +1354,7 @@
             </run_script>
           </do_if>
         </do_if>
-        <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$minerCycleJitter"/>
+        <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$demandRecheckInterval / 4"/>
         <resume label="main_loop"/>
       </do_if>
 
@@ -1978,7 +2035,7 @@
             </run_script>
           </do_if>
         </do_if>
-        <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$minerCycleJitter"/>
+        <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$demandRecheckInterval / 4"/>
         <resume label="main_loop"/>
       </do_if>
       <set_value name="this.$activeMiningWare" exact="$selectedWare"/>
@@ -2075,7 +2132,7 @@
             </run_script>
           </do_if>
         </do_if>
-        <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$minerCycleJitter"/>
+        <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$demandRecheckInterval / 4"/>
         <resume label="main_loop"/>
       </do_if>
       <do_if value="$demandOffCargoHasWillingBuyer?"><remove_value name="$demandOffCargoHasWillingBuyer"/></do_if>
@@ -2099,7 +2156,122 @@
           <param name="debugchance" value="this.$debugchance"/>
         </run_script>
         <set_value name="$overflowSearchHomeSector" exact="if this.$homeStation? and this.$homeStation.exists and this.$homeStation.sector? then @$this.$homeStation.sector else $overflowSearchRefSector"/>
+        <!-- One cached basket search answers "which candidate ware has the most buyers" for every
+             candidate at once. This previously ran one live search per candidate ware, each over
+             the full sell-space set (27-136 sectors), with no cache and no concurrency cap - the
+             dominant cost when a large mining fleet is active. Ranking only needs offer counts, so
+             the whole basket can be fetched once and sliced per ware below.
+             The next two are pinned before the cache calls because those yield and the ranking
+             loop reads both; a lost local would leave the loop with nothing to rank. -->
         <set_value name="this.$minerOverflowCandidateWares" exact="$candidateWares"/>
+        <set_value name="this.$minerSellReachable" exact="$wareReachable"/>
+        <create_list name="$overflowCandidates"/>
+        <do_all exact="$candidateWares.count" counter="$ocwi">
+          <set_value name="$ocWare" exact="$candidateWares.{$ocwi}"/>
+          <do_if value="@$ocWare != null and $wareReachable.{$ocWare}? and $wareReachable.{$ocWare}">
+            <append_to_list name="$overflowCandidates" exact="$ocWare"/>
+          </do_if>
+        </do_all>
+        <set_value name="this.$minerSellOffers" exact="[]"/>
+        <set_value name="this.$minerSellSpaces" exact="$overflowSellSpaces"/>
+        <set_value name="this.$minerSellRefSector" exact="$overflowSearchRefSector"/>
+        <set_value name="this.$minerSellHomeSector" exact="$overflowSearchHomeSector"/>
+        <do_if value="$overflowCandidates.count gt 0">
+          <run_script name="'lib.gt.miner.sell.search'" result="$overflowCache">
+            <param name="refSector" value="$overflowSearchRefSector"/>
+            <param name="maxSell" value="this.$maxSellDistance"/>
+            <param name="wares" value="$overflowCandidates"/>
+            <param name="ownerFilter" value="if this.$playerStationsOnly then 'player_only' else 'any'"/>
+            <param name="ignoreTradeRules" value="this.$playerStationsOnly"/>
+            <param name="allowIllegal" value="this.$allowillegal"/>
+            <param name="maxAge" value="this.$demandRecheckInterval"/>
+            <param name="debugchance" value="this.$debugchance"/>
+          </run_script>
+          <do_if value="@$overflowCache.$Hit == true">
+            <set_value name="this.$minerSellOffers" exact="@$overflowCache.$Offers"/>
+          </do_if>
+          <do_else>
+            <!-- Pool key and fill basket go on this.$ before the first yielding call, because the
+                 basket the fill searches and the basket the write records must agree even though
+                 the claim and the search sit between them. The basket unions the pool's previous
+                 coverage so two ships with different candidate lists converge instead of
+                 overwriting each other every cycle. -->
+            <set_value name="this.$minerSellPoolKey" exact="@$overflowCache.$PoolKey"/>
+            <create_list name="$fillBasket"/>
+            <set_value name="$fillSeen" exact="table[]"/>
+            <do_all exact="$overflowCandidates.count" counter="$fbi">
+              <set_value name="$fbWare" exact="$overflowCandidates.{$fbi}"/>
+              <do_if value="not $fillSeen.{$fbWare}?">
+                <set_value name="$fillSeen.{$fbWare}" exact="true"/>
+                <append_to_list name="$fillBasket" exact="$fbWare"/>
+              </do_if>
+            </do_all>
+            <set_value name="$prevCover" exact="if @$overflowCache.$CoveredWares != null then @$overflowCache.$CoveredWares else []"/>
+            <do_all exact="$prevCover.count" counter="$pci">
+              <set_value name="$pcWare" exact="$prevCover.{$pci}"/>
+              <do_if value="@$pcWare != null and not $fillSeen.{$pcWare}?">
+                <set_value name="$fillSeen.{$pcWare}" exact="true"/>
+                <append_to_list name="$fillBasket" exact="$pcWare"/>
+              </do_if>
+            </do_all>
+            <set_value name="this.$minerSellCover" exact="$fillBasket"/>
+
+            <run_script name="'lib.gt.miner.sell.claim'" result="$overflowClaim">
+              <param name="poolKey" value="this.$minerSellPoolKey"/>
+              <param name="maxAge" value="this.$demandRecheckInterval"/>
+              <param name="debugchance" value="this.$debugchance"/>
+            </run_script>
+
+            <do_if value="@$overflowClaim.$Hit == true">
+              <!-- A peer published while we waited: read its result instead of repeating the scan. -->
+              <run_script name="'lib.gt.miner.sell.search'" result="$overflowPeer">
+                <param name="knownPoolKey" value="this.$minerSellPoolKey"/>
+                <param name="wares" value="this.$minerSellCover"/>
+                <param name="maxAge" value="this.$demandRecheckInterval"/>
+                <param name="debugchance" value="this.$debugchance"/>
+              </run_script>
+              <do_if value="@$overflowPeer.$Hit == true">
+                <set_value name="this.$minerSellOffers" exact="@$overflowPeer.$Offers"/>
+              </do_if>
+            </do_if>
+            <do_else>
+              <!-- A save/load resume re-enters the order at whatever node its instruction pointer
+                   held, which can be inside this branch with none of the pins above set. Searching
+                   then would hand lib.gt.live.search a null basket. Skip the fill instead: the
+                   write below still runs, the claim's own stale prune frees the slot, and the next
+                   cycle takes a clean miss. -->
+              <do_if value="this.$minerSellCover? and this.$minerSellSpaces?">
+                <run_script name="'lib.gt.live.search'" result="$overflowFillResult">
+                  <param name="ship" value="this.ship"/>
+                  <param name="searchMode" value="'sell_only'"/>
+                  <param name="sellSpaces" value="this.$minerSellSpaces"/>
+                  <param name="homeSector" value="if this.$minerSellHomeSector? then this.$minerSellHomeSector else this.sector"/>
+                  <param name="maxDistance" value="this.$maxSellDistance"/>
+                  <param name="wareBasket" value="this.$minerSellCover"/>
+                  <param name="allowIllegal" value="this.$allowillegal"/>
+                  <param name="ownerFilter" value="if this.$playerStationsOnly then 'player_only' else 'any'"/>
+                  <param name="ignoreTradeRules" value="this.$playerStationsOnly"/>
+                  <param name="debugchance" value="this.$debugchance"/>
+                </run_script>
+                <set_value name="this.$minerSellOffers" exact="if @$overflowFillResult.$BuyOffers != null then @$overflowFillResult.$BuyOffers else []"/>
+              </do_if>
+              <!-- Always called, including when the resumed order lost the live result: the write
+                   library releases the fill slot on every path. -->
+              <run_script name="'lib.gt.miner.sell.write'">
+                <param name="poolKey" value="if this.$minerSellPoolKey? then this.$minerSellPoolKey else ''"/>
+                <param name="offers" value="if this.$minerSellOffers? then this.$minerSellOffers else null"/>
+                <param name="coverWares" value="if this.$minerSellCover? then this.$minerSellCover else null"/>
+                <param name="refSector" value="if this.$minerSellRefSector? then this.$minerSellRefSector else null"/>
+                <param name="maxSell" value="this.$maxSellDistance"/>
+                <param name="ownerFilter" value="if this.$playerStationsOnly then 'player_only' else 'any'"/>
+                <param name="ignoreTradeRules" value="this.$playerStationsOnly"/>
+                <param name="allowIllegal" value="this.$allowillegal"/>
+                <param name="debugchance" value="this.$debugchance"/>
+              </run_script>
+            </do_else>
+          </do_else>
+        </do_if>
+
         <set_value name="this.$minerOverflowBestWare" exact="null"/>
         <set_value name="this.$minerOverflowBestOffers" exact="0"/>
         <set_value name="this.$minerOverflowIndex" exact="1"/>
@@ -2109,19 +2281,17 @@
             <set_value name="$owi" exact="this.$minerOverflowIndex + $chunkOffset - 1"/>
             <set_value name="$overflowWare" exact="this.$minerOverflowCandidateWares.{$owi}"/>
             <set_value name="$overflowOfferCount" exact="0"/>
-            <do_if value="$wareReachable.{$overflowWare}? and $wareReachable.{$overflowWare}">
-              <run_script name="'lib.gt.live.search'" result="$overflowSearchResult">
-                <param name="ship" value="this.ship"/>
-                <param name="searchMode" value="'sell_only'"/>
-                <param name="sellSpaces" value="$overflowSellSpaces"/>
-                <param name="homeSector" value="$overflowSearchHomeSector"/>
-                <param name="maxDistance" value="this.$maxSellDistance"/>
-                <param name="wareBasket" value="[$overflowWare]"/>
-                <param name="allowIllegal" value="this.$allowillegal"/>
-                <param name="ownerFilter" value="if this.$playerStationsOnly then 'player_only' else 'any'"/>
-                <param name="ignoreTradeRules" value="this.$playerStationsOnly"/>
-                <param name="debugchance" value="this.$debugchance"/>
-              </run_script>
+            <do_if value="this.$minerSellReachable? and this.$minerSellReachable.{$overflowWare}? and this.$minerSellReachable.{$overflowWare}">
+              <!-- Offers for every candidate already came from the single basket search above;
+                   take this ware's slice instead of issuing another live search per ware. -->
+              <create_list name="$overflowWareOffers"/>
+              <do_all exact="if this.$minerSellOffers? then this.$minerSellOffers.count else 0" counter="$osi">
+                <set_value name="$osOffer" exact="this.$minerSellOffers.{$osi}"/>
+                <do_if value="@$osOffer != null and @$osOffer.ware == $overflowWare">
+                  <append_to_list name="$overflowWareOffers" exact="$osOffer"/>
+                </do_if>
+              </do_all>
+              <set_value name="$overflowSearchResult" exact="table[$BuyOffers = $overflowWareOffers]"/>
               <do_if value="$overflowSearchResult? and $overflowSearchResult.$BuyOffers?">
                 <set_value name="$overflowOfferCount" exact="$overflowSearchResult.$BuyOffers.count"/>
                 <do_if value="$minerBlockedStations? and $minerBlockedStations.count gt 0 and $overflowOfferCount gt 0">
@@ -2160,6 +2330,13 @@
         <remove_value name="this.$minerOverflowBestWare"/>
         <remove_value name="this.$minerOverflowBestOffers"/>
         <remove_value name="this.$minerOverflowIndex"/>
+        <remove_value name="this.$minerSellOffers"/>
+        <remove_value name="this.$minerSellReachable"/>
+        <remove_value name="this.$minerSellCover"/>
+        <remove_value name="this.$minerSellPoolKey"/>
+        <remove_value name="this.$minerSellSpaces"/>
+        <remove_value name="this.$minerSellRefSector"/>
+        <remove_value name="this.$minerSellHomeSector"/>
         <do_if value="$overflowBestWare? and $overflowBestOffers gt 0">
           <set_value name="$selectedWare" exact="$overflowBestWare"/>
           <set_value name="this.$activeMiningWare" exact="$selectedWare"/>
@@ -2189,7 +2366,7 @@
               </run_script>
             </do_if>
           </do_if>
-          <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$minerCycleJitter"/>
+          <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$demandRecheckInterval / 4"/>
           <resume label="main_loop"/>
         </do_else>
       </do_if>
@@ -2260,7 +2437,7 @@
             </run_script>
           </do_if>
         </do_if>
-        <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$minerCycleJitter"/>
+        <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$demandRecheckInterval / 4"/>
         <resume label="main_loop"/>
       </do_if>
 
@@ -2683,7 +2860,7 @@
           <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': COLLECTOR PRE-CHECK FAILED - missing ' + $collectorMissing + ' drones for ' + $selectedWare.name + '. AutoResupply is DISABLED in GT settings - cannot auto-buy. Standing by ' + this.$demandRecheckInterval + 's. Enable Settings -> Maintenance -> AutoResupply, or manually equip the missing collector drones at any wharf, to allow this miner to mine.'" chance="100"/>
         </do_else>
         <set_command_action commandaction="commandaction.standingby"/>
-        <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$minerCycleJitter"/>
+        <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$demandRecheckInterval / 4"/>
         <resume label="main_loop"/>
       </do_if>
 
@@ -2726,7 +2903,7 @@
         <do_if value="this.ship.cargo.{$selectedWare}.count le 0">
           <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': Physical storage gate blocked ware=' + $selectedWare.name + ' with empty bay and no alternate open projection. Waiting ' + this.$demandRecheckInterval + ' for demand to drain.'" chance="this.$debugchance"/>
           <set_command_action commandaction="commandaction.standingby"/>
-          <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$minerCycleJitter"/>
+          <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$demandRecheckInterval / 4"/>
           <resume label="main_loop"/>
         </do_if>
         <do_else>
@@ -2795,7 +2972,7 @@
           <do_if value="$blacklistgroup?">
             <remove_value name="$blacklistgroup"/>
           </do_if>
-          <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$minerCycleJitter"/>
+          <wait min="this.$demandRecheckInterval" max="this.$demandRecheckInterval + this.$demandRecheckInterval / 4"/>
           <resume label="main_loop"/>
         </do_elseif>
         <remove_value name="$locateResult"/>
@@ -3119,10 +3296,21 @@
     <do_if value="this.$minerBuyOfferAmounts?"><remove_value name="this.$minerBuyOfferAmounts"/></do_if>
     <do_if value="this.$minerTargetSeen?"><remove_value name="this.$minerTargetSeen"/></do_if>
     <do_if value="this.$minerDemandSeen?"><remove_value name="this.$minerDemandSeen"/></do_if>
+    <do_if value="this.$minerDemandCachedOffers?"><remove_value name="this.$minerDemandCachedOffers"/></do_if>
+    <do_if value="this.$minerDemandFreshOffers?"><remove_value name="this.$minerDemandFreshOffers"/></do_if>
+    <do_if value="this.$minerDemandCacheHit?"><remove_value name="this.$minerDemandCacheHit"/></do_if>
+    <do_if value="this.$minerDemandPoolKey?"><remove_value name="this.$minerDemandPoolKey"/></do_if>
     <do_if value="this.$minerOverflowCandidateWares?"><remove_value name="this.$minerOverflowCandidateWares"/></do_if>
     <do_if value="this.$minerOverflowBestWare?"><remove_value name="this.$minerOverflowBestWare"/></do_if>
     <do_if value="this.$minerOverflowBestOffers?"><remove_value name="this.$minerOverflowBestOffers"/></do_if>
     <do_if value="this.$minerOverflowIndex?"><remove_value name="this.$minerOverflowIndex"/></do_if>
+    <do_if value="this.$minerSellOffers?"><remove_value name="this.$minerSellOffers"/></do_if>
+    <do_if value="this.$minerSellReachable?"><remove_value name="this.$minerSellReachable"/></do_if>
+    <do_if value="this.$minerSellCover?"><remove_value name="this.$minerSellCover"/></do_if>
+    <do_if value="this.$minerSellPoolKey?"><remove_value name="this.$minerSellPoolKey"/></do_if>
+    <do_if value="this.$minerSellSpaces?"><remove_value name="this.$minerSellSpaces"/></do_if>
+    <do_if value="this.$minerSellRefSector?"><remove_value name="this.$minerSellRefSector"/></do_if>
+    <do_if value="this.$minerSellHomeSector?"><remove_value name="this.$minerSellHomeSector"/></do_if>
     <do_if value="this.$minerPrimaryDemandStations?"><remove_value name="this.$minerPrimaryDemandStations"/></do_if>
     <do_if value="this.$minerPrimarySelectedWare?"><remove_value name="this.$minerPrimarySelectedWare"/></do_if>
     <do_if value="this.$minerPrimaryBestDeficit?"><remove_value name="this.$minerPrimaryBestDeficit"/></do_if>

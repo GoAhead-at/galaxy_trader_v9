@@ -75,7 +75,24 @@
             <set_value name="$abortEarly" exact="true"/>
           </do_if>
         </do_if>
-        
+
+        <!-- 3. Clean-result backoff. The 30s throttle above bounds signal bursts, but a fleet still
+             re-runs the full equipment/hull/drone evaluation for every ship twice a minute, and a ship
+             that needed nothing last time needs nothing now unless it consumed or lost something -
+             measured at 144 of 144 checks concluding "no maintenance needed". The marker is written
+             only on that conclusion and dropped the moment a check finds work, so a ship with real
+             needs stays on the 30s cadence. 5min matches the shortest real maintenance cycle named
+             above, so nothing legitimate is deferred past its own period.
+             An intact hull is required because damage is the one need that appears without the ship
+             consuming anything. Any damage at all forces the full check, which then applies the real
+             repair threshold, so repair dispatch keeps its 30s latency. -->
+        <do_if value="not $abortEarly and global.$GT_MaintenanceCleanAt? and global.$GT_MaintenanceCleanAt.{$ship}? and (player.age - @global.$GT_MaintenanceCleanAt.{$ship}) lt 300s and $ship.hullpercentage ge 100">
+          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+            <debug_text text="'[GT-Maintenance] ' + $ship.idcode + ' skipped - needed nothing ' + (player.age - @global.$GT_MaintenanceCleanAt.{$ship}) + 's ago (recheck after 300s)'" chance="100"/>
+          </do_if>
+          <set_value name="$abortEarly" exact="true"/>
+        </do_if>
+
         <do_if value="not $abortEarly">
           <set_value name="global.$GT_MaintenanceLastSignaledAt.{$ship}" exact="player.age"/>
           
@@ -313,9 +330,21 @@
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-Maintenance] ' + $ship.idcode + ' no maintenance needed'" chance="100"/>
           </do_if>
+          <!-- Arms the backoff guard at the top of this cue. Written here only, where the full
+               evaluation has just proven the ship needs nothing. -->
+          <do_if value="not global.$GT_MaintenanceCleanAt?">
+            <set_value name="global.$GT_MaintenanceCleanAt" exact="table[]"/>
+          </do_if>
+          <set_value name="global.$GT_MaintenanceCleanAt.{$ship}" exact="player.age"/>
           <signal_objects object="$ship" param="'GT_Maintenance_Complete'" delay="1ms"/>
         </do_if>
         <do_else>
+          <!-- Something is needed: back to the 30s cadence until a check comes back clean again.
+               This also covers restock and repair completion, because a ship that reaches those
+               paths took this branch and therefore holds no marker. -->
+          <do_if value="global.$GT_MaintenanceCleanAt? and global.$GT_MaintenanceCleanAt.{$ship}?">
+            <remove_value name="global.$GT_MaintenanceCleanAt.{$ship}"/>
+          </do_if>
           <!-- CRITICAL PERFORMANCE FIX: Queue maintenance execution to prevent CPU spikes -->
           <!-- When many ships need maintenance simultaneously (save load, fleet init), unlimited concurrent instances cause massive spikes -->
           <!-- Initialize queue if needed -->

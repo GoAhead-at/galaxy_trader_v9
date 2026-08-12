@@ -672,6 +672,22 @@
         <set_value name="$next_resupply_check" exact="player.age + 30min"/>
       </do_if>
 
+      <!-- Last sale failed and the hold is at least half full: mining more would only add cargo we
+           already cannot move, and retrying the sale straight away just re-reads the same rejected
+           offers, so wait for the market to change first. Below half full we fall through and mine,
+           because topping up a light load is worth doing before the next attempt.
+           The wait is the single exit-rate control for a stranded miner: a sale becoming possible
+           ends it, and nothing here re-triggers itself faster than this interval. -->
+      <do_if value="$cannotsell? and this.assignedcontrolled.cargo.capacity.all gt 0 and ((this.assignedcontrolled.cargo.free.all)f / this.assignedcontrolled.cargo.capacity.all le 0.5)">
+        <remove_value name="$cannotsell"/>
+        <debug_text text="'[GT-MiningRoutine] ' + this.assignedcontrolled.idcode + ': Cannot sell with a full hold - waiting for buyers instead of mining more'" chance="$debugchance"/>
+        <run_script name="'move.idle'">
+          <param name="Min" value="90s"/>
+          <param name="Max" value="150s"/>
+        </run_script>
+        <resume label="sellwares"/>
+      </do_if>
+
       <!-- sell wares first if cargo full or less than 50% free cargo -->
       <do_if value="this.assignedcontrolled.cargo.free.all le 0 or (not $cannotsell? and this.assignedcontrolled.cargo.capacity.all gt 0 and ((this.assignedcontrolled.cargo.free.all)f / this.assignedcontrolled.cargo.capacity.all le 0.5))">
         <resume label="sellwares" />
@@ -1419,18 +1435,106 @@
             </do_if>
           </do_all>
         </do_if>
-        <run_script name="'lib.gt.live.search'" result="$liveResult">
-          <param name="ship" value="this.assignedcontrolled"/>
-          <param name="searchMode" value="'sell_only'"/>
-          <param name="sellSpaces" value="$sellspaces"/>
-          <param name="homeSector" value="$searchHomeSector"/>
-          <param name="maxDistance" value="$searchMaxDistance"/>
-          <param name="wareBasket" value="$sellCargoWares"/>
-          <param name="allowIllegal" value="true"/>
+        <!-- Shared sell pool. Every miner selling out of the same range asks the identical question
+             here - which stations in range buy these wares - once per trip, so uncached this was the
+             single most frequent galaxy-wide search in the game. The pool is keyed on exactly the
+             arguments handed to the live search below, plus a span count, because $sellspaces is a
+             clone of the gather range when $samebuysellrange and anchor+radius alone would then not
+             pin the sector set. Instance vars use an $mrSell prefix: this script runs nested under
+             order.trade.galaxyminer on the same entity, which owns the $minerSell names. -->
+        <set_value name="this.$mrSellCover" exact="$sellCargoWares"/>
+        <set_value name="this.$mrSellSpaces" exact="$sellspaces"/>
+        <set_value name="this.$mrSellHome" exact="$searchHomeSector"/>
+        <set_value name="this.$mrSellRef" exact="$searchHomeSector"/>
+        <set_value name="this.$mrSellMax" exact="$searchMaxDistance"/>
+        <set_value name="this.$mrSellVariant" exact="'n' + $sellspaces.count"/>
+        <set_value name="this.$mrSellOwner" exact="$sellOwnerFilter"/>
+        <set_value name="this.$mrSellTR" exact="$sellIgnoreTradeRules"/>
+        <set_value name="this.$mrSellDebug" exact="$debugchance"/>
+        <run_script name="'lib.gt.miner.sell.search'" result="$mrSellCache">
+          <param name="refSector" value="$searchHomeSector"/>
+          <param name="maxSell" value="$searchMaxDistance"/>
+          <param name="variant" value="'n' + $sellspaces.count"/>
+          <param name="wares" value="$sellCargoWares"/>
           <param name="ownerFilter" value="$sellOwnerFilter"/>
           <param name="ignoreTradeRules" value="$sellIgnoreTradeRules"/>
+          <param name="allowIllegal" value="true"/>
+          <param name="maxAge" value="60s"/>
           <param name="debugchance" value="$debugchance"/>
         </run_script>
+
+        <!-- Kept as a table on every path: the offer-filtering block below dereferences
+             $liveResult.$BuyOffers directly. -->
+        <set_value name="$liveResult" exact="table[$BuyOffers = []]"/>
+        <set_value name="$mrSellFilled" exact="false"/>
+        <do_if value="@$mrSellCache.$Hit == true">
+          <set_value name="$liveResult" exact="table[$BuyOffers = @$mrSellCache.$Offers]"/>
+        </do_if>
+        <do_else>
+          <set_value name="this.$mrSellPoolKey" exact="@$mrSellCache.$PoolKey"/>
+          <run_script name="'lib.gt.miner.sell.claim'" result="$mrSellClaim">
+            <param name="poolKey" value="this.$mrSellPoolKey"/>
+            <param name="maxAge" value="60s"/>
+            <param name="debugchance" value="$debugchance"/>
+          </run_script>
+
+          <do_if value="@$mrSellClaim.$Hit == true">
+            <!-- A peer published while we waited: read its result instead of repeating the scan. -->
+            <run_script name="'lib.gt.miner.sell.search'" result="$mrSellPeer">
+              <param name="knownPoolKey" value="this.$mrSellPoolKey"/>
+              <param name="wares" value="this.$mrSellCover"/>
+              <param name="maxAge" value="60s"/>
+              <param name="debugchance" value="this.$mrSellDebug"/>
+            </run_script>
+            <do_if value="@$mrSellPeer.$Hit == true">
+              <set_value name="$liveResult" exact="table[$BuyOffers = @$mrSellPeer.$Offers]"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <!-- A save/load resume can re-enter here with the pins above unset; searching then would
+                 hand the live search a null basket. Skip the fill and take a clean miss next trip. -->
+            <do_if value="this.$mrSellCover? and this.$mrSellSpaces?">
+              <run_script name="'lib.gt.live.search'" result="$liveResult">
+                <param name="ship" value="this.assignedcontrolled"/>
+                <param name="searchMode" value="'sell_only'"/>
+                <param name="sellSpaces" value="this.$mrSellSpaces"/>
+                <param name="homeSector" value="this.$mrSellHome"/>
+                <param name="maxDistance" value="this.$mrSellMax"/>
+                <param name="wareBasket" value="this.$mrSellCover"/>
+                <param name="allowIllegal" value="true"/>
+                <param name="ownerFilter" value="this.$mrSellOwner"/>
+                <param name="ignoreTradeRules" value="this.$mrSellTR"/>
+                <param name="debugchance" value="this.$mrSellDebug"/>
+              </run_script>
+              <set_value name="$mrSellFilled" exact="true"/>
+            </do_if>
+            <!-- Always called: the write library releases the fill slot on every path. Offers stay
+                 null unless the search actually ran, so a skipped fill releases the slot without
+                 publishing an empty pool that every peer would read as "no buyers". -->
+            <run_script name="'lib.gt.miner.sell.write'">
+              <param name="poolKey" value="if this.$mrSellPoolKey? then this.$mrSellPoolKey else ''"/>
+              <param name="offers" value="if $mrSellFilled and @$liveResult.$BuyOffers != null then @$liveResult.$BuyOffers else null"/>
+              <param name="coverWares" value="if this.$mrSellCover? then this.$mrSellCover else null"/>
+              <param name="refSector" value="if this.$mrSellRef? then this.$mrSellRef else null"/>
+              <param name="maxSell" value="if this.$mrSellMax? then this.$mrSellMax else 0"/>
+              <param name="ownerFilter" value="if this.$mrSellOwner? then this.$mrSellOwner else 'any'"/>
+              <param name="ignoreTradeRules" value="if this.$mrSellTR? then this.$mrSellTR else false"/>
+              <param name="allowIllegal" value="true"/>
+              <param name="debugchance" value="this.$mrSellDebug"/>
+            </run_script>
+          </do_else>
+        </do_else>
+
+        <do_if value="this.$mrSellCover?"><remove_value name="this.$mrSellCover"/></do_if>
+        <do_if value="this.$mrSellSpaces?"><remove_value name="this.$mrSellSpaces"/></do_if>
+        <do_if value="this.$mrSellHome?"><remove_value name="this.$mrSellHome"/></do_if>
+        <do_if value="this.$mrSellRef?"><remove_value name="this.$mrSellRef"/></do_if>
+        <do_if value="this.$mrSellMax?"><remove_value name="this.$mrSellMax"/></do_if>
+        <do_if value="this.$mrSellVariant?"><remove_value name="this.$mrSellVariant"/></do_if>
+        <do_if value="this.$mrSellOwner?"><remove_value name="this.$mrSellOwner"/></do_if>
+        <do_if value="this.$mrSellTR?"><remove_value name="this.$mrSellTR"/></do_if>
+        <do_if value="this.$mrSellDebug?"><remove_value name="this.$mrSellDebug"/></do_if>
+        <do_if value="this.$mrSellPoolKey?"><remove_value name="this.$mrSellPoolKey"/></do_if>
         <set_value name="$liveBuyOffers" exact="[]"/>
         <do_if value="$liveResult? and $liveResult.$BuyOffers?">
           <set_value name="$liveBuyOffers" exact="@$liveResult.$BuyOffers"/>
@@ -1780,9 +1884,12 @@
             <remove_value name="$maxamount" />
             <remove_value name="$droppedwares" />
           </do_if>
-          <do_elseif value="this.assignedcontrolled.cargo.free.all">
+          <!-- Player ships never dump cargo, so record the failed sale whatever the fill level.
+               This used to require free space, which meant a completely full miner never set the
+               flag and looped straight back into sellwares every idle period. -->
+          <do_else>
             <set_value name="$cannotsell"/>
-          </do_elseif>
+          </do_else>
           <set_value name="$idle"/>
         </do_if>
       </do_if>

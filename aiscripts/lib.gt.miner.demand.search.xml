@@ -1,0 +1,216 @@
+<?xml version="1.0" encoding="utf-8"?>
+<aiscript name="lib.gt.miner.demand.search" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <!--
+    Galaxy Miner demand-snapshot read. Dedicated pool, unrelated to GT_TradeCache (MK3),
+    GT_TradeCacheMK4 or GT_TradeCacheMK1.
+
+    Storage: global.$GT_MinerDemandCache.{poolKey} = table[$At, $Stations, $OffersByStation]
+      poolKey = '$' + ownerId + '|' + mode + '|' + anchor + '|d' + maxSell
+                + '|p' + playerStationsOnly + '|f' + demandFirst + '|b' + blockedFingerprint
+
+    The pool holds the ship-independent half of the demand rebuild: which stations are in range and
+    which buy offers each one posts. Everything that makes one ship's answer differ from another's
+    is in the key, so two configurations can never overwrite each other.
+
+    What deliberately stays per ship is the amount. offeramount.{$object} is "trade amount plus the
+    reserved amount for this object" (scriptproperties.xml), so two miners legitimately read
+    different amounts from the same offer. Callers therefore get offer objects and evaluate the
+    amount themselves; caching a number here would hand one ship another ship's reservation.
+
+    Single-flight: on a cold pool every miner in a fleet would otherwise run the same station scan
+    in the same frame, which is exactly the stampede this cache exists to remove. The first caller
+    claims the fill lock and gets a MISS; the rest poll briefly and take its result. A caller that
+    dies before writing only strands the lock until the stale window passes.
+  -->
+  <params>
+    <param name="ship" default="null" comment="Requesting miner (owner is part of pool identity)"/>
+    <param name="homeStation" default="null"/>
+    <param name="homeSector" default="null"/>
+    <param name="stationList" default="[]" comment="Explicit target stations, if configured"/>
+    <param name="blockedStations" default="[]"/>
+    <param name="maxSellDistance" default="0"/>
+    <param name="playerStationsOnly" default="false"/>
+    <param name="demandFirst" default="true" comment="Demand-off pools carry no offers, so they cannot share a key with demand-on"/>
+    <param name="maxAge" default="60s" comment="Normally the order's demand recheck interval"/>
+    <param name="debugchance" default="0"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <do_if value="@$ship == null or not $ship.exists">
+        <return value="table[
+          $Hit = false,
+          $PoolKey = '',
+          $Stations = [],
+          $OffersByStation = table[],
+          $Age = 0s,
+          $Reason = 'noship'
+        ]"/>
+      </do_if>
+
+      <!-- Pool identity. Mode records which branch the caller's station resolution takes, because
+           the four branches read different inputs and must not share a pool. -->
+      <set_value name="$ownerId" exact="if @$ship.owner != null and $ship.owner.id? then @$ship.owner.id else 'none'"/>
+      <set_value name="$mode" exact="'C'"/>
+      <set_value name="$anchor" exact="'nosec'"/>
+      <do_if value="$stationList? and $stationList.count gt 0">
+        <set_value name="$mode" exact="'L'"/>
+        <!-- The station-list branch range-checks against this sector, so it is part of identity. -->
+        <set_value name="$refSector" exact="if @$homeStation != null and $homeStation.exists and $homeStation.sector? then @$homeStation.sector else (if @$homeSector != null and $homeSector.exists then $homeSector else @$ship.sector)"/>
+        <do_if value="@$refSector != null">
+          <set_value name="$anchor" exact="'' + $refSector.macro.id"/>
+        </do_if>
+        <do_all exact="$stationList.count" counter="$sli">
+          <set_value name="$slEntry" exact="$stationList.{$sli}"/>
+          <do_if value="@$slEntry != null and $slEntry.exists">
+            <set_value name="$anchor" exact="$anchor + '#' + $slEntry.idcode"/>
+          </do_if>
+        </do_all>
+      </do_if>
+      <!-- These conditions mirror the caller's station-resolution branches exactly. If the key said
+           'H' while the caller actually fell through to the home-sector or current-sector branch,
+           two ships could share a key and resolve different station sets. -->
+      <do_elseif value="@$homeStation != null and $homeStation.exists and $homeStation.isoperational and ((not $playerStationsOnly) or ($homeStation.owner == $ship.owner))">
+        <set_value name="$mode" exact="'H'"/>
+        <set_value name="$anchor" exact="$homeStation.idcode"/>
+      </do_elseif>
+      <do_elseif value="@$homeSector != null and $homeSector.exists">
+        <set_value name="$mode" exact="'S'"/>
+        <set_value name="$anchor" exact="'' + $homeSector.macro.id"/>
+      </do_elseif>
+      <do_elseif value="@$ship.sector != null">
+        <set_value name="$anchor" exact="'' + $ship.sector.macro.id"/>
+      </do_elseif>
+
+      <set_value name="$blockedFp" exact="'0'"/>
+      <do_if value="$blockedStations? and $blockedStations.count gt 0">
+        <set_value name="$blockedFp" exact="''"/>
+        <do_all exact="$blockedStations.count" counter="$bfi">
+          <set_value name="$bfEntry" exact="$blockedStations.{$bfi}"/>
+          <do_if value="@$bfEntry != null and $bfEntry.exists">
+            <set_value name="$blockedFp" exact="$blockedFp + $bfEntry.idcode + ','"/>
+          </do_if>
+        </do_all>
+      </do_if>
+
+      <set_value name="$poolKey" exact="'$' + $ownerId + '|' + $mode + '|' + $anchor + '|d' + $maxSellDistance + '|p' + (if $playerStationsOnly then 1 else 0) + '|f' + (if $demandFirst then 1 else 0) + '|b' + $blockedFp"/>
+      <set_value name="$ttl" exact="if $maxAge? and $maxAge gt 0s then $maxAge else 60s"/>
+
+      <!-- Fast HIT path (no yield). -->
+      <do_if value="global.$GT_MinerDemandCache? and typeof global.$GT_MinerDemandCache == datatype.table and global.$GT_MinerDemandCache.{$poolKey}?">
+        <set_value name="$entry" exact="global.$GT_MinerDemandCache.{$poolKey}"/>
+        <do_if value="typeof $entry == datatype.table and $entry.$At != null and (player.age - $entry.$At) le $ttl">
+          <debug_text text="'[GT-MinerCache] ' + $ship.idcode + ': HIT stations=' + (if $entry.$Stations? then @$entry.$Stations.count else 0) + ' age=' + (player.age - $entry.$At) + ' key=' + $poolKey" chance="$debugchance"/>
+          <!-- Stations is handed out as a copy so a caller cannot mutate the shared pool. The offer
+               lists are read-only for callers and stay by reference to keep the hit path cheap. -->
+          <return value="table[
+            $Hit = true,
+            $PoolKey = $poolKey,
+            $Stations = if $entry.$Stations? then @$entry.$Stations.clone else [],
+            $OffersByStation = if $entry.$OffersByStation? then @$entry.$OffersByStation else table[],
+            $Age = player.age - $entry.$At,
+            $Reason = 'hit'
+          ]"/>
+        </do_if>
+      </do_if>
+
+      <!-- Persist across the single-flight waits (locals do not survive a yield). -->
+      <set_value name="this.$gtMdcKey" exact="$poolKey"/>
+      <set_value name="this.$gtMdcTtl" exact="$ttl"/>
+      <set_value name="this.$gtMdcDebug" exact="$debugchance"/>
+      <set_value name="this.$gtMdcWaitLeft" exact="20"/>
+      <set_value name="this.$gtMdcClaimed" exact="false"/>
+      <set_value name="this.$gtMdcHit" exact="null"/>
+
+      <!-- Active fills, as a list of table[$Key, $At]. A single scalar lock would only ever hold one
+           key: a second pool starting a fill would silently unlock the first, letting a third ship
+           duplicate a fill already in progress. A list also enumerates reliably, which a table keyed
+           by these composite strings does not.
+
+           Two guarantees come out of one structure:
+             1. At most one fill per pool key (no duplicated scan for the same configuration).
+             2. At most 3 fills galaxy-wide, so many distinct homes cannot all scan at once.
+           Entries carry a timestamp and are pruned when stale, so an order torn down mid-scan
+           releases its slot on its own and no counter can leak.
+           The slot count is inlined below rather than held in a local: locals do not survive the
+           poll wait, so a variable would read as null from the second round on. -->
+      <do_while value="not this.$gtMdcClaimed and this.$gtMdcHit == null and this.$gtMdcWaitLeft gt 0">
+        <do_if value="not global.$GT_MinerDemandFills? or typeof global.$GT_MinerDemandFills != datatype.list">
+          <set_value name="global.$GT_MinerDemandFills" exact="[]"/>
+        </do_if>
+        <set_value name="$mineLocked" exact="false"/>
+        <do_all exact="global.$GT_MinerDemandFills.count" counter="$fki" reverse="true">
+          <set_value name="$fillEntry" exact="global.$GT_MinerDemandFills.{$fki}"/>
+          <do_if value="$fillEntry? and $fillEntry.$At? and (player.age - @$fillEntry.$At) lt 15s">
+            <do_if value="$fillEntry.$Key? and @$fillEntry.$Key == this.$gtMdcKey">
+              <set_value name="$mineLocked" exact="true"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <remove_value name="global.$GT_MinerDemandFills.{$fki}"/>
+          </do_else>
+        </do_all>
+
+        <do_if value="not $mineLocked and global.$GT_MinerDemandFills.count lt 3">
+          <append_to_list name="global.$GT_MinerDemandFills" exact="table[$Key = this.$gtMdcKey, $At = player.age]"/>
+          <set_value name="this.$gtMdcClaimed" exact="true"/>
+        </do_if>
+        <do_else>
+          <wait min="150ms" max="350ms"/>
+          <set_value name="this.$gtMdcWaitLeft" exact="this.$gtMdcWaitLeft - 1"/>
+          <!-- The holder may have published while we waited. -->
+          <do_if value="global.$GT_MinerDemandCache? and global.$GT_MinerDemandCache.{this.$gtMdcKey}?">
+            <set_value name="$waitEntry" exact="global.$GT_MinerDemandCache.{this.$gtMdcKey}"/>
+            <do_if value="typeof $waitEntry == datatype.table and $waitEntry.$At != null and (player.age - $waitEntry.$At) le this.$gtMdcTtl">
+              <set_value name="this.$gtMdcHit" exact="$waitEntry"/>
+            </do_if>
+          </do_if>
+        </do_else>
+      </do_while>
+
+      <do_if value="this.$gtMdcHit != null">
+        <set_value name="$hitEntry" exact="this.$gtMdcHit"/>
+        <set_value name="$hitKey" exact="this.$gtMdcKey"/>
+        <debug_text text="'[GT-MinerCache] HIT-after-wait stations=' + (if $hitEntry.$Stations? then @$hitEntry.$Stations.count else 0) + ' key=' + $hitKey" chance="this.$gtMdcDebug"/>
+        <remove_value name="this.$gtMdcKey"/>
+        <remove_value name="this.$gtMdcTtl"/>
+        <remove_value name="this.$gtMdcDebug"/>
+        <remove_value name="this.$gtMdcWaitLeft"/>
+        <remove_value name="this.$gtMdcClaimed"/>
+        <remove_value name="this.$gtMdcHit"/>
+        <return value="table[
+          $Hit = true,
+          $PoolKey = $hitKey,
+          $Stations = if $hitEntry.$Stations? then @$hitEntry.$Stations.clone else [],
+          $OffersByStation = if $hitEntry.$OffersByStation? then @$hitEntry.$OffersByStation else table[],
+          $Age = player.age - $hitEntry.$At,
+          $Reason = 'hit_after_wait'
+        ]"/>
+      </do_if>
+
+      <!-- Waited out the budget without a slot or a published result. Take a slot anyway rather than
+           sending the miner away empty: the release path keys off this entry, so claiming keeps the
+           write symmetric, and the worst case is one duplicated scan while the system is saturated. -->
+      <do_if value="not this.$gtMdcClaimed">
+        <append_to_list name="global.$GT_MinerDemandFills" exact="table[$Key = this.$gtMdcKey, $At = player.age]"/>
+        <debug_text text="'[GT-MinerCache] Fill slots saturated - proceeding uncoordinated key=' + this.$gtMdcKey" chance="this.$gtMdcDebug"/>
+      </do_if>
+
+      <set_value name="$missKey" exact="this.$gtMdcKey"/>
+      <debug_text text="'[GT-MinerCache] MISS - filling key=' + $missKey" chance="this.$gtMdcDebug"/>
+      <remove_value name="this.$gtMdcKey"/>
+      <remove_value name="this.$gtMdcTtl"/>
+      <remove_value name="this.$gtMdcDebug"/>
+      <remove_value name="this.$gtMdcWaitLeft"/>
+      <remove_value name="this.$gtMdcClaimed"/>
+      <remove_value name="this.$gtMdcHit"/>
+      <return value="table[
+        $Hit = false,
+        $PoolKey = $missKey,
+        $Stations = [],
+        $OffersByStation = table[],
+        $Age = 0s,
+        $Reason = 'fill'
+      ]"/>
+    </actions>
+  </attention>
+</aiscript>

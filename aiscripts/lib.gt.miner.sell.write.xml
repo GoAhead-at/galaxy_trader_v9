@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="utf-8"?>
+<aiscript name="lib.gt.miner.sell.write" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="1">
+  <!--
+    Galaxy Miner overflow sell-offer cache write, and the release half of lib.gt.miner.sell.claim.
+    Called only by a ship holding the fill slot, so there is never a second writer for the pool key.
+
+    The pool key is produced by lib.gt.miner.sell.search and handed back in, so read and write can
+    never disagree about pool identity. $CoveredWares records the ware superset the fill actually
+    searched; the reader requires its candidate list to be inside it.
+
+    global.$GT_TradeCacheMinerSellKeys is a parallel key list: the pool table is keyed by composite
+    strings, which table.keys does not enumerate reliably, and it bounds how many pools a save can
+    accumulate after repeated setting changes.
+
+    The slot release runs on every path, including the skipped write, so a caller that lost its
+    live result cannot strand the pool for the next miner.
+  -->
+  <params>
+    <param name="poolKey" default="''" comment="Key returned by lib.gt.miner.sell.search"/>
+    <param name="offers" default="[]" comment="Buy offers returned by the live search"/>
+    <param name="coverWares" default="[]" comment="Ware superset this fill searched"/>
+    <param name="refSector" default="null"/>
+    <param name="maxSell" default="0"/>
+    <param name="ownerFilter" default="'any'"/>
+    <param name="ignoreTradeRules" default="false"/>
+    <param name="allowIllegal" default="false"/>
+    <param name="debugchance" default="0"/>
+  </params>
+  <attention min="unknown">
+    <actions>
+      <do_if value="$poolKey == ''">
+        <return value="false"/>
+      </do_if>
+
+      <!-- A param default only applies when the argument is omitted, so a caller that passes an
+           explicit null overrides it. That happens after a save/load resume, where the caller's
+           live-search local is gone and it hands us null.
+           Publishing an empty pool would be worse than publishing nothing: every miner on this key
+           would then read an authoritative "no buyers" until the entry expires. Skip the write so
+           the next caller takes a clean miss and refills. -->
+      <set_value name="$payloadMissing" exact="@$offers == null or @$coverWares == null"/>
+
+      <do_if value="not $payloadMissing">
+        <do_if value="not global.$GT_TradeCacheMinerSell? or typeof global.$GT_TradeCacheMinerSell != datatype.table">
+          <set_value name="global.$GT_TradeCacheMinerSell" exact="table[]"/>
+        </do_if>
+        <do_if value="not global.$GT_TradeCacheMinerSellKeys?">
+          <set_value name="global.$GT_TradeCacheMinerSellKeys" exact="[]"/>
+        </do_if>
+
+        <!-- Memory guard only. lib.gt.live.search already caps at maxOffersPerWare (20), so a real
+             candidate basket stays far below this; tripping it means the basket grew unexpectedly. -->
+        <set_value name="$maxOffers" exact="400"/>
+        <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$Performance?">
+          <do_if value="global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries?">
+            <set_value name="$maxOffers" exact="(@global.$GT_GlobalSettings.$Performance.$CacheQueryMaxEntries) * 2"/>
+          </do_if>
+        </do_if>
+
+        <create_list name="$storeOffers"/>
+        <set_value name="$capped" exact="false"/>
+        <do_all exact="$offers.count" counter="$woi">
+          <do_if value="$storeOffers.count ge $maxOffers">
+            <set_value name="$capped" exact="true"/>
+            <break/>
+          </do_if>
+          <set_value name="$wOffer" exact="$offers.{$woi}"/>
+          <do_if value="@$wOffer == null">
+            <continue/>
+          </do_if>
+          <do_if value="@$wOffer.ware == null">
+            <continue/>
+          </do_if>
+          <do_if value="not $wOffer.available">
+            <continue/>
+          </do_if>
+          <append_to_list name="$storeOffers" exact="$wOffer"/>
+        </do_all>
+
+        <create_list name="$storeCover"/>
+        <do_all exact="$coverWares.count" counter="$wci">
+          <set_value name="$cWare" exact="$coverWares.{$wci}"/>
+          <do_if value="@$cWare != null">
+            <append_to_list name="$storeCover" exact="$cWare"/>
+          </do_if>
+        </do_all>
+
+        <set_value name="$isNewKey" exact="not global.$GT_TradeCacheMinerSell.{$poolKey}?"/>
+        <set_value name="global.$GT_TradeCacheMinerSell.{$poolKey}" exact="table[
+          $At = player.age,
+          $RefSector = $refSector,
+          $MaxSell = $maxSell,
+          $OwnerFilter = $ownerFilter,
+          $IgnoreTR = $ignoreTradeRules,
+          $AllowIllegal = $allowIllegal,
+          $CoveredWares = $storeCover,
+          $Offers = $storeOffers
+        ]"/>
+
+        <do_if value="$isNewKey">
+          <append_to_list name="global.$GT_TradeCacheMinerSellKeys" exact="$poolKey"/>
+          <!-- Bound pool count: evict the oldest key (and its pool) once past the limit. -->
+          <do_while value="global.$GT_TradeCacheMinerSellKeys.count gt 64">
+            <set_value name="$evictKey" exact="global.$GT_TradeCacheMinerSellKeys.{1}"/>
+            <remove_value name="global.$GT_TradeCacheMinerSellKeys.{1}"/>
+            <do_if value="global.$GT_TradeCacheMinerSell.{$evictKey}?">
+              <remove_value name="global.$GT_TradeCacheMinerSell.{$evictKey}"/>
+            </do_if>
+            <debug_text text="'[GT-MinerSell] Evicted oldest pool key=' + $evictKey" chance="$debugchance"/>
+          </do_while>
+        </do_if>
+
+        <debug_text text="'[GT-MinerSell] WRITE offers=' + $storeOffers.count + '/' + $offers.count + ' cover=' + $storeCover.count + (if $capped then ' CAPPED' else '') + ' pools=' + global.$GT_TradeCacheMinerSellKeys.count + ' key=' + $poolKey" chance="$debugchance"/>
+      </do_if>
+      <do_else>
+        <debug_text text="'[GT-MinerSell] WRITE skipped - live result missing (resumed order), key=' + $poolKey" chance="$debugchance"/>
+      </do_else>
+
+      <!-- Release the fill slot on every path. -->
+      <do_if value="global.$GT_MinerSellFills? and typeof global.$GT_MinerSellFills == datatype.list">
+        <do_all exact="global.$GT_MinerSellFills.count" counter="$rfi" reverse="true">
+          <set_value name="$relEntry" exact="global.$GT_MinerSellFills.{$rfi}"/>
+          <do_if value="$relEntry? and $relEntry.$Key? and @$relEntry.$Key == $poolKey">
+            <remove_value name="global.$GT_MinerSellFills.{$rfi}"/>
+          </do_if>
+        </do_all>
+      </do_if>
+
+      <return value="not $payloadMissing"/>
+    </actions>
+  </attention>
+</aiscript>

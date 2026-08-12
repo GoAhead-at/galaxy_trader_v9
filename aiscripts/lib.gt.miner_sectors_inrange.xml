@@ -79,55 +79,74 @@
       <set_value name="this.$gtMscBL" exact="$blEpoch"/>
       <set_value name="this.$gtMscTtl" exact="$ttlSafe"/>
       <set_value name="this.$gtMscWaitLeft" exact="12"/>
+      <set_value name="this.$gtMscClaimed" exact="false"/>
+      <set_value name="this.$gtMscHit" exact="null"/>
 
-      <!-- Single-flight: wait while another ship fills this exact key (stale lock >2s is ignored).
+      <!-- Single-flight: wait while another ship builds this exact key, otherwise claim it.
+           Active builds are a list of table[$Key, $At], not a single key. A scalar only ever holds
+           one key, so a second ref sector starting a build silently unlocked the first and let a
+           third ship duplicate a build already in progress - the exclusion only held while the
+           whole fleet shared one key. Entries carry a timestamp and are pruned once stale, so an
+           order torn down mid-build releases on its own and no counter can leak.
            Poll slowly and with jitter: a 1ms poll is one script wake per frame per waiter, and a
-           fleet hits the same key in the same frame, so the polling cost scaled with fleet size.
-           12 rounds at ~250ms average still outlasts the 2s stale-lock window. -->
-      <do_while value="this.$gtMscWaitLeft gt 0 and global.$GT_MinerSectorBfsKey? and global.$GT_MinerSectorBfsKey == this.$gtMscKey and global.$GT_MinerSectorBfsAt? and (player.age - global.$GT_MinerSectorBfsAt) lt 2s">
-        <wait min="150ms" max="350ms"/>
-        <set_value name="this.$gtMscWaitLeft" exact="this.$gtMscWaitLeft - 1"/>
-        <do_if value="global.$GT_MinerSectorCache.{this.$gtMscKey}? and typeof global.$GT_MinerSectorCache.{this.$gtMscKey} == datatype.table">
-          <set_value name="$entry" exact="global.$GT_MinerSectorCache.{this.$gtMscKey}"/>
-          <do_if value="$entry.$Spaces? and $entry.$At? and (player.age - $entry.$At) le this.$gtMscTtl">
-            <set_value name="$result" exact="$entry.$Spaces.clone"/>
-            <set_value name="this.$gtMinerSectorsResult" exact="$result"/>
-            <debug_text text="'[GT-Miner] ' + this.assignedcontrolled.idcode + ': sector-cache HIT-after-wait count=' + $result.count + ' key=' + this.$gtMscKey" chance="$debugchance"/>
-            <remove_value name="this.$gtMscKey"/>
-            <remove_value name="this.$gtMscRef"/>
-            <remove_value name="this.$gtMscRefId"/>
-            <remove_value name="this.$gtMscMax"/>
-            <remove_value name="this.$gtMscDisc"/>
-            <remove_value name="this.$gtMscBL"/>
-            <remove_value name="this.$gtMscTtl"/>
-            <remove_value name="this.$gtMscWaitLeft"/>
-            <return value="$result"/>
-          </do_if>
+           fleet hits the same key in the same frame, so the polling cost scaled with fleet size. -->
+      <do_while value="not this.$gtMscClaimed and this.$gtMscHit == null and this.$gtMscWaitLeft gt 0">
+        <do_if value="not global.$GT_MinerSectorBfsFills? or typeof global.$GT_MinerSectorBfsFills != datatype.list">
+          <set_value name="global.$GT_MinerSectorBfsFills" exact="[]"/>
         </do_if>
+        <set_value name="$mineLocked" exact="false"/>
+        <do_all exact="global.$GT_MinerSectorBfsFills.count" counter="$bfi" reverse="true">
+          <set_value name="$bfsEntry" exact="global.$GT_MinerSectorBfsFills.{$bfi}"/>
+          <do_if value="$bfsEntry? and $bfsEntry.$At? and (player.age - @$bfsEntry.$At) lt 10s">
+            <do_if value="$bfsEntry.$Key? and @$bfsEntry.$Key == this.$gtMscKey">
+              <set_value name="$mineLocked" exact="true"/>
+            </do_if>
+          </do_if>
+          <do_else>
+            <remove_value name="global.$GT_MinerSectorBfsFills.{$bfi}"/>
+          </do_else>
+        </do_all>
+
+        <do_if value="not $mineLocked">
+          <append_to_list name="global.$GT_MinerSectorBfsFills" exact="table[$Key = this.$gtMscKey, $At = player.age]"/>
+          <set_value name="this.$gtMscClaimed" exact="true"/>
+        </do_if>
+        <do_else>
+          <wait min="150ms" max="350ms"/>
+          <set_value name="this.$gtMscWaitLeft" exact="this.$gtMscWaitLeft - 1"/>
+          <!-- The holder may have published, possibly backfilled from a higher maxgate. -->
+          <do_if value="global.$GT_MinerSectorCache.{this.$gtMscKey}? and typeof global.$GT_MinerSectorCache.{this.$gtMscKey} == datatype.table">
+            <set_value name="$entry" exact="global.$GT_MinerSectorCache.{this.$gtMscKey}"/>
+            <do_if value="$entry.$Spaces? and $entry.$At? and (player.age - $entry.$At) le this.$gtMscTtl">
+              <set_value name="this.$gtMscHit" exact="$entry"/>
+            </do_if>
+          </do_if>
+        </do_else>
       </do_while>
 
-      <!-- Re-check after wait (another ship may have backfilled this key from a higher maxgate). -->
-      <do_if value="global.$GT_MinerSectorCache.{this.$gtMscKey}? and typeof global.$GT_MinerSectorCache.{this.$gtMscKey} == datatype.table">
-        <set_value name="$entry" exact="global.$GT_MinerSectorCache.{this.$gtMscKey}"/>
-        <do_if value="$entry.$Spaces? and $entry.$At? and (player.age - $entry.$At) le this.$gtMscTtl">
-          <set_value name="$result" exact="$entry.$Spaces.clone"/>
-          <set_value name="this.$gtMinerSectorsResult" exact="$result"/>
-          <debug_text text="'[GT-Miner] ' + this.assignedcontrolled.idcode + ': sector-cache HIT count=' + $result.count + ' maxgate=' + this.$gtMscMax + ' key=' + this.$gtMscKey" chance="$debugchance"/>
-          <remove_value name="this.$gtMscKey"/>
-          <remove_value name="this.$gtMscRef"/>
-          <remove_value name="this.$gtMscRefId"/>
-          <remove_value name="this.$gtMscMax"/>
-          <remove_value name="this.$gtMscDisc"/>
-          <remove_value name="this.$gtMscBL"/>
-          <remove_value name="this.$gtMscTtl"/>
-          <remove_value name="this.$gtMscWaitLeft"/>
-          <return value="$result"/>
-        </do_if>
+      <!-- Took a peer's result: nothing was claimed, so there is nothing to release. -->
+      <do_if value="this.$gtMscHit != null">
+        <set_value name="$result" exact="this.$gtMscHit.$Spaces.clone"/>
+        <set_value name="this.$gtMinerSectorsResult" exact="$result"/>
+        <debug_text text="'[GT-Miner] ' + this.assignedcontrolled.idcode + ': sector-cache HIT-after-wait count=' + $result.count + ' key=' + this.$gtMscKey" chance="$debugchance"/>
+        <remove_value name="this.$gtMscKey"/>
+        <remove_value name="this.$gtMscRef"/>
+        <remove_value name="this.$gtMscRefId"/>
+        <remove_value name="this.$gtMscMax"/>
+        <remove_value name="this.$gtMscDisc"/>
+        <remove_value name="this.$gtMscBL"/>
+        <remove_value name="this.$gtMscTtl"/>
+        <remove_value name="this.$gtMscWaitLeft"/>
+        <remove_value name="this.$gtMscClaimed"/>
+        <remove_value name="this.$gtMscHit"/>
+        <return value="$result"/>
       </do_if>
 
-      <!-- Claim single-flight lock for this key. -->
-      <set_value name="global.$GT_MinerSectorBfsKey" exact="this.$gtMscKey"/>
-      <set_value name="global.$GT_MinerSectorBfsAt" exact="player.age"/>
+      <!-- Waited out the budget while the holder kept the key. Build anyway rather than returning
+           nothing; the release path keys off this entry, so claiming keeps the release symmetric. -->
+      <do_if value="not this.$gtMscClaimed">
+        <append_to_list name="global.$GT_MinerSectorBfsFills" exact="table[$Key = this.$gtMscKey, $At = player.age]"/>
+      </do_if>
 
       <!-- Distance table: one BFS, then backfill all lower maxgates for this ref. No vanilla debug spam. -->
       <run_script name="'lib.find.sectors.inrange'" result="$sectorTable">
@@ -169,9 +188,19 @@
       </do_if>
       <set_value name="this.$gtMinerSectorsResult" exact="$requestedSpaces"/>
 
-      <do_if value="global.$GT_MinerSectorBfsKey? and global.$GT_MinerSectorBfsKey == this.$gtMscKey">
-        <remove_value name="global.$GT_MinerSectorBfsKey"/>
-        <do_if value="global.$GT_MinerSectorBfsAt?"><remove_value name="global.$GT_MinerSectorBfsAt"/></do_if>
+      <!-- Release this key so waiters stop polling. Only the first match is dropped: a waiter that
+           timed out may hold a second entry for the same key and still owns it. -->
+      <do_if value="global.$GT_MinerSectorBfsFills? and typeof global.$GT_MinerSectorBfsFills == datatype.list">
+        <set_value name="$released" exact="false"/>
+        <do_all exact="global.$GT_MinerSectorBfsFills.count" counter="$rbi" reverse="true">
+          <do_if value="not $released">
+            <set_value name="$relEntry" exact="global.$GT_MinerSectorBfsFills.{$rbi}"/>
+            <do_if value="$relEntry? and $relEntry.$Key? and @$relEntry.$Key == this.$gtMscKey">
+              <remove_value name="global.$GT_MinerSectorBfsFills.{$rbi}"/>
+              <set_value name="$released" exact="true"/>
+            </do_if>
+          </do_if>
+        </do_all>
       </do_if>
 
       <debug_text text="'[GT-Miner] ' + this.assignedcontrolled.idcode + ': sector-cache MISS count=' + $requestedSpaces.count + ' maxgate=' + this.$gtMscMax + ' disc=' + this.$gtMscDisc + ' bl=' + this.$gtMscBL + ' key=' + this.$gtMscKey + ' backfilled=0..' + this.$gtMscMax" chance="$debugchance"/>
@@ -185,6 +214,8 @@
       <remove_value name="this.$gtMscTtl"/>
       <remove_value name="this.$gtMscWaitLeft"/>
       <remove_value name="this.$gtMscFillGate"/>
+      <remove_value name="this.$gtMscClaimed"/>
+      <remove_value name="this.$gtMscHit"/>
 
       <return value="$requestedSpaces"/>
     </actions>

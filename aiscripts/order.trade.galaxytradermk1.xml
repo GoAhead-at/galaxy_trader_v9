@@ -685,69 +685,138 @@
           <param name="refreshName" value="true"/>
           <param name="reason" value="'mk1_leftover_cargo'"/>
         </run_script>
-        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Leftover cargo detected — selling at nearest buyer'" chance="this.$debugchance"/>
+        <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Leftover cargo detected - clearance via sell_only'" chance="this.$debugchance"/>
 
-        <!-- Build sector list for leftover cargo clearance -->
-        <create_list name="$clearSectors"/>
-        <append_to_list name="$clearSectors" exact="this.ship.sector"/>
-        <do_if value="this.$maxsell gt 0">
-          <find_sector name="$clearNearbySectors" space="player.galaxy" multiple="true">
-            <match_gate_distance object="this.ship.sector" min="0" max="this.$maxsell"/>
-          </find_sector>
-          <do_if value="$clearNearbySectors? and $clearNearbySectors.count gt 0">
-            <do_all exact="$clearNearbySectors.count" counter="$csi">
-              <do_if value="$clearNearbySectors.{$csi} != this.ship.sector">
-                <append_to_list name="$clearSectors" exact="$clearNearbySectors.{$csi}"/>
-              </do_if>
-            </do_all>
+        <!-- Same CL stack as MK3/MK4/MK2: BL-scoped spaces, live buy offers, lib.gt.search.sell_only.
+             Scan from the ship; radius is ship-to-home + MaxSell so the home bubble stays reachable.
+             Territory gate in sell_only remains MaxSell from home. -->
+        <set_value name="this.$mk1_clearPathHome" exact="if this.ship.sector? and this.ship.sector.exists then this.ship.sector else this.$homeStation.sector"/>
+        <set_value name="this.$mk1_clearHomeDist" exact="0"/>
+        <do_if value="this.$homeStation.sector? and this.$homeStation.sector.exists and this.$mk1_clearPathHome? and this.$mk1_clearPathHome != this.$homeStation.sector">
+          <set_value name="this.$mk1_clearHomeDist" exact="this.$mk1_clearPathHome.gatedistance.{this.$homeStation.sector}"/>
+          <do_if value="this.$mk1_clearHomeDist lt 0">
+            <set_value name="this.$mk1_clearHomeDist" exact="this.$maxsell"/>
           </do_if>
         </do_if>
+        <set_value name="this.$mk1_clearPathMax" exact="this.$mk1_clearHomeDist + this.$maxsell"/>
+        <run_script name="'lib.gt.pathfinding'" result="$mk1ClearPath">
+          <param name="ship" value="this.ship"/>
+          <param name="homeSector" value="this.$mk1_clearPathHome"/>
+          <param name="maxDistance" value="this.$mk1_clearPathMax"/>
+          <param name="maxDistanceBuy" value="this.$mk1_clearPathMax"/>
+          <param name="maxDistanceSell" value="this.$mk1_clearPathMax"/>
+          <param name="ignoreBlacklist" value="false"/>
+          <param name="filterBlacklistedSpaces" value="true"/>
+          <param name="blacklistGroup" value="blacklistgroup.civilian"/>
+        </run_script>
+        <set_value name="this.$mk1_clearSellSpaces" exact="if @$mk1ClearPath.$SellSpaces != null then $mk1ClearPath.$SellSpaces else []"/>
 
-        <!-- For each ware in cargo, find nearest NPC buyer and sell -->
-        <set_value name="$cargoWares" exact="this.ship.cargo.list"/>
-        <do_all exact="$cargoWares.count" counter="$mk1ClrWareIdx">
-          <set_value name="$cWare" exact="$cargoWares.{$mk1ClrWareIdx}"/>
-          <set_value name="$cAmount" exact="this.ship.cargo.{$cWare}.count"/>
-          <do_if value="$cAmount gt 0">
-            <!-- Find nearest buyer for this ware across sectors in range -->
-            <set_value name="$clearBuyOffer" exact="null"/>
-            <do_all exact="$clearSectors.count" counter="$csi">
-              <find_buy_offer wares="$cWare" space="$clearSectors.{$csi}" tradepartner="this.ship" result="$secClearOffer">
-                <match_buyer tradesknownto="this.ship.owner" owner="faction.player" negateownerfilter="true">
-                  <match_relation_to object="this.ship" relation="dock" comparison="ge"/>
-                  <match_relation_to faction="this.ship.owner" relation="enemy" comparison="not"/>
-                </match_buyer>
-                <amount min="1"/>
-              </find_buy_offer>
-              <do_if value="$secClearOffer.available">
-                <do_if value="this.$ignoretraderules or $secClearOffer.cantradewith.{this.$homeStation}">
-                  <set_value name="$clearBuyOffer" exact="$secClearOffer"/>
-                  <break/>
-                </do_if>
-              </do_if>
-            </do_all>
-            <do_if value="$clearBuyOffer? and $clearBuyOffer != null and $clearBuyOffer.available">
-              <set_value name="$clearAmount" exact="[$cAmount, $clearBuyOffer.amount].min"/>
-              <do_if value="global.$GT_ReturnHomeHold? and global.$GT_ReturnHomeHold.{this.ship}?">
-                <remove_value name="global.$GT_ReturnHomeHold.{this.ship}"/>
-                <do_if value="global.$GT_ReturnHomeHoldUntil? and global.$GT_ReturnHomeHoldUntil.{this.ship}?">
-                  <remove_value name="global.$GT_ReturnHomeHoldUntil.{this.ship}"/>
-                </do_if>
-              </do_if>
-              <do_if value="global.$GT_MK1DockedSince? and global.$GT_MK1DockedSince.{this.ship}?">
-                <remove_value name="global.$GT_MK1DockedSince.{this.ship}"/>
-              </do_if>
-              <do_if value="global.$GT_MK1ReturnHomeReleased? and global.$GT_MK1ReturnHomeReleased.{this.ship}?">
-                <remove_value name="global.$GT_MK1ReturnHomeReleased.{this.ship}"/>
-              </do_if>
-              <remove_value name="this.$mk1_dockedSince"/>
-              <remove_value name="this.$mk1_returnhomeReleased"/>
-              <create_trade_order object="this.ship" tradeoffer="$clearBuyOffer" amount="$clearAmount" immediate="true" internal="true"/>
-              <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Clearing leftover ' + $clearAmount + ' ' + $cWare.name + ' at ' + $clearBuyOffer.owner.knownname" chance="this.$debugchance"/>
+        <run_script name="'lib.gt.live.search'" result="$mk1ClearLive">
+          <param name="ship" value="this.ship"/>
+          <param name="searchMode" value="'sell_only'"/>
+          <param name="buySpaces" value="[]"/>
+          <param name="sellSpaces" value="this.$mk1_clearSellSpaces"/>
+          <param name="homeSector" value="this.$homeStation.sector"/>
+          <param name="maxDistance" value="this.$maxsell"/>
+          <param name="wareBasket" value="this.ship.cargo.list"/>
+          <param name="allowIllegal" value="this.$allowillegal"/>
+          <param name="ownerFilter" value="'any'"/>
+          <param name="ignoreTradeRules" value="this.$ignoretraderules"/>
+          <param name="ignoreMK1Supply" value="false"/>
+          <param name="buyPriceMin" value="-1.0"/>
+          <param name="searchPurpose" value="'direct_live'"/>
+          <param name="debugchance" value="this.$debugchance"/>
+        </run_script>
+        <set_value name="this.$mk1_clearLiveResult" exact="$mk1ClearLive"/>
+        <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield after clearance live search"/>
+        <set_value name="$mk1ClearLive" exact="this.$mk1_clearLiveResult"/>
+
+        <create_list name="$mk1ClearBuyOffers"/>
+        <do_if value="$mk1ClearLive? and $mk1ClearLive.$BuyOffers?">
+          <do_all exact="$mk1ClearLive.$BuyOffers.count" counter="$mk1ClrOi">
+            <set_value name="$mk1ClrOffer" exact="$mk1ClearLive.$BuyOffers.{$mk1ClrOi}"/>
+            <do_if value="not $mk1ClrOffer? or not @$mk1ClrOffer.exists or not $mk1ClrOffer.available">
+              <continue/>
+            </do_if>
+            <do_if value="not this.$ignoretraderules and not $mk1ClrOffer.cantradewith.{this.$homeStation}">
+              <continue/>
+            </do_if>
+            <append_to_list name="$mk1ClearBuyOffers" exact="$mk1ClrOffer"/>
+          </do_all>
+        </do_if>
+        <set_value name="this.$mk1_clearBuyOffers" exact="$mk1ClearBuyOffers"/>
+
+        <run_script name="'lib.gt.search.sell_only'" result="$mk1ClearPick">
+          <param name="ship" value="this.ship"/>
+          <param name="buyOffers" value="this.$mk1_clearBuyOffers"/>
+          <param name="homeSector" value="this.$homeStation.sector"/>
+          <param name="maxDistance" value="this.$maxsell"/>
+          <param name="blacklistGroup" value="blacklistgroup.civilian"/>
+          <param name="sectorWhitelist" value="[]"/>
+          <param name="distancePenalty" value="0.1"/>
+          <param name="debugchance" value="this.$debugchance"/>
+        </run_script>
+        <set_value name="this.$mk1ClearPick" exact="$mk1ClearPick"/>
+
+        <do_if value="@this.$mk1ClearPick.$Found == true and @this.$mk1ClearPick.$BestTrade != null">
+          <set_value name="this.$mk1ClearOffer" exact="@this.$mk1ClearPick.$BestTrade.$SellOffer"/>
+          <set_value name="this.$mk1ClearAmount" exact="if this.$mk1ClearPick.$BestTrade.$Amount != null then @this.$mk1ClearPick.$BestTrade.$Amount else 0"/>
+        </do_if>
+        <do_else>
+          <set_value name="this.$mk1ClearOffer" exact="null"/>
+          <set_value name="this.$mk1ClearAmount" exact="0"/>
+        </do_else>
+
+        <do_if value="@this.$mk1ClearOffer.available == true and this.$mk1ClearAmount gt 0">
+          <do_if value="global.$GT_ReturnHomeHold? and global.$GT_ReturnHomeHold.{this.ship}?">
+            <remove_value name="global.$GT_ReturnHomeHold.{this.ship}"/>
+            <do_if value="global.$GT_ReturnHomeHoldUntil? and global.$GT_ReturnHomeHoldUntil.{this.ship}?">
+              <remove_value name="global.$GT_ReturnHomeHoldUntil.{this.ship}"/>
             </do_if>
           </do_if>
-        </do_all>
-        <wait exact="this.$gt_yieldMs * 1ms" comment="Cooperative yield after clearance ware scan"/>
+          <do_if value="global.$GT_MK1DockedSince? and global.$GT_MK1DockedSince.{this.ship}?">
+            <remove_value name="global.$GT_MK1DockedSince.{this.ship}"/>
+          </do_if>
+          <do_if value="global.$GT_MK1ReturnHomeReleased? and global.$GT_MK1ReturnHomeReleased.{this.ship}?">
+            <remove_value name="global.$GT_MK1ReturnHomeReleased.{this.ship}"/>
+          </do_if>
+          <remove_value name="this.$mk1_dockedSince"/>
+          <remove_value name="this.$mk1_returnhomeReleased"/>
+          <wait exact="this.$gt_yieldMs * 1ms" comment="Desync cargo-clear trade creation across ships"/>
+          <create_trade_order object="this.ship" tradeoffer="this.$mk1ClearOffer" amount="this.$mk1ClearAmount" immediate="true" internal="true"/>
+          <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': Clearing leftover ' + this.$mk1ClearAmount + ' ' + (if this.$mk1ClearOffer.ware? then this.$mk1ClearOffer.ware.name else '?') + ' at ' + this.$mk1ClearOffer.owner.knownname" chance="this.$debugchance"/>
+          <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}? and global.$GT_Ships.{this.ship}.$Unreachable?">
+            <run_script name="'lib.gt.ship.opstate'">
+              <param name="ship" value="this.ship"/>
+              <param name="opState" value="'Unreachable'"/>
+              <param name="active" value="false"/>
+              <param name="refreshName" value="true"/>
+              <param name="reason" value="'mk1_clearance_buyer_reachable'"/>
+            </run_script>
+          </do_if>
+        </do_if>
+        <do_else>
+          <set_value name="$mk1ClrSkipUR" exact="if this.$mk1ClearPick? and @this.$mk1ClearPick.$SkippedUnreachable != null then @this.$mk1ClearPick.$SkippedUnreachable else 0"/>
+          <do_if value="$mk1ClrSkipUR gt 0">
+            <run_script name="'lib.gt.ship.opstate'">
+              <param name="ship" value="this.ship"/>
+              <param name="opState" value="'Unreachable'"/>
+              <param name="active" value="true"/>
+              <param name="refreshName" value="true"/>
+              <param name="reason" value="'mk1_clearance_buyers_unreachable'"/>
+            </run_script>
+            <debug_text text="'[GT-MK1] ' + this.ship.idcode + ': CL+[UR] clearance buyers unreachable (skipUnreachable=' + $mk1ClrSkipUR + ')'" chance="this.$debugchance"/>
+          </do_if>
+          <do_elseif value="global.$GT_Ships? and global.$GT_Ships.{this.ship}? and global.$GT_Ships.{this.ship}.$Unreachable?">
+            <run_script name="'lib.gt.ship.opstate'">
+              <param name="ship" value="this.ship"/>
+              <param name="opState" value="'Unreachable'"/>
+              <param name="active" value="false"/>
+              <param name="refreshName" value="true"/>
+              <param name="reason" value="'mk1_clearance_not_path_blocked'"/>
+            </run_script>
+          </do_elseif>
+        </do_else>
 
         <!-- Wait for trade orders to execute -->
         <do_if value="this.ship.orders.count gt 0">
@@ -776,6 +845,15 @@
           <param name="refreshName" value="true"/>
           <param name="reason" value="'mk1_cargo_empty_loop'"/>
         </run_script>
+        <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship}? and global.$GT_Ships.{this.ship}.$Unreachable?">
+          <run_script name="'lib.gt.ship.opstate'">
+            <param name="ship" value="this.ship"/>
+            <param name="opState" value="'Unreachable'"/>
+            <param name="active" value="false"/>
+            <param name="refreshName" value="true"/>
+            <param name="reason" value="'mk1_cargo_empty_loop'"/>
+          </run_script>
+        </do_if>
       </do_if>
 
       <!-- ============================================================== -->

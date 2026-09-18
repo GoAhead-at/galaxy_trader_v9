@@ -234,7 +234,7 @@ local function offerMatchesDirection(tradeData, wantPickup)
     return tradeData.isbuyoffer == true
 end
 
-local function canQueueOffer(tradeData, shipId, amount)
+local function canQueueOffer(tradeData, shipId, amount, wantPickup)
     if tradeData == nil or tradeData.id == nil then
         return false
     end
@@ -242,6 +242,12 @@ local function canQueueOffer(tradeData, shipId, amount)
     local queueAmount = tonumber(amount) or 0
     if queueAmount < minAmount then
         return false
+    end
+    -- Deliver is resolved before pickup has landed. Vanilla CanTradeWith on a station
+    -- buy offer requires the ware already in the ship hold (map UI greys it out).
+    -- MD already validated dest gap / dock / lane, so skip CanTradeWith on deliver.
+    if not wantPickup then
+        return true
     end
     local ok, canTrade = pcall(function()
         return CanTradeWith(tradeData.id, shipId, minAmount)
@@ -279,7 +285,7 @@ local function resolveWareExchangeLeg(shipId, leg)
             wareHits = wareHits + 1
             if offerMatchesDirection(tradeData, wantPickup) then
                 directionHits = directionHits + 1
-                if canQueueOffer(tradeData, shipId, amount) then
+                if canQueueOffer(tradeData, shipId, amount, wantPickup) then
                     return tradeData.id, nil
                 end
             end
@@ -350,25 +356,25 @@ RegisterEvent("gt.mk2QueueWareExchange", function(_, requestId)
         end
     end
 
-    local queueLegs = {}
-    local function resolveAndQueueBatch(batch)
+    -- Resolve every requested leg first. Queue nothing until all ids exist,
+    -- otherwise a failed deliver leaves an orphan pickup TradePerform on the ship.
+    local resolvedLegs = {}
+    local function resolveBatch(batch)
         for _, leg in ipairs(batch) do
             local offerId, err = resolveWareExchangeLeg(shipId, leg)
             if not offerId then
                 return err or "resolve failed"
             end
-            local amount = tonumber(legField(leg, "Amount")) or 0
-            queueResolvedLeg(shipId, offerId, amount)
-            table.insert(queueLegs, {
+            table.insert(resolvedLegs, {
                 Direction = legField(leg, "Direction"),
-                Amount = amount,
+                Amount = tonumber(legField(leg, "Amount")) or 0,
                 TradeOffer = offerId,
             })
         end
         return nil
     end
 
-    local err = resolveAndQueueBatch(pickups)
+    local err = resolveBatch(pickups)
     if err then
         result.Error = err
         writeResult(playerId, result)
@@ -377,13 +383,19 @@ RegisterEvent("gt.mk2QueueWareExchange", function(_, requestId)
         return
     end
 
-    err = resolveAndQueueBatch(delivers)
+    err = resolveBatch(delivers)
     if err then
         result.Error = err
         writeResult(playerId, result)
         SignalObject(shipId, "gt_mk2_ware_exchange_done", requestId)
         debugLog(result.Error)
         return
+    end
+
+    local queueLegs = {}
+    for _, item in ipairs(resolvedLegs) do
+        queueResolvedLeg(shipId, item.TradeOffer, item.Amount)
+        table.insert(queueLegs, item)
     end
 
     result.Success = true

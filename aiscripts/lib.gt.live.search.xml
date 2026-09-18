@@ -34,7 +34,8 @@
     <param name="demandLedSupplierScan" default="false" comment="MK4: collect buy offers first, then limit supplier scan to demand wares only (S4)."/>
     <param name="mk4BuildStorageOnlyMode" default="false" comment="Legacy MK4 v1 — prefer mk4Priorities for MK4; kept as explicit override."/>
     <param name="mk4Priorities" default="table[]" comment="MK4 class sliders — bitmask + classify-at-ingest"/>
-    <param name="mk4AnchorHome" default="null" comment="MK4 home anchor for build-storage-only scope (station or sector)."/>
+    <param name="mk4AnchorHome" default="null" comment="MK4 home anchor for serveHomeOnly / build-storage-only scope (station or sector)."/>
+    <param name="mk4DedicatedServe" default="false" comment="MK4 serveHomeOnly: collect buy offers only from the home anchor (station + its BS, or home sector)."/>
     <param name="maxDistanceSell" default="0" comment="MK4 jumpDistanceCoverage — max gate distance from home for BS delivery buyers (0 = use maxDistance)."/>
     <param name="stationwhitelist" default="[]" comment="MK4: direct-probe these NPC stations as suppliers (sector scan can miss them via per-ware fill order / range edge)."/>
     <param name="enableVolumeThresholds" default="true" comment="When false (MK4), force totalvolume floors to 1 / no meaningful max. MK3 default true keeps fleet-min / cargotarget floors."/>
@@ -127,6 +128,7 @@
         <set_value name="$gtlsMk4BuildStorageOnlyMode" exact="true"/>
       </do_if>
       <set_value name="$gtlsMk4AnchorHome" exact="if $mk4AnchorHome? then $mk4AnchorHome else null"/>
+      <set_value name="this.$gtlsMk4DedicatedServe" exact="if $mk4DedicatedServe? then $mk4DedicatedServe else false"/>
       <set_value name="$gtlsEnableVolumeThresholds" exact="if @$enableVolumeThresholds != null then $enableVolumeThresholds else true"/>
       <set_value name="$gtlsPhase5LocalsReady" exact="true"/>
       <set_value name="$gtlsDistancePenalty" exact="if $distancePenalty? then $distancePenalty else 0.1"/>
@@ -506,6 +508,7 @@
             <set_value name="$gtlsMk4BuildStorageOnlyMode" exact="true"/>
           </do_if>
           <set_value name="$gtlsMk4AnchorHome" exact="if $mk4AnchorHome? then $mk4AnchorHome else null"/>
+          <set_value name="this.$gtlsMk4DedicatedServe" exact="if $mk4DedicatedServe? then $mk4DedicatedServe else false"/>
           <do_if value="not this.$gtlsDemandLedSupplierScan?">
             <set_value name="this.$gtlsDemandLedSupplierScan" exact="if $demandLedSupplierScan? then $demandLedSupplierScan else false"/>
           </do_if>
@@ -530,6 +533,9 @@
       </do_else>
       <do_if value="not this.$gtlsDemandLedSupplierScan?">
         <set_value name="this.$gtlsDemandLedSupplierScan" exact="false"/>
+      </do_if>
+      <do_if value="not this.$gtlsMk4DedicatedServe?">
+        <set_value name="this.$gtlsMk4DedicatedServe" exact="if $mk4DedicatedServe? then $mk4DedicatedServe else false"/>
       </do_if>
       <!-- Phase 5 save migration: always declare MK4-merge locals (old scratch / restored v6 locals omit them). -->
       <do_if value="not $gtlsIncludeNpcSellOffers?">
@@ -631,6 +637,61 @@
             <set_value name="global.$GT_LiveSearchScratch.{$gtlsShip}.$SupplierCoverageMax" exact="$gtlsSupplierCoverageMax"/>
           </do_if>
         </do_else>
+      </do_if>
+      <!-- serveHomeOnly: collect buy offers only from the home anchor so Auto Wares
+           (empty basket) is not drowned by other player buyers in coverage, then
+           wiped by the order-script home-scope post-filter. Suppliers stay coverage-wide.
+           BSO keeps all player build-storage buyers; sell_only clearance is untouched.
+           Re-applied after every ensure_state fall-through (idempotent). -->
+      <do_if value="if this.$gtlsMk4DedicatedServe? then this.$gtlsMk4DedicatedServe else false">
+        <set_value name="$gtlsApplyServeHomeBuyers" exact="true"/>
+        <do_if value="if $gtlsMk4BuildStorageOnlyMode? then $gtlsMk4BuildStorageOnlyMode else false">
+          <set_value name="$gtlsApplyServeHomeBuyers" exact="false"/>
+        </do_if>
+        <do_if value="$gtlsSearchMode?">
+          <do_if value="$gtlsSearchMode == 'sell_only'">
+            <set_value name="$gtlsApplyServeHomeBuyers" exact="false"/>
+          </do_if>
+        </do_if>
+        <do_if value="$gtlsApplyServeHomeBuyers">
+          <set_value name="$gtlsServeAnchor" exact="if $gtlsMk4AnchorHome? then $gtlsMk4AnchorHome else null"/>
+          <create_list name="$gtlsServeHomeBuyers"/>
+          <set_value name="$gtlsServeHomeType" exact="'none'"/>
+          <do_if value="@$gtlsServeAnchor != null">
+            <do_if value="$gtlsServeAnchor.isclass.station">
+              <set_value name="$gtlsServeHomeType" exact="'station'"/>
+              <append_to_list name="$gtlsServeHomeBuyers" exact="$gtlsServeAnchor"/>
+              <do_if value="$gtlsServeAnchor.buildstorage? and $gtlsServeAnchor.buildstorage.exists">
+                <append_to_list name="$gtlsServeHomeBuyers" exact="$gtlsServeAnchor.buildstorage"/>
+              </do_if>
+              <set_value name="$gtlsPlayerBuyersInRange" exact="$gtlsServeHomeBuyers"/>
+              <set_value name="$gtlsUsePlayerStationDiscovery" exact="true"/>
+            </do_if>
+            <do_elseif value="$gtlsServeAnchor.isclass.sector">
+              <set_value name="$gtlsServeHomeType" exact="'sector'"/>
+              <do_if value="$gtlsPlayerBuyersInRange?">
+                <do_if value="$gtlsPlayerBuyersInRange.count gt 0">
+                  <do_all exact="$gtlsPlayerBuyersInRange.count" counter="$gtlsShbi">
+                    <set_value name="$gtlsShb" exact="$gtlsPlayerBuyersInRange.{$gtlsShbi}"/>
+                    <do_if value="not $gtlsShb? or not @$gtlsShb.exists">
+                      <continue/>
+                    </do_if>
+                    <do_if value="$gtlsShb.sector?">
+                      <do_if value="@$gtlsShb.sector == $gtlsServeAnchor">
+                        <append_to_list name="$gtlsServeHomeBuyers" exact="$gtlsShb"/>
+                      </do_if>
+                    </do_if>
+                  </do_all>
+                </do_if>
+              </do_if>
+              <set_value name="$gtlsPlayerBuyersInRange" exact="$gtlsServeHomeBuyers"/>
+              <!-- Keep discovery on even when the scoped list is empty so buy collection
+                   does not fall back to whole-coverage sellSpaces. -->
+              <set_value name="$gtlsUsePlayerStationDiscovery" exact="true"/>
+            </do_elseif>
+          </do_if>
+          <debug_text text="'[GT-LiveSearch] ' + $gtlsShip.idcode + ': serveHomeOnly buyer scope home=' + (if @$gtlsServeAnchor.exists then @$gtlsServeAnchor.knownname else 'null') + ' type=' + $gtlsServeHomeType + ' buyers=' + $gtlsPlayerBuyersInRange.count" chance="$gtlsDebugchance"/>
+        </do_if>
       </do_if>
       <!-- ══════════════════════════════════════════════════════════════════
            Collect seller offers (ship buys from seller)

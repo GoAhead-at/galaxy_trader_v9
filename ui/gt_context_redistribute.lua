@@ -3571,19 +3571,13 @@ local function processPendingPostSwapRefreshRetries()
     end
 end
 
-if menu and menu.update then
-    local originalUpdate = menu.update
-    menu.update = function(...)
-        originalUpdate(...)
-        maybePublishMapSelectionShipCount()
-        processPendingPilotDataRefreshTimeout()
-        processPendingReleaseRetries()
-        retryFailedDockAssignments()
-        runSettlementMaintenance()
-        processDockSwapQueue()
-        processPendingPostSwapRefreshRetries()
-    end
-end
+-- NOTE: the per-frame processors are driven ONLY from onUpdate below.
+-- They used to ALSO be called from a wrapper around MapMenu.update, so each of them ran
+-- twice on every frame while the map was open. MapMenu is Helper.getMenu("MapMenu"), so
+-- that wrapper only fired with the map up, whereas onUpdate is the unconditional
+-- per-frame hook. onUpdate is a strict superset of the old wrapper - it additionally
+-- calls gtProcessPostSwapBusyRefreshes(), which the wrapper never did - so removing the
+-- wrapper loses no work and removes the duplicate pass.
 
 function onUpdate()
     maybePublishMapSelectionShipCount()

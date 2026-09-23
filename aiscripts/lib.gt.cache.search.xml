@@ -447,6 +447,13 @@
       <set_value name="$maxDistanceSellLeg" exact="if $maxDistanceSell? and $maxDistanceSell gt 0 then $maxDistanceSell else $maxDistance"/>
       <set_value name="this.$cs_homeDist" exact="table[]"/>
       <set_value name="this.$cs_homeDist.{$homeSector}" exact="0"/>
+      <!-- MK4 measures gate distance to the station COMPONENT (build storage often has no
+           .sector), so it cannot use the sector-keyed memo above. Memoise those per-object
+           results for the duration of this read, so a pool holding many wares at the same
+           station pays for gatedistance once instead of once per row. Rebuilt on every read,
+           exactly like $cs_homeDist, so it stays bounded by the distinct stations in one pool
+           rather than growing with the save. -->
+      <set_value name="this.$cs_homeDistObj" exact="table[]"/>
       <!-- If cache was populated with a smaller search radius than this ship needs, treat as miss
            so live search (with completion pass) can find trades outside the cached radius. -->
       <set_value name="$foundCount" exact="0"/>
@@ -1276,7 +1283,17 @@
           <set_value name="$mk4BsoCoverageMax" exact="if $maxDistanceSell? and $maxDistanceSell gt 0 then $maxDistanceSell else $maxDistance"/>
           <set_value name="$mk4BsoInScope" exact="false"/>
           <do_if value="this.$gt_cachePoolIsMk4">
-            <set_value name="$mk4BsoDist" exact="if $homeSector? and $entrySellStation? then $homeSector.gatedistance.{$entrySellStation} else -1"/>
+            <do_if value="this.$cs_homeDistObj? and this.$cs_homeDistObj.{$entrySellStation}?">
+              <set_value name="$mk4BsoDist" exact="this.$cs_homeDistObj.{$entrySellStation}"/>
+            </do_if>
+            <do_else>
+              <set_value name="$mk4BsoDist" exact="if $homeSector? and $entrySellStation? then $homeSector.gatedistance.{$entrySellStation} else -1"/>
+              <!-- Same quantity as the distance gate below, so share its memo; only real
+                   measurements are cached, never the -1 the guard above can produce. -->
+              <do_if value="$homeSector? and $entrySellStation?">
+                <set_value name="this.$cs_homeDistObj.{$entrySellStation}" exact="$mk4BsoDist"/>
+              </do_if>
+            </do_else>
           </do_if>
           <do_else>
             <set_value name="$mk4BsoDist" exact="if $homeSector? and @$entrySellStation != null and $entrySellStation.sector? then $homeSector.gatedistance.{$entrySellStation.sector} else -1"/>
@@ -1333,13 +1350,25 @@
              MK3: sector-to-sector via GT_SectorDistanceCache + this.$cs_homeDist memo. -->
         <do_if value="this.$gt_cachePoolIsMk4">
           <do_if value="$maxDistanceBuyLeg gt 0 and $entryBuyStation?">
-            <set_value name="$distBuy" exact="$homeSector.gatedistance.{$entryBuyStation}"/>
+            <do_if value="this.$cs_homeDistObj? and this.$cs_homeDistObj.{$entryBuyStation}?">
+              <set_value name="$distBuy" exact="this.$cs_homeDistObj.{$entryBuyStation}"/>
+            </do_if>
+            <do_else>
+              <set_value name="$distBuy" exact="$homeSector.gatedistance.{$entryBuyStation}"/>
+              <set_value name="this.$cs_homeDistObj.{$entryBuyStation}" exact="$distBuy"/>
+            </do_else>
             <do_if value="$distBuy lt 0 or $distBuy gt $maxDistanceBuyLeg">
               <continue/>
             </do_if>
           </do_if>
           <do_if value="$maxDistanceSellLeg gt 0 and $entrySellStation?">
-            <set_value name="$distSell" exact="$homeSector.gatedistance.{$entrySellStation}"/>
+            <do_if value="this.$cs_homeDistObj? and this.$cs_homeDistObj.{$entrySellStation}?">
+              <set_value name="$distSell" exact="this.$cs_homeDistObj.{$entrySellStation}"/>
+            </do_if>
+            <do_else>
+              <set_value name="$distSell" exact="$homeSector.gatedistance.{$entrySellStation}"/>
+              <set_value name="this.$cs_homeDistObj.{$entrySellStation}" exact="$distSell"/>
+            </do_else>
             <do_if value="$distSell lt 0 or $distSell gt $maxDistanceSellLeg">
               <continue/>
             </do_if>
@@ -1524,8 +1553,11 @@
         </do_if>
 
         <!-- MK4 class-at-0 filter on cached delivery customer (O(1) prefilter).
-             Use stored $CustomerClass tag; only classify inline when tag is missing (legacy entries). -->
-        <do_if value="this.$gt_cachePoolIsMk4 and $mk4Priorities? and $entrySellStation? and @$entrySellStation.exists">
+             Use stored $CustomerClass tag; only classify inline when tag is missing (legacy entries).
+             The priorities test is inlined rather than hoisted to a local: this loop yields, and a
+             local flag would not survive. `$mk4Priorities?` alone is always true for the table[]
+             the callers pass when this.$mk4Priorities is unset, which rejected every cache entry. -->
+        <do_if value="this.$gt_cachePoolIsMk4 and $mk4Priorities != null and ($mk4Priorities.$Buildstorage? or $mk4Priorities.$Stations? or $mk4Priorities.$Aux?) and $entrySellStation? and @$entrySellStation.exists">
           <set_value name="$mk4CacheClass" exact="if $entry.$CustomerClass? then @$entry.$CustomerClass else 'None'"/>
           <do_if value="$mk4CacheClass == 'None'">
             <do_if value="@$entrySellStation.isclass.buildstorage and @$entrySellStation.isplayerowned">

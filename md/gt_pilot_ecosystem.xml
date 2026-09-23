@@ -782,6 +782,84 @@
       </actions>
     </library>
 
+    <!-- Sweep HANDLE-KEYED pilot rows whose entity is gone (C-10).
+         Scope is deliberately narrow: $GT_Pilots, $GT_PilotLiveIndex, and dead entries in the
+         derived $GT_PilotsByStable index. $GT_PilotBySeed is NOT touched and must not be - it is
+         keyed by a STABLE seed, not a live handle, and carries $XP/$Level for EJECTED pilots so a
+         rescue can recover their progress; gt_core_system.xml:3766-3768 exists precisely to
+         protect that. Removing seed rows would destroy the data the design preserves.
+         A row is dropped only after its entity has been missing for N CONSECUTIVE loads, so a
+         pilot the engine transiently reports as non-existent during eject/destroy (the same
+         documented hazard) has its counter cleared the moment it is seen alive again.
+         Called once per load from GT_Pilot_Migrate_On_Load - deliberately not a periodic loop,
+         matching the scheduler's stated "no periodic loops" policy. -->
+    <library name="GT_Pilot_Sweep_Dead_Entity_Rows" purpose="run_actions">
+      <params>
+        <param name="missingLoads" default="2" comment="Consecutive loads an entity must be missing before its handle-keyed rows are dropped"/>
+      </params>
+      <actions>
+        <run_actions ref="GT_Pilot_Ensure_Tables"/>
+        <set_value name="$sweptRows" exact="0"/>
+        <set_value name="$scannedRows" exact="0"/>
+        <set_value name="$aliveSeen" exact="0"/>
+
+        <do_if value="global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
+          <!-- Snapshot the key list: the loop removes rows from the table it is walking. -->
+          <set_value name="$sweepKeys" exact="global.$GT_Pilots.keys.list"/>
+          <set_value name="$scannedRows" exact="$sweepKeys.count"/>
+          <do_all exact="$sweepKeys.count" counter="$pi">
+            <set_value name="$pe" exact="$sweepKeys.{$pi}"/>
+            <do_if value="$pe? and $pe != null and @$pe.exists">
+              <!-- Alive: clear the miss counter so a future disappearance starts from zero. -->
+              <set_value name="$aliveSeen" operation="add"/>
+              <do_if value="global.$GT_Pilots.{$pe}.$MissingLoads?">
+                <remove_value name="global.$GT_Pilots.{$pe}.$MissingLoads"/>
+              </do_if>
+            </do_if>
+            <do_else>
+              <set_value name="$peMisses" exact="if global.$GT_Pilots.{$pe}.$MissingLoads? then global.$GT_Pilots.{$pe}.$MissingLoads else 0"/>
+              <set_value name="$peMisses" exact="$peMisses + 1"/>
+              <do_if value="$peMisses ge $missingLoads">
+                <remove_value name="global.$GT_Pilots.{$pe}"/>
+                <do_if value="global.$GT_PilotLiveIndex.{$pe}?">
+                  <remove_value name="global.$GT_PilotLiveIndex.{$pe}"/>
+                </do_if>
+                <set_value name="$sweptRows" operation="add"/>
+              </do_if>
+              <do_else>
+                <set_value name="global.$GT_Pilots.{$pe}.$MissingLoads" exact="$peMisses"/>
+              </do_else>
+            </do_else>
+          </do_all>
+        </do_if>
+
+        <!-- Derived index hygiene. Only entries whose entity is already gone AND no longer present
+             in $GT_Pilots are dropped, so this cannot remove a row the primary table still tracks
+             (i.e. it inherits the N-consecutive-loads proof above rather than racing it). -->
+        <do_if value="global.$GT_PilotsByStable?">
+          <do_all exact="2" counter="$bsi">
+            <set_value name="$bsBucket" exact="if $bsi == 1 then '$s' else '$i'"/>
+            <do_if value="global.$GT_PilotsByStable.{$bsBucket}? and global.$GT_PilotsByStable.{$bsBucket}.keys.count gt 0">
+              <set_value name="$bsKeys" exact="global.$GT_PilotsByStable.{$bsBucket}.keys.list"/>
+              <do_all exact="$bsKeys.count" counter="$bi">
+                <set_value name="$bsKey" exact="$bsKeys.{$bi}"/>
+                <set_value name="$bsEnt" exact="@global.$GT_PilotsByStable.{$bsBucket}.{$bsKey}"/>
+                <do_if value="$bsEnt? and $bsEnt != null and not $bsEnt.exists and not global.$GT_Pilots.{$bsEnt}?">
+                  <remove_value name="global.$GT_PilotsByStable.{$bsBucket}.{$bsKey}"/>
+                  <set_value name="$sweptRows" operation="add"/>
+                </do_if>
+              </do_all>
+            </do_if>
+          </do_all>
+        </do_if>
+
+        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging and $sweptRows gt 0">
+          <debug_text text="'[GT-PilotEco] Sweep_Dead_Entity_Rows removed=' + $sweptRows + ' scanned=' + $scannedRows + ' alive=' + $aliveSeen + ' (threshold=' + $missingLoads + ' loads)'" chance="100"/>
+        </do_if>
+        <return value="table[$Swept = $sweptRows, $Scanned = $scannedRows, $Alive = $aliveSeen]"/>
+      </actions>
+    </library>
+
     <cue name="GT_Pilot_Migrate_On_Load" instantiate="true" version="1">
       <conditions>
         <event_game_loaded/>
@@ -795,6 +873,8 @@
             <debug_text text="'[GT-PilotEco] Migrated legacy $GT_Pilots into $GT_PilotBySeed'" chance="100"/>
           </do_if>
         </do_if>
+        <!-- Handle-keyed row hygiene (C-10). Seed-keyed rows are deliberately out of scope. -->
+        <run_actions ref="GT_Pilot_Sweep_Dead_Entity_Rows"/>
       </actions>
     </cue>
 

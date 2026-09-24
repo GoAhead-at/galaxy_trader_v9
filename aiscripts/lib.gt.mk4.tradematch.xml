@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<aiscript name="lib.gt.mk4.tradematch" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="8">
+<aiscript name="lib.gt.mk4.tradematch" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../stock_game/X4 Foundations/libraries/aiscripts.xsd" version="9">
   <params>
     <param name="ship" default="this.ship"/>
     <param name="sellOffers" default="[]"/>
@@ -133,6 +133,15 @@
   </patch>
   <patch sinceversion="8">
     <debug_text text="'[GT-TradeMatch] lib.gt.tradematch v8: post-wait resume only when offer scratch lost (fixes MK3 live-search freeze from v7 unconditional resume)'" chance="100" filter="savegame"/>
+  </patch>
+  <patch sinceversion="9">
+    <!-- v9: this.$tm_mk4PrioActive replaced the local that the loop's batch-chunk yield used to
+         destroy. It is recomputed at tm_ensure_state as well, but seed it here too so a call
+         resumed by a load has it before the loop reads it. $mk4Priorities is a param and survives
+         the load; the declaration guard covers patch-vs-param ordering. -->
+    <do_if value="not this.$tm_mk4PrioActive?">
+      <set_value name="this.$tm_mk4PrioActive" exact="if $mk4Priorities? then ($mk4Priorities != null and ($mk4Priorities.$Buildstorage? or $mk4Priorities.$Stations? or $mk4Priorities.$Aux?)) else false"/>
+    </do_if>
   </patch>
   <attention min="unknown">
     <actions>
@@ -603,11 +612,14 @@
            table[] when this.$mk4Priorities is unset (orders saved before the property existed take
            that path). `$mk4Priorities?` was always true for an empty table, which drove the
            class-at-0 gate with every multiplier at 0 (hard-rejecting 100% of trades) and also
-           skipped the legacy class exclusions below. -->
-      <set_value name="$mk4PrioActive" exact="$mk4Priorities != null and ($mk4Priorities.$Buildstorage? or $mk4Priorities.$Stations? or $mk4Priorities.$Aux?)"/>
+           skipped the legacy class exclusions below.
+           Held on this.$tm_*, not a local: the match loop yields at the batch-chunk boundary
+           below, AI locals do not survive a yield, and a dead local read as `not $mk4PrioActive`
+           flips the reads to the legacy path (and logged one error per read per resumed chunk). -->
+      <set_value name="this.$tm_mk4PrioActive" exact="$mk4Priorities != null and ($mk4Priorities.$Buildstorage? or $mk4Priorities.$Stations? or $mk4Priorities.$Aux?)"/>
       <!-- MK4 dual-axis buckets: delivery class x supplier source (Player/Npc). -->
       <set_value name="this.$tm_useDualAxisBuckets" exact="false"/>
-      <do_if value="$scoreMode == 'supply' and $mk4PrioActive">
+      <do_if value="$scoreMode == 'supply' and this.$tm_mk4PrioActive">
         <set_value name="this.$tm_useDualAxisBuckets" exact="true"/>
         <set_value name="this.$tm_maxTradesPerBucket" exact="if $maxTradesPerBucket? and $maxTradesPerBucket gt 0 then $maxTradesPerBucket else 30"/>
         <set_value name="this.$tm_tradesByBucket" exact="table[$BS_P = [], $BS_N = [], $ST_P = [], $ST_N = [], $AX_P = [], $AX_N = []]"/>
@@ -616,17 +628,11 @@
       <remove_value name="this.$tm_abortMatch"/>
 
       <!-- Rebuild match state after save/load resume at blocking wait (index 1).
-           In-loop waits resume at tm_ensure_state below (skip accumulator reset above). -->
+           In-loop waits resume at tm_ensure_state below (skip accumulator reset above).
+           this.$ is not carried in saves for this library context, so every this.$tm_* read
+           below is rebuilt here rather than assumed. -->
       <label name="tm_ensure_state"/>
-      <!-- MUST be recomputed here as well as at the top of this library. The assignment above this
-           label is skipped by every in-loop yield, because the <wait> at the batch-chunk boundary
-           resumes via `resume label="tm_ensure_state"` and lands BELOW it - so the reads further
-           down found $mk4PrioActive undeclared and logged "Property lookup failed" once per
-           resumed chunk. $mk4Priorities is a param, so it survives the yield and recomputing is
-           cheap. NOTE: the local-after-wait lint cannot see this - the assignment IS before the
-           read in document order with no wait between them; the skip is a control-flow jump, not
-           a yield. -->
-      <set_value name="$mk4PrioActive" exact="$mk4Priorities != null and ($mk4Priorities.$Buildstorage? or $mk4Priorities.$Stations? or $mk4Priorities.$Aux?)"/>
+      <set_value name="this.$tm_mk4PrioActive" exact="$mk4Priorities != null and ($mk4Priorities.$Buildstorage? or $mk4Priorities.$Stations? or $mk4Priorities.$Aux?)"/>
       <do_if value="this.$tm_abortMatch?">
         <remove_value name="this.$tm_abortMatch"/>
       </do_if>
@@ -804,7 +810,7 @@
             </do_if>
             <append_to_list name="this.$tm_buyOffersByWare.{$boWare}" exact="$boIdx"/>
             <!-- MK4 §7.2: buyIndex[ware][class] — inline classify (no run_script; avoids AIDirector wake loop). -->
-            <do_if value="$mk4PrioActive">
+            <do_if value="this.$tm_mk4PrioActive">
               <set_value name="$boClassTag" exact="'None'"/>
               <set_value name="$boClassMult" exact="0"/>
               <set_value name="$boBuyerForClass" exact="if $boIdx.buyer? then @$boIdx.buyer else (if $boIdx.owner? then @$boIdx.owner else null)"/>
@@ -936,7 +942,7 @@
         </do_if>
 
         <set_value name="$tmBuyListForWare" exact="[]"/>
-        <do_if value="$mk4PrioActive and $ware? and this.$tm_buyIndexByWare? and this.$tm_buyIndexByWare.{$ware}?">
+        <do_if value="this.$tm_mk4PrioActive and $ware? and this.$tm_buyIndexByWare? and this.$tm_buyIndexByWare.{$ware}?">
           <set_value name="$tmWareClassBuckets" exact="this.$tm_buyIndexByWare.{$ware}"/>
           <do_if value="$mk4Priorities.$Buildstorage? and $mk4Priorities.$Buildstorage gt 0 and $tmWareClassBuckets.$Buildstorage?">
             <do_all exact="$tmWareClassBuckets.$Buildstorage.count" counter="$bcixBs">
@@ -1019,7 +1025,7 @@
           <!-- MK4 class-at-0 gate (delivery customer = buy-offer owner; cached at index time). -->
           <set_value name="$mk4CustomerClass" exact="'None'"/>
           <set_value name="$mk4ClassMultiplier" exact="1"/>
-          <do_if value="$scoreMode == 'supply' and $mk4PrioActive">
+          <do_if value="$scoreMode == 'supply' and this.$tm_mk4PrioActive">
             <do_if value="$buyOffer? and this.$tm_mk4MultByOffer? and this.$tm_mk4MultByOffer.{$buyOffer}?">
               <set_value name="$mk4CustomerClass" exact="if this.$tm_mk4ClassByOffer? and this.$tm_mk4ClassByOffer.{$buyOffer}? then this.$tm_mk4ClassByOffer.{$buyOffer} else 'None'"/>
               <set_value name="$mk4ClassMultiplier" exact="this.$tm_mk4MultByOffer.{$buyOffer}"/>
@@ -1215,7 +1221,7 @@
 
           <!-- MK4 build-storage-only (slider-derived) / MK4 legacy BSO: BS delivery within jumpDistanceCoverage; BS supplier legs blocked. -->
           <set_value name="$mk4BuildStorageOnlyMode" exact="false"/>
-          <do_if value="$mk4PrioActive and $mk4Priorities.$Buildstorage? and $mk4Priorities.$Buildstorage gt 0 and (not $mk4Priorities.$Stations? or $mk4Priorities.$Stations == 0) and (not $mk4Priorities.$Aux? or $mk4Priorities.$Aux == 0)">
+          <do_if value="this.$tm_mk4PrioActive and $mk4Priorities.$Buildstorage? and $mk4Priorities.$Buildstorage gt 0 and (not $mk4Priorities.$Stations? or $mk4Priorities.$Stations == 0) and (not $mk4Priorities.$Aux? or $mk4Priorities.$Aux == 0)">
             <set_value name="$mk4BuildStorageOnlyMode" exact="true"/>
           </do_if>
           <do_if value="$scoreMode == 'supply' and $mk4CustomerMustBePlayer and ($mk4BuildStorageOnlyMode or $mk4BuildStorageOnlyMode)">
@@ -1279,7 +1285,7 @@
           </do_if>
 
           <!-- Legacy MK4 v1 class exclusions (skipped when MK4 priorities drive classification). -->
-          <do_if value="not $mk4PrioActive">
+          <do_if value="not this.$tm_mk4PrioActive">
             <do_if value="$ignoreBuildStorage">
               <do_if value="$buyStation.isclass.buildstorage or $sellStation.isclass.buildstorage">
                 <set_value name="this.$tm_tradesRejected" operation="add"/>

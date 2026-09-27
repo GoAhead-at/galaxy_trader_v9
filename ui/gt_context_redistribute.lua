@@ -33,14 +33,14 @@ ffi.cdef[[
     UniverseID GetContextByClass(UniverseID componentid, const char* classname, bool includeself);
     float GetDistanceBetween(UniverseID component1id, UniverseID component2id);
     uint32_t CreateOrder(UniverseID controllableid, const char* orderid, bool defaultorder);
-    void EnableOrder(UniverseID controllableid, uint32_t idx);
+    bool EnableOrder(UniverseID controllableid, size_t idx);
     UniverseID ConvertStringTo64Bit(const char* idcode);
     uint32_t GetNumAllFactionShips(const char* factionid);
     uint32_t GetAllFactionShips(UniverseID* result, uint32_t resultlen, const char* factionid);
     uint32_t GetNumOrders(UniverseID controllableid);
     uint32_t GetOrders(Order* result, uint32_t resultlen, UniverseID controllableid);
     bool GetDefaultOrder(Order* result, UniverseID controllableid);
-    float GetEntityCombinedSkill(UniverseID entityid, const char* roleid, const char* postid);
+    int32_t GetEntityCombinedSkill(UniverseID entityid, const char* role, const char* postid);
     UICrewExchangeResult PerformCrewExchange2(UniverseID controllableid, UniverseID partnercontrollableid, NPCSeed* npcs, uint32_t numnpcs, NPCSeed* partnernpcs, uint32_t numpartnernpcs, NPCSeed captainfromcontainer, NPCSeed captainfrompartner, bool exchangecaptains, bool checkonly);
     bool IsCurrentOrderCritical(UniverseID controllableid);
 ]]

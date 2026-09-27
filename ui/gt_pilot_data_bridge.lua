@@ -27,9 +27,6 @@ local C = ffi.C
 ffi.cdef[[
     const char* GetComponentName(uint64_t componentid);
     uint64_t ConvertStringTo64Bit(const char* idcode);
-    const char* ConvertIDToString(uint64_t componentid);
-    long long strtoll(const char* nptr, char** endptr, int base);
-    unsigned long long strtoull(const char* nptr, char** endptr, int base);
 ]]
 
 -- =============================================================================
@@ -139,22 +136,15 @@ local function parseDecimalToInt64Pair(body)
     if not body or body == "" or not body:match("^%-?%d+$") then
         return nil, nil
     end
-    local ok, u64, i64 = pcall(function()
-        if body:sub(1, 1) == "-" then
-            local i = ffi.C.strtoll(body, nil, 10)
-            local ic = ffi.typeof("int64_t")(i)
-            local uc = ffi.cast("uint64_t", ic)
-            return uc, ic
-        end
-        local u = ffi.C.strtoull(body, nil, 10)
-        local uc = ffi.typeof("uint64_t")(u)
-        local ic = ffi.cast("int64_t", uc)
-        return uc, ic
-    end)
-    if not ok or u64 == nil or i64 == nil then
-        return nil, nil
+    local negative = body:sub(1, 1) == "-"
+    local u = ffi.new("uint64_t", 0)
+    for i = negative and 2 or 1, #body do
+        u = u * 10 + (body:byte(i) - 48)
     end
-    return u64, i64
+    if negative then
+        u = ffi.new("uint64_t", 0) - u
+    end
+    return u, ffi.cast("int64_t", u)
 end
 
 -- Prefer engine uint64 (cdata); tostring(NPCSeed) alone can disagree with map keys for some builds.

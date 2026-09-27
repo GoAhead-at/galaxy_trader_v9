@@ -6,7 +6,6 @@ local ffi = require("ffi")
 local C = ffi.C
 ffi.cdef[[
     typedef uint64_t UniverseID;
-    const char* ConvertIDToString(uint64_t componentid);
     bool IsComponentOperational(uint64_t componentid);
     uint32_t GetNumAllFactionShips(const char* factionid);
     uint32_t GetAllFactionShips(UniverseID* result, uint32_t resultlen, const char* factionid);

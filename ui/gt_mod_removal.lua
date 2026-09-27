@@ -84,7 +84,6 @@ ffi.cdef[[
     void DismantleEngineMod(UniverseID objectid);
     void DismantleShieldMod(UniverseID defensibleid, UniverseID contextid, const char* group);
     void DismantleWeaponMod(UniverseID weaponid);
-    void DismantleThrusterMod(UniverseID objectid);
     bool InstallEngineMod(UniverseID objectid, const char* wareid);
     bool InstallShipMod(UniverseID shipid, const char* wareid);
     bool InstallShieldMod(UniverseID defensibleid, UniverseID contextid, const char* group, const char* wareid);
@@ -475,7 +474,7 @@ local function GT_DismantleMod(_, params)
             C.DismantleShipMod(shipId)
             -- logDebug(string.format("Dismantled ship mod from %s ware=%s", shipIdCode, shipWare), "WARNING")
         end
-    elseif type == "engine" then
+    elseif type == "engine" or type == "thruster" then
         local engineBuf = ffi.new("UIEngineMod2")
         local hasEngine = C.GetInstalledEngineMod2(shipId, engineBuf)
         local engineWare = hasEngine and SafeCString(engineBuf.Ware) or "none"
@@ -503,8 +502,6 @@ local function GT_DismantleMod(_, params)
         else
             logDebug(string.format("WARNING: No component ID provided for weapon mod - ship: %s", shipIdCode), "WARNING")
         end
-    elseif type == "thruster" then
-        C.DismantleThrusterMod(shipId)
     else
         logDebug(string.format("ERROR: Unknown mod type: %s", type), "ERROR")
     end

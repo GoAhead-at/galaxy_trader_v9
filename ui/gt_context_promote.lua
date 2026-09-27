@@ -20,12 +20,12 @@ ffi.cdef[[
     bool IsOrderSelectableFor(const char* orderdefid, UniverseID controllableid);
     bool GetDefaultOrder(Order* result, UniverseID controllableid);
     const char* GetFleetName(UniverseID controllableid);
-    float GetEntityCombinedSkill(UniverseID entityid, const char* roleid, const char* postid);
+    int32_t GetEntityCombinedSkill(UniverseID entityid, const char* role, const char* postid);
     uint32_t CreateOrder(UniverseID controllableid, const char* orderid, bool defaultorder);
-    void EnableOrder(UniverseID controllableid, uint32_t idx);
+    bool EnableOrder(UniverseID controllableid, size_t idx);
     bool EnablePlannedDefaultOrder(UniverseID controllableid, bool checkonly);
     void ResetOrderLoop(UniverseID controllableid);
-    bool AdjustOrder(UniverseID controllableid, uint32_t idx, uint32_t targetidx, bool begindragdrop, bool immediate, bool removecriticalorder);
+    bool AdjustOrder(UniverseID controllableid, size_t idx, size_t newidx, bool enabled, bool forcestates, bool checkonly);
     bool RemoveCommander2(UniverseID controllableid);
     void SetFleetName(UniverseID controllableid, const char* fleetname);
 ]]

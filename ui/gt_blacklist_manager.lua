@@ -30,17 +30,17 @@ ffi.cdef[[
     typedef int32_t BlacklistID;
     
     typedef struct {
-        const char* name;
+        uint32_t id;                // ID for updates
         const char* type;           // "sectortravel" or "sectoractivity"
+        const char* name;
+        bool usemacrowhitelist;
         uint32_t nummacros;         // Number of sector macros
         const char** macros;        // Array of sector macro names
+        bool usefactionwhitelist;
         uint32_t numfactions;       // Number of factions
         const char** factions;      // Array of faction IDs
         const char* relation;       // Relation threshold
         bool hazardous;
-        bool usemacrowhitelist;
-        bool usefactionwhitelist;
-        BlacklistID id;             // ID for updates
     } BlacklistInfo2;
     
     BlacklistID CreateBlacklist2(BlacklistInfo2 info);
@@ -59,8 +59,6 @@ ffi.cdef[[
     
     // Component lookup
     uint64_t ConvertStringTo64Bit(const char* idcode);
-    const char* ConvertIDToString(uint64_t componentid);
-    const char* GetComponentData(uint64_t componentid, const char* propertyname);
 ]]
 
 -- =============================================================================

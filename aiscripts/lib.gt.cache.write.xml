@@ -258,14 +258,54 @@
         <set_value name="this.$gt_cacheMaxEntries" exact="(this.$gt_cacheMaxEntries)i"/>
       </do_if>
 
+      <set_value name="$coverageRefresh" exact="false"/>
       <!-- Bulk MK3 refresh: writing >= cap rows means replace the pool. Prevents insert-to-2k then
            O(n^2) age-trim hitch (log: silent ~1s between trim and CacheSearch BEGIN). -->
       <do_if value="not this.$gt_cachePoolIsMk4 and $tradeList.count ge this.$gt_cacheMaxEntries">
+        <set_value name="$coverageRefresh" exact="true"/>
+        <!-- Round-robin coverage by ware and supplier sector before the bounded bulk write.
+             The best route from each bucket precedes its second route, so one home-favoured
+             region cannot consume the entire pool before ships apply their own route scores. -->
+        <set_value name="$coverageInput" exact="$tradeList.clone"/>
+        <sort_list list="$coverageInput" sortbyvalue="loop.element.$Score" sortdescending="true"/>
+        <create_list name="$coverageCandidates"/>
+        <set_value name="$coverageCounts" exact="table[]"/>
+        <do_all exact="$coverageInput.count" counter="$coverageIdx">
+          <set_value name="$coverageTrade" exact="$coverageInput.{$coverageIdx}"/>
+          <set_value name="$coverageSector" exact="if @$coverageTrade.$BuySector.exists then $coverageTrade.$BuySector else @$coverageTrade.$BuyStation.sector"/>
+          <set_value name="$coverageKey" exact="'$' + @$coverageTrade.$Ware.id + '|' + @$coverageSector.macro.id"/>
+          <set_value name="$coverageRank" exact="1 + (if $coverageCounts.{$coverageKey}? then $coverageCounts.{$coverageKey} else 0)"/>
+          <set_value name="$coverageCounts.{$coverageKey}" exact="$coverageRank"/>
+          <set_value name="$coverageScore" exact="[0, $coverageTrade.$Score].max"/>
+          <append_to_list name="$coverageCandidates" exact="table[$Trade = $coverageTrade, $Rank = ($coverageRank - 1) + (1.0 / (1.0 + $coverageScore))]"/>
+          <do_if value="($coverageIdx % 20) == 0"><wait exact="1ms"/></do_if>
+        </do_all>
+        <sort_list list="$coverageCandidates" sortbyvalue="loop.element.$Rank"/>
+        <create_list name="$tradeList"/>
+        <do_all exact="$coverageCandidates.count" counter="$coverageIdx">
+          <do_if value="$coverageIdx gt 1 and (($coverageIdx - 1) % 20) == 0">
+            <wait exact="1ms" comment="Yield coverage candidate copy"/>
+          </do_if>
+          <append_to_list name="$tradeList" exact="$coverageCandidates.{$coverageIdx}.$Trade"/>
+        </do_all>
         <set_value name="global.$GT_TradeCache.{$homeSector}" exact="[]"/>
       </do_if>
 
       <!-- Phase 2: Sorted insertion by $Score descending -->
       <do_all exact="$tradeList.count" counter="$ti">
+        <!-- Budget every visited row, including rule rejections and duplicate routes. -->
+        <do_if value="$ti gt 1 and (($ti - 1) % this.$writeBatchSize) == 0">
+          <do_if value="this.$gt_cachePoolIsMk4">
+            <set_value name="this.$cw_cacheNow" exact="$cacheNow"/>
+            <set_value name="this.$cw_expiredCount" exact="$expiredCount"/>
+            <wait exact="this.$gt_yieldMs * 1ms" comment="Yield between sorted insertions"/>
+            <set_value name="$cacheNow" exact="this.$cw_cacheNow"/>
+            <set_value name="$expiredCount" exact="this.$cw_expiredCount"/>
+          </do_if>
+          <do_else>
+            <wait exact="this.$gt_yieldMs * 1ms" comment="Yield between sorted insertions"/>
+          </do_else>
+        </do_if>
         <do_if value="not this.$gt_cacheNow?">
           <set_value name="this.$gt_cacheNow" exact="player.age"/>
         </do_if>
@@ -282,13 +322,11 @@
         <do_if value="not this.$gt_cachePoolIsMk4">
           <set_value name="$preInsertSize" exact="if @global.$GT_TradeCache.{$homeSector}.count != null then @global.$GT_TradeCache.{$homeSector}.count else 0"/>
           <do_if value="$preInsertSize ge this.$gt_cacheMaxEntries">
+            <!-- Count accepted unique rows, so rejected/duplicate candidates leave room for later ones. -->
+            <do_if value="@$coverageRefresh"><break/></do_if>
             <set_value name="$tailScore" exact="if @global.$GT_TradeCache.{$homeSector}.{$preInsertSize}.$Score != null then @global.$GT_TradeCache.{$homeSector}.{$preInsertSize}.$Score else 0"/>
             <set_value name="$incomingScore" exact="if $newTrade.$Score? then @$newTrade.$Score else 0"/>
             <do_if value="$incomingScore le $tailScore">
-              <set_value name="$tiInt" exact="($ti)i"/>
-              <do_if value="($tiInt % this.$writeBatchSize) == 0">
-                <wait exact="this.$gt_yieldMs * 1ms" comment="Yield while skipping at-cap low-score rows"/>
-              </do_if>
               <continue/>
             </do_if>
           </do_if>
@@ -597,6 +635,10 @@
                   <set_value name="$dupKey" exact="'' + $dupSupplierId + '|' + $dupDeliveryId + '|' + $dupWareId"/>
                 </do_if>
                 <do_if value="$dupKey == $newTrade.$RouteKey">
+                  <do_if value="@$coverageRefresh">
+                    <set_value name="$writeUpserted" exact="true"/>
+                    <break/>
+                  </do_if>
                   <do_if value="$dupEntry.$FailedShips? and $dupEntry.$FailedShips.count gt 0">
                     <do_if value="not $newTrade.$FailedShips?">
                       <create_list name="$newTrade.$FailedShips"/>
@@ -736,19 +778,7 @@
           </do_if>
         </do_if>
 
-        <set_value name="$tiInt" exact="($ti)i"/>
-        <do_if value="($tiInt % this.$writeBatchSize) == 0">
-          <do_if value="this.$gt_cachePoolIsMk4">
-            <set_value name="this.$cw_cacheNow" exact="$cacheNow"/>
-            <set_value name="this.$cw_expiredCount" exact="$expiredCount"/>
-            <wait exact="this.$gt_yieldMs * 1ms" comment="Yield between sorted insertions"/>
-            <set_value name="$cacheNow" exact="this.$cw_cacheNow"/>
-            <set_value name="$expiredCount" exact="this.$cw_expiredCount"/>
-          </do_if>
-          <do_else>
-            <wait exact="this.$gt_yieldMs * 1ms" comment="Yield between sorted insertions"/>
-          </do_else>
-        </do_if>
+
       </do_all>
 
       <set_value name="$finalCacheSize" exact="0"/>

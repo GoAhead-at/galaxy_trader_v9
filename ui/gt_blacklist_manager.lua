@@ -694,8 +694,9 @@ local function onInitialize(_, event_data)
     
     local relation_value, existing_id, threshold = "", 0, 3
     if event_data and event_data ~= "" then
+        -- Keep empty fields: relation is "" when enemy-faction blocking is off.
         local parts = {}
-        for part in string.gmatch(event_data, "[^|]+") do
+        for part in string.gmatch(event_data .. "|", "([^|]*)|") do
             table.insert(parts, part)
         end
         logTrace(string.format(

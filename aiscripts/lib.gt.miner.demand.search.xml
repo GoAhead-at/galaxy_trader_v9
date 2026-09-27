@@ -113,7 +113,7 @@
         </do_if>
       </do_if>
 
-      <!-- Persist across the single-flight waits (locals do not survive a yield). -->
+      <!-- Publish claim state for the writer and order interruption cleanup. -->
       <set_value name="this.$gtMdcKey" exact="$poolKey"/>
       <set_value name="this.$gtMdcTtl" exact="$ttl"/>
       <set_value name="this.$gtMdcDebug" exact="$debugchance"/>
@@ -121,7 +121,7 @@
       <set_value name="this.$gtMdcClaimed" exact="false"/>
       <set_value name="this.$gtMdcHit" exact="null"/>
 
-      <!-- Active fills, as a list of table[$Key, $At]. A single scalar lock would only ever hold one
+      <!-- Active fills, as a list of table[$Key, $At, $Owner]. A single scalar lock would only ever hold one
            key: a second pool starting a fill would silently unlock the first, letting a third ship
            duplicate a fill already in progress. A list also enumerates reliably, which a table keyed
            by these composite strings does not.
@@ -129,10 +129,8 @@
            Two guarantees come out of one structure:
              1. At most one fill per pool key (no duplicated scan for the same configuration).
              2. At most 3 fills galaxy-wide, so many distinct homes cannot all scan at once.
-           Entries carry a timestamp and are pruned when stale, so an order torn down mid-scan
-           releases its slot on its own and no counter can leak.
-           The slot count is inlined below rather than held in a local: locals do not survive the
-           poll wait, so a variable would read as null from the second round on. -->
+           Owner claim keys are cleared on completion or interruption; elapsed time alone does not
+           release a running scan. Re-read the shared slot count after each poll. -->
       <do_while value="not this.$gtMdcClaimed and this.$gtMdcHit == null and this.$gtMdcWaitLeft gt 0">
         <do_if value="not global.$GT_MinerDemandFills? or typeof global.$GT_MinerDemandFills != datatype.list">
           <set_value name="global.$GT_MinerDemandFills" exact="[]"/>
@@ -140,7 +138,7 @@
         <set_value name="$mineLocked" exact="false"/>
         <do_all exact="global.$GT_MinerDemandFills.count" counter="$fki" reverse="true">
           <set_value name="$fillEntry" exact="global.$GT_MinerDemandFills.{$fki}"/>
-          <do_if value="$fillEntry? and $fillEntry.$At? and (player.age - @$fillEntry.$At) lt 15s">
+          <do_if value="@$fillEntry.$Owner.exists and @$fillEntry.$Owner.$gtMinerDemandFillKey == @$fillEntry.$Key">
             <do_if value="$fillEntry.$Key? and @$fillEntry.$Key == this.$gtMdcKey">
               <set_value name="$mineLocked" exact="true"/>
             </do_if>
@@ -151,8 +149,9 @@
         </do_all>
 
         <do_if value="not $mineLocked and global.$GT_MinerDemandFills.count lt 3">
-          <append_to_list name="global.$GT_MinerDemandFills" exact="table[$Key = this.$gtMdcKey, $At = player.age]"/>
+          <append_to_list name="global.$GT_MinerDemandFills" exact="table[$Key = this.$gtMdcKey, $At = player.age, $Owner = this]"/>
           <set_value name="this.$gtMdcClaimed" exact="true"/>
+          <set_value name="this.$gtMinerDemandFillKey" exact="this.$gtMdcKey"/>
         </do_if>
         <do_else>
           <wait min="150ms" max="350ms"/>
@@ -187,14 +186,31 @@
         ]"/>
       </do_if>
 
-      <!-- Waited out the budget without a slot or a published result. Take a slot anyway rather than
-           sending the miner away empty: the release path keys off this entry, so claiming keeps the
-           write symmetric, and the worst case is one duplicated scan while the system is saturated. -->
-      <do_if value="not this.$gtMdcClaimed">
-        <append_to_list name="global.$GT_MinerDemandFills" exact="table[$Key = this.$gtMdcKey, $At = player.age]"/>
-        <debug_text text="'[GT-MinerCache] Fill slots saturated - proceeding uncoordinated key=' + this.$gtMdcKey" chance="this.$gtMdcDebug"/>
+      <!-- Waited out the budget without a slot or a fresh result. Serve the expired snapshot for this
+           pool if one exists: every waiter would otherwise start its own scan at once and the 3-fill
+           cap would stop meaning anything under saturation. Only a pool that was never filled scans. -->
+      <do_if value="not this.$gtMdcClaimed and global.$GT_MinerDemandCache? and typeof @global.$GT_MinerDemandCache.{this.$gtMdcKey} == datatype.table and @global.$GT_MinerDemandCache.{this.$gtMdcKey}.$At != null">
+        <set_value name="$staleEntry" exact="global.$GT_MinerDemandCache.{this.$gtMdcKey}"/>
+        <set_value name="$staleKey" exact="this.$gtMdcKey"/>
+        <debug_text text="'[GT-MinerCache] Fill slots saturated - serving expired snapshot age=' + (player.age - $staleEntry.$At) + ' key=' + $staleKey" chance="this.$gtMdcDebug"/>
+        <remove_value name="this.$gtMdcKey"/>
+        <remove_value name="this.$gtMdcTtl"/>
+        <remove_value name="this.$gtMdcDebug"/>
+        <remove_value name="this.$gtMdcWaitLeft"/>
+        <remove_value name="this.$gtMdcClaimed"/>
+        <remove_value name="this.$gtMdcHit"/>
+        <return value="table[
+          $Hit = true,
+          $PoolKey = $staleKey,
+          $Stations = if $staleEntry.$Stations? then @$staleEntry.$Stations.clone else [],
+          $OffersByStation = if $staleEntry.$OffersByStation? then @$staleEntry.$OffersByStation else table[],
+          $Age = player.age - $staleEntry.$At,
+          $Reason = 'stale_saturated'
+        ]"/>
       </do_if>
 
+      <!-- Cold saturated pools defer; only an owner may scan and publish. -->
+      <set_value name="$deferred" exact="not this.$gtMdcClaimed"/>
       <set_value name="$missKey" exact="this.$gtMdcKey"/>
       <debug_text text="'[GT-MinerCache] MISS - filling key=' + $missKey" chance="this.$gtMdcDebug"/>
       <remove_value name="this.$gtMdcKey"/>
@@ -209,7 +225,8 @@
         $Stations = [],
         $OffersByStation = table[],
         $Age = 0s,
-        $Reason = 'fill'
+        $Deferred = $deferred,
+        $Reason = if $deferred then 'deferred' else 'fill'
       ]"/>
     </actions>
   </attention>

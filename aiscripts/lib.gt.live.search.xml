@@ -213,6 +213,7 @@
            Atomic per-sector upsert after find; reuse fresh buckets to skip find_*_offer.
            Ship-specific clamp / trade_found remain the eligibility authority. -->
       <set_value name="this.$gtlsOfferIndexEnabled" exact="false"/>
+      <set_value name="$gtlsOfferIndexBucket" exact="null"/>
       <set_value name="this.$gtlsOfferIndexHits" exact="0"/>
       <set_value name="this.$gtlsOfferIndexMisses" exact="0"/>
       <set_value name="this.$gtlsOfferIndexTTL" exact="300s"/>
@@ -222,21 +223,32 @@
       <do_if value="this.$gtlsSearchPurpose == 'cache_refresh' and $gtlsSearchMode == 'buy_and_sell' and $gtlsUseAllWares and $gtlsHomeSector? and @$gtlsHomeSector.exists and not $gtlsRetainCheapestSellPerWare and not $gtlsUseScoreAwareBuyCap and not $gtlsRequirePlayerBuyOfferOwner and (not this.$gtlsDemandLedSupplierScan? or not this.$gtlsDemandLedSupplierScan)">
         <set_value name="this.$gtlsOfferIndexEnabled" exact="true"/>
         <set_value name="this.$gtlsOfferIndexProfile" exact="'cr|' + $gtlsMaxDistance + '|' + $gtlsSellPriceMax + '|' + $gtlsBuyPriceMin + '|' + $gtlsOwnerFilter + '|' + (if $gtlsIgnoreTradeRules then 1 else 0) + '|' + (if $gtlsIncludePlayerSellOffers then 1 else 0) + '|' + (if $gtlsIncludeNpcSellOffers then 1 else 0) + '|' + (if $gtlsIncludePlayerBuyOffers then 1 else 0) + '|' + (if $gtlsBypassPlayerSellerPricing then 1 else 0) + '|' + (if $gtlsExcludePlayerBuyers then 1 else 0) + '|' + (if $gtlsAllowIllegal then 1 else 0) + '|' + $gtlsMaxOffersPerWare"/>
-        <do_if value="not global.$GT_OfferIndex?">
-          <set_value name="global.$GT_OfferIndex" exact="table[]"/>
+        <!-- Keep a bounded set of profiles per stable home key. A worker keeps its bucket
+             reference across yields, so another profile cannot replace its snapshots mid-scan. -->
+        <do_if value="@global.$GT_OfferIndex.$Version != 2">
+          <set_value name="global.$GT_OfferIndex" exact="table[$Version = 2]"/>
         </do_if>
-        <do_if value="not global.$GT_OfferIndex.{$gtlsHomeSector}?">
-          <set_value name="global.$GT_OfferIndex.{$gtlsHomeSector}" exact="table[$Profile = this.$gtlsOfferIndexProfile, $Sells = table[], $Buys = table[]]"/>
+        <set_value name="$gtlsIndexHomeKey" exact="'$' + $gtlsHomeSector.macro.id"/>
+        <do_if value="not global.$GT_OfferIndex.{$gtlsIndexHomeKey}?">
+          <set_value name="global.$GT_OfferIndex.{$gtlsIndexHomeKey}" exact="[]"/>
         </do_if>
-        <do_elseif value="not global.$GT_OfferIndex.{$gtlsHomeSector}.$Profile? or global.$GT_OfferIndex.{$gtlsHomeSector}.$Profile != this.$gtlsOfferIndexProfile">
-          <set_value name="global.$GT_OfferIndex.{$gtlsHomeSector}" exact="table[$Profile = this.$gtlsOfferIndexProfile, $Sells = table[], $Buys = table[]]"/>
-        </do_elseif>
-        <do_if value="not global.$GT_OfferIndex.{$gtlsHomeSector}.$Sells?">
-          <set_value name="global.$GT_OfferIndex.{$gtlsHomeSector}.$Sells" exact="table[]"/>
+        <set_value name="$gtlsIndexProfiles" exact="global.$GT_OfferIndex.{$gtlsIndexHomeKey}"/>
+        <do_all exact="$gtlsIndexProfiles.count" counter="$profileIdx">
+          <do_if value="$gtlsIndexProfiles.{$profileIdx}.$Profile == this.$gtlsOfferIndexProfile">
+            <set_value name="$gtlsOfferIndexBucket" exact="$gtlsIndexProfiles.{$profileIdx}"/>
+            <break/>
+          </do_if>
+        </do_all>
+        <do_if value="$gtlsOfferIndexBucket == null">
+          <do_if value="$gtlsIndexProfiles.count ge 4">
+            <sort_list list="$gtlsIndexProfiles" sortbyvalue="loop.element.$LastUsed"/>
+            <remove_value name="$gtlsIndexProfiles.{1}"/>
+          </do_if>
+          <set_value name="$gtlsOfferIndexBucket" exact="table[$Profile = this.$gtlsOfferIndexProfile, $LastUsed = player.age, $Sells = table[], $Buys = table[]]"/>
+          <append_to_list name="$gtlsIndexProfiles" exact="$gtlsOfferIndexBucket"/>
         </do_if>
-        <do_if value="not global.$GT_OfferIndex.{$gtlsHomeSector}.$Buys?">
-          <set_value name="global.$GT_OfferIndex.{$gtlsHomeSector}.$Buys" exact="table[]"/>
-        </do_if>
+        <set_value name="$gtlsOfferIndexBucket.$LastUsed" exact="player.age"/>
+
       </do_if>
       <set_value name="global.$GT_LiveSearchActiveShip" exact="$gtlsShip"/>
       <do_if value="not global.$GT_LiveSearchScratch?">
@@ -906,8 +918,8 @@
           <create_list name="$gtlsSectorSellSnap"/>
           <set_value name="$gtlsSellFromIndex" exact="false"/>
           <!-- Offer index hit: reuse fresh sector sell snapshot (re-clamp for this ship). -->
-          <do_if value="this.$gtlsOfferIndexEnabled? and this.$gtlsOfferIndexEnabled and $gtlsUseAllWares and global.$GT_OfferIndex? and global.$GT_OfferIndex.{$gtlsHomeSector}? and global.$GT_OfferIndex.{$gtlsHomeSector}.$Sells? and global.$GT_OfferIndex.{$gtlsHomeSector}.$Sells.{$space}?">
-            <set_value name="$gtlsIdxBucket" exact="global.$GT_OfferIndex.{$gtlsHomeSector}.$Sells.{$space}"/>
+          <do_if value="this.$gtlsOfferIndexEnabled? and this.$gtlsOfferIndexEnabled and $gtlsUseAllWares and @$gtlsOfferIndexBucket != null and $gtlsOfferIndexBucket.$Sells? and $gtlsOfferIndexBucket.$Sells.{'$' + $space.macro.id}?">
+            <set_value name="$gtlsIdxBucket" exact="$gtlsOfferIndexBucket.$Sells.{'$' + $space.macro.id}"/>
             <do_if value="$gtlsIdxBucket.$ScannedAt? and (player.age - $gtlsIdxBucket.$ScannedAt) le this.$gtlsOfferIndexTTL and $gtlsIdxBucket.$Offers?">
               <set_value name="$gtlsSellFromIndex" exact="true"/>
               <set_value name="this.$gtlsOfferIndexHits" operation="add"/>
@@ -1269,11 +1281,11 @@
           </do_else>
           </do_if>
           <!-- Atomic sector upsert after live find (skip when reused from index). -->
-          <do_if value="this.$gtlsOfferIndexEnabled? and this.$gtlsOfferIndexEnabled and $gtlsUseAllWares and not $gtlsSellFromIndex and $gtlsHomeSector? and global.$GT_OfferIndex? and global.$GT_OfferIndex.{$gtlsHomeSector}?">
-            <do_if value="not global.$GT_OfferIndex.{$gtlsHomeSector}.$Sells?">
-              <set_value name="global.$GT_OfferIndex.{$gtlsHomeSector}.$Sells" exact="table[]"/>
+          <do_if value="this.$gtlsOfferIndexEnabled? and this.$gtlsOfferIndexEnabled and $gtlsUseAllWares and not $gtlsSellFromIndex and $gtlsHomeSector? and @$gtlsOfferIndexBucket != null">
+            <do_if value="not $gtlsOfferIndexBucket.$Sells?">
+              <set_value name="$gtlsOfferIndexBucket.$Sells" exact="table[]"/>
             </do_if>
-            <set_value name="global.$GT_OfferIndex.{$gtlsHomeSector}.$Sells.{$space}" exact="table[$ScannedAt = player.age, $Offers = $gtlsSectorSellSnap]"/>
+            <set_value name="$gtlsOfferIndexBucket.$Sells.{'$' + $space.macro.id}" exact="table[$ScannedAt = player.age, $Offers = $gtlsSectorSellSnap]"/>
           </do_if>
           <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
                  Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and
@@ -1959,8 +1971,8 @@
           <set_value name="$gtlsBuyFromIndex" exact="false"/>
           <!-- Offer index hit: reuse fresh sector buy snapshot. Per-buyer scans only see one
                station of the sector, so they must neither read nor write the sector-wide index. -->
-          <do_if value="this.$gtlsOfferIndexEnabled? and this.$gtlsOfferIndexEnabled and $gtlsUseAllWares and not $gtlsBuyScanUseBuyers and global.$GT_OfferIndex? and global.$GT_OfferIndex.{$gtlsHomeSector}? and global.$GT_OfferIndex.{$gtlsHomeSector}.$Buys? and global.$GT_OfferIndex.{$gtlsHomeSector}.$Buys.{$space}?">
-            <set_value name="$gtlsIdxBucket" exact="global.$GT_OfferIndex.{$gtlsHomeSector}.$Buys.{$space}"/>
+          <do_if value="this.$gtlsOfferIndexEnabled? and this.$gtlsOfferIndexEnabled and $gtlsUseAllWares and not $gtlsBuyScanUseBuyers and @$gtlsOfferIndexBucket != null and $gtlsOfferIndexBucket.$Buys? and $gtlsOfferIndexBucket.$Buys.{'$' + $space.macro.id}?">
+            <set_value name="$gtlsIdxBucket" exact="$gtlsOfferIndexBucket.$Buys.{'$' + $space.macro.id}"/>
             <do_if value="$gtlsIdxBucket.$ScannedAt? and (player.age - $gtlsIdxBucket.$ScannedAt) le this.$gtlsOfferIndexTTL and $gtlsIdxBucket.$Offers?">
               <set_value name="$gtlsBuyFromIndex" exact="true"/>
               <set_value name="this.$gtlsOfferIndexHits" operation="add"/>
@@ -2529,11 +2541,11 @@
           </do_else>
           </do_if>
           <!-- Atomic sector buy upsert after live find (skip when reused from index). -->
-          <do_if value="this.$gtlsOfferIndexEnabled? and this.$gtlsOfferIndexEnabled and $gtlsUseAllWares and not $gtlsBuyFromIndex and not $gtlsBuyScanUseBuyers and $gtlsHomeSector? and global.$GT_OfferIndex? and global.$GT_OfferIndex.{$gtlsHomeSector}?">
-            <do_if value="not global.$GT_OfferIndex.{$gtlsHomeSector}.$Buys?">
-              <set_value name="global.$GT_OfferIndex.{$gtlsHomeSector}.$Buys" exact="table[]"/>
+          <do_if value="this.$gtlsOfferIndexEnabled? and this.$gtlsOfferIndexEnabled and $gtlsUseAllWares and not $gtlsBuyFromIndex and not $gtlsBuyScanUseBuyers and $gtlsHomeSector? and @$gtlsOfferIndexBucket != null">
+            <do_if value="not $gtlsOfferIndexBucket.$Buys?">
+              <set_value name="$gtlsOfferIndexBucket.$Buys" exact="table[]"/>
             </do_if>
-            <set_value name="global.$GT_OfferIndex.{$gtlsHomeSector}.$Buys.{$space}" exact="table[$ScannedAt = player.age, $Offers = $gtlsSectorBuySnap]"/>
+            <set_value name="$gtlsOfferIndexBucket.$Buys.{'$' + $space.macro.id}" exact="table[$ScannedAt = player.age, $Offers = $gtlsSectorBuySnap]"/>
           </do_if>
           <!-- Save/load mid-wait can restore older locals while Phase 5 fields stay undeclared.
                  Use a single sentinel (not 0/false fields): PlayerSupplierReserve=0 is declared and

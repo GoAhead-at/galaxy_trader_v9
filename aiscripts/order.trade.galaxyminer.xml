@@ -639,6 +639,10 @@
   <attention min="unknown">
     <actions>
       <label name="main_loop"/>
+      <!-- A child-script interrupt restarts here without running this order's on_abort. -->
+      <do_if value="this.$gtMinerDemandFillKey?"><remove_value name="this.$gtMinerDemandFillKey"/></do_if>
+      <do_if value="this.$gtMinerSellFillKey?"><remove_value name="this.$gtMinerSellFillKey"/></do_if>
+
 
       <!-- Save-load / hot-reload backfill: <init> does not re-run; patch may not have fired yet. -->
       <do_if value="not this.$physicalStorageAbortPercent?">
@@ -1001,6 +1005,10 @@
         <param name="maxAge" value="this.$demandRecheckInterval"/>
         <param name="debugchance" value="this.$debugchance"/>
       </run_script>
+      <do_if value="@$minerDemandCacheResult.$Deferred">
+        <wait min="1s" max="2s"/>
+        <resume label="main_loop"/>
+      </do_if>
       <set_value name="this.$minerDemandCacheHit" exact="if $minerDemandCacheResult? and $minerDemandCacheResult.$Hit? then @$minerDemandCacheResult.$Hit else false"/>
       <set_value name="this.$minerDemandPoolKey" exact="if $minerDemandCacheResult? and $minerDemandCacheResult.$PoolKey? then @$minerDemandCacheResult.$PoolKey else ''"/>
       <set_value name="this.$minerDemandCachedOffers" exact="if this.$minerDemandCacheHit and $minerDemandCacheResult.$OffersByStation? then @$minerDemandCacheResult.$OffersByStation else table[]"/>
@@ -2095,9 +2103,23 @@
           <do_if value="$cargoFirstBestWare? and $cargoFirstBestWare != null and $selectedWare? and $selectedWare != null and $cargoFirstBestWare != $selectedWare and $wareReachable? and $wareReachable.{$cargoFirstBestWare}? and not $wareReachable.{$cargoFirstBestWare}">
             <set_value name="$cargoFirstStaleDepleted" exact="true"/>
           </do_if>
-          <set_value name="$cargoFirstShouldOverride" exact="$cargoFirstNoScoring or $cargoFirstUnreachable or $cargoFirstCargoFull or $cargoFirstStaleDepleted"/>
-          <do_if value="$cargoFirstShouldOverride and ($cargoFirstNoScoring or $cargoFirstStaleDepleted or $selectedWare != $cargoFirstBestWare)">
-            <set_value name="$cargoFirstReason" exact="if $cargoFirstNoScoring then 'no scoring winner' else (if $cargoFirstStaleDepleted then 'stale cargo ' + $cargoFirstBestWare.name + ' no longer mineable while scoring picked ' + $selectedWare.name + ' - deliver before re-score' else (if $cargoFirstCargoFull then 'cargo is FULL (' + (this.ship.cargo.capacity.all - this.ship.cargo.free.all) + '/' + this.ship.cargo.capacity.all + ') - cannot mine more without delivering, scoring picked ' + $selectedWare.name + ' (urgency=' + (if $wareUrgency? and $wareUrgency.{$selectedWare}? then $wareUrgency.{$selectedWare} else 0) + ')' else 'scoring picked ' + $selectedWare.name + ' (urgency=' + (if $wareUrgency? and $wareUrgency.{$selectedWare}? then $wareUrgency.{$selectedWare} else 0) + ') but it is unreachable - no discovered asteroid in range') + '; cargo holds ' + $cargoFirstBestAmount + ' ' + $cargoFirstBestWare.name + ' with a willing primary buyer')"/>
+          <!-- (e) Capital ship without the collector drones the selected ware needs (same test as the
+               collector pre-check before the mining routine): it cannot mine, so deliver what is aboard
+               instead of standing by for drones with a sellable load. -->
+          <set_value name="$cargoFirstNoCollectors" exact="false"/>
+          <do_if value="not $cargoFirstNoScoring and this.ship.iscapitalship">
+            <do_if value="$selectedWare.waretransport == waretransport.solid and not this.ship.units.{unitcategory.orecollector}.count">
+              <set_value name="$cargoFirstNoCollectors" exact="true"/>
+            </do_if>
+            <do_elseif value="$selectedWare.waretransport == waretransport.liquid and not this.ship.units.{unitcategory.gascollector}.count">
+              <set_value name="$cargoFirstNoCollectors" exact="true"/>
+            </do_elseif>
+          </do_if>
+          <set_value name="$cargoFirstShouldOverride" exact="$cargoFirstNoScoring or $cargoFirstUnreachable or $cargoFirstCargoFull or $cargoFirstStaleDepleted or $cargoFirstNoCollectors"/>
+          <!-- Also when the selected ware IS the cargo ware: a full hold or missing collectors still means
+               this slice can only deliver, and only the delivery-only slice skips the collector gate. -->
+          <do_if value="$cargoFirstShouldOverride">
+            <set_value name="$cargoFirstReason" exact="if $cargoFirstNoScoring then 'no scoring winner' else (if $cargoFirstStaleDepleted then 'stale cargo ' + $cargoFirstBestWare.name + ' no longer mineable while scoring picked ' + $selectedWare.name + ' - deliver before re-score' else (if $cargoFirstNoCollectors then 'no collector drones for ' + $selectedWare.name + ' - cannot mine, delivering cargo aboard' else (if $cargoFirstCargoFull then 'cargo is FULL (' + (this.ship.cargo.capacity.all - this.ship.cargo.free.all) + '/' + this.ship.cargo.capacity.all + ') - cannot mine more without delivering, scoring picked ' + $selectedWare.name + ' (urgency=' + (if $wareUrgency? and $wareUrgency.{$selectedWare}? then $wareUrgency.{$selectedWare} else 0) + ')' else 'scoring picked ' + $selectedWare.name + ' (urgency=' + (if $wareUrgency? and $wareUrgency.{$selectedWare}? then $wareUrgency.{$selectedWare} else 0) + ') but it is unreachable - no discovered asteroid in range')) + '; cargo holds ' + $cargoFirstBestAmount + ' ' + $cargoFirstBestWare.name + ' with a willing primary buyer')"/>
             <debug_text text="'[GT-Miner] ' + this.ship.idcode + ': CARGO-FIRST override - ' + $cargoFirstReason + '. Switching selected to ' + $cargoFirstBestWare.name + ' so the mining routine delivers existing cargo before mining anything new.'" chance="this.$debugchance"/>
             <set_value name="$selectedWare" exact="$cargoFirstBestWare"/>
             <set_value name="$bestWare" exact="$cargoFirstBestWare"/>
@@ -2126,6 +2148,7 @@
           <remove_value name="$cargoFirstUnreachable"/>
           <remove_value name="$cargoFirstCargoFull"/>
           <remove_value name="$cargoFirstStaleDepleted"/>
+          <remove_value name="$cargoFirstNoCollectors"/>
           <remove_value name="$cargoFirstShouldOverride"/>
         </do_if>
         <do_if value="$cargoFirstBestWare?"><remove_value name="$cargoFirstBestWare"/></do_if>
@@ -2432,13 +2455,14 @@
                 <param name="knownPoolKey" value="this.$minerSellPoolKey"/>
                 <param name="wares" value="this.$minerSellCover"/>
                 <param name="maxAge" value="this.$demandRecheckInterval"/>
+                <param name="allowExpired" value="@$overflowClaim.$Stale == true"/>
                 <param name="debugchance" value="this.$debugchance"/>
               </run_script>
               <do_if value="@$overflowPeer.$Hit == true">
                 <set_value name="this.$minerSellOffers" exact="@$overflowPeer.$Offers"/>
               </do_if>
             </do_if>
-            <do_else>
+            <do_elseif value="@$overflowClaim.$Claimed == true">
               <!-- A save/load resume re-enters the order at whatever node its instruction pointer
                    held, which can be inside this branch with none of the pins above set. Searching
                    then would hand lib.gt.live.search a null basket. Skip the fill instead: the
@@ -2472,7 +2496,7 @@
                 <param name="allowIllegal" value="this.$allowillegal"/>
                 <param name="debugchance" value="this.$debugchance"/>
               </run_script>
-            </do_else>
+            </do_elseif>
           </do_else>
         </do_if>
 
@@ -3027,7 +3051,8 @@
       <!-- ============================================================================ -->
       <set_value name="$collectorPrecheckOK" exact="true"/>
       <set_value name="$collectorMissing" exact="''"/>
-      <do_if value="$selectedWare? and $selectedWare != null and this.ship.iscapitalship">
+      <!-- Delivery-only (CARGO-FIRST) slices sell cargo already aboard and never mine, so collectors are not required. -->
+      <do_if value="$selectedWare? and $selectedWare != null and this.ship.iscapitalship and not @this.$minerDeliveryOnlySlice">
         <do_if value="$selectedWare.waretransport == waretransport.solid and not this.ship.units.{unitcategory.orecollector}.count">
           <set_value name="$collectorPrecheckOK" exact="false"/>
           <set_value name="$collectorMissing" exact="'ore-collector'"/>
@@ -3367,6 +3392,8 @@
   </attention>
 
   <on_abort>
+    <do_if value="this.$gtMinerDemandFillKey?"><remove_value name="this.$gtMinerDemandFillKey"/></do_if>
+    <do_if value="this.$gtMinerSellFillKey?"><remove_value name="this.$gtMinerSellFillKey"/></do_if>
     <!-- Intentional handoff: idle parking delegates to GTIdlePark for visible queued docking. -->
     <set_value name="$isIdleParkHandoff" exact="false"/>
     <do_if value="global.$GT_IdleParkingHold? and global.$GT_IdleParkingHold.{this.ship}?">

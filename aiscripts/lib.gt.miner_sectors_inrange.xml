@@ -4,13 +4,14 @@
     Cached wrapper around vanilla lib.find.sectors.inrange for Galaxy Miner.
 
     Storage: global.$GT_MinerSectorCache keyed by fingerprint
-      ref sector macro id + maxgate + stat.sectors_discovered + GT_BlacklistEpoch
-    Shared across all ships. Soft TTL 300s.
+      ref sector macro id + maxgate + stat.sectors_discovered + GT_BlacklistEpoch + effective blacklist
+      (group, commander sector and the blacklisted sectors in range, or 'nobl')
+    Shared across ships whose blacklists agree on the range. Soft TTL 300s. Reset whenever the
+    discovery count or blacklist epoch changes (global.$GT_MinerSectorCacheGen).
 
-    On MISS for maxgate=N: one vanilla BFS with returndistancetable, then backfill
-    cache entries for every k=0..N from the distance table (avoids repeat BFS for
-    the same ref at lower maxgates). Vanilla debugchance forced to 0 (our HIT/MISS
-    line is enough; per-sector debug_text was dominating hitch density).
+    On MISS: one vanilla BFS for the requested radius. Do not derive smaller radii
+    from its outward distances: vanilla also validates return distance and policy.
+    Vanilla debugchance is forced to 0; the cache's HIT/MISS line is sufficient.
 
     Single-flight: if another ship is filling the same key, wait and reuse.
     Writes this.$gtMinerSectorsResult for callers that must avoid result=.
@@ -42,10 +43,6 @@
         <return value="$emptyResult"/>
       </do_if>
 
-      <do_if value="not global.$GT_MinerSectorCache? or typeof global.$GT_MinerSectorCache != datatype.table">
-        <set_value name="global.$GT_MinerSectorCache" exact="table[]"/>
-      </do_if>
-
       <set_value name="$refId" exact="'$' + $refsector.macro.id"/>
       <set_value name="$maxGate" exact="$maxgatedistance"/>
       <set_value name="$disc" exact="0"/>
@@ -57,7 +54,46 @@
         <set_value name="$blEpoch" exact="global.$GT_BlacklistEpoch"/>
       </do_if>
       <set_value name="$ttlSafe" exact="if $ttl? and $ttl gt 0s then $ttl else 300s"/>
-      <set_value name="$cacheKey" exact="$refId + '.' + $maxGate + '.' + $disc + '.' + $blEpoch"/>
+
+      <!-- Entries from an older discovery count or blacklist epoch can never be read again: drop the
+           whole table when either changes instead of letting dead keys accumulate. -->
+      <set_value name="$cacheGen" exact="'' + $disc + '.' + $blEpoch"/>
+      <do_if value="not global.$GT_MinerSectorCache? or typeof global.$GT_MinerSectorCache != datatype.table or @global.$GT_MinerSectorCacheGen != $cacheGen">
+        <set_value name="global.$GT_MinerSectorCache" exact="table[]"/>
+        <set_value name="global.$GT_MinerSectorCacheGen" exact="$cacheGen"/>
+      </do_if>
+
+      <!-- Vanilla's result depends on the calling ship. Without a sector blacklist it takes the
+           unfiltered branch, the same answer for every ship. With one, the answer depends only on which
+           sectors in the in-range clusters that blacklist marks (a path of at most maxgate jumps never
+           leaves them), the group, and the commander's sector (always allowed). Script cannot read which
+           blacklist a ship is assigned, so the key carries those marks instead: ships whose blacklists
+           agree on this range share an entry, and any two that differ get different keys. -->
+      <include_interrupt_actions ref="GetBlacklistgroup"/>
+      <set_value name="$mscGroup" exact="if $blacklistgroup? then $blacklistgroup else null"/>
+      <set_value name="$mscHasBL" exact="false"/>
+      <do_if value="$mscGroup != null">
+        <set_value name="$mscHasBL" exact="$ship.hasblacklist.{blacklisttype.sectoractivity}.{$mscGroup} or $ship.hasblacklist.{blacklisttype.sectortravel}.{$mscGroup}"/>
+      </do_if>
+      <set_value name="$policy" exact="(if this.isplayerowned then 'p' else 'n') + '.nobl'"/>
+      <do_if value="$mscHasBL">
+        <set_value name="$policy" exact="(if this.isplayerowned then 'p' else 'n') + '.' + $mscGroup + '.c' + (if @$ship.commander.sector then $ship.commander.sector.macro.id else 'none') + '.'"/>
+        <find_cluster_in_range distances="$mscClusters" multiple="true" object="$refsector" mindistance="0" maxdistance="$maxGate"/>
+        <do_for_each name="$mscCluster" in="$mscClusters">
+          <find_sector name="$mscSectors" space="$mscCluster" multiple="true"/>
+          <do_for_each name="$mscSec" in="$mscSectors">
+            <do_if value="$mscSec.isblacklisted.{blacklisttype.sectoractivity}.{$mscGroup}.{$ship}">
+              <set_value name="$policy" exact="$policy + 'a' + $mscSec.macro.id"/>
+            </do_if>
+            <do_if value="$mscSec.isblacklisted.{blacklisttype.sectortravel}.{$mscGroup}.{$ship}">
+              <set_value name="$policy" exact="$policy + 't' + $mscSec.macro.id"/>
+            </do_if>
+          </do_for_each>
+        </do_for_each>
+        <remove_value name="$mscClusters"/>
+        <remove_value name="$mscSectors"/>
+      </do_if>
+      <set_value name="$cacheKey" exact="$refId + '.' + $maxGate + '.' + $disc + '.' + $blEpoch + '.' + $policy"/>
 
       <!-- Fast HIT path (no yield). -->
       <do_if value="global.$GT_MinerSectorCache.{$cacheKey}? and typeof global.$GT_MinerSectorCache.{$cacheKey} == datatype.table">
@@ -77,6 +113,7 @@
       <set_value name="this.$gtMscMax" exact="$maxGate"/>
       <set_value name="this.$gtMscDisc" exact="$disc"/>
       <set_value name="this.$gtMscBL" exact="$blEpoch"/>
+      <set_value name="this.$gtMscPolicy" exact="$policy"/>
       <set_value name="this.$gtMscTtl" exact="$ttlSafe"/>
       <set_value name="this.$gtMscWaitLeft" exact="12"/>
       <set_value name="this.$gtMscClaimed" exact="false"/>
@@ -114,7 +151,7 @@
         <do_else>
           <wait min="150ms" max="350ms"/>
           <set_value name="this.$gtMscWaitLeft" exact="this.$gtMscWaitLeft - 1"/>
-          <!-- The holder may have published, possibly backfilled from a higher maxgate. -->
+          <!-- The holder may have published this exact radius and policy. -->
           <do_if value="global.$GT_MinerSectorCache.{this.$gtMscKey}? and typeof global.$GT_MinerSectorCache.{this.$gtMscKey} == datatype.table">
             <set_value name="$entry" exact="global.$GT_MinerSectorCache.{this.$gtMscKey}"/>
             <do_if value="$entry.$Spaces? and $entry.$At? and (player.age - $entry.$At) le this.$gtMscTtl">
@@ -123,6 +160,12 @@
           </do_if>
         </do_else>
       </do_while>
+
+      <!-- Timed out behind the holder: reuse the expired entry for this key instead of running the
+           same BFS a second time while the holder is still building it. -->
+      <do_if value="not this.$gtMscClaimed and this.$gtMscHit == null and typeof @global.$GT_MinerSectorCache.{this.$gtMscKey} == datatype.table and @global.$GT_MinerSectorCache.{this.$gtMscKey}.$Spaces != null">
+        <set_value name="this.$gtMscHit" exact="global.$GT_MinerSectorCache.{this.$gtMscKey}"/>
+      </do_if>
 
       <!-- Took a peer's result: nothing was claimed, so there is nothing to release. -->
       <do_if value="this.$gtMscHit != null">
@@ -135,6 +178,7 @@
         <remove_value name="this.$gtMscMax"/>
         <remove_value name="this.$gtMscDisc"/>
         <remove_value name="this.$gtMscBL"/>
+        <remove_value name="this.$gtMscPolicy"/>
         <remove_value name="this.$gtMscTtl"/>
         <remove_value name="this.$gtMscWaitLeft"/>
         <remove_value name="this.$gtMscClaimed"/>
@@ -142,13 +186,13 @@
         <return value="$result"/>
       </do_if>
 
-      <!-- Waited out the budget while the holder kept the key. Build anyway rather than returning
+      <!-- Waited out the budget on a key that has never been built. Build anyway rather than returning
            nothing; the release path keys off this entry, so claiming keeps the release symmetric. -->
       <do_if value="not this.$gtMscClaimed">
         <append_to_list name="global.$GT_MinerSectorBfsFills" exact="table[$Key = this.$gtMscKey, $At = player.age]"/>
       </do_if>
 
-      <!-- Distance table: one BFS, then backfill all lower maxgates for this ref. No vanilla debug spam. -->
+      <!-- Distance table for this exact radius and blacklist fingerprint. -->
       <run_script name="'lib.find.sectors.inrange'" result="$sectorTable">
         <param name="refobject" value="this.$gtMscRef"/>
         <param name="mingatedistance" value="0"/>
@@ -163,29 +207,16 @@
         <set_value name="$sectorTable.{this.$gtMscRef}" exact="0"/>
       </do_if>
 
-      <set_value name="this.$gtMscFillGate" exact="0"/>
-      <set_value name="$requestedSpaces" exact="null"/>
-      <do_while value="this.$gtMscFillGate le this.$gtMscMax">
-        <create_list name="$listK"/>
-        <do_for_each name="$sec" valuename="$dist" in="$sectorTable">
-          <do_if value="$sec? and $sec.exists and $dist? and $dist ge 0 and $dist le this.$gtMscFillGate">
-            <append_to_list name="$listK" exact="$sec"/>
-          </do_if>
-        </do_for_each>
-        <set_value name="$keyK" exact="this.$gtMscRefId + '.' + this.$gtMscFillGate + '.' + this.$gtMscDisc + '.' + this.$gtMscBL"/>
-        <set_value name="$entryK" exact="table[]"/>
-        <set_value name="$entryK.$Spaces" exact="$listK.clone"/>
-        <set_value name="$entryK.$At" exact="player.age"/>
-        <set_value name="global.$GT_MinerSectorCache.{$keyK}" exact="$entryK"/>
-        <do_if value="this.$gtMscFillGate == this.$gtMscMax">
-          <set_value name="$requestedSpaces" exact="$listK"/>
+      <!-- Vanilla validates both outward and return distance. Its distance table records only
+           the outward leg, so deriving smaller-radius entries here is not sound. -->
+      <create_list name="$requestedSpaces"/>
+      <do_for_each name="$sec" valuename="$dist" in="$sectorTable">
+        <do_if value="@$sec.exists and $dist ge 0 and $dist le this.$gtMscMax">
+          <append_to_list name="$requestedSpaces" exact="$sec"/>
         </do_if>
-        <set_value name="this.$gtMscFillGate" exact="this.$gtMscFillGate + 1"/>
-      </do_while>
+      </do_for_each>
+      <set_value name="global.$GT_MinerSectorCache.{this.$gtMscKey}" exact="table[$Spaces = $requestedSpaces.clone, $At = player.age]"/>
 
-      <do_if value="not $requestedSpaces?">
-        <create_list name="$requestedSpaces"/>
-      </do_if>
       <set_value name="this.$gtMinerSectorsResult" exact="$requestedSpaces"/>
 
       <!-- Release this key so waiters stop polling. Only the first match is dropped: a waiter that
@@ -203,7 +234,7 @@
         </do_all>
       </do_if>
 
-      <debug_text text="'[GT-Miner] ' + this.assignedcontrolled.idcode + ': sector-cache MISS count=' + $requestedSpaces.count + ' maxgate=' + this.$gtMscMax + ' disc=' + this.$gtMscDisc + ' bl=' + this.$gtMscBL + ' key=' + this.$gtMscKey + ' backfilled=0..' + this.$gtMscMax" chance="$debugchance"/>
+      <debug_text text="'[GT-Miner] ' + this.assignedcontrolled.idcode + ': sector-cache MISS count=' + $requestedSpaces.count + ' maxgate=' + this.$gtMscMax + ' disc=' + this.$gtMscDisc + ' bl=' + this.$gtMscBL + ' key=' + this.$gtMscKey" chance="$debugchance"/>
 
       <remove_value name="this.$gtMscKey"/>
       <remove_value name="this.$gtMscRef"/>
@@ -211,9 +242,9 @@
       <remove_value name="this.$gtMscMax"/>
       <remove_value name="this.$gtMscDisc"/>
       <remove_value name="this.$gtMscBL"/>
+      <remove_value name="this.$gtMscPolicy"/>
       <remove_value name="this.$gtMscTtl"/>
       <remove_value name="this.$gtMscWaitLeft"/>
-      <remove_value name="this.$gtMscFillGate"/>
       <remove_value name="this.$gtMscClaimed"/>
       <remove_value name="this.$gtMscHit"/>
 

@@ -301,45 +301,52 @@ local function queueResolvedLeg(shipId, offerId, amount)
     AddTradeToShipQueue(ConvertStringToLuaID(tostring(offerId)), shipId, amount, false)
 end
 
-local function writeResult(playerId, result)
-    SetNPCBlackboard(playerId, "$GT_MK2_WareExchangeResult", result)
+local function writeResult(entityId, result)
+    SetNPCBlackboard(entityId, "$GT_MK2_WareExchangeResult", result)
 end
 
-RegisterEvent("gt.mk2QueueWareExchange", function(_, requestId)
-    local playerId = ConvertStringTo64Bit(tostring(C.GetPlayerID()))
-    local request = GetNPCBlackboard(playerId, "$GT_MK2_WareExchangeRequest")
+-- MD raises this with the requesting pilot entity; request and result live on that entity's
+-- blackboard, so concurrent ships never share a mailbox.
+RegisterEvent("gt.mk2QueueWareExchange", function(_, entity)
+    local entityId = entity and ConvertIDTo64Bit(entity) or 0
+    if entityId == 0 then
+        debugLog("missing requesting entity")
+        return
+    end
+    local request = GetNPCBlackboard(entityId, "$GT_MK2_WareExchangeRequest")
+    if type(request) ~= "table" then
+        -- Caller already timed out and removed its request; nobody is waiting.
+        debugLog("missing request on entity " .. tostring(entityId))
+        return
+    end
+
+    local requestId = request.RequestId or request["$RequestId"]
+    local previous = GetNPCBlackboard(entityId, "$GT_MK2_WareExchangeResult")
+    if type(previous) == "table" and (previous.RequestId or previous["$RequestId"]) == requestId then
+        -- Already answered: a second event for the same request must not queue the legs twice.
+        return
+    end
+
     local result = {
         RequestId = requestId,
         Success = false,
         Queued = 0,
-        Error = "missing request",
+        Error = "",
         QueueLegs = {},
     }
-
-    if type(request) ~= "table" then
-        writeResult(playerId, result)
-        return
-    end
-
-    local reqId = request.RequestId or request["$RequestId"]
-    if reqId ~= requestId then
-        result.Error = "request id mismatch"
-        writeResult(playerId, result)
-        return
-    end
 
     local shipId = resolveShipId(request.Ship or request["$Ship"], request.ShipIdCode or request["$ShipIdCode"])
     if shipId == 0 then
         result.Error = "invalid ship"
-        writeResult(playerId, result)
-        SignalObject(shipId, "gt_mk2_ware_exchange_done", requestId)
+        writeResult(entityId, result)
+        debugLog(result.Error)
         return
     end
 
     local legs = collectLegs(request.Legs or request["$Legs"])
     if #legs == 0 then
         result.Error = "missing legs"
-        writeResult(playerId, result)
+        writeResult(entityId, result)
         SignalObject(shipId, "gt_mk2_ware_exchange_done", requestId)
         return
     end
@@ -381,7 +388,7 @@ RegisterEvent("gt.mk2QueueWareExchange", function(_, requestId)
         result.Error = err
         result.Queued = #queueLegs
         result.QueueLegs = queueLegs
-        writeResult(playerId, result)
+        writeResult(entityId, result)
         SignalObject(shipId, "gt_mk2_ware_exchange_done", requestId)
         debugLog(result.Error)
     end
@@ -402,7 +409,7 @@ RegisterEvent("gt.mk2QueueWareExchange", function(_, requestId)
     result.Queued = #queueLegs
     result.Error = ""
     result.QueueLegs = queueLegs
-    writeResult(playerId, result)
+    writeResult(entityId, result)
     SignalObject(shipId, "gt_mk2_ware_exchange_done", requestId)
     debugLog("queued " .. tostring(#queueLegs) .. " ware-exchange legs for " .. tostring(requestId))
 end)

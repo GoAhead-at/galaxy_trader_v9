@@ -2540,8 +2540,10 @@
             </do_if>
           </do_if>
           <do_else>
-            <!-- Pre-rank: best sell offer per ware (player tier first, then cheapest, then closer, then more stock). -->
-            <set_value name="this.$mk2BestSellByWare" exact="table[]"/>
+            <!-- Pre-rank: sell offers per ware (player tier first, then cheapest, then closer, then more stock).
+                 The whole ranking is kept so pairing can fall back to the next supplier when the best
+                 one fails a destination-specific check (lane blacklist, distance, detour). -->
+            <set_value name="this.$mk2SellRankByWare" exact="table[]"/>
             <do_all exact="this.$mk2AutoSellOffers.count" counter="$aspri">
               <set_value name="$asCand" exact="this.$mk2AutoSellOffers.{$aspri}"/>
               <set_value name="$asCandWare" exact="$asCand.ware"/>
@@ -2564,44 +2566,37 @@
                 </do_else>
               </do_if>
               <set_value name="$asCandPlayer" exact="$asCandOwner.isplayerowned"/>
-              <set_value name="$asBest" exact="null"/>
-              <do_if value="this.$mk2BestSellByWare.{$asCandWare}?">
-                <set_value name="$asBest" exact="this.$mk2BestSellByWare.{$asCandWare}"/>
+              <do_if value="not this.$mk2SellRankByWare.{$asCandWare}?">
+                <set_value name="this.$mk2SellRankByWare.{$asCandWare}" exact="[]"/>
               </do_if>
-              <set_value name="$asTakeCand" exact="false"/>
-              <do_if value="not $asBest? or $asBest == null">
-                <set_value name="$asTakeCand" exact="true"/>
-              </do_if>
-              <do_else>
-                <set_value name="$asBestPlayer" exact="$asBest.$Player"/>
-                <set_value name="$asBestPrice" exact="$asBest.$UnitPrice"/>
-                <set_value name="$asBestDist" exact="$asBest.$Dist"/>
-                <set_value name="$asBestAmount" exact="$asBest.$Amount"/>
-                <do_if value="$asCandPlayer and not $asBestPlayer">
-                  <set_value name="$asTakeCand" exact="true"/>
-                </do_if>
-                <do_elseif value="$asCandPlayer == $asBestPlayer">
-                  <do_if value="$asCandPrice lt $asBestPrice">
-                    <set_value name="$asTakeCand" exact="true"/>
+              <set_value name="$asWareRank" exact="this.$mk2SellRankByWare.{$asCandWare}"/>
+              <append_to_list name="$asWareRank" exact="table[
+                $Offer = $asCand,
+                $Owner = $asCandOwner,
+                $UnitPrice = $asCandPrice,
+                $Dist = $asCandDist,
+                $Amount = $asCandAmount,
+                $Player = $asCandPlayer
+              ]"/>
+            </do_all>
+            <!-- Selection sort per ware (at most maxOffersPerWare entries); sort_list cannot express the tiered order. -->
+            <set_value name="$asRankWares" exact="this.$mk2SellRankByWare.keys.list"/>
+            <do_all exact="$asRankWares.count" counter="$asrwi">
+              <set_value name="$asRemaining" exact="this.$mk2SellRankByWare.{$asRankWares.{$asrwi}}.clone"/>
+              <set_value name="$asRanked" exact="[]"/>
+              <do_while value="$asRemaining.count gt 0">
+                <set_value name="$asBestIdx" exact="1"/>
+                <do_all exact="$asRemaining.count" counter="$asri">
+                  <set_value name="$asA" exact="$asRemaining.{$asri}"/>
+                  <set_value name="$asB" exact="$asRemaining.{$asBestIdx}"/>
+                  <do_if value="($asA.$Player and not $asB.$Player) or ($asA.$Player == $asB.$Player and ($asA.$UnitPrice lt $asB.$UnitPrice or ($asA.$UnitPrice == $asB.$UnitPrice and ($asA.$Dist lt $asB.$Dist or ($asA.$Dist == $asB.$Dist and $asA.$Amount gt $asB.$Amount)))))">
+                    <set_value name="$asBestIdx" exact="$asri"/>
                   </do_if>
-                  <do_elseif value="$asCandPrice == $asBestPrice and $asCandDist lt $asBestDist">
-                    <set_value name="$asTakeCand" exact="true"/>
-                  </do_elseif>
-                  <do_elseif value="$asCandPrice == $asBestPrice and $asCandDist == $asBestDist and $asCandAmount gt $asBestAmount">
-                    <set_value name="$asTakeCand" exact="true"/>
-                  </do_elseif>
-                </do_elseif>
-              </do_else>
-              <do_if value="$asTakeCand">
-                <set_value name="this.$mk2BestSellByWare.{$asCandWare}" exact="table[
-                  $Offer = $asCand,
-                  $Owner = $asCandOwner,
-                  $UnitPrice = $asCandPrice,
-                  $Dist = $asCandDist,
-                  $Amount = $asCandAmount,
-                  $Player = $asCandPlayer
-                ]"/>
-              </do_if>
+                </do_all>
+                <append_to_list name="$asRanked" exact="$asRemaining.{$asBestIdx}"/>
+                <remove_value name="$asRemaining.{$asBestIdx}"/>
+              </do_while>
+              <set_value name="this.$mk2SellRankByWare.{$asRankWares.{$asrwi}}" exact="$asRanked"/>
             </do_all>
 
             <!-- Dest-outer: pair each needing destination+ware with pre-ranked best sell. -->
@@ -2670,25 +2665,13 @@
                   <continue/>
                 </do_if>
 
-                <do_if value="not this.$mk2BestSellByWare.{$ware}?">
+                <set_value name="this.$mk2SellRank" exact="@this.$mk2SellRankByWare.{$ware}"/>
+                <do_if value="not @this.$mk2SellRank.count">
                   <set_value name="$skipNoSourceOffer" operation="add"/>
                   <continue/>
                 </do_if>
-                <set_value name="this.$mk2BestSellEntry" exact="this.$mk2BestSellByWare.{$ware}"/>
-                <set_value name="$bestSell" exact="this.$mk2BestSellEntry.$Offer"/>
-                <set_value name="$source" exact="this.$mk2BestSellEntry.$Owner"/>
-                <do_if value="not $bestSell? or not $source? or not $source.exists or $source == $dest">
-                  <set_value name="$skipSelfTarget" operation="add"/>
-                  <continue/>
-                </do_if>
 
-                <set_value name="this.$mk2ScoringSource" exact="$source"/>
                 <set_value name="this.$mk2ScoringWare" exact="$ware"/>
-                <set_value name="this.$mk2ScoringSourceOffer" exact="$bestSell"/>
-                <set_value name="this.$mk2ScoringSourceOfferAmount" exact="this.$mk2BestSellEntry.$Amount"/>
-                <set_value name="this.$mk2ScoringSourceStorageDiscovery" exact="false"/>
-                <set_value name="this.$mk2ScoringSourceRatio" exact="0"/>
-                <set_value name="this.$mk2ScoringSourceFillRatio" exact="0"/>
                 <set_value name="this.$mk2AutoDest" exact="$dest"/>
                 <set_value name="this.$mk2NeedBucket" exact="$needBucket"/>
                 <set_value name="this.$mk2DestRatio" exact="$destRatio"/>
@@ -2696,50 +2679,8 @@
                 <set_value name="this.$mk2BucketWeight" exact="$bucketWeight"/>
                 <set_value name="this.$mk2DestTarget" exact="$destTarget"/>
 
-                <run_script name="'lib.gt.blacklist.validate_lane'" result="$mk2LaneBL">
-                  <param name="ship" value="this.ship"/>
-                  <param name="buyStation" value="this.$mk2ScoringSource"/>
-                  <param name="sellStation" value="this.$mk2AutoDest"/>
-                  <param name="blacklistGroup" value="if this.$blacklistgroup? then this.$blacklistgroup else blacklistgroup.civilian"/>
-                  <param name="sectorWhitelist" value="if this.$mk2SectorWhitelist? then this.$mk2SectorWhitelist else []"/>
-                  <param name="checkPath" value="false"/>
-                  <param name="debugchance" value="0"/>
-                </run_script>
-                <set_value name="this.$mk2LaneBL" exact="$mk2LaneBL"/>
-                <set_value name="$source" exact="this.$mk2ScoringSource"/>
-                <set_value name="$dest" exact="this.$mk2AutoDest"/>
-                <set_value name="$ware" exact="this.$mk2ScoringWare"/>
-                <do_if value="this.$mk2LaneBL.$Blocked? and this.$mk2LaneBL.$Blocked">
-                  <set_value name="$skipBlacklist" operation="add"/>
-                  <continue/>
-                </do_if>
-                <do_if value="this.$maxDistance gt 0">
-                  <set_value name="$dist" exact="-1"/>
-                  <set_value name="$distNormal" exact="-1"/>
-                  <do_if value="$source.sector == $dest.sector">
-                    <set_value name="$dist" exact="0"/>
-                    <set_value name="$distNormal" exact="0"/>
-                  </do_if>
-                  <do_else>
-                    <set_value name="$dist" exact="$source.sector.gatedistance.{$dest.sector}.{if this.$blacklistgroup? then this.$blacklistgroup else blacklistgroup.civilian}.{this.ship}"/>
-                    <set_value name="$distNormal" exact="$source.sector.gatedistance.{$dest.sector}"/>
-                  </do_else>
-                  <do_if value="$dist lt 0 or $dist gt this.$maxDistance">
-                    <set_value name="$skipDistance" operation="add"/>
-                    <continue/>
-                  </do_if>
-                  <do_if value="$dist ge 0 and $distNormal ge 0">
-                    <set_value name="$maxDetour" exact="2"/>
-                    <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$ThreatAvoidance? and global.$GT_GlobalSettings.$ThreatAvoidance.$MaxBlacklistDetourJumps?">
-                      <set_value name="$maxDetour" exact="global.$GT_GlobalSettings.$ThreatAvoidance.$MaxBlacklistDetourJumps"/>
-                    </do_if>
-                    <do_if value="($dist - $distNormal) gt $maxDetour">
-                      <set_value name="$skipDistance" operation="add"/>
-                      <continue/>
-                    </do_if>
-                  </do_if>
-                </do_if>
-
+                <!-- Destination side, resolved once: the destination offer and the minimum trade size do
+                     not depend on which supplier is used. -->
                 <run_script name="'lib.gt.tradematch'" result="$mk2DestOfferResolve">
                   <param name="mode" value="'mk2_player_offer'"/>
                   <param name="operation" value="'find'"/>
@@ -2749,20 +2690,88 @@
                   <param name="wareText" value="this.$mk2ScoringWare"/>
                   <param name="ignoreTradeRules" value="this.$ignoretraderules"/>
                 </run_script>
-                <set_value name="$dest" exact="this.$mk2AutoDest"/>
-                <set_value name="$ware" exact="this.$mk2ScoringWare"/>
-                <set_value name="$source" exact="this.$mk2ScoringSource"/>
-                <set_value name="$destOffer" exact="$mk2DestOfferResolve.$Offer"/>
-                <do_if value="$destOffer == null">
+                <set_value name="this.$mk2AsDestOffer" exact="@$mk2DestOfferResolve.$Offer"/>
+                <set_value name="$destOfferAmount" exact="@this.$mk2AsDestOffer.offeramount.{this.ship}"/>
+                <do_if value="this.$mk2AsDestOffer == null or not @this.$mk2AsDestOffer.available or not ($destOfferAmount gt 0)">
                   <set_value name="$skipNoDestOffer" operation="add"/>
                   <continue/>
                 </do_if>
-                <set_value name="$destOfferAmount" exact="$destOffer.offeramount.{this.ship}"/>
-                <do_if value="$destOfferAmount == null">
-                  <set_value name="$destOfferAmount" exact="0"/>
+                <set_value name="$ware" exact="this.$mk2ScoringWare"/>
+                <set_value name="$cargoCapacity" exact="this.ship.cargo.{$ware}.max"/>
+                <set_value name="this.$mk2AsNormalMin" exact="[1, (($cargoCapacity * this.$minCargoFillPercent) / 100)i].max"/>
+                <set_value name="this.$mk2AsMinTrade" exact="this.$mk2AsNormalMin"/>
+                <set_value name="this.$mk2AsUsedLowVolume" exact="false"/>
+                <do_if value="this.$allowlowvolume and (this.$mk2PilotLevelProfile ge 6 or this.$mk2IsCriticalNeed)">
+                  <set_value name="this.$mk2AsMinTrade" exact="[1, (($cargoCapacity * this.$mk2LowVolumeFloorEffPercent) / 100)i].max"/>
+                  <do_if value="this.$mk2IsCriticalNeed">
+                    <set_value name="this.$mk2AsMinTrade" exact="[1, (this.$mk2AsMinTrade / 2)i].max"/>
+                  </do_if>
+                  <set_value name="this.$mk2AsUsedLowVolume" exact="true"/>
                 </do_if>
-                <do_if value="not $destOffer.available or $destOfferAmount le 0">
+
+                <!-- First ranked supplier that passes every supplier-dependent check for this destination:
+                     lane (self, distance, detour, blacklist), stock against the minimum trade, and the
+                     offer match. Destination-side failures (matched offer gone, fairness exhausted, cargo
+                     or demand below the minimum) stop the walk because no other supplier can fix them.
+                     A skip counter is charged once, with the reason that ended the walk. -->
+                <set_value name="this.$mk2BestSellEntry" exact="null"/>
+                <set_value name="this.$mk2AsSkip" exact="'self'"/>
+                <set_value name="this.$mk2AsStop" exact="''"/>
+                <do_all exact="this.$mk2SellRank.count" counter="$asci">
+                  <set_value name="this.$mk2AsCandidate" exact="this.$mk2SellRank.{$asci}"/>
+                  <set_value name="$source" exact="this.$mk2AsCandidate.$Owner"/>
+                  <set_value name="$dest" exact="this.$mk2AutoDest"/>
+                  <do_if value="not @$source.exists or $source == $dest">
+                    <set_value name="this.$mk2AsSkip" exact="'self'"/>
+                    <continue/>
+                  </do_if>
+                  <do_if value="this.$maxDistance gt 0">
+                    <set_value name="$dist" exact="0"/>
+                    <set_value name="$distNormal" exact="0"/>
+                    <do_if value="$source.sector != $dest.sector">
+                      <set_value name="$dist" exact="$source.sector.gatedistance.{$dest.sector}.{if this.$blacklistgroup? then this.$blacklistgroup else blacklistgroup.civilian}.{this.ship}"/>
+                      <set_value name="$distNormal" exact="$source.sector.gatedistance.{$dest.sector}"/>
+                    </do_if>
+                    <set_value name="$maxDetour" exact="2"/>
+                    <do_if value="global.$GT_GlobalSettings? and global.$GT_GlobalSettings.$ThreatAvoidance? and global.$GT_GlobalSettings.$ThreatAvoidance.$MaxBlacklistDetourJumps?">
+                      <set_value name="$maxDetour" exact="global.$GT_GlobalSettings.$ThreatAvoidance.$MaxBlacklistDetourJumps"/>
+                    </do_if>
+                    <do_if value="$dist lt 0 or $dist gt this.$maxDistance or ($distNormal ge 0 and ($dist - $distNormal) gt $maxDetour)">
+                      <set_value name="this.$mk2AsSkip" exact="'distance'"/>
+                      <continue/>
+                    </do_if>
+                  </do_if>
+                  <run_script name="'lib.gt.blacklist.validate_lane'" result="$mk2LaneBL">
+                    <param name="ship" value="this.ship"/>
+                    <param name="buyStation" value="this.$mk2AsCandidate.$Owner"/>
+                    <param name="sellStation" value="this.$mk2AutoDest"/>
+                    <param name="blacklistGroup" value="if this.$blacklistgroup? then this.$blacklistgroup else blacklistgroup.civilian"/>
+                    <param name="sectorWhitelist" value="if this.$mk2SectorWhitelist? then this.$mk2SectorWhitelist else []"/>
+                    <param name="checkPath" value="false"/>
+                    <param name="debugchance" value="0"/>
+                  </run_script>
+                  <set_value name="this.$mk2LaneBL" exact="$mk2LaneBL"/>
+                  <do_if value="this.$mk2LaneBL.$Blocked? and this.$mk2LaneBL.$Blocked">
+                    <set_value name="this.$mk2AsSkip" exact="'blacklist'"/>
+                    <continue/>
+                  </do_if>
+                <set_value name="this.$mk2ScoringSource" exact="this.$mk2AsCandidate.$Owner"/>
+                <set_value name="this.$mk2ScoringSourceOffer" exact="this.$mk2AsCandidate.$Offer"/>
+                <set_value name="this.$mk2ScoringSourceOfferAmount" exact="this.$mk2AsCandidate.$Amount"/>
+                <set_value name="this.$mk2ScoringSourceStorageDiscovery" exact="false"/>
+                <set_value name="this.$mk2ScoringSourceRatio" exact="0"/>
+                <set_value name="this.$mk2ScoringSourceFillRatio" exact="0"/>
+                <set_value name="$source" exact="this.$mk2ScoringSource"/>
+                <set_value name="$dest" exact="this.$mk2AutoDest"/>
+                <set_value name="$ware" exact="this.$mk2ScoringWare"/>
+
+                <set_value name="$destOffer" exact="this.$mk2AsDestOffer"/>
+                <do_if value="not @$destOffer.available">
                   <set_value name="$skipNoDestOffer" operation="add"/>
+                  <break/>
+                </do_if>
+                <do_if value="this.$mk2ScoringSourceOfferAmount lt this.$mk2AsMinTrade">
+                  <set_value name="$skipMinTrade" operation="add"/>
                   <continue/>
                 </do_if>
 
@@ -2852,29 +2861,16 @@
                 </do_if>
 
                 <set_value name="$cargoCapacity" exact="this.ship.cargo.{$ware}.max"/>
-                <set_value name="$tradeAmount" exact="[this.ship.cargo.{$ware}.free, this.$mk2ScoringSourceOfferAmount, $effectiveDestOfferAmount].min"/>
-                <set_value name="$normalMinimumTrade" exact="[1, (($cargoCapacity * this.$minCargoFillPercent) / 100)i].max"/>
-                <set_value name="$minimumTrade" exact="$normalMinimumTrade"/>
-                <set_value name="$usedLowVolume" exact="false"/>
-                <set_value name="$canLowVolume" exact="false"/>
-                <do_if value="this.$allowlowvolume">
-                  <do_if value="this.$mk2PilotLevelProfile ge 6 or $isCriticalNeed">
-                    <set_value name="$canLowVolume" exact="true"/>
-                  </do_if>
-                </do_if>
-                <do_if value="$canLowVolume">
-                  <set_value name="$minimumTrade" exact="[1, (($cargoCapacity * this.$mk2LowVolumeFloorEffPercent) / 100)i].max"/>
-                  <do_if value="$isCriticalNeed">
-                    <set_value name="$minimumTrade" exact="[1, ($minimumTrade / 2)i].max"/>
-                  </do_if>
-                  <set_value name="$usedLowVolume" exact="true"/>
-                </do_if>
+                <set_value name="$tradeAmount" exact="[this.ship.cargo.{$ware}.free, this.$mk2ScoringSourceOfferAmount, this.$mk2MatchResult.$TradeList.{1}.$Amount, $effectiveDestOfferAmount].min"/>
+                <set_value name="$normalMinimumTrade" exact="this.$mk2AsNormalMin"/>
+                <set_value name="$minimumTrade" exact="this.$mk2AsMinTrade"/>
+                <set_value name="$usedLowVolume" exact="this.$mk2AsUsedLowVolume"/>
                 <do_if value="$tradeAmount lt $minimumTrade">
                   <set_value name="$skipMinTrade" operation="add"/>
                   <continue/>
                 </do_if>
 
-                <!-- Re-fetch after ware_fairness yield (locals do not survive run_script). -->
+                <!-- Refresh reservations after ware_fairness yields. -->
                 <set_value name="$incomingReservedAmount" exact="0"/>
                 <do_if value="this.$fleetcoordination">
                   <get_ware_reservation object="$dest" ware="$ware" type="sell" virtual="false" result="$incomingReservedAmount"/>
@@ -2912,6 +2908,8 @@
                   $SourceStorageDiscovery = false,
                   $DestStorageDiscovery = false
                 ]"/>
+                <break/>
+                </do_all>
               </do_all>
             </do_all>
           </do_else>
@@ -3150,7 +3148,8 @@
               <set_value name="$mk2ClampSrcCount" exact="this.$mk2QueuedTrade.$Source.cargo.{this.$mk2QueuedTrade.$Ware}.count"/>
               <get_ware_reservation object="this.$mk2QueuedTrade.$Source" ware="this.$mk2QueuedTrade.$Ware" type="buy" virtual="false" result="$mk2ClampSrcReserved"/>
               <set_value name="$mk2ClampSrcEff" exact="[$mk2ClampSrcCount - $mk2ClampSrcReserved, 0].max"/>
-              <set_value name="$mk2ClampSrcFloor" exact="(($mk2ClampSrcTarget * this.$staticStorage) / 100)i"/>
+              <!-- Auto-source buys market offers; the fixed-source staticStorage reserve does not apply. -->
+              <set_value name="$mk2ClampSrcFloor" exact="if this.$mk2AutoSourceMode then 0 else (($mk2ClampSrcTarget * this.$staticStorage) / 100)i"/>
               <set_value name="$mk2ClampSrcSurplus" exact="[$mk2ClampSrcEff - $mk2ClampSrcFloor, 0].max"/>
               <set_value name="$mk2SourceOfferStillAmount" exact="[$mk2SourceOfferStillAmount, $mk2ClampSrcSurplus].min"/>
             </do_if>
@@ -3306,7 +3305,7 @@
                 <get_ware_reservation object="$mk2ResSrc" ware="$mk2ResWare" type="buy" reserver="this.ship" virtual="false" result="$mk2ResSelfBefore"/>
                 <set_value name="$mk2ResOthers" exact="[$mk2ResTotalBefore - $mk2ResSelfBefore, 0].max"/>
                 <set_value name="$mk2ResTarget" exact="[$mk2ResSrc.cargo.{$mk2ResWare}.target, 1].max"/>
-                <set_value name="$mk2ResFloor" exact="(($mk2ResTarget * this.$staticStorage) / 100)i"/>
+                <set_value name="$mk2ResFloor" exact="if this.$mk2AutoSourceMode then 0 else (($mk2ResTarget * this.$staticStorage) / 100)i"/>
                 <set_value name="$mk2ResMaxAllowed" exact="[$mk2ResSrc.cargo.{$mk2ResWare}.count - $mk2ResOthers - $mk2ResFloor, 0].max"/>
                 <do_if value="$mk2ResWant gt $mk2ResMaxAllowed">
                   <set_value name="$mk2ResWant" exact="$mk2ResMaxAllowed"/>
@@ -3375,14 +3374,18 @@
                 <create_trade_order object="this.ship" tradeoffer="this.$mk2QueuedTrade.$SourceOffer" amount="this.$mk2QueuedTrade.$QueuedAmount" immediate="false" internal="this.$mk2TradeOrderInternal"/>
               </do_elseif>
             </do_all>
-            <!-- Phase 2: queue all sells (official offers + ware-exchange deliveries). -->
+            <!-- Phase 2: queue all sells (official offers + ware-exchange deliveries).
+                 Official sells wait in $mk2DeferredSells until the ware-exchange legs are queued:
+                 Lua appends pickups at the end of the queue, so a sell created here would run
+                 before a ware-exchange pickup and leave the ship empty at the buyer. -->
+            <create_list name="this.$mk2DeferredSells"/>
             <do_all exact="this.$mk2FinalQueueTrades.count" counter="$mqsi">
               <set_value name="this.$mk2QueuedTrade" exact="this.$mk2FinalQueueTrades.{$mqsi}"/>
               <do_if value="this.$mk2QueuedTrade.$DestStorageDiscovery? and this.$mk2QueuedTrade.$DestStorageDiscovery">
                 <append_to_list name="this.$mk2WareExchangeLegs" exact="table[$Station = this.$mk2QueuedTrade.$Destination, $StationId = this.$mk2QueuedTrade.$Destination.idcode, $Ware = this.$mk2QueuedTrade.$Ware, $WareName = @this.$mk2QueuedTrade.$Ware.name, $Amount = this.$mk2QueuedTrade.$QueuedAmount, $Direction = 'deliver']"/>
               </do_if>
               <do_elseif value="this.$mk2QueuedTrade.$DestOffer? and this.$mk2QueuedTrade.$DestOffer != null and this.$mk2QueuedTrade.$DestOffer.available">
-                <create_trade_order object="this.ship" tradeoffer="this.$mk2QueuedTrade.$DestOffer" amount="this.$mk2QueuedTrade.$QueuedAmount" immediate="false" internal="this.$mk2TradeOrderInternal"/>
+                <append_to_list name="this.$mk2DeferredSells" exact="this.$mk2QueuedTrade"/>
               </do_elseif>
               <set_value name="$mk2QueuedAmount" exact="if this.$mk2QueuedTrade.$QueuedAmount? and this.$mk2QueuedTrade.$QueuedAmount != null then this.$mk2QueuedTrade.$QueuedAmount else 0"/>
               <do_if value="$mk2QueuedAmount gt 0">
@@ -3469,6 +3472,19 @@
                   </do_if>
                 </do_if>
               </do_if>
+            </do_if>
+            <do_if value="not this.$mk2DenyTrade and @this.$mk2DeferredSells.count gt 0">
+              <do_all exact="this.$mk2DeferredSells.count" counter="$mk2Dsi">
+                <set_value name="this.$mk2QueuedTrade" exact="this.$mk2DeferredSells.{$mk2Dsi}"/>
+                <do_if value="@this.$mk2QueuedTrade.$DestOffer.available">
+                  <create_trade_order object="this.ship" tradeoffer="this.$mk2QueuedTrade.$DestOffer" amount="this.$mk2QueuedTrade.$QueuedAmount" immediate="false" internal="this.$mk2TradeOrderInternal"/>
+                </do_if>
+                <do_else>
+                  <set_value name="this.$mk2DenyTrade" exact="true"/>
+                  <set_value name="this.$mk2LastSkipReason" exact="'deferred destination offer unavailable'"/>
+                  <break/>
+                </do_else>
+              </do_all>
             </do_if>
             <!-- Drop pre-commit source/dest reservations if queue was denied before orders run. -->
             <do_if value="this.$mk2DenyTrade and this.$mk2SourceReservations? and this.$mk2SourceReservations.count gt 0">

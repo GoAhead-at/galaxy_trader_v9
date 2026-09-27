@@ -7,17 +7,16 @@
     On a cold pool every miner sharing a mining range would otherwise run the same 27-136 sector
     live search in the same frame, which is the stampede the cache exists to remove. The first
     caller claims the slot and is told to fill; the rest poll briefly and are told a peer published,
-    at which point the caller re-reads the cache with the same pool key.
+    at which point the caller re-reads the cache with the same pool key. A waiter that times out on a
+    pool filled earlier gets $Stale = true and re-reads it with allowExpired instead of searching.
 
     Two guarantees come out of one structure:
       1. At most one fill per pool key, so a range is never scanned twice at once.
       2. At most 3 fills galaxy-wide, so many distinct ranges cannot all scan at once.
-    Entries carry a timestamp and are pruned when stale, so an order torn down mid-search releases
-    its slot on its own and no counter can leak.
+    Entries retain their owner and claim key until completion or interruption. A slow live scan
+    cannot lose its slot merely because it exceeded a timer.
 
-    The concurrency lives here rather than in an MD slot scheduler because the miner order cannot
-    host the wait/resume/label a ticket protocol needs: its hot path has documented local-after-wait
-    fragility, and a library yield keeps the caller's flow untouched.
+    The library keeps the bounded polling protocol in one place for both miner callers.
   -->
   <params>
     <param name="poolKey" default="''"/>
@@ -30,7 +29,7 @@
         <return value="table[$Claimed = false, $Hit = false]"/>
       </do_if>
 
-      <!-- Persist across the poll waits (locals do not survive a yield). -->
+      <!-- Publish claim state for the writer and order interruption cleanup. -->
       <set_value name="this.$gtMscKey" exact="$poolKey"/>
       <set_value name="this.$gtMscTtl" exact="if $maxAge? and $maxAge gt 0s then $maxAge else 300s"/>
       <set_value name="this.$gtMscDebug" exact="$debugchance"/>
@@ -38,12 +37,11 @@
       <set_value name="this.$gtMscClaimed" exact="false"/>
       <set_value name="this.$gtMscHit" exact="false"/>
 
-      <!-- Active fills as a list of table[$Key, $At]. A single scalar lock would only ever hold one
+      <!-- Active fills as a list of table[$Key, $At, $Owner]. A single scalar lock would only ever hold one
            key: a second pool starting a fill would silently unlock the first, letting a third ship
            duplicate a fill already in progress. A list also enumerates reliably, which a table keyed
            by these composite strings does not.
-           The slot count is inlined below rather than held in a local: locals do not survive the
-           poll wait, so a variable would read as null from the second round on. -->
+           Re-read the shared slot count each poll because peers may claim or release while we wait. -->
       <do_while value="not this.$gtMscClaimed and not this.$gtMscHit and this.$gtMscWaitLeft gt 0">
         <do_if value="not global.$GT_MinerSellFills? or typeof global.$GT_MinerSellFills != datatype.list">
           <set_value name="global.$GT_MinerSellFills" exact="[]"/>
@@ -51,7 +49,7 @@
         <set_value name="$sellLocked" exact="false"/>
         <do_all exact="global.$GT_MinerSellFills.count" counter="$fki" reverse="true">
           <set_value name="$fillEntry" exact="global.$GT_MinerSellFills.{$fki}"/>
-          <do_if value="$fillEntry? and $fillEntry.$At? and (player.age - @$fillEntry.$At) lt 30s">
+          <do_if value="@$fillEntry.$Owner.exists and @$fillEntry.$Owner.$gtMinerSellFillKey == @$fillEntry.$Key">
             <do_if value="$fillEntry.$Key? and @$fillEntry.$Key == this.$gtMscKey">
               <set_value name="$sellLocked" exact="true"/>
             </do_if>
@@ -62,8 +60,9 @@
         </do_all>
 
         <do_if value="not $sellLocked and global.$GT_MinerSellFills.count lt 3">
-          <append_to_list name="global.$GT_MinerSellFills" exact="table[$Key = this.$gtMscKey, $At = player.age]"/>
+          <append_to_list name="global.$GT_MinerSellFills" exact="table[$Key = this.$gtMscKey, $At = player.age, $Owner = this]"/>
           <set_value name="this.$gtMscClaimed" exact="true"/>
+          <set_value name="this.$gtMinerSellFillKey" exact="this.$gtMscKey"/>
         </do_if>
         <do_else>
           <wait min="150ms" max="350ms"/>
@@ -78,25 +77,30 @@
         </do_else>
       </do_while>
 
-      <!-- Waited out the budget without a slot or a published result. Take a slot anyway rather than
-           sending the miner away empty: the release path keys off this entry, so claiming keeps the
-           write symmetric, and the worst case is one duplicated search while the system is saturated. -->
-      <do_if value="not this.$gtMscClaimed and not this.$gtMscHit">
-        <append_to_list name="global.$GT_MinerSellFills" exact="table[$Key = this.$gtMscKey, $At = player.age]"/>
-        <set_value name="this.$gtMscClaimed" exact="true"/>
-        <debug_text text="'[GT-MinerSell] Fill slots saturated - proceeding uncoordinated key=' + this.$gtMscKey" chance="this.$gtMscDebug"/>
+      <!-- Waited out the budget without a slot or a fresh result. If the pool was filled before, report
+           it as an expired hit: every waiter would otherwise start its own search at once and the 3-fill
+           cap would stop meaning anything under saturation. The caller re-reads with allowExpired, and
+           lib.gt.miner.sell.search still drops dead, unavailable and blacklisted offers on that read. -->
+      <set_value name="this.$gtMscStale" exact="false"/>
+      <do_if value="not this.$gtMscClaimed and not this.$gtMscHit and global.$GT_TradeCacheMinerSell? and typeof @global.$GT_TradeCacheMinerSell.{this.$gtMscKey} == datatype.table and @global.$GT_TradeCacheMinerSell.{this.$gtMscKey}.$At != null">
+        <set_value name="this.$gtMscHit" exact="true"/>
+        <set_value name="this.$gtMscStale" exact="true"/>
+        <debug_text text="'[GT-MinerSell] Fill slots saturated - reusing expired pool key=' + this.$gtMscKey" chance="this.$gtMscDebug"/>
       </do_if>
 
+      <!-- A cold saturated pool is deferred. Never scan or publish without a fill slot. -->
       <set_value name="$outClaimed" exact="this.$gtMscClaimed"/>
       <set_value name="$outHit" exact="this.$gtMscHit"/>
-      <debug_text text="'[GT-MinerSell] CLAIM claimed=' + $outClaimed + ' peerPublished=' + $outHit + ' key=' + this.$gtMscKey" chance="this.$gtMscDebug"/>
+      <set_value name="$outStale" exact="@this.$gtMscStale == true"/>
+      <debug_text text="'[GT-MinerSell] CLAIM claimed=' + $outClaimed + ' peerPublished=' + $outHit + ' expired=' + $outStale + ' key=' + this.$gtMscKey" chance="this.$gtMscDebug"/>
       <remove_value name="this.$gtMscKey"/>
       <remove_value name="this.$gtMscTtl"/>
       <remove_value name="this.$gtMscDebug"/>
       <remove_value name="this.$gtMscWaitLeft"/>
       <remove_value name="this.$gtMscClaimed"/>
       <remove_value name="this.$gtMscHit"/>
-      <return value="table[$Claimed = $outClaimed, $Hit = $outHit]"/>
+      <remove_value name="this.$gtMscStale"/>
+      <return value="table[$Claimed = $outClaimed, $Hit = $outHit, $Stale = $outStale, $Deferred = (not $outClaimed and not $outHit)]"/>
     </actions>
   </attention>
 </aiscript>

@@ -1451,25 +1451,42 @@ local function isCrossClassInversion(a, b)
     return small.level > large.level
 end
 
-local function countCrossClassInversions(ships)
-    local byRank = buildShipsByRank(ships)
+-- counts[rank][level] = number of ships. The planner works on this histogram so an inversion
+-- count costs O(ranks x levels) instead of a scan over every ship.
+local function buildRankLevelCounts(ships)
+    local counts = {}
+    for _, s in ipairs(ships) do
+        local byLevel = counts[s.rank]
+        if not byLevel then
+            byLevel = {}
+            counts[s.rank] = byLevel
+        end
+        byLevel[s.level] = (byLevel[s.level] or 0) + 1
+    end
+    return counts
+end
+
+-- Cross-class inversions (smaller class, higher level) over the S/M/L/XL ranks
+local function countCrossClassInversionsFromCounts(counts)
     local count = 0
     for r1 = 1, 3 do
-        for r2 = r1 + 1, 4 do
-            for _, a in ipairs(byRank[r1]) do
-                for _, b in ipairs(byRank[r2]) do
-                    if a.level > b.level then
-                        count = count + 1
+        local low = counts[r1]
+        if low then
+            for r2 = r1 + 1, 4 do
+                local high = counts[r2]
+                if high then
+                    for l1, n1 in pairs(low) do
+                        for l2, n2 in pairs(high) do
+                            if l1 > l2 then
+                                count = count + n1 * n2
+                            end
+                        end
                     end
                 end
             end
         end
     end
     return count
-end
-
-local function isSelectionWellOrdered(ships)
-    return countCrossClassInversions(ships) == 0
 end
 
 local function distinctClassRankCount(ships)
@@ -1502,37 +1519,71 @@ local function applyVirtualPilotSwap(a, b)
     a.level, b.level = b.level, a.level
 end
 
-local function pairInversion(s1, s2)
-    if s1.rank == s2.rank then
-        return 0
+-- Inversions a ship of this rank and level forms with every counted ship: larger classes at a
+-- lower level plus smaller classes at a higher level (same class never counts).
+local function inversionsAgainstCounts(counts, memo, rank, level)
+    local memoRank = memo[rank]
+    if memoRank and memoRank[level] then
+        return memoRank[level]
     end
-    local small, large = smallerAndLargerShip(s1, s2)
-    if not small then
-        return 0
+    local total = 0
+    for r, byLevel in pairs(counts) do
+        if r > rank then
+            for l, n in pairs(byLevel) do
+                if l < level then
+                    total = total + n
+                end
+            end
+        elseif r < rank then
+            for l, n in pairs(byLevel) do
+                if l > level then
+                    total = total + n
+                end
+            end
+        end
     end
-    return (small.level > large.level) and 1 or 0
+    if not memoRank then
+        memoRank = {}
+        memo[rank] = memoRank
+    end
+    memoRank[level] = total
+    return total
 end
 
-local function inversionDeltaForSwap(state, a, b)
+-- Change in total inversions if a and b trade pilots (positive = fewer inversions).
+-- memo caches inversionsAgainstCounts per rank and level; it is only valid for this counts.
+-- counts holds a at la and b at lb. Before: each ship's count includes the a-b pair once, so
+-- the pair is subtracted once. After: a at lb against the b entry (also lb) and b at la against
+-- the a entry (also la) are equal levels and count 0, so the histogram needs no correction.
+local function inversionDeltaForSwap(counts, memo, a, b)
     if a.rank == b.rank then
         return 0
     end
     local la, lb = a.level, b.level
-    local before = pairInversion(a, b)
-    for _, other in ipairs(state) do
-        if other ~= a and other ~= b then
-            before = before + pairInversion(a, other) + pairInversion(b, other)
-        end
-    end
-    a.level, b.level = lb, la
-    local after = pairInversion(a, b)
-    for _, other in ipairs(state) do
-        if other ~= a and other ~= b then
-            after = after + pairInversion(a, other) + pairInversion(b, other)
-        end
-    end
-    a.level, b.level = la, lb
+    local small, large = smallerAndLargerShip(a, b)
+    local pairBefore = (small.level > large.level) and 1 or 0
+    local smallAfter = (small == a) and lb or la
+    local largeAfter = (small == a) and la or lb
+    local pairAfter = (smallAfter > largeAfter) and 1 or 0
+    local before = inversionsAgainstCounts(counts, memo, a.rank, la) + inversionsAgainstCounts(counts, memo, b.rank, lb) - pairBefore
+    local after = inversionsAgainstCounts(counts, memo, a.rank, lb) + inversionsAgainstCounts(counts, memo, b.rank, la) + pairAfter
     return before - after
+end
+
+-- Planner order: largest level gap, then largest inversion reduction, then idcodes
+local function isBetterSwapCandidate(gap, invDelta, small, large, pick)
+    if gap ~= pick.gap then
+        return gap > pick.gap
+    end
+    if invDelta ~= pick.invDelta then
+        return invDelta > pick.invDelta
+    end
+    local xs, ys = tostring(small.idcode), tostring(pick.small.idcode)
+    if xs ~= ys then
+        return xs < ys
+    end
+    -- the old table.sort left this tie to chance
+    return tostring(large.idcode) < tostring(pick.large.idcode)
 end
 
 local function planSelectionSwaps(ships)
@@ -1556,30 +1607,36 @@ local function planSelectionSwaps(ships)
     local maxIterations = math.max(1, #state)
     local iterations = 0
 
-    while not isSelectionWellOrdered(state) and iterations < maxIterations do
+    local counts = buildRankLevelCounts(state)
+    while countCrossClassInversionsFromCounts(counts) > 0 and iterations < maxIterations do
         iterations = iterations + 1
+        local memo = {}
         local buckets = buildShipsByRank(state)
-        local candidates = {}
+        -- Keep only the best candidate; the pair key (a string) is built only for a pair that
+        -- would replace the current pick.
+        local pick = nil
         for r1 = 1, 3 do
             for r2 = r1 + 1, 4 do
                 for _, a in ipairs(buckets[r1]) do
                     for _, b in ipairs(buckets[r2]) do
                         if isCrossClassInversion(a, b) then
-                            local pairKey = swapPairKeyForState(a, b)
-                            if not usedPairs[pairKey] then
-                                local small, large = smallerAndLargerShip(a, b)
+                            local small, large = smallerAndLargerShip(a, b)
+                            if swapPassesSelectionGates(small, large) then
+                                local invDelta = inversionDeltaForSwap(counts, memo, a, b)
                                 local gap = small.level - large.level
-                                local invDelta = inversionDeltaForSwap(state, a, b)
-                                if swapPassesSelectionGates(small, large) and invDelta > 0 then
-                                    table.insert(candidates, {
-                                        a = a,
-                                        b = b,
-                                        small = small,
-                                        large = large,
-                                        gap = gap,
-                                        invDelta = invDelta,
-                                        pairKey = pairKey,
-                                    })
+                                if invDelta > 0 and (not pick or isBetterSwapCandidate(gap, invDelta, small, large, pick)) then
+                                    local pairKey = swapPairKeyForState(a, b)
+                                    if not usedPairs[pairKey] then
+                                        pick = {
+                                            a = a,
+                                            b = b,
+                                            small = small,
+                                            large = large,
+                                            gap = gap,
+                                            invDelta = invDelta,
+                                            pairKey = pairKey,
+                                        }
+                                    end
                                 end
                             end
                         end
@@ -1588,25 +1645,15 @@ local function planSelectionSwaps(ships)
             end
         end
 
-        if #candidates == 0 then
+        if not pick then
             break
         end
 
-        table.sort(candidates, function(x, y)
-            if x.gap ~= y.gap then
-                return x.gap > y.gap
-            end
-            if x.invDelta ~= y.invDelta then
-                return x.invDelta > y.invDelta
-            end
-            return tostring(x.small.idcode) < tostring(y.small.idcode)
-        end)
-
-        local pick = candidates[1]
         usedPairs[pick.pairKey] = true
         local smallLevel = pick.small.level
         local largeLevel = pick.large.level
         applyVirtualPilotSwap(pick.a, pick.b)
+        counts = buildRankLevelCounts(state)
         table.insert(swaps, {
             left = pick.a.ship,
             right = pick.b.ship,

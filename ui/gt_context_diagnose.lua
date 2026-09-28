@@ -106,7 +106,8 @@ local SECTION_COLUMNS = {
         align    = { "center", "left", "right", "center", "right", "left" },
     },
 }
-SECTION_COLUMNS["Search Summary (Buyer Side)"] = SECTION_COLUMNS["Search Summary"]
+-- "Search Summary (Buyer Side)" (miner) is deliberately not in SECTION_COLUMNS: MD renamed that
+-- section so its 3-column rows fall back to the generic layout instead of the 6-column one.
 
 local GENERIC_SIX_COLUMNS = {
     percents = { 8, 18, 18, 14, 14 },

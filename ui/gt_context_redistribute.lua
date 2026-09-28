@@ -453,6 +453,15 @@ local function publishPilotExchangeRenameState(leftCode, rightCode, active)
     })
 end
 
+-- MD reads leftObj/rightObj as components; a raw 64-bit id fails its @$ship.exists gate.
+-- Convert the same way AssignDockOrders does; nil (key omitted) when there is no ship.
+local function toMdShipRef(ship)
+    if (not ship) or ship == 0 then
+        return nil
+    end
+    return ConvertStringToLuaID(tostring(ship))
+end
+
 function gtPublishPilotExchangeRelease(leftCode, rightCode, leftShip, rightShip)
     if type(AddUITriggeredEvent) ~= "function" then
         return
@@ -460,8 +469,8 @@ function gtPublishPilotExchangeRelease(leftCode, rightCode, leftShip, rightShip)
     AddUITriggeredEvent("GT_Redistribute", "ReleaseDockHold", {
         left = tostring(leftCode or ""),
         right = tostring(rightCode or ""),
-        leftObj = leftShip,
-        rightObj = rightShip,
+        leftObj = toMdShipRef(leftShip),
+        rightObj = toMdShipRef(rightShip),
         releaseDock = true,
         closeSession = true,
     })
@@ -1009,8 +1018,8 @@ local function requestPeSettlementWatch(leftCode, rightCode, leftShip, rightShip
     AddUITriggeredEvent("GT_Redistribute", "RegisterPeSettlementWatch", {
         left = tostring(leftCode or ""),
         right = tostring(rightCode or ""),
-        leftObj = leftShip,
-        rightObj = rightShip,
+        leftObj = toMdShipRef(leftShip),
+        rightObj = toMdShipRef(rightShip),
     })
 end
 

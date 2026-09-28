@@ -30,6 +30,21 @@ ffi.cdef[[
     void SetFleetName(UniverseID controllableid, const char* fleetname);
 ]]
 
+-- Trace output only with GT debug logging on; failures keep calling DebugError directly.
+local function isPromoteDebugEnabled()
+    local bridge = _G.GT_PlayerBridge
+    if bridge and bridge.IsDebugLoggingEnabled then
+        return bridge.IsDebugLoggingEnabled() and true or false
+    end
+    return false
+end
+
+local function debugLog(msg)
+    if isPromoteDebugEnabled() then
+        DebugError(msg)
+    end
+end
+
 local function asComponentId(entry)
     if not entry then
         return nil
@@ -224,7 +239,7 @@ local function applyFleetName(ship, fleetName)
     end
     local ok = pcall(C.SetFleetName, sid, fleetName)
     if ok then
-        DebugError(string.format(
+        debugLog(string.format(
             "[GT Promote] Fleet name reapplied ship=%s fleet=%s",
             formatComponentRef(sid),
             tostring(fleetName)
@@ -240,11 +255,14 @@ local function applyFleetName(ship, fleetName)
 end
 
 local function logDefaultOrderSnapshotDetailed(tag, snapshot)
-    if not snapshot then
-        DebugError(string.format("[GT Promote] SNAPSHOT[%s] default-order snapshot: <nil>", tostring(tag)))
+    if not isPromoteDebugEnabled() then
         return
     end
-    DebugError(string.format(
+    if not snapshot then
+        debugLog(string.format("[GT Promote] SNAPSHOT[%s] default-order snapshot: <nil>", tostring(tag)))
+        return
+    end
+    debugLog(string.format(
         "[GT Promote] SNAPSHOT[%s] default-order source=%s order=%s params=%d",
         tostring(tag),
         formatComponentRef(snapshot.sourceShip),
@@ -253,7 +271,7 @@ local function logDefaultOrderSnapshotDetailed(tag, snapshot)
     ))
     for _, entry in ipairs(snapshot.params or {}) do
         if entry then
-            DebugError(string.format(
+            debugLog(string.format(
                 "[GT Promote] SNAPSHOT[%s] default-order param idx=%s name=%s value=%s",
                 tostring(tag),
                 tostring(entry.idx),
@@ -265,9 +283,12 @@ local function logDefaultOrderSnapshotDetailed(tag, snapshot)
 end
 
 local function logFleetSnapshot(label, rootCommander)
+    if not isPromoteDebugEnabled() then
+        return
+    end
     local root = asComponentId(rootCommander)
     if not root or root == 0 then
-        DebugError(string.format("[GT Promote] SNAPSHOT[%s] root invalid: %s", tostring(label), tostring(rootCommander)))
+        debugLog(string.format("[GT Promote] SNAPSHOT[%s] root invalid: %s", tostring(label), tostring(rootCommander)))
         return
     end
 
@@ -275,7 +296,7 @@ local function logFleetSnapshot(label, rootCommander)
     local queue = { root }
     local qhead = 1
     local count = 0
-    DebugError(string.format("[GT Promote] SNAPSHOT[%s] begin root=%s", tostring(label), formatComponentRef(root)))
+    debugLog(string.format("[GT Promote] SNAPSHOT[%s] begin root=%s", tostring(label), formatComponentRef(root)))
 
     while qhead <= #queue do
         local ship = asComponentId(queue[qhead])
@@ -294,7 +315,7 @@ local function logFleetSnapshot(label, rootCommander)
             local pilotRef = pilot and asComponentId(pilot) or nil
             local pilotCode = pilotRef and GetComponentData(pilotRef, "idcode") or "NONE"
 
-            DebugError(string.format(
+            debugLog(string.format(
                 "[GT Promote] SNAPSHOT[%s] ship=%s (%s) class=%s commander=%s (%s) assignment=%s group=%s order=%s pilot=%s level=%s directSubs=%d",
                 tostring(label),
                 tostring(idcode or "NOID"),
@@ -319,7 +340,7 @@ local function logFleetSnapshot(label, rootCommander)
         end
     end
 
-    DebugError(string.format("[GT Promote] SNAPSHOT[%s] end ships=%d", tostring(label), count))
+    debugLog(string.format("[GT Promote] SNAPSHOT[%s] end ships=%d", tostring(label), count))
 end
 
 local function subordinateIdList(ship)
@@ -367,7 +388,7 @@ local function enqueueOldCommanderReattach(oldCommander, newCommander, assignmen
         maxPostForceChecks = 20, -- short post-force settle window
         issuedShips = issuedShips or {},
     }
-    DebugError(string.format(
+    debugLog(string.format(
         "[GT Promote] Deferred old commander attach queued old=%s new=%s assignment=%s group=%s",
         formatComponentRef(oldCommander),
         formatComponentRef(newCommander),
@@ -392,7 +413,7 @@ local function enqueuePromotedCommanderAttach(promotedCommander, parentCommander
         maxChecks = 80, -- ~1.3s at 60fps
         forceIssued = false,
     }
-    DebugError(string.format(
+    debugLog(string.format(
         "[GT Promote] Deferred promoted commander attach queued ship=%s parent=%s assignment=%s group=%s",
         formatComponentRef(promotedCommander),
         formatComponentRef(parentCommander),
@@ -452,13 +473,13 @@ end
 local function applyCapturedDefaultOrder(toShip, snapshot, quiet)
     if not snapshot or not snapshot.orderId then
         if not quiet then
-            DebugError(string.format("[GT Promote] Default order apply skipped: no snapshot for ship=%s", tostring(toShip)))
+            debugLog(string.format("[GT Promote] Default order apply skipped: no snapshot for ship=%s", tostring(toShip)))
         end
         return false
     end
     if not C.IsOrderSelectableFor(snapshot.orderId, toShip) then
         if not quiet then
-            DebugError(string.format("[GT Promote] Default order apply skipped: order not selectable order=%s ship=%s", tostring(snapshot.orderId), tostring(toShip)))
+            debugLog(string.format("[GT Promote] Default order apply skipped: order not selectable order=%s ship=%s", tostring(snapshot.orderId), tostring(toShip)))
         end
         return false
     end
@@ -508,7 +529,7 @@ local function applyCapturedDefaultOrder(toShip, snapshot, quiet)
     C.EnableOrder(toShip, orderidx)
     -- Match vanilla behavior: promote planned default to active default immediately.
     pcall(C.EnablePlannedDefaultOrder, toShip, false)
-    DebugError(string.format("[GT Promote] Default order applied: order=%s ship=%s idx=%s params=%d source=%s", tostring(snapshot.orderId), tostring(toShip), tostring(orderidx), #(snapshot.params or {}), tostring(snapshot.sourceShip)))
+    debugLog(string.format("[GT Promote] Default order applied: order=%s ship=%s idx=%s params=%d source=%s", tostring(snapshot.orderId), tostring(toShip), tostring(orderidx), #(snapshot.params or {}), tostring(snapshot.sourceShip)))
     return true
 end
 
@@ -536,7 +557,7 @@ local function processPendingDefaultApplies()
             else
                 local currentOrderId = getDefaultOrderId(ship)
                 if (not currentOrderId) or (snapshot and snapshot.orderId and currentOrderId ~= snapshot.orderId) then
-                    DebugError(string.format("[GT Promote] Pending default-apply trigger ship=%s currentOrder=%s", tostring(ship), tostring(currentOrderId)))
+                    debugLog(string.format("[GT Promote] Pending default-apply trigger ship=%s currentOrder=%s", tostring(ship), tostring(currentOrderId)))
                     logFleetSnapshot("PENDING_APPLY_BEFORE", ship)
                     logDefaultOrderSnapshotDetailed("PENDING_APPLY", snapshot)
                     applyCapturedDefaultOrder(ship, snapshot, false)
@@ -566,7 +587,7 @@ local function processPendingPromotionReassign()
                     if ship and ship ~= 0 and C.IsComponentClass(ship, "controllable") and ship ~= newCommander and ship ~= oldCommander then
                         local beforeCommander = GetCommander(ship)
                         beforeCommander = beforeCommander and ConvertIDTo64Bit(beforeCommander) or nil
-                        DebugError(string.format(
+                        debugLog(string.format(
                             "[GT Promote] Reassign step [%d/%d] ship=%s beforeCommander=%s targetCommander=%s assignment=%s group=%s",
                             idx,
                             total,
@@ -577,7 +598,7 @@ local function processPendingPromotionReassign()
                             tostring(e.group)
                         ))
                         if beforeCommander == newCommander then
-                            DebugError(string.format(
+                            debugLog(string.format(
                                 "[GT Promote] Reassign skip ship=%s already assigned to target=%s",
                                 formatComponentRef(ship),
                                 formatComponentRef(newCommander)
@@ -609,10 +630,10 @@ local function processPendingPromotionReassign()
                     applyFleetName(newCommander, job.originalFleetName)
                     logFleetSnapshot("POST_FINAL_DEFAULT_APPLY_NEW_TREE", newCommander)
                     local verifySubs = collectFleetSubordinatesRecursive(newCommander)
-                    DebugError(string.format("[GT Promote] Post-promote verify commander=%s descendants=%d", tostring(newCommander), #verifySubs))
+                    debugLog(string.format("[GT Promote] Post-promote verify commander=%s descendants=%d", tostring(newCommander), #verifySubs))
                     logFleetSnapshot("POST_VERIFY_NEW_TREE", newCommander)
                     local newName = GetComponentData(newCommander, "name") or "ship"
-                    DebugError(string.format("[GT Promote] Promotion complete: %s is new commander (moved=%d, failed=%d)", tostring(newName), job.moved or 0, job.failed or 0))
+                    debugLog(string.format("[GT Promote] Promotion complete: %s is new commander (moved=%d, failed=%d)", tostring(newName), job.moved or 0, job.failed or 0))
 
                     pendingPromotionReassign[key] = nil
                 end
@@ -640,7 +661,7 @@ local function processPendingOldCommanderReattach()
                 currentCommander = currentCommander and ConvertIDTo64Bit(currentCommander) or nil
                 local oldAttached = (currentCommander == newCommander)
                 if (entry.checks % 10) == 1 or subCount == 0 or shouldForce then
-                    DebugError(string.format(
+                    debugLog(string.format(
                         "[GT Promote] Deferred attach check old=%s subs=%d list=%s checks=%d/%d force=%s attached=%s",
                         formatComponentRef(oldCommander),
                         subCount,
@@ -653,7 +674,7 @@ local function processPendingOldCommanderReattach()
                 end
 
                 if subCount == 0 and oldAttached then
-                    DebugError(string.format(
+                    debugLog(string.format(
                         "[GT Promote] Deferred attach converged old=%s new=%s",
                         formatComponentRef(oldCommander),
                         formatComponentRef(newCommander)
@@ -671,12 +692,12 @@ local function processPendingOldCommanderReattach()
                                     local assignment, group = GetComponentData(sid, "assignment", "subordinategroup")
                                     local alreadyIssued = entry.issuedShips and entry.issuedShips[tostring(sid)] or false
                                     if alreadyIssued then
-                                        DebugError(string.format(
+                                        debugLog(string.format(
                                             "[GT Promote] Deferred stuck-subordinate requeue skip ship=%s already had AssignCommander in this promote cycle",
                                             formatComponentRef(sid)
                                         ))
                                     elseif isShipAssignedToCommander(sid, newCommander) then
-                                        DebugError(string.format(
+                                        debugLog(string.format(
                                             "[GT Promote] Deferred stuck-subordinate requeue skip ship=%s already assigned to new=%s",
                                             formatComponentRef(sid),
                                             formatComponentRef(newCommander)
@@ -687,7 +708,7 @@ local function processPendingOldCommanderReattach()
                                             entry.issuedShips = entry.issuedShips or {}
                                             entry.issuedShips[tostring(sid)] = true
                                         end
-                                        DebugError(string.format(
+                                        debugLog(string.format(
                                             "[GT Promote] Deferred stuck-subordinate requeue ship=%s old=%s new=%s ok=%s assignment=%s group=%s cancelOrders=true",
                                             formatComponentRef(sid),
                                             formatComponentRef(oldCommander),
@@ -701,7 +722,7 @@ local function processPendingOldCommanderReattach()
                             end
                         end
                         local ok = orderAssignCommander(oldCommander, newCommander, entry.assignment, entry.group, true)
-                        DebugError(string.format(
+                        debugLog(string.format(
                             "[GT Promote] Deferred old commander attach result old=%s new=%s ok=%s cancelOrders=true",
                             formatComponentRef(oldCommander),
                             formatComponentRef(newCommander),
@@ -719,7 +740,7 @@ local function processPendingOldCommanderReattach()
                         local postCommander = GetCommander(oldCommander)
                         postCommander = postCommander and ConvertIDTo64Bit(postCommander) or nil
                         local postAttached = (postCommander == newCommander)
-                        DebugError(string.format(
+                        debugLog(string.format(
                             "[GT Promote] Deferred attach final status old=%s new=%s attached=%s remainingSubs=%d list=%s",
                             formatComponentRef(oldCommander),
                             formatComponentRef(newCommander),
@@ -747,7 +768,7 @@ local function processPendingPromotedCommanderAttach()
             pendingPromotedCommanderAttach[key] = nil
         else
             if isShipAssignedToCommander(ship, parent) then
-                DebugError(string.format(
+                debugLog(string.format(
                     "[GT Promote] Deferred promoted commander attach converged ship=%s parent=%s",
                     formatComponentRef(ship),
                     formatComponentRef(parent)
@@ -767,7 +788,7 @@ local function processPendingPromotedCommanderAttach()
                     entry.orderQueued = orderAssignCommander(ship, parent, entry.assignment, entry.group, cancelOrders)
                     issued = true
                 end
-                DebugError(string.format(
+                debugLog(string.format(
                     "[GT Promote] Deferred promoted commander attach %s ship=%s parent=%s queued=%s check=%d/%d force=%s cancelOrders=%s",
                     issued and "attempt" or "wait",
                     formatComponentRef(ship),
@@ -820,11 +841,13 @@ collectFleetSubordinatesRecursive = function(rootCommander)
             end
         end
     end
-    DebugError(string.format("[GT Promote] Recursive collection root=%s count=%d", tostring(rootCommander), #result))
-    for _, sid in ipairs(result) do
-        local cmd = GetCommander(sid)
-        cmd = cmd and ConvertIDTo64Bit(cmd) or nil
-        DebugError(string.format("[GT Promote]  - candidate ship=%s currentCommander=%s", tostring(sid), tostring(cmd)))
+    if isPromoteDebugEnabled() then
+        debugLog(string.format("[GT Promote] Recursive collection root=%s count=%d", tostring(rootCommander), #result))
+        for _, sid in ipairs(result) do
+            local cmd = GetCommander(sid)
+            cmd = cmd and ConvertIDTo64Bit(cmd) or nil
+            debugLog(string.format("[GT Promote]  - candidate ship=%s currentCommander=%s", tostring(sid), tostring(cmd)))
+        end
     end
     return result
 end
@@ -835,7 +858,7 @@ orderAssignCommander = function(ship, newCommander, assignment, group, cancelOrd
         return false
     end
     if (not C.IsOrderSelectableFor("AssignCommander", ship)) or (not GetComponentData(ship, "assignedpilot")) then
-        DebugError(string.format("[GT Promote] AssignCommander not selectable/no pilot ship=%s selectable=%s hasPilot=%s", tostring(ship), tostring(C.IsOrderSelectableFor("AssignCommander", ship)), tostring(GetComponentData(ship, "assignedpilot") ~= nil)))
+        debugLog(string.format("[GT Promote] AssignCommander not selectable/no pilot ship=%s selectable=%s hasPilot=%s", tostring(ship), tostring(C.IsOrderSelectableFor("AssignCommander", ship)), tostring(GetComponentData(ship, "assignedpilot") ~= nil)))
         return false
     end
 
@@ -871,7 +894,7 @@ orderAssignCommander = function(ship, newCommander, assignment, group, cancelOrd
         end
         C.AdjustOrder(ship, orderidx, targetIdx, true, true, false)
     end
-    DebugError(string.format("[GT Promote] AssignCommander immediate ship=%s before=%s target=%s assignment=%s group=%s idx=%s cancelOrders=%s", tostring(ship), tostring(beforeCommander), tostring(newCommander), tostring(safeAssignment), tostring(safeGroup), tostring(orderidx), tostring(cancelOrders)))
+    debugLog(string.format("[GT Promote] AssignCommander immediate ship=%s before=%s target=%s assignment=%s group=%s idx=%s cancelOrders=%s", tostring(ship), tostring(beforeCommander), tostring(newCommander), tostring(safeAssignment), tostring(safeGroup), tostring(orderidx), tostring(cancelOrders)))
     return true
 end
 
@@ -896,7 +919,7 @@ local function promoteSubordinateToCommander(subordinateComponent)
         DebugError("[GT Promote] Clicked ship is not a subordinate (no commander)")
         return
     end
-    DebugError(string.format("[GT Promote] Start promote new=%s old=%s", tostring(newCommander), tostring(oldCommander)))
+    debugLog(string.format("[GT Promote] Start promote new=%s old=%s", tostring(newCommander), tostring(oldCommander)))
     logFleetSnapshot("PRE_OLD_COMMANDER_TREE", oldCommander)
     logFleetSnapshot("PRE_PROMOTED_SHIP_TREE", newCommander)
 
@@ -923,7 +946,7 @@ local function promoteSubordinateToCommander(subordinateComponent)
     local originalFleetName = captureFleetName(oldCommander)
     local defaultOrderSnapshot = capturePromotionDefaultOrder(oldCommander)
     if defaultOrderSnapshot then
-        DebugError(string.format("[GT Promote] Snapshot captured: source=%s order=%s params=%d", tostring(defaultOrderSnapshot.sourceShip), tostring(defaultOrderSnapshot.orderId), #(defaultOrderSnapshot.params or {})))
+        debugLog(string.format("[GT Promote] Snapshot captured: source=%s order=%s params=%d", tostring(defaultOrderSnapshot.sourceShip), tostring(defaultOrderSnapshot.orderId), #(defaultOrderSnapshot.params or {})))
         logDefaultOrderSnapshotDetailed("CAPTURED", defaultOrderSnapshot)
     else
         DebugError(string.format("[GT Promote] Snapshot missing: no default order found in commander chain starting at %s", tostring(oldCommander)))
@@ -931,7 +954,7 @@ local function promoteSubordinateToCommander(subordinateComponent)
 
     -- 1) Make clicked ship commander first.
     C.RemoveCommander2(newCommander)
-    DebugError(string.format("[GT Promote] Detached promoted ship=%s from commander=%s", tostring(newCommander), tostring(oldCommander)))
+    debugLog(string.format("[GT Promote] Detached promoted ship=%s from commander=%s", tostring(newCommander), tostring(oldCommander)))
     logFleetSnapshot("POST_DETACH_OLD_COMMANDER_TREE", oldCommander)
     logFleetSnapshot("POST_DETACH_NEW_COMMANDER_TREE", newCommander)
 
@@ -943,7 +966,7 @@ local function promoteSubordinateToCommander(subordinateComponent)
     -- This avoids a detached-fleet window where promoted fleets temporarily lose station attachment.
     if oldCommanderParent and oldCommanderParent ~= 0 and oldCommanderParent ~= newCommander then
         local attached = orderAssignCommander(newCommander, oldCommanderParent, oldCommanderAssign, oldCommanderGroup, false)
-        DebugError(string.format(
+        debugLog(string.format(
             "[GT Promote] Promoted commander parent attach ship=%s parent=%s assignment=%s group=%s ok=%s cancelOrders=false",
             formatComponentRef(newCommander),
             formatComponentRef(oldCommanderParent),
@@ -986,7 +1009,7 @@ local function promoteSubordinateToCommander(subordinateComponent)
         issuedShips = {},
         originalFleetName = originalFleetName,
     }
-    DebugError(string.format(
+    debugLog(string.format(
         "[GT Promote] Sequential subordinate reassignment queued commander=%s old=%s ships=%d paceFrames=%d",
         formatComponentRef(newCommander),
         formatComponentRef(oldCommander),
@@ -1007,4 +1030,4 @@ local function onUpdate()
 end
 SetScript("onUpdate", onUpdate)
 
-DebugError("[GT Promote] Commander-only promote integration loaded")
+debugLog("[GT Promote] Commander-only promote integration loaded")

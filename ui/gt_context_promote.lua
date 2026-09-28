@@ -991,7 +991,7 @@ RegisterEvent("gt.openPromoteContext", function(_, subordinateComponent)
     promoteSubordinateToCommander(subordinateComponent)
 end)
 
-function onUpdate()
+local function onUpdate()
     processPendingPromotionReassign()
     processPendingDefaultApplies()
     processPendingPromotedCommanderAttach()

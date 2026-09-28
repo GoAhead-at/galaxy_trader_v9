@@ -463,6 +463,9 @@ local function toMdShipRef(ship)
     return ConvertStringToLuaID(tostring(ship))
 end
 
+-- The gt* helpers in this file stay global on purpose: the main chunk is within 4 of Lua's limit
+-- of 200 locals per function, and the file stops loading past it. Add new file-level helpers to
+-- a table rather than as more top-level locals.
 function gtPublishPilotExchangeRelease(leftCode, rightCode, leftShip, rightShip)
     if type(AddUITriggeredEvent) ~= "function" then
         return
@@ -3636,7 +3639,7 @@ end
 -- calls gtProcessPostSwapBusyRefreshes(), which the wrapper never did - so removing the
 -- wrapper loses no work and removes the duplicate pass.
 
-function onUpdate()
+local function onUpdate()
     maybePublishMapSelectionShipCount()
     processPendingPilotDataRefreshTimeout()
     processPendingReleaseRetries()

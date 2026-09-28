@@ -809,28 +809,48 @@
       <set_value name="$commanderOrder" exact="this.ship.commander.defaultorder"/>
     </do_if>
 
-    <!-- MK4 fleet key (CONTEXT-009): cache fleet root = ship not a ship-subordinate (commander
-         missing/self/station). Root allocates+owns a key once; ship-subordinates copy the
-         commander's key from GT_Ships (cross-order this.$ reads are unreliable). An independent
-         root that previously only held an inherited (non-owned) key allocates a fresh one. -->
+    <!-- MK4 fleet key (CONTEXT-009) belongs to the cache fleet root SHIP and lives on its $GT_Ships
+         row; the pilot's this.$ copy is only a cache (this.$ moves with the pilot in a pilot exchange).
+         Root = walk up ship commanders (a station commander ends the walk). The root uses the key its
+         row owns, or allocates one; an independent ship whose row holds an inherited (non-owned) key
+         allocates a fresh one. A subordinate takes the root's key, allocating it on the root's row
+         when the root has none yet; it keys a bucket of its own only while its root has no registry
+         row. A replaced key only strands the old bucket, which the cache age cleanup empties. -->
+    <!-- Same resolution runs on every main_loop pass (fleet key guard). -->
+    <set_value name="$mk4FkRoot" exact="this.ship"/>
+    <set_value name="$mk4FkDepth" exact="0"/>
+    <do_while value="$mk4FkDepth lt 8 and @$mk4FkRoot.commander.exists and @$mk4FkRoot.commander != $mk4FkRoot and not @$mk4FkRoot.commander.isclass.station">
+      <set_value name="$mk4FkRoot" exact="$mk4FkRoot.commander"/>
+      <set_value name="$mk4FkDepth" operation="add"/>
+    </do_while>
     <do_if value="not global.$GT_Ships?">
       <set_value name="global.$GT_Ships" exact="table[]"/>
     </do_if>
     <do_if value="not global.$GT_Ships.{this.ship}?">
       <set_value name="global.$GT_Ships.{this.ship}" exact="table[]"/>
     </do_if>
-    <do_if value="$isSubordinate">
-      <set_value name="$mk4FleetKey" exact="if global.$GT_Ships.{this.ship.commander}? and global.$GT_Ships.{this.ship.commander}.$Mk4FleetKey? and global.$GT_Ships.{this.ship.commander}.$Mk4FleetKey != '' then global.$GT_Ships.{this.ship.commander}.$Mk4FleetKey else ''"/>
-      <set_value name="this.$mk4FleetKeyOwned" exact="false"/>
+    <set_value name="$mk4FkKey" exact="@this.$mk4FleetKey"/>
+    <!-- A root without a registry row (a subordinate's commander not registered yet) is left alone:
+         rows mean registration elsewhere, so no partial row is created for it. -->
+    <do_if value="global.$GT_Ships.{$mk4FkRoot}?">
+      <do_if value="@global.$GT_Ships.{$mk4FkRoot}.$Mk4FleetKeyOwned != true or @global.$GT_Ships.{$mk4FkRoot}.$Mk4FleetKey == null or @global.$GT_Ships.{$mk4FkRoot}.$Mk4FleetKey == ''">
+        <set_value name="global.$GT_Ships.{$mk4FkRoot}.$Mk4FleetKey" exact="'$MK4F_' + $mk4FkRoot.idcode + '_' + player.age"/>
+        <set_value name="global.$GT_Ships.{$mk4FkRoot}.$Mk4FleetKeyOwned" exact="true"/>
+      </do_if>
+      <set_value name="$mk4FkKey" exact="global.$GT_Ships.{$mk4FkRoot}.$Mk4FleetKey"/>
     </do_if>
-    <do_else>
-      <set_value name="$mk4FleetKeyAlreadyOwned" exact="(this.$mk4FleetKeyOwned? and this.$mk4FleetKeyOwned and this.$mk4FleetKey? and this.$mk4FleetKey != '') or (global.$GT_Ships.{this.ship}.$Mk4FleetKeyOwned? and global.$GT_Ships.{this.ship}.$Mk4FleetKeyOwned and global.$GT_Ships.{this.ship}.$Mk4FleetKey? and global.$GT_Ships.{this.ship}.$Mk4FleetKey != '')"/>
-      <set_value name="$mk4FleetKey" exact="if $mk4FleetKeyAlreadyOwned then (if this.$mk4FleetKey? and this.$mk4FleetKey != '' then this.$mk4FleetKey else global.$GT_Ships.{this.ship}.$Mk4FleetKey) else ('$MK4F_' + this.ship.idcode + '_' + player.age)"/>
-      <set_value name="this.$mk4FleetKeyOwned" exact="true"/>
-      <set_value name="global.$GT_Ships.{this.ship}.$Mk4FleetKeyOwned" exact="true"/>
-    </do_else>
+    <!-- Root not registered and this ship has no key yet: key its own bucket until the root has
+         a row (then the next pass switches to the root's key); keyless would mean no cache. -->
+    <do_if value="$mk4FkKey == null or $mk4FkKey == ''">
+      <set_value name="$mk4FkKey" exact="'$MK4F_' + this.ship.idcode + '_' + player.age"/>
+    </do_if>
+    <do_if value="$mk4FkRoot != this.ship">
+      <set_value name="global.$GT_Ships.{this.ship}.$Mk4FleetKey" exact="$mk4FkKey"/>
+      <set_value name="global.$GT_Ships.{this.ship}.$Mk4FleetKeyOwned" exact="false"/>
+    </do_if>
+    <set_value name="$mk4FleetKey" exact="$mk4FkKey"/>
     <set_value name="this.$mk4FleetKey" exact="$mk4FleetKey"/>
-    <set_value name="global.$GT_Ships.{this.ship}.$Mk4FleetKey" exact="$mk4FleetKey"/>
+    <set_value name="this.$mk4FleetKeyOwned" exact="$mk4FkRoot == this.ship"/>
 
     <!-- Clear this ship's stale FailedShips entries from its own fleet's cache bucket
          (nested sector -> fleetKey -> list; legacy flat lists are discarded, not migrated). -->
@@ -1819,17 +1839,8 @@
            Station commanders must not override MK4 station-home scope. -->
       <do_if value="this.ship.commander and this.ship.commander.exists and this.ship.commander != this.ship and not this.ship.commander.isclass.station">
         <set_value name="$commanderOrder" exact="this.ship.commander.defaultorder"/>
-        <!-- MK4 fleet key resync (ship-subordinate): re-copy commander's key from GT_Ships every
-             pass so a late-registering commander or a commander swap is picked up without a restart. -->
-        <do_if value="global.$GT_Ships? and global.$GT_Ships.{this.ship.commander}? and global.$GT_Ships.{this.ship.commander}.$Mk4FleetKey? and global.$GT_Ships.{this.ship.commander}.$Mk4FleetKey != ''">
-          <set_value name="this.$mk4FleetKey" exact="global.$GT_Ships.{this.ship.commander}.$Mk4FleetKey"/>
-          <set_value name="this.$mk4FleetKeyOwned" exact="false"/>
-          <do_if value="not global.$GT_Ships.{this.ship}?">
-            <set_value name="global.$GT_Ships.{this.ship}" exact="table[]"/>
-          </do_if>
-          <set_value name="global.$GT_Ships.{this.ship}.$Mk4FleetKey" exact="this.$mk4FleetKey"/>
-        </do_if>
-        <do_if value="$commanderOrder?">
+        <!-- The MK4 fleet key is resolved on every main_loop pass (fleet key guard below). -->
+<do_if value="$commanderOrder?">
           <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
             <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Re-inheriting settings from commander ' + this.ship.commander.idcode" chance="100"/>
           </do_if>
@@ -2109,31 +2120,52 @@
       <do_if value="not this.$minPlayerMoney?">
         <run_script name="'lib.gt.attention.min_player_money'" result="this.$minPlayerMoney"/>
       </do_if>
-      <!-- SAVEGAME GUARD: MK4 fleet cache key (CONTEXT-009). Init does not re-run on load;
-           allocate/inherit here if missing so cache search/write never get an empty fleetKey. -->
-      <do_if value="not this.$mk4FleetKey? or this.$mk4FleetKey == '' or this.$mk4FleetKey == null">
-        <do_if value="not global.$GT_Ships?">
-          <set_value name="global.$GT_Ships" exact="table[]"/>
-        </do_if>
-        <do_if value="not global.$GT_Ships.{this.ship}?">
-          <set_value name="global.$GT_Ships.{this.ship}" exact="table[]"/>
-        </do_if>
-        <set_value name="$sgIsSubordinate" exact="this.ship.commander and this.ship.commander.exists and this.ship.commander != this.ship and not this.ship.commander.isclass.station"/>
-        <do_if value="$sgIsSubordinate and global.$GT_Ships.{this.ship.commander}? and global.$GT_Ships.{this.ship.commander}.$Mk4FleetKey? and global.$GT_Ships.{this.ship.commander}.$Mk4FleetKey != ''">
-          <set_value name="this.$mk4FleetKey" exact="global.$GT_Ships.{this.ship.commander}.$Mk4FleetKey"/>
-          <set_value name="this.$mk4FleetKeyOwned" exact="false"/>
-        </do_if>
-        <do_elseif value="global.$GT_Ships.{this.ship}.$Mk4FleetKey? and global.$GT_Ships.{this.ship}.$Mk4FleetKey != ''">
-          <set_value name="this.$mk4FleetKey" exact="global.$GT_Ships.{this.ship}.$Mk4FleetKey"/>
-          <set_value name="this.$mk4FleetKeyOwned" exact="if global.$GT_Ships.{this.ship}.$Mk4FleetKeyOwned? then global.$GT_Ships.{this.ship}.$Mk4FleetKeyOwned else (not $sgIsSubordinate)"/>
-        </do_elseif>
-        <do_else>
-          <set_value name="this.$mk4FleetKey" exact="'$MK4F_' + this.ship.idcode + '_' + player.age"/>
-          <set_value name="this.$mk4FleetKeyOwned" exact="not $sgIsSubordinate"/>
-          <set_value name="global.$GT_Ships.{this.ship}.$Mk4FleetKeyOwned" exact="this.$mk4FleetKeyOwned"/>
-        </do_else>
-        <set_value name="global.$GT_Ships.{this.ship}.$Mk4FleetKey" exact="this.$mk4FleetKey"/>
+      <!-- FLEET KEY GUARD, every pass (also covers save load, where <init> does not re-run):
+           a subordinate follows its root at once when the root's key changes or the fleet
+           was split, instead of at its next order start. -->
+      <!-- MK4 fleet key (CONTEXT-009) belongs to the cache fleet root SHIP and lives on its $GT_Ships
+           row; the pilot's this.$ copy is only a cache (this.$ moves with the pilot in a pilot exchange).
+           Root = walk up ship commanders (a station commander ends the walk). The root uses the key its
+           row owns, or allocates one; an independent ship whose row holds an inherited (non-owned) key
+           allocates a fresh one. A subordinate takes the root's key, allocating it on the root's row
+           when the root has none yet; it keys a bucket of its own only while its root has no registry
+           row. A replaced key only strands the old bucket, which the cache age cleanup empties. -->
+      <set_value name="$sgFkRoot" exact="this.ship"/>
+      <set_value name="$sgFkDepth" exact="0"/>
+      <do_while value="$sgFkDepth lt 8 and @$sgFkRoot.commander.exists and @$sgFkRoot.commander != $sgFkRoot and not @$sgFkRoot.commander.isclass.station">
+        <set_value name="$sgFkRoot" exact="$sgFkRoot.commander"/>
+        <set_value name="$sgFkDepth" operation="add"/>
+      </do_while>
+      <do_if value="not global.$GT_Ships?">
+        <set_value name="global.$GT_Ships" exact="table[]"/>
       </do_if>
+      <do_if value="not global.$GT_Ships.{this.ship}?">
+        <set_value name="global.$GT_Ships.{this.ship}" exact="table[]"/>
+      </do_if>
+      <set_value name="$sgFkKey" exact="@this.$mk4FleetKey"/>
+      <!-- A root without a registry row (a subordinate's commander not registered yet) is left alone:
+           rows mean registration elsewhere, so no partial row is created for it. -->
+      <do_if value="global.$GT_Ships.{$sgFkRoot}?">
+        <do_if value="@global.$GT_Ships.{$sgFkRoot}.$Mk4FleetKeyOwned != true or @global.$GT_Ships.{$sgFkRoot}.$Mk4FleetKey == null or @global.$GT_Ships.{$sgFkRoot}.$Mk4FleetKey == ''">
+          <set_value name="global.$GT_Ships.{$sgFkRoot}.$Mk4FleetKey" exact="'$MK4F_' + $sgFkRoot.idcode + '_' + player.age"/>
+          <set_value name="global.$GT_Ships.{$sgFkRoot}.$Mk4FleetKeyOwned" exact="true"/>
+        </do_if>
+        <set_value name="$sgFkKey" exact="global.$GT_Ships.{$sgFkRoot}.$Mk4FleetKey"/>
+      </do_if>
+      <!-- Root not registered and this ship has no key yet: key its own bucket until the root has
+           a row (then the next pass switches to the root's key); keyless would mean no cache. -->
+      <do_if value="$sgFkKey == null or $sgFkKey == ''">
+        <set_value name="$sgFkKey" exact="'$MK4F_' + this.ship.idcode + '_' + player.age"/>
+      </do_if>
+      <do_if value="$sgFkRoot != this.ship">
+        <set_value name="global.$GT_Ships.{this.ship}.$Mk4FleetKey" exact="$sgFkKey"/>
+        <set_value name="global.$GT_Ships.{this.ship}.$Mk4FleetKeyOwned" exact="false"/>
+      </do_if>
+      <do_if value="@this.$mk4FleetKey != $sgFkKey and @global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+        <debug_text text="'[GT-AI] ' + this.ship.idcode + ': MK4 fleet key ' + @this.$mk4FleetKey + ' -&gt; ' + $sgFkKey + ' (root ' + $sgFkRoot.idcode + ')'" chance="100"/>
+      </do_if>
+      <set_value name="this.$mk4FleetKey" exact="$sgFkKey"/>
+      <set_value name="this.$mk4FleetKeyOwned" exact="$sgFkRoot == this.ship"/>
       <!-- SAVEGAME GUARD: Restore training session flag from persisted MD state
            or an active DockAndTrain order (instance flag is lost on load). -->
       <do_if value="this.ship.pilot? and global.$GT_Pilots? and global.$GT_Pilots.{this.ship.pilot}?">
@@ -4015,16 +4047,19 @@
              Deterministic, single pass per search cycle; no retry/cooldown state. -->
         <do_if value="this.$mk4FleetKeyOwned? and this.$mk4FleetKeyOwned and this.$mk4FleetKey? and this.$mk4FleetKey != ''">
           <!-- Home-change clear: root's resolved home sector moved - drop the stale bucket, no row migration. -->
-          <do_if value="$searchHomeSector? and $searchHomeSector.exists and this.$mk4CacheHomeSector? and this.$mk4CacheHomeSector.exists and this.$mk4CacheHomeSector != $searchHomeSector">
-            <do_if value="global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{this.$mk4CacheHomeSector}? and typeof global.$GT_TradeCacheMK4.{this.$mk4CacheHomeSector} == datatype.table and global.$GT_TradeCacheMK4.{this.$mk4CacheHomeSector}.{this.$mk4FleetKey}?">
-              <remove_value name="global.$GT_TradeCacheMK4.{this.$mk4CacheHomeSector}.{this.$mk4FleetKey}"/>
+          <!-- The stamped home is read from the ship's row: the pilot's this.$ copy may come from
+               another ship after a pilot exchange. -->
+          <set_value name="$mk4StampedHome" exact="@global.$GT_Ships.{this.ship}.$Mk4CacheHomeSector"/>
+          <do_if value="$searchHomeSector? and $searchHomeSector.exists and @$mk4StampedHome.exists and $mk4StampedHome != $searchHomeSector">
+            <do_if value="global.$GT_TradeCacheMK4? and global.$GT_TradeCacheMK4.{$mk4StampedHome}? and typeof global.$GT_TradeCacheMK4.{$mk4StampedHome} == datatype.table and global.$GT_TradeCacheMK4.{$mk4StampedHome}.{this.$mk4FleetKey}?">
+              <remove_value name="global.$GT_TradeCacheMK4.{$mk4StampedHome}.{this.$mk4FleetKey}"/>
             </do_if>
-            <do_if value="global.$GT_TradeCacheMK4MaxDistance? and global.$GT_TradeCacheMK4MaxDistance.{this.$mk4CacheHomeSector}? and typeof global.$GT_TradeCacheMK4MaxDistance.{this.$mk4CacheHomeSector} == datatype.table and global.$GT_TradeCacheMK4MaxDistance.{this.$mk4CacheHomeSector}.{this.$mk4FleetKey}?">
-              <remove_value name="global.$GT_TradeCacheMK4MaxDistance.{this.$mk4CacheHomeSector}.{this.$mk4FleetKey}"/>
+            <do_if value="global.$GT_TradeCacheMK4MaxDistance? and global.$GT_TradeCacheMK4MaxDistance.{$mk4StampedHome}? and typeof global.$GT_TradeCacheMK4MaxDistance.{$mk4StampedHome} == datatype.table and global.$GT_TradeCacheMK4MaxDistance.{$mk4StampedHome}.{this.$mk4FleetKey}?">
+              <remove_value name="global.$GT_TradeCacheMK4MaxDistance.{$mk4StampedHome}.{this.$mk4FleetKey}"/>
             </do_if>
             <set_value name="this.$mk4PolicyNeedsLiveSearch" exact="true"/>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': MK4 home changed (' + this.$mk4CacheHomeSector.knownname + ' -&gt; ' + $searchHomeSector.knownname + ') - cleared fleet cache bucket ' + this.$mk4FleetKey" chance="100"/>
+              <debug_text text="'[GT-AI] ' + this.ship.idcode + ': MK4 home changed (' + $mk4StampedHome.knownname + ' -&gt; ' + $searchHomeSector.knownname + ') - cleared fleet cache bucket ' + this.$mk4FleetKey" chance="100"/>
             </do_if>
           </do_if>
           <do_if value="$searchHomeSector? and $searchHomeSector.exists">

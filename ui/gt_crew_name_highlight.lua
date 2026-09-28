@@ -134,13 +134,13 @@ local function installCrewHighlightHook()
             return result
         end
 
-        -- Keep GT pilot-id cache fresh while crew menu is open (newly swapped pilots).
-        requestGTRefreshIfNeeded("periodic_refresh")
-
         -- Strict behavior: crew highlight is enabled only when pilot renaming is enabled in GT settings.
         if not isCrewHighlightEnabledBySettings() then
             return result
         end
+
+        -- Keep GT pilot-id cache fresh while crew menu is open (newly swapped pilots).
+        requestGTRefreshIfNeeded("periodic_refresh")
 
         local gtPilotIdMap = getGTPilotIdMap()
         recolorPassCounter = recolorPassCounter + 1

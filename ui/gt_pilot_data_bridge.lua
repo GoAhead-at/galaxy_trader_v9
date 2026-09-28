@@ -531,20 +531,8 @@ function GT_PilotData.lookupPilotIdMapTaggedName(idMap, person)
                 return v, kk
             end
         end
-        local ok, u = pcall(function()
-            return ffi.new("uint64_t", decNorm or dec)
-        end)
-        if ok and u then
-            local i64 = ffi.cast("int64_t", u)
-            v, kk = tryKey("s:" .. normalizeUniquePilotKey(tostring(i64)))
-            if v then
-                return v, kk
-            end
-            v, kk = tryKey(normalizeUniquePilotKey(tostring(u)))
-            if v then
-                return v, kk
-            end
-        end
+        -- The signed / unsigned / "s:" aliases of dec are tried by probe(dec) below
+        -- (collectPilotIdAliasKeys); an ffi.new("uint64_t", <string>) attempt here always failed.
     end
 
     local seen = {}

@@ -369,8 +369,9 @@ local function clearPendingRedistributionForShip(idcode)
             pendingDockAssignmentsByPair[key] = nil
         end
     end
+    -- Swap entries keep the ship handles in left/right and the idcodes in leftCode/rightCode
     for key, pair in pairs(pendingSwapShipsByPair) do
-        if pair and (tostring(pair.left or "") == codeKey or tostring(pair.right or "") == codeKey) then
+        if pair and (tostring(pair.leftCode or "") == codeKey or tostring(pair.rightCode or "") == codeKey) then
             pendingSwapShipsByPair[key] = nil
         end
     end

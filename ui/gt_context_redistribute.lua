@@ -463,9 +463,9 @@ local function toMdShipRef(ship)
     return ConvertStringToLuaID(tostring(ship))
 end
 
--- The gt* helpers in this file stay global on purpose: the main chunk is within 4 of Lua's limit
--- of 200 locals per function, and the file stops loading past it. Add new file-level helpers to
--- a table rather than as more top-level locals.
+-- The gt* helpers in this file stay global on purpose: the main chunk is a few slots below Lua's
+-- limit of 200 locals per function, and the file stops loading past it. Add new file-level state
+-- to a table or a do-block rather than as more top-level locals.
 function gtPublishPilotExchangeRelease(leftCode, rightCode, leftShip, rightShip)
     if type(AddUITriggeredEvent) ~= "function" then
         return
@@ -3639,17 +3639,31 @@ end
 -- calls gtProcessPostSwapBusyRefreshes(), which the wrapper never did - so removing the
 -- wrapper loses no work and removes the duplicate pass.
 
-local function onUpdate()
-    maybePublishMapSelectionShipCount()
-    processPendingPilotDataRefreshTimeout()
-    processPendingReleaseRetries()
-    gtProcessPostSwapBusyRefreshes()
-    retryFailedDockAssignments()
-    runSettlementMaintenance()
-    processDockSwapQueue()
-    processPendingPostSwapRefreshRetries()
+-- The map selection poll covers selections made from the Lua side (property list clicks), which
+-- raise no updateselectedcomponents event; engine selection changes and opening the interact menu
+-- publish immediately through the events below. Building the selection key walks every selected
+-- component, so poll 4 times a second instead of every frame. (do-block: the main chunk is near
+-- the 200-local limit, see the note above gtPublishPilotExchangeRelease.)
+do
+    local MAP_SELECTION_POLL_INTERVAL = 0.25
+    local nextMapSelectionPollAt = 0
+
+    local function onUpdate()
+        local now = getElapsedTime()
+        if now >= nextMapSelectionPollAt then
+            nextMapSelectionPollAt = now + MAP_SELECTION_POLL_INTERVAL
+            maybePublishMapSelectionShipCount()
+        end
+        processPendingPilotDataRefreshTimeout()
+        processPendingReleaseRetries()
+        gtProcessPostSwapBusyRefreshes()
+        retryFailedDockAssignments()
+        runSettlementMaintenance()
+        processDockSwapQueue()
+        processPendingPostSwapRefreshRetries()
+    end
+    SetScript("onUpdate", onUpdate)
 end
-SetScript("onUpdate", onUpdate)
 
 if menu then
     RegisterEvent("interact", function()

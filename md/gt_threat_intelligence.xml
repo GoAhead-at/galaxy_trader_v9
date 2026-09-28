@@ -818,6 +818,7 @@
         </do_if>
         <set_value name="global.$GT_AutoBlacklistedMacroList" exact="[]"/>
         <set_value name="global.$GT_PendingBlacklistMacroRemovals" exact="[]"/>
+        <set_value name="global.$GT_InFlightBlacklistMacroRemovals" exact="[]"/>
         <set_value name="global.$GT_PlayerDismissedHostileEntries" exact="[]"/>
         
         <do_if value="global.$GT_ThreatBlacklistSpeakQueue?">
@@ -4120,6 +4121,10 @@
         <event_ui_triggered screen="'gt_blacklist_manager'" control="'BlacklistWritten'"/>
       </conditions>
       <actions>
+        <!-- Lua reports a successful write: the in-flight #rem macros it carried are applied -->
+        <do_if value="global.$GT_InFlightBlacklistMacroRemovals?">
+          <set_value name="global.$GT_InFlightBlacklistMacroRemovals" exact="[]"/>
+        </do_if>
         <do_if value="not global.$GT_BlacklistEpoch?">
           <set_value name="global.$GT_BlacklistEpoch" exact="0"/>
         </do_if>
@@ -4295,27 +4300,51 @@
           </do_all>
           
           <set_value name="$payload" exact="$threatDataString"/>
+          <!-- Removals move to an in-flight list that only a successful Lua write (OnBlacklistWritten)
+               clears. The macros already left $GT_AutoBlacklistedMacroList, so an Update that Lua drops
+               (before Initialize) or fails to write would otherwise never retry the #rem and the sector
+               stayed on the vanilla blacklist. Until acknowledged, every Update re-sends them. -->
+          <do_if value="not global.$GT_InFlightBlacklistMacroRemovals?">
+            <set_value name="global.$GT_InFlightBlacklistMacroRemovals" exact="[]"/>
+          </do_if>
           <do_if value="global.$GT_PendingBlacklistMacroRemovals? and global.$GT_PendingBlacklistMacroRemovals.count gt 0">
-            <set_value name="$removalsString" exact="''"/>
             <do_all exact="global.$GT_PendingBlacklistMacroRemovals.count" counter="$rIdx">
-              <set_value name="$remMacro" exact="global.$GT_PendingBlacklistMacroRemovals.{$rIdx}"/>
+              <do_if value="not global.$GT_InFlightBlacklistMacroRemovals.indexof.{global.$GT_PendingBlacklistMacroRemovals.{$rIdx}}">
+                <append_to_list name="global.$GT_InFlightBlacklistMacroRemovals" exact="global.$GT_PendingBlacklistMacroRemovals.{$rIdx}"/>
+              </do_if>
+            </do_all>
+            <set_value name="global.$GT_PendingBlacklistMacroRemovals" exact="[]"/>
+          </do_if>
+          <do_if value="global.$GT_InFlightBlacklistMacroRemovals.count gt 0">
+            <set_value name="$removalsString" exact="''"/>
+            <set_value name="$inFlightSnapshot" exact="global.$GT_InFlightBlacklistMacroRemovals.clone"/>
+            <do_all exact="$inFlightSnapshot.count" counter="$rIdx">
+              <set_value name="$remMacro" exact="$inFlightSnapshot.{$rIdx}"/>
               <!-- Never #rem a permanent pin (safety if something queued it earlier). -->
               <run_actions ref="GT_IsPermanentBlacklistMacro" result="$remIsPinned">
                 <param name="SectorMacro" value="$remMacro"/>
               </run_actions>
-              <do_if value="not $remIsPinned">
+              <!-- A sector blacklisted again since it was queued is in this payload's adds; removing it
+                   too would undo the new episode, and the old removal is moot -->
+              <run_actions ref="GT_MacroListContains" result="$remReAdded">
+                <param name="MacroList" value="$payloadMacros"/>
+                <param name="SectorMacro" value="$remMacro"/>
+              </run_actions>
+              <do_if value="$remIsPinned or $remReAdded">
+                <remove_from_list name="global.$GT_InFlightBlacklistMacroRemovals" exact="$remMacro"/>
+              </do_if>
+              <do_else>
                 <do_if value="$removalsString == ''">
                   <set_value name="$removalsString" exact="$remMacro"/>
                 </do_if>
                 <do_else>
                   <set_value name="$removalsString" exact="$removalsString + '|' + $remMacro"/>
                 </do_else>
-              </do_if>
+              </do_else>
             </do_all>
             <do_if value="$removalsString != ''">
               <set_value name="$payload" exact="$threatDataString + '#rem=' + $removalsString"/>
             </do_if>
-            <set_value name="global.$GT_PendingBlacklistMacroRemovals" exact="[]"/>
           </do_if>
           
           <!-- Lua read-merge-write: vanilla base + auto adds + explicit auto removals -->

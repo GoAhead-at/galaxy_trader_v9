@@ -746,16 +746,19 @@ local function onInitialize(_, event_data)
     end
     
     -- Create/Update blacklist shell (read-merge-write preserves any existing player sectors)
+    local id_before_write = GT_Blacklist.fleet_blacklist_id
     local success = mergeAndWriteFleetBlacklist({}, {}, GT_Blacklist.relation_value, false)
-    
+
     if not success then
         logTrace("Initialize failed: updateFleetBlacklist returned false", "ERROR")
         debugLog(" Failed to create/update blacklist", "WARN")
         return false
     end
-    
-    -- If we created a NEW blacklist, notify MD to store the ID
-    if not already_initialized and existing_id == 0 and GT_Blacklist.fleet_blacklist_id then
+
+    -- MD sent no id but Lua updated the blacklist it already had: tell MD that id. When the write
+    -- created a blacklist (the id changed), the write has already sent BlacklistCreated.
+    if not already_initialized and existing_id == 0 and GT_Blacklist.fleet_blacklist_id
+        and GT_Blacklist.fleet_blacklist_id == id_before_write then
         logTrace(string.format("Notifying MD BlacklistCreated id=%d", GT_Blacklist.fleet_blacklist_id))
         debugLog(string.format("Notifying MD of new blacklist ID: %d", GT_Blacklist.fleet_blacklist_id))
         AddUITriggeredEvent("gt_blacklist_manager", "BlacklistCreated", GT_Blacklist.fleet_blacklist_id)
@@ -855,7 +858,9 @@ local function onRemoveFromShip(_, event_data)
     return removeBlacklistFromShip(ship_id)
 end
 
---- Force recreate the blacklist (bypasses initialized check)
+--- Settings "Recreate Blacklist": re-run Initialize with no id from MD. The fleet blacklist is
+--- rebuilt in place when it still exists (keeps the player's sectors and the ships' assignment)
+--- and created anew when it was deleted; either way MD receives the id once via BlacklistCreated.
 local function onRecreateBlacklist(_, event_data)
     logTrace("EVENT Recreate received - resetting initialized flag")
     debugLog("FORCE RECREATE: Resetting blacklist system...")

@@ -26,6 +26,8 @@ local C = ffi.C
 -- FFI DEFINITIONS - X4 Blacklist API
 -- =============================================================================
 
+-- Declare only what this file calls: ffi.cdef declarations are global to the Lua state and
+-- must match the engine (and vanilla) signatures exactly.
 ffi.cdef[[
     typedef int32_t BlacklistID;
     
@@ -45,10 +47,8 @@ ffi.cdef[[
     
     BlacklistID CreateBlacklist2(BlacklistInfo2 info);
     void UpdateBlacklist2(BlacklistInfo2 info);
-    void RemoveBlacklist(BlacklistID id);
     void SetControllableBlacklist(uint64_t controllableid, BlacklistID id, const char* listtype, bool value);
     BlacklistID GetControllableBlacklistID(uint64_t controllableid, const char* listtype, const char* defaultgroup);
-    bool IsComponentBlacklisted(uint64_t componentid, const char* listtype, const char* defaultgroup, uint64_t controllableid);
     bool GetBlacklistInfo2(BlacklistInfo2* info, BlacklistID id);
     
     typedef struct {

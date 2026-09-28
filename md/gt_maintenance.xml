@@ -377,6 +377,13 @@
             <set_value name="global.$GT_MaintenanceQueue.$MaxConcurrent" exact="2"/>
           </do_if>
           
+          <!-- A slot is released 100 ms after its ExecuteMaintenance ran (ReleaseMaintenanceSlot), so a
+               count that has not moved for 5 s is stranded (e.g. from a save made before slots were
+               released that way) and is reset instead of stopping maintenance fleet-wide. -->
+          <do_if value="global.$GT_MaintenanceQueue.$ActiveInstances gt 0 and player.age gt @global.$GT_MaintenanceQueue.$LastSlotAt + 5s">
+            <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" exact="0"/>
+          </do_if>
+
           <!-- Check concurrency limit -->
           <set_value name="$shouldQueue" exact="false"/>
           <do_if value="global.$GT_MaintenanceQueue.$ActiveInstances ge global.$GT_MaintenanceQueue.$MaxConcurrent">
@@ -402,6 +409,7 @@
           <do_else>
             <!-- Below limit - process immediately -->
             <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" operation="add"/>
+            <set_value name="global.$GT_MaintenanceQueue.$LastSlotAt" exact="player.age"/>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GT-Maintenance] Processing maintenance immediately for ' + $ship.idcode + ' (active: ' + global.$GT_MaintenanceQueue.$ActiveInstances + '/' + global.$GT_MaintenanceQueue.$MaxConcurrent + ')'" chance="10"/>
             </do_if>
@@ -438,11 +446,13 @@
             <do_if value="$nextRequest?">
               <remove_from_list name="global.$GT_MaintenanceQueue.$Requests" exact="$nextRequest"/>
               <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" operation="add"/>
+              <set_value name="global.$GT_MaintenanceQueue.$LastSlotAt" exact="player.age"/>
               
               <!-- Process request -->
               <signal_cue_instantly cue="md.GT_Maintenance.ExecuteMaintenance" param="$nextRequest"/>
-              
-              <!-- Continue processing queue -->
+
+              <!-- Continue processing queue (takes the next slot if one is free; otherwise the
+                   slot release kicks the queue again) -->
               <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
             </do_if>
             <do_else>
@@ -458,12 +468,31 @@
       </actions>
     </cue>
     
+    <!-- Releases a maintenance slot 100 ms after its ExecuteMaintenance ran. ExecuteMaintenance is
+         synchronous, so decrementing at its end let every request of a burst run in the same frame and
+         MaxConcurrent never bounded anything; holding the slot bounds the work to MaxConcurrent
+         executions per 100 ms. Signalled first thing in ExecuteMaintenance, so an action block that
+         aborts cannot strand the count. -->
+    <cue name="ReleaseMaintenanceSlot" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <delay exact="100ms"/>
+      <actions>
+        <do_if value="@global.$GT_MaintenanceQueue.$ActiveInstances gt 0">
+          <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" operation="subtract"/>
+        </do_if>
+        <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
+      </actions>
+    </cue>
+
     <!-- Execute Maintenance Orders -->
     <cue name="ExecuteMaintenance" instantiate="true">
       <conditions>
         <event_cue_signalled/>
       </conditions>
       <actions>
+        <signal_cue_instantly cue="md.GT_Maintenance.ReleaseMaintenanceSlot"/>
         <set_value name="$params" exact="event.param"/>
         <set_value name="$ship" exact="$params.$Ship"/>
         <do_if value="@$ship.exists">
@@ -2000,10 +2029,7 @@
         </do_else>
         <signal_objects object="$ship" param="'GT_Maintenance_Prepared'"/>
         </do_if>
-        <do_if value="@global.$GT_MaintenanceQueue.$ActiveInstances gt 0">
-          <set_value name="global.$GT_MaintenanceQueue.$ActiveInstances" operation="subtract"/>
-        </do_if>
-        <signal_cue_instantly cue="md.GT_Maintenance.ProcessMaintenanceQueue"/>
+        <!-- The slot is released by ReleaseMaintenanceSlot (signalled at the top), which also kicks the queue -->
 
       </actions>
     </cue>
@@ -2612,6 +2638,21 @@
           </do_if>
         </do_if>
         
+        <!-- The cache is shared by every ship and was sorted by the builder's gate distance. Re-sort a
+             copy by this ship's distance (dropping stations it cannot reach), so the scans below can
+             stop early instead of running blacklist, reachability and path checks galaxy-wide. -->
+        <set_value name="$readerStations" exact="[]"/>
+        <do_all exact="$potentialStations.count" counter="$i">
+          <set_value name="$station" exact="$potentialStations.{$i}"/>
+          <do_if value="@$station.exists">
+            <do_if value="$station.gatedistance.{$ship} ge 0">
+              <append_to_list name="$readerStations" exact="$station"/>
+            </do_if>
+          </do_if>
+        </do_all>
+        <sort_list list="$readerStations" sortbyvalue="loop.element.gatedistance.{$ship}"/>
+        <set_value name="$potentialStations" exact="$readerStations"/>
+
         <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
           <debug_text text="'[GT-Maintenance] (' + $ship.idcode + ') Found ' + $potentialStations.count + ' stations with shiptrader (sorted by distance)'" chance="100"/>
         </do_if>
@@ -2621,10 +2662,16 @@
         <set_value name="$validatedStations" exact="[]"/>
         <set_value name="$preFilterRejectCapability" exact="0"/>
         <set_value name="$preFilterRejectDocking" exact="0"/>
+        <set_value name="$maxRepairCandidates" exact="20"/>
         <do_all exact="$potentialStations.count" counter="$i">
           <set_value name="$station" exact="$potentialStations.{$i}"/>
+          <!-- Sorted by gate distance: past the jump limit nothing further can qualify, and the nearest
+               20 candidates are enough for the selection below -->
+          <do_if value="$validatedStations.count ge $maxRepairCandidates or $station.gatedistance.{$ship} gt $maxJumpDistance">
+            <break/>
+          </do_if>
           <set_value name="$isValid" exact="true"/>
-          
+
           <!-- Verify repair capability: can build OR supply this ship class -->
           <set_value name="$canBuild" exact="@$station.canbuildclass.{$ship.class}"/>
           <set_value name="$canSupply" exact="@$station.cansupplyclass.{$ship.class}"/>
@@ -2672,6 +2719,17 @@
         
         <do_all exact="$potentialStations.count" counter="$i">
           <set_value name="$station" exact="$potentialStations.{$i}"/>
+          <!-- Early exit: the blacklist-aware path is never shorter than the plain gate distance the
+               list is sorted by, so once that exceeds what the current picks allow (a foreign station
+               at d admits a player station up to d + 2; a player station at p beats anything at p or
+               more), no later station can change the selection -->
+          <set_value name="$plainGateDistance" exact="$station.gatedistance.{$ship}"/>
+          <do_if value="$nearestForeignStation and $plainGateDistance gt ($nearestForeignDistance + $playerStationJumpPreference)">
+            <break/>
+          </do_if>
+          <do_if value="$nearestPlayerStation and $plainGateDistance ge $nearestPlayerDistance">
+            <break/>
+          </do_if>
           <set_value name="$isValid" exact="true"/>
           <set_value name="$rejectReason" exact="''"/>
           <set_value name="$gateDistance" exact="-1"/>

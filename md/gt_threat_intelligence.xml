@@ -813,12 +813,41 @@
         
         <set_value name="global.$GT_ThreatIntelligence" exact="table[]"/>
         
+        <!-- Build the removal of GT's own auto macros before the lists are reset. '!CLEAR!' wrote an
+             empty fleet blacklist, which also deleted the player's manual sectors and the permanent
+             pins (not re-pushed until the next UpdateBlacklistOnThreat). -->
+        <set_value name="$clearRemovals" exact="''"/>
+        <set_value name="$clearRemovalList" exact="[]"/>
+        <set_value name="$clearCandidates" exact="global.$GT_AutoBlacklistedMacroList.clone"/>
+        <do_if value="global.$GT_InFlightBlacklistMacroRemovals?">
+          <do_all exact="global.$GT_InFlightBlacklistMacroRemovals.count" counter="$cfi">
+            <append_to_list name="$clearCandidates" exact="global.$GT_InFlightBlacklistMacroRemovals.{$cfi}"/>
+          </do_all>
+        </do_if>
+        <do_all exact="global.$GT_PendingBlacklistMacroRemovals.count" counter="$cfi">
+          <append_to_list name="$clearCandidates" exact="global.$GT_PendingBlacklistMacroRemovals.{$cfi}"/>
+        </do_all>
+        <do_all exact="$clearCandidates.count" counter="$cci">
+          <set_value name="$clearMacro" exact="'' + $clearCandidates.{$cci}"/>
+          <run_actions ref="GT_IsPermanentBlacklistMacro" result="$clearIsPinned">
+            <param name="SectorMacro" value="$clearMacro"/>
+          </run_actions>
+          <do_if value="not $clearIsPinned and not (global.$GT_PlayerOwnedBlacklistMacros? and global.$GT_PlayerOwnedBlacklistMacros.indexof.{$clearMacro})">
+            <do_if value="not $clearRemovalList.indexof.{$clearMacro}">
+              <append_to_list name="$clearRemovalList" exact="$clearMacro"/>
+              <set_value name="$clearRemovals" exact="$clearRemovals + (if $clearRemovals == '' then '' else '|') + $clearMacro"/>
+            </do_if>
+          </do_if>
+        </do_all>
+
         <do_if value="global.$GT_AutoBlacklistedMacros?">
           <remove_value name="global.$GT_AutoBlacklistedMacros"/>
         </do_if>
         <set_value name="global.$GT_AutoBlacklistedMacroList" exact="[]"/>
+        <set_value name="global.$GT_NewAutoBlacklistMacros" exact="[]"/>
         <set_value name="global.$GT_PendingBlacklistMacroRemovals" exact="[]"/>
-        <set_value name="global.$GT_InFlightBlacklistMacroRemovals" exact="[]"/>
+        <!-- Clear All's own removals stay in flight until Lua confirms the write, like any other -->
+        <set_value name="global.$GT_InFlightBlacklistMacroRemovals" exact="$clearRemovalList"/>
         <set_value name="global.$GT_PlayerDismissedHostileEntries" exact="[]"/>
         
         <do_if value="global.$GT_ThreatBlacklistSpeakQueue?">
@@ -850,8 +879,9 @@
           </do_all>
         </do_if>
         
-        <!-- Force Lua + route-epoch sync even when threat table is already empty -->
-        <raise_lua_event name="'GT_Blacklist.Update'" param="'!CLEAR!'"/>
+        <!-- Force Lua + route-epoch sync even when threat table is already empty (an empty payload
+             still rewrites the list and reports BlacklistWritten) -->
+        <raise_lua_event name="'GT_Blacklist.Update'" param="if $clearRemovals != '' then '#rem=' + $clearRemovals else ''"/>
         
         <do_if value="$RefreshFleetBlacklist">
           <set_value name="global.$GT_ManualBlacklistAssignRequested" exact="true"/>
@@ -1407,6 +1437,11 @@
             </do_all>
             <do_if value="not $alreadyRegistered">
               <append_to_list name="global.$GT_AutoBlacklistedMacroList" exact="$SectorMacro"/>
+              <!-- Flagged 'n' in the next Update so Lua can tell whether the player already had it -->
+              <do_if value="not global.$GT_NewAutoBlacklistMacros?">
+                <set_value name="global.$GT_NewAutoBlacklistMacros" exact="[]"/>
+              </do_if>
+              <append_to_list name="global.$GT_NewAutoBlacklistMacros" exact="$SectorMacro"/>
             </do_if>
           </do_if>
         </do_if>
@@ -4166,12 +4201,35 @@
     </cue>
     
     <!-- Lua read-merge-write: GT-auto macro missing from vanilla on blacklist update -->
+    <!-- Lua found a sector GT just auto-added already on the fleet blacklist without a GT write: the
+         player put it there. Remembered so GT never sends a #rem for it. -->
+    <cue name="OnManualMacroPreexisting" instantiate="true">
+      <conditions>
+        <event_ui_triggered screen="'gt_blacklist_manager'" control="'ManualMacroPreexisting'"/>
+      </conditions>
+      <actions>
+        <set_value name="$ownedMacro" exact="if event.param3? then '' + event.param3 else ''"/>
+        <do_if value="$ownedMacro != ''">
+          <do_if value="not global.$GT_PlayerOwnedBlacklistMacros?">
+            <set_value name="global.$GT_PlayerOwnedBlacklistMacros" exact="[]"/>
+          </do_if>
+          <do_if value="not global.$GT_PlayerOwnedBlacklistMacros.indexof.{$ownedMacro}">
+            <append_to_list name="global.$GT_PlayerOwnedBlacklistMacros" exact="$ownedMacro"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+
     <cue name="OnVanillaSectorRemoved" instantiate="true">
       <conditions>
         <event_ui_triggered screen="'gt_blacklist_manager'" control="'VanillaSectorRemoved'"/>
       </conditions>
       <actions>
         <set_value name="$removedMacro" exact="if event.param3? then event.param3 else ''"/>
+        <!-- The player removed it themselves: it is no longer theirs to protect -->
+        <do_if value="$removedMacro != '' and global.$GT_PlayerOwnedBlacklistMacros?">
+          <remove_from_list name="global.$GT_PlayerOwnedBlacklistMacros" exact="$removedMacro"/>
+        </do_if>
         <do_if value="$removedMacro != '' and @global.$GT_GlobalSettings.$ThreatAvoidance.$UseDynamicBlacklist">
           <run_actions ref="GT_ProcessPlayerRemovedAutoBlacklistMacro">
             <param name="SectorMacro" value="$removedMacro"/>
@@ -4258,6 +4316,9 @@
                     <param name="SectorMacro" value="$sectorMacro"/>
                   </run_actions>
                   <set_value name="$entry" exact="$sectorMacro + ':' + $threatData.$ThreatLevel + ':' + $threatData.$Timestamp"/>
+                  <do_if value="global.$GT_NewAutoBlacklistMacros? and global.$GT_NewAutoBlacklistMacros.indexof.{$sectorMacro}">
+                    <set_value name="$entry" exact="$entry + ':n'"/>
+                  </do_if>
                   
                   <do_if value="$threatDataString == ''">
                     <set_value name="$threatDataString" exact="$entry"/>
@@ -4330,7 +4391,10 @@
                 <param name="MacroList" value="$payloadMacros"/>
                 <param name="SectorMacro" value="$remMacro"/>
               </run_actions>
-              <do_if value="$remIsPinned or $remReAdded">
+              <!-- The player had this sector on the list before GT auto-added it: GT's episode ending
+                   must not take the player's own entry away -->
+              <set_value name="$remPlayerOwned" exact="global.$GT_PlayerOwnedBlacklistMacros? and global.$GT_PlayerOwnedBlacklistMacros.indexof.{$remMacro}"/>
+              <do_if value="$remIsPinned or $remReAdded or $remPlayerOwned">
                 <remove_from_list name="global.$GT_InFlightBlacklistMacroRemovals" exact="$remMacro"/>
               </do_if>
               <do_else>
@@ -4349,6 +4413,7 @@
           
           <!-- Lua read-merge-write: vanilla base + auto adds + explicit auto removals -->
           <raise_lua_event name="'GT_Blacklist.Update'" param="$payload"/>
+          <set_value name="global.$GT_NewAutoBlacklistMacros" exact="[]"/>
           <do_if value="$payload != global.$GT_LastThreatBlacklistData">
             <set_value name="global.$GT_LastThreatBlacklistData" exact="$payload"/>
           </do_if>

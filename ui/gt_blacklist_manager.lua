@@ -475,7 +475,7 @@ local function writeFleetBlacklistMacros(final_macro_list, relation_value)
 end
 
 --- Read vanilla, detect player removals vs last GT write, merge, write. Preserves manual sectors.
-local function mergeAndWriteFleetBlacklist(add_macros, remove_macros, relation_value, clear_all)
+local function mergeAndWriteFleetBlacklist(add_macros, remove_macros, relation_value, clear_all, new_set)
     if clear_all then
         GT_Blacklist.blacklisted_sectors = {}
         GT_Blacklist.last_written_macros = {}
@@ -484,6 +484,16 @@ local function mergeAndWriteFleetBlacklist(add_macros, remove_macros, relation_v
     end
 
     local vanilla_macros = readFleetBlacklistMacros()
+    -- A sector GT is auto-adding for the first time that is already on the list, and was not put there
+    -- by a GT write, belongs to the player: report it so MD never sends a #rem for it later.
+    if new_set then
+        local vanilla_set = macroListToSet(vanilla_macros)
+        for macro, _ in pairs(new_set) do
+            if vanilla_set[macro] and not (GT_Blacklist.last_written_macros and GT_Blacklist.last_written_macros[macro]) then
+                AddUITriggeredEvent("gt_blacklist_manager", "ManualMacroPreexisting", macro)
+            end
+        end
+    end
     local player_removed = macrosRemovedSinceLastWrite(vanilla_macros)
     local player_removed_set = macroListToSet(player_removed)
     local filtered_add_macros = add_macros
@@ -616,6 +626,8 @@ local function parseUpdatePayload(event_data)
 
     local add_macros = {}
     local remove_macros = {}
+    -- Macros MD registered as GT-auto for the first time in this payload (4th field "n")
+    local new_set = {}
 
     if adds_part ~= "" then
         for sector_entry in string.gmatch(adds_part, "([^|]+)") do
@@ -627,6 +639,9 @@ local function parseUpdatePayload(event_data)
                 local sector_macro = parts[1]
                 if sector_macro and sector_macro ~= "" and sector_macro ~= "nil" then
                     table.insert(add_macros, sector_macro)
+                    if parts[4] == "n" then
+                        new_set[sector_macro] = true
+                    end
                     if #parts >= 3 then
                         GT_Blacklist.blacklisted_sectors[sector_macro] = {
                             threat_level = tonumber(parts[2]) or 0,
@@ -646,7 +661,7 @@ local function parseUpdatePayload(event_data)
         end
     end
 
-    return false, add_macros, remove_macros
+    return false, add_macros, remove_macros, new_set
 end
 
 --- Parse threat data from MD script format (legacy helper)
@@ -784,9 +799,9 @@ local function onUpdateBlacklist(_, event_data)
     debugLog("Received blacklist update request")
 
     GT_Blacklist.blacklisted_sectors = {}
-    local clear_all, add_macros, remove_macros = parseUpdatePayload(event_data or "")
+    local clear_all, add_macros, remove_macros, new_set = parseUpdatePayload(event_data or "")
 
-    local ok = mergeAndWriteFleetBlacklist(add_macros, remove_macros, GT_Blacklist.relation_value, clear_all)
+    local ok = mergeAndWriteFleetBlacklist(add_macros, remove_macros, GT_Blacklist.relation_value, clear_all, new_set)
     if ok then
         AddUITriggeredEvent("gt_blacklist_manager", "BlacklistWritten", GT_Blacklist.last_written_fingerprint or "")
         logTrace(string.format(

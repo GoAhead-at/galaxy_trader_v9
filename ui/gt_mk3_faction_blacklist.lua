@@ -41,11 +41,13 @@ local function readBlackboard()
                 local idx = tonumber(fields[1]) or 0
                 local name = tostring(fields[2] or "Unknown Faction")
                 local selected = tostring(fields[3] or "0") == "1"
+                local factionId = tostring(fields[4] or "")
                 if idx > 0 then
                     table.insert(state.rows, {
                         index = idx,
                         name = name,
                         selected = selected,
+                        factionId = factionId,
                     })
                 end
             end
@@ -125,7 +127,8 @@ local function createFrame()
         local buttonColor = row.selected and GT_UI.COLORS.textNegative or GT_UI.COLORS.textPositive
         r[3]:createButton({ active = true }):setText(buttonText, { halign = "center", color = buttonColor })
         r[3].handlers.onClick = function()
-            AddUITriggeredEvent("GT_MK3FactionBlacklist", "ToggleFaction", { index = row.index })
+            -- The faction id lets MD resolve the right faction even if its list was rebuilt meanwhile
+            AddUITriggeredEvent("GT_MK3FactionBlacklist", "ToggleFaction", { index = row.index, faction = row.factionId })
         end
     end
 

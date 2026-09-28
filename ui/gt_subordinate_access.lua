@@ -36,6 +36,23 @@ local function isGTOrder(orderID)
     return orderID ~= nil and GT_OrderIDs[orderID] == true
 end
 
+-- Restore the commander before anything else, then pass on vanilla's results or its error
+local function finishCommanderHiddenCall(infoTableData, commander, ok, ...)
+    infoTableData.commander = commander
+    if not ok then
+        error((...), 0)
+    end
+    return ...
+end
+
+-- Run a vanilla renderer with infoTableData.commander hidden. The commander comes back even
+-- when vanilla throws, and all arguments and return values are passed through.
+local function callWithCommanderHidden(infoTableData, fn, ...)
+    local commander = infoTableData.commander
+    infoTableData.commander = nil
+    return finishCommanderHiddenCall(infoTableData, commander, pcall(fn, ...))
+end
+
 -- Hook: displayOrderParam
 -- Vanilla check (menu_map.lua ~line 9764):
 --   paramactive = (menu.infoTableData[instance].commander == nil) and (not isplayeroccupiedship)
@@ -43,24 +60,15 @@ end
 --
 -- NOTE: The order table uses .orderdef (string ID), NOT .id.
 -- Structure: { state, statename, orderdef="GalaxyTraderMK3", actualparams, enabled, orderdefref }
-function menu.displayOrderParam(ftable, orderidx, order, paramidx, param, listidx, instance)
-    local commander = nil
-    local didOverride = false
-
+function menu.displayOrderParam(ftable, orderidx, order, paramidx, param, listidx, instance, ...)
     -- Only unlock for GT orders (order.orderdef holds the order ID string)
-    if order and isGTOrder(order.orderdef) then
-        commander = menu.infoTableData[instance].commander
-        menu.infoTableData[instance].commander = nil
-        didOverride = true
+    local infoTableData = menu.infoTableData and menu.infoTableData[instance]
+    if infoTableData and order and isGTOrder(order.orderdef) then
+        -- vanilla renders params as editable since commander is nil
+        return callWithCommanderHidden(infoTableData, orig_displayOrderParam,
+            ftable, orderidx, order, paramidx, param, listidx, instance, ...)
     end
-
-    -- Call original (vanilla renders params as editable since commander is nil)
-    orig_displayOrderParam(ftable, orderidx, order, paramidx, param, listidx, instance)
-
-    -- Always restore commander
-    if didOverride then
-        menu.infoTableData[instance].commander = commander
-    end
+    return orig_displayOrderParam(ftable, orderidx, order, paramidx, param, listidx, instance, ...)
 end
 
 -- Hook: displayDefaultBehaviour
@@ -69,28 +77,15 @@ end
 -- Same approach: null commander for GT default orders.
 --
 -- NOTE: The defaultorder table uses .orderdef (string ID), NOT .id.
-function menu.displayDefaultBehaviour(ftable, mode, titlerow, instance)
-    local commander = nil
-    local didOverride = false
-
+function menu.displayDefaultBehaviour(ftable, mode, titlerow, instance, ...)
     -- Check if the default order is a GT order
-    local infoTableData = menu.infoTableData[instance]
-    if infoTableData then
-        local defaultorder = infoTableData.defaultorder
-        if defaultorder and isGTOrder(defaultorder.orderdef) then
-            commander = infoTableData.commander
-            infoTableData.commander = nil
-            didOverride = true
-        end
+    local infoTableData = menu.infoTableData and menu.infoTableData[instance]
+    if infoTableData and infoTableData.defaultorder and isGTOrder(infoTableData.defaultorder.orderdef) then
+        -- vanilla renders the default behaviour selector as active since commander is nil
+        return callWithCommanderHidden(infoTableData, orig_displayDefaultBehaviour,
+            ftable, mode, titlerow, instance, ...)
     end
-
-    -- Call original (vanilla renders default behaviour selector as active)
-    orig_displayDefaultBehaviour(ftable, mode, titlerow, instance)
-
-    -- Always restore commander
-    if didOverride then
-        menu.infoTableData[instance].commander = commander
-    end
+    return orig_displayDefaultBehaviour(ftable, mode, titlerow, instance, ...)
 end
 
 DebugError("[GT Subordinate Access] MapMenu hooks installed — GT orders editable when station-assigned")

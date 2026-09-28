@@ -3970,8 +3970,10 @@
         <!-- Add to queue -->
         <append_to_list name="global.$GT_RegistrationQueue.$Ships" exact="$registrationData"/>
         
-        <!-- Process queue if not already processing -->
-        <do_if value="not global.$GT_RegistrationQueue.$Processing">
+        <!-- Process queue if no chain is running. A chain refreshes $ProcessingSince every step
+             (500 ms), so a flag older than 10 s is left over from a lost chain and is ignored. -->
+        <do_if value="not global.$GT_RegistrationQueue.$Processing or not global.$GT_RegistrationQueue.$ProcessingSince? or player.age gt @global.$GT_RegistrationQueue.$ProcessingSince + 10s">
+          <set_value name="global.$GT_RegistrationQueue.$Processing" exact="false"/>
           <signal_cue_instantly cue="ProcessRegistrationQueue"/>
         </do_if>
       </actions>
@@ -3986,7 +3988,8 @@
         <!-- Prevent concurrent processing -->
         <do_if value="not global.$GT_RegistrationQueue.$Processing and global.$GT_RegistrationQueue.$Ships.count gt 0">
           <set_value name="global.$GT_RegistrationQueue.$Processing" exact="true"/>
-          
+          <set_value name="global.$GT_RegistrationQueue.$ProcessingSince" exact="player.age"/>
+
           <!-- Process ONE ship at a time to prevent stutter -->
           <set_value name="$registrationData" exact="global.$GT_RegistrationQueue.$Ships.{1}"/>
           <remove_from_list name="global.$GT_RegistrationQueue.$Ships" exact="$registrationData"/>
@@ -4119,10 +4122,11 @@
               <param name="nameRefreshReason" value="'register_ship_sync_fallback_path'"/>
             </run_actions>
           </do_else>
+
+          <!-- Signal post-processing delay (yields CPU after processing this ship). Only the
+               instance that took a ship continues the chain; a skipped kick must not start one. -->
+          <signal_cue_instantly cue="PostRegistrationDelay"/>
         </do_if>
-        
-        <!-- Signal post-processing delay (yields CPU after processing this ship) -->
-        <signal_cue_instantly cue="PostRegistrationDelay"/>
       </actions>
     </cue>
     
@@ -4135,12 +4139,15 @@
       <!-- Increased from 100ms to prevent stutter when initializing large fleets -->
       <delay exact="200ms"/>
       <actions>
-        <set_value name="global.$GT_RegistrationQueue.$Processing" exact="false"/>
-        
-        <!-- Continue processing if more ships in queue WITH DELAY to prevent stutter -->
+        <!-- Continue processing if more ships in queue WITH DELAY to prevent stutter. $Processing
+             stays true across the 300 ms gap so new enqueues do not start a second chain. -->
         <do_if value="global.$GT_RegistrationQueue.$Ships.count gt 0">
+          <set_value name="global.$GT_RegistrationQueue.$ProcessingSince" exact="player.age"/>
           <signal_cue_instantly cue="DelayedRegistrationProcessing"/>
         </do_if>
+        <do_else>
+          <set_value name="global.$GT_RegistrationQueue.$Processing" exact="false"/>
+        </do_else>
       </actions>
     </cue>
     
@@ -4155,6 +4162,8 @@
       <!-- Total delay per ship: 300ms before + 200ms after = 500ms per ship -->
       <delay exact="300ms"/>
       <actions>
+        <!-- Hand the chain to the next step: release the flag and dequeue in the same frame -->
+        <set_value name="global.$GT_RegistrationQueue.$Processing" exact="false"/>
         <signal_cue_instantly cue="ProcessRegistrationQueue"/>
       </actions>
     </cue>
@@ -5519,8 +5528,13 @@
           <debug_text text="'[GT-Core] Ship modification update QUEUED: ' + (if $ship? then $ship.knownname else 'NULL') + ' (Type: ' + $updateType + ', queued=' + global.$GT_ShipUpdateQueue.$Ships.count + ')'" chance="100"/>
         </do_if>
 
-        <!-- Kick the queue processor (single-threaded) -->
-        <signal_cue_instantly cue="md.GT_CoreSystem.ProcessShipModificationUpdateQueue"/>
+        <!-- Kick the queue processor only when no chain is running (single-threaded). The chain
+             refreshes $ProcessingSince every step, so a flag older than 10 s is from a lost chain. -->
+        <do_if value="not global.$GT_ShipUpdateQueue.$Processing or not global.$GT_ShipUpdateQueue.$ProcessingSince? or player.age gt @global.$GT_ShipUpdateQueue.$ProcessingSince + 10s">
+          <set_value name="global.$GT_ShipUpdateQueue.$Processing" exact="true"/>
+          <set_value name="global.$GT_ShipUpdateQueue.$ProcessingSince" exact="player.age"/>
+          <signal_cue_instantly cue="md.GT_CoreSystem.ProcessShipModificationUpdateQueue"/>
+        </do_if>
       </actions>
     </cue>
 
@@ -5532,18 +5546,14 @@
       <!-- Yield a little to avoid same-frame stampedes -->
       <delay min="5ms" max="25ms"/>
       <actions>
+        <!-- Only the kicker (HandleShipModificationUpdate, which claims $Processing) and this cue's
+             own re-signal start an instance, so every instance belongs to the single running chain. -->
         <set_value name="$proceed" exact="true"/>
         <do_if value="not global.$GT_ShipUpdateQueue?">
           <set_value name="$proceed" exact="false"/>
           <cancel_cue cue="this"/>
         </do_if>
-        <do_if value="global.$GT_ShipUpdateQueue? and global.$GT_ShipUpdateQueue.$Processing">
-          <set_value name="$proceed" exact="false"/>
-          <cancel_cue cue="this"/>
-        </do_if>
         <do_if value="$proceed">
-          <set_value name="global.$GT_ShipUpdateQueue.$Processing" exact="true"/>
-
           <!-- Process ONE ship per invocation (smooth gameplay > speed) -->
           <do_if value="global.$GT_ShipUpdateQueue.$Ships.count gt 0">
             <set_value name="$ship" exact="global.$GT_ShipUpdateQueue.$Ships.{1}"/>
@@ -5562,12 +5572,14 @@
             </do_if>
           </do_if>
 
-          <set_value name="global.$GT_ShipUpdateQueue.$Processing" exact="false"/>
-        </do_if>
-
-        <!-- Continue draining if needed -->
-        <do_if value="$proceed and global.$GT_ShipUpdateQueue? and global.$GT_ShipUpdateQueue.$Ships.count gt 0">
-          <signal_cue_instantly cue="md.GT_CoreSystem.ProcessShipModificationUpdateQueue"/>
+          <!-- Continue draining if needed; the chain keeps $Processing until the queue is empty -->
+          <do_if value="global.$GT_ShipUpdateQueue.$Ships.count gt 0">
+            <set_value name="global.$GT_ShipUpdateQueue.$ProcessingSince" exact="player.age"/>
+            <signal_cue_instantly cue="md.GT_CoreSystem.ProcessShipModificationUpdateQueue"/>
+          </do_if>
+          <do_else>
+            <set_value name="global.$GT_ShipUpdateQueue.$Processing" exact="false"/>
+          </do_else>
         </do_if>
       </actions>
     </cue>

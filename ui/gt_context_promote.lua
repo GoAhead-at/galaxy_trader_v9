@@ -759,12 +759,20 @@ local function processPendingPromotedCommanderAttach()
                 entry.checks = (entry.checks or 0) + 1
                 local shouldForce = entry.checks >= (entry.maxChecks or 80)
                 local cancelOrders = shouldForce and (not entry.forceIssued) or false
-                local ok = orderAssignCommander(ship, parent, entry.assignment, entry.group, cancelOrders)
+                -- A queued AssignCommander may just be waiting (e.g. behind a critical order); issuing
+                -- another on every check stacked up to ~100 of them. Create one only while none could
+                -- be created yet (not selectable / no pilot) and for the single forced attempt.
+                local issued = false
+                if (not entry.orderQueued) or cancelOrders then
+                    entry.orderQueued = orderAssignCommander(ship, parent, entry.assignment, entry.group, cancelOrders)
+                    issued = true
+                end
                 DebugError(string.format(
-                    "[GT Promote] Deferred promoted commander attach attempt ship=%s parent=%s ok=%s check=%d/%d force=%s cancelOrders=%s",
+                    "[GT Promote] Deferred promoted commander attach %s ship=%s parent=%s queued=%s check=%d/%d force=%s cancelOrders=%s",
+                    issued and "attempt" or "wait",
                     formatComponentRef(ship),
                     formatComponentRef(parent),
-                    tostring(ok),
+                    tostring(entry.orderQueued),
                     entry.checks,
                     entry.maxChecks or 80,
                     tostring(shouldForce),

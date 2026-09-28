@@ -74,7 +74,6 @@ local GT_Blacklist = {
     },
     
     -- State tracking
-    dynamic_blacklists = {},  -- { ship_id -> blacklist_id }
     blacklisted_sectors = {}, -- { sector_macro -> { threat_level, timestamp } } (GT auto metadata)
     fleet_blacklist_id = nil, -- Shared fleet-wide blacklist ID
     relation_value = "",      -- Stored relation value: "enemy" or ""
@@ -237,7 +236,10 @@ local function readFleetBlacklistMacros()
 
     local buf = ffi.new("BlacklistInfo2")
     buf.nummacros = nummacros
-    buf.macros = ffi.new("const char*[?]", nummacros)
+    -- A pointer stored in a struct field does not keep its ffi.new array alive; hold it in a local
+    -- until the reads below are done (vanilla anchors the same call via Helper.ffiNewHelper).
+    local macros_array = ffi.new("const char*[?]", nummacros)
+    buf.macros = macros_array
 
     local ok, exists = pcall(function()
         return C.GetBlacklistInfo2(buf, GT_Blacklist.fleet_blacklist_id)
@@ -249,8 +251,8 @@ local function readFleetBlacklistMacros()
 
     local macros = {}
     for i = 0, nummacros - 1 do
-        if buf.macros[i] ~= nil then
-            local macro = ffi.string(buf.macros[i])
+        if macros_array[i] ~= nil then
+            local macro = ffi.string(macros_array[i])
             if macro and macro ~= "" and macro ~= "nil" then
                 table.insert(macros, macro)
             end
@@ -521,9 +523,6 @@ local function applyBlacklistToShip(ship_id, blacklist_id)
     -- Apply blacklist to ship for sector travel (no per-ship logging for performance)
     C.SetControllableBlacklist(ship_id, blacklist_id, "sectortravel", true)
     
-    -- Track assignment
-    GT_Blacklist.dynamic_blacklists[ship_id] = blacklist_id
-    
     return true
 end
 
@@ -534,16 +533,19 @@ local function removeBlacklistFromShip(ship_id)
         return false
     end
     
-    local blacklist_id = GT_Blacklist.dynamic_blacklists[ship_id]
-    if not blacklist_id then
-        return true -- Already has no blacklist
+    -- Ask the engine which list the ship uses. A Lua map keyed by the uint64 cdata id never
+    -- matched a fresh conversion of the same id, and it was empty after every load anyway.
+    -- Only the GT fleet list is ours to remove; any other assignment belongs to the player.
+    local fleet_id = GT_Blacklist.fleet_blacklist_id
+    if not fleet_id or fleet_id == 0 then
+        return true
+    end
+    if C.GetControllableBlacklistID(ship_id, "sectortravel", "civilian") ~= fleet_id then
+        return true -- GT fleet blacklist not assigned
     end
     
     -- Remove blacklist assignment (-1 = use default)
     C.SetControllableBlacklist(ship_id, -1, "sectortravel", false)
-    
-    -- Clear tracking
-    GT_Blacklist.dynamic_blacklists[ship_id] = nil
     
     return true
 end

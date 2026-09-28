@@ -440,7 +440,13 @@
               <set_value name="$currentSkillLevel" exact="$skillLevel"/>
             </do_if>
           </do_all>
-          
+          <!-- A block freezes $Level below the XP-derived level. When it ends without the course (Cancel
+               Training), starting the level gate from the XP-derived level would skip the mandatory level
+               that was cancelled, so start from the stored level when it is lower. -->
+          <do_if value="@global.$GT_Pilots.{$pilot}.$Level != null and global.$GT_Pilots.{$pilot}.$Level lt $currentSkillLevel">
+            <set_value name="$currentSkillLevel" exact="global.$GT_Pilots.{$pilot}.$Level"/>
+          </do_if>
+
           <!-- Unified training/XP gate -->
           <run_actions ref="md.GT_Libraries_General.GT_GetTrainingGate" result="$pilotTrainingGate">
             <param name="pilot" value="$pilot"/>
@@ -1128,11 +1134,33 @@
                 <set_value name="$shownLevelUpNotification" exact="false"/>
                 <set_value name="$trainedLevel" exact="global.$GT_Pilots.{$pilot}.$BlockedLevel"/>
                 <append_to_list name="global.$GT_Pilots.{$pilot}.$TrainingCompleted" exact="$trainedLevel"/>
-                
+
+                <!-- The pending target and released blocked XP may reach past further mandatory levels.
+                     Levels are applied only up to just below the next required level the pilot has not
+                     completed; the remainder goes through GT_ProcessLevelUpTrainingGate further down,
+                     which blocks again at that level. -->
+                <set_value name="$completionCapLevel" exact="15"/>
+                <set_value name="$completionGateTarget" exact="0"/>
+                <set_value name="$completionReblocked" exact="false"/>
+                <do_if value="global.$GT_Config.$Training.$RequiredLevels?">
+                  <do_all exact="global.$GT_Config.$Training.$RequiredLevels.count" counter="$rli">
+                    <set_value name="$reqLevel" exact="global.$GT_Config.$Training.$RequiredLevels.{$rli}"/>
+                    <do_if value="$reqLevel gt $trainedLevel and $reqLevel - 1 lt $completionCapLevel">
+                      <do_if value="not global.$GT_Pilots.{$pilot}.$TrainingCompleted.indexof.{$reqLevel}">
+                        <set_value name="$completionCapLevel" exact="$reqLevel - 1"/>
+                      </do_if>
+                    </do_if>
+                  </do_all>
+                </do_if>
+
                 <!-- Apply pending skill level increase if available -->
                 <do_if value="global.$GT_Pilots.{$pilot}.$PendingSkillLevel?">
                   <set_value name="$pendingLevel" exact="global.$GT_Pilots.{$pilot}.$PendingSkillLevel"/>
-                  
+                  <set_value name="$completionGateTarget" exact="$pendingLevel"/>
+                  <do_if value="$pendingLevel gt $completionCapLevel">
+                    <set_value name="$pendingLevel" exact="[$completionCapLevel, $trainedLevel].max"/>
+                  </do_if>
+
                   <!-- Now apply the skill level increase that was delayed (raise-only sync). -->
                   <set_value name="$vanillaMgmtLevel" exact="if $pilot.skill.management? then $pilot.skill.management else 0"/>
                   <do_if value="$pendingLevel gt $vanillaMgmtLevel">
@@ -1235,6 +1263,10 @@
                       <set_value name="$currentSkillLevel" exact="$skillLevel"/>
                     </do_if>
                   </do_all>
+                  <set_value name="$completionGateTarget" exact="$currentSkillLevel"/>
+                  <do_if value="$currentSkillLevel gt $completionCapLevel">
+                    <set_value name="$currentSkillLevel" exact="[$completionCapLevel, $trainedLevel].max"/>
+                  </do_if>
                 </do_else>
                 
                 <!-- PHASE 2 IMPROVEMENT: Award any blocked XP that accumulated during training -->
@@ -1258,6 +1290,13 @@
                     </do_if>
                   </do_all>
                   
+                  <do_if value="$postTrainingSkillLevel gt $completionGateTarget">
+                    <set_value name="$completionGateTarget" exact="$postTrainingSkillLevel"/>
+                  </do_if>
+                  <do_if value="$postTrainingSkillLevel gt $completionCapLevel">
+                    <set_value name="$postTrainingSkillLevel" exact="$completionCapLevel"/>
+                  </do_if>
+
                   <!-- Update skill level if blocked XP caused additional increases -->
                   <do_if value="$postTrainingSkillLevel gt $currentSkillLevel">
                     <set_value name="$vanillaMgmtLevel" exact="if $pilot.skill.management? then $pilot.skill.management else 0"/>
@@ -1335,7 +1374,21 @@
                   <param name="clear_blocked_level" value="true"/>
                 </run_actions>
                 <set_value name="global.$GT_Pilots.{$pilot}.$TrainingState" exact="'active'"/>
-                
+
+                <!-- Levels beyond the cap need their own course: gate them like live XP (blocks at the next
+                     mandatory level, keeps the target as $PendingSkillLevel, renames and requests training) -->
+                <do_if value="$completionGateTarget gt $completionCapLevel and $completionGateTarget gt $currentSkillLevel">
+                  <run_actions ref="md.GT_Libraries_General.GT_ProcessLevelUpTrainingGate" result="$completionGate">
+                    <param name="pilot" value="$pilot"/>
+                    <param name="ship" value="$ship"/>
+                    <param name="currentSkillLevel" value="$currentSkillLevel"/>
+                    <param name="newSkillLevel" value="$completionGateTarget"/>
+                    <param name="newXP" value="@global.$GT_Pilots.{$pilot}.$XP"/>
+                    <param name="logTag" value="'TRAINING COMPLETION'"/>
+                  </run_actions>
+                  <set_value name="$completionReblocked" exact="@$completionGate.$TrainingBlocked == true"/>
+                </do_if>
+
                 <!-- Update ship name / mods only for GT-service ships; non-GT keep vanilla knownname. -->
                 <set_value name="$completeShipInGTService" exact="false"/>
                 <do_if value="$ship? and $ship.exists">
@@ -1343,26 +1396,29 @@
                     <param name="ship" value="$ship"/>
                   </run_actions>
                 </do_if>
+                <!-- A re-block by the completion gate above already renamed the ship to its blocked state -->
                 <do_if value="$completeShipInGTService">
-                  <run_actions ref="md.GT_Ship_Management.Update_Ship_Name">
-                    <param name="ship" value="$ship"/>
-                    <param name="pilot" value="$pilot"/>
-                    <param name="xp" value="@global.$GT_Pilots.{$pilot}.$XP"/>
-                    <param name="level" value="$currentSkillLevel"/>
-                    <param name="nameType" value="'trader'"/>
-                  </run_actions>
+                  <do_if value="not $completionReblocked">
+                    <run_actions ref="md.GT_Ship_Management.Update_Ship_Name">
+                      <param name="ship" value="$ship"/>
+                      <param name="pilot" value="$pilot"/>
+                      <param name="xp" value="@global.$GT_Pilots.{$pilot}.$XP"/>
+                      <param name="level" value="$currentSkillLevel"/>
+                      <param name="nameType" value="'trader'"/>
+                    </run_actions>
+                  </do_if>
                   <signal_objects object="player.galaxy" param="'GT_Update_Ship'" param2="table[
                     $Ship = $ship,
                     $pilot = $pilot,
                     $updateType = 'training_completion'
                   ]"/>
                 </do_if>
-                <do_else>
+                <do_elseif value="not $completionReblocked">
                   <run_actions ref="md.GT_Ship_Management.Update_Pilot_Name_Tag">
                     <param name="pilot" value="$pilot"/>
                     <param name="level" value="$currentSkillLevel"/>
                   </run_actions>
-                </do_else>
+                </do_elseif>
                 
                 <!-- Clean up training data -->
                 <remove_value name="global.$GT_Pilots.{$pilot}.$TrainingStarted"/>

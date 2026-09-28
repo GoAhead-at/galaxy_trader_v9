@@ -7053,6 +7053,67 @@
                   </do_if>
                 </do_if>
                 
+                <!-- Fleet reservation slot (ORS R1: stable dest_<stationId>_<wareId> key; TTL=10s). Test it
+                     before this trade can enter the window or become primary: a slot a live peer
+                     claimed during the dockcheck yields is not ours to deliver to. -->
+                <set_value name="$resCreateKey" exact="''"/>
+                <do_if value="global.$GT_Reservations? and $currentTrade.$SellOffer?">
+                  <set_value name="$rkDest" exact="''"/>
+                  <set_value name="$rkWare" exact="''"/>
+                  <do_if value="$currentTrade.$DeliveryStationId? and $currentTrade.$DeliveryStationId != null and $currentTrade.$DeliveryStationId != ''">
+                    <set_value name="$rkDest" exact="'' + $currentTrade.$DeliveryStationId"/>
+                  </do_if>
+                  <do_if value="$rkDest == '' and $currentTrade.$SellStation? and @$currentTrade.$SellStation.exists">
+                    <do_if value="@$currentTrade.$SellStation.isclass.buildstorage and $currentTrade.$SellStation.base? and @$currentTrade.$SellStation.base.exists and @$currentTrade.$SellStation.base.idcode != null">
+                      <set_value name="$rkDest" exact="'' + @$currentTrade.$SellStation.base.idcode"/>
+                    </do_if>
+                    <do_elseif value="@$currentTrade.$SellStation.idcode != null">
+                      <set_value name="$rkDest" exact="'' + @$currentTrade.$SellStation.idcode"/>
+                    </do_elseif>
+                  </do_if>
+                  <do_if value="$rkDest == '' and $currentTrade.$SellOffer? and @$currentTrade.$SellOffer.exists">
+                    <set_value name="$rkBuyer" exact="null"/>
+                    <do_if value="$currentTrade.$SellOffer.buyer? and @$currentTrade.$SellOffer.buyer.exists">
+                      <set_value name="$rkBuyer" exact="@$currentTrade.$SellOffer.buyer"/>
+                    </do_if>
+                    <do_elseif value="$currentTrade.$SellOffer.owner? and @$currentTrade.$SellOffer.owner.exists">
+                      <set_value name="$rkBuyer" exact="@$currentTrade.$SellOffer.owner"/>
+                    </do_elseif>
+                    <do_if value="$rkBuyer? and @$rkBuyer.exists">
+                      <do_if value="@$rkBuyer.isclass.buildstorage and $rkBuyer.base? and @$rkBuyer.base.exists and @$rkBuyer.base.idcode != null">
+                        <set_value name="$rkDest" exact="'' + @$rkBuyer.base.idcode"/>
+                      </do_if>
+                      <do_elseif value="@$rkBuyer.idcode != null">
+                        <set_value name="$rkDest" exact="'' + @$rkBuyer.idcode"/>
+                      </do_elseif>
+                    </do_if>
+                  </do_if>
+                  <do_if value="$currentTrade.$Ware? and $currentTrade.$Ware != null and $currentTrade.$Ware.id?">
+                    <set_value name="$rkWare" exact="'' + @$currentTrade.$Ware.id"/>
+                  </do_if>
+                  <do_if value="$rkWare == '' and $currentTrade.$SellOffer? and @$currentTrade.$SellOffer.exists and $currentTrade.$SellOffer.ware? and @$currentTrade.$SellOffer.ware != null">
+                    <set_value name="$rkWare" exact="'' + @$currentTrade.$SellOffer.ware.id"/>
+                  </do_if>
+                  <do_if value="$rkDest != '' and $rkWare != ''">
+                    <set_value name="$resCreateKey" exact="'$dest_' + $rkDest + '_' + $rkWare"/>
+                  </do_if>
+                </do_if>
+                <!-- Do NOT blind-write. The validation check ran before the dockcheck yields, so
+                     a peer may hold this dest+ware key now; the old unconditional write replaced
+                     its row and the peer's release then deleted the new holder's. Claim only when
+                     the slot is free or expired.
+                     DECIDED (project owner, 0.17.5 dev): a LIVE reservation is first-writer-wins
+                     - a peer must not steal it. The "single-slot (last-writer-wins)" note near
+                     the delivery-budget block below describes the OLD behaviour and the budget
+                     workaround that tolerated it; an EXPIRED row is still re-claimable, so that
+                     workaround remains valid. -->
+                <do_if value="$resCreateKey != '' and global.$GT_Reservations.{$resCreateKey}? and @global.$GT_Reservations.{$resCreateKey}.$Until != null and player.age lt @global.$GT_Reservations.{$resCreateKey}.$Until and @global.$GT_Reservations.{$resCreateKey}.$Ship != null and @global.$GT_Reservations.{$resCreateKey}.$Ship != this.ship">
+                  <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                    <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Trade ' + $tradeIdxSafe + '/' + $tradeListCountSafe + ' skipped - fleet reservation key ' + $resCreateKey + ' was claimed by a peer during the dockcheck yields'" chance="100"/>
+                  </do_if>
+                  <continue/>
+                </do_if>
+
                 <!-- All checks passed including clamping and final docking verification - this trade is valid -->
                 <set_value name="$validTradesFound" operation="add"/>
                 <!-- Persist clamped amounts on candidate so fallback retries can reuse validated values. -->
@@ -7093,81 +7154,19 @@
                   <set_value name="$selectedTradeIdx" exact="if $tradeIdxSafe? then $tradeIdxSafe else 0"/>
                   <set_value name="$selectedCurrentSectorIsBlacklisted" exact="$currentSectorIsBlacklisted"/>
 
-                  <!-- Create fleet reservation (ORS R1: stable dest_<stationId>_<wareId> key; TTL=10s). -->
-                  <do_if value="global.$GT_Reservations? and $currentTrade.$SellOffer?">
-                    <set_value name="$resCreateKey" exact="''"/>
-                    <set_value name="$rkDest" exact="''"/>
-                    <set_value name="$rkWare" exact="''"/>
-                    <do_if value="$currentTrade.$DeliveryStationId? and $currentTrade.$DeliveryStationId != null and $currentTrade.$DeliveryStationId != ''">
-                      <set_value name="$rkDest" exact="'' + $currentTrade.$DeliveryStationId"/>
+                  <!-- Claim the fleet reservation slot tested above. -->
+                  <do_if value="$resCreateKey != ''">
+                    <set_value name="global.$GT_Reservations.{$resCreateKey}" exact="table[
+                      $Ship = this.ship,
+                      $Until = player.age + 10s,
+                      $Amount = if $finalSellAmount? and $finalSellAmount gt 0 then $finalSellAmount else (if $pendingTrade.$Amount? and $pendingTrade.$Amount gt 0 then $pendingTrade.$Amount else 1)
+                    ]"/>
+                    <set_value name="this.$activeReservationKey" exact="$resCreateKey"/>
+                    <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                      <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Fleet reservation CREATED (TTL=10s, key=' + $resCreateKey + ')'" chance="100"/>
                     </do_if>
-                    <do_if value="$rkDest == '' and $currentTrade.$SellStation? and @$currentTrade.$SellStation.exists">
-                      <do_if value="@$currentTrade.$SellStation.isclass.buildstorage and $currentTrade.$SellStation.base? and @$currentTrade.$SellStation.base.exists and @$currentTrade.$SellStation.base.idcode != null">
-                        <set_value name="$rkDest" exact="'' + @$currentTrade.$SellStation.base.idcode"/>
-                      </do_if>
-                      <do_elseif value="@$currentTrade.$SellStation.idcode != null">
-                        <set_value name="$rkDest" exact="'' + @$currentTrade.$SellStation.idcode"/>
-                      </do_elseif>
-                    </do_if>
-                    <do_if value="$rkDest == '' and $currentTrade.$SellOffer? and @$currentTrade.$SellOffer.exists">
-                      <set_value name="$rkBuyer" exact="null"/>
-                      <do_if value="$currentTrade.$SellOffer.buyer? and @$currentTrade.$SellOffer.buyer.exists">
-                        <set_value name="$rkBuyer" exact="@$currentTrade.$SellOffer.buyer"/>
-                      </do_if>
-                      <do_elseif value="$currentTrade.$SellOffer.owner? and @$currentTrade.$SellOffer.owner.exists">
-                        <set_value name="$rkBuyer" exact="@$currentTrade.$SellOffer.owner"/>
-                      </do_elseif>
-                      <do_if value="$rkBuyer? and @$rkBuyer.exists">
-                        <do_if value="@$rkBuyer.isclass.buildstorage and $rkBuyer.base? and @$rkBuyer.base.exists and @$rkBuyer.base.idcode != null">
-                          <set_value name="$rkDest" exact="'' + @$rkBuyer.base.idcode"/>
-                        </do_if>
-                        <do_elseif value="@$rkBuyer.idcode != null">
-                          <set_value name="$rkDest" exact="'' + @$rkBuyer.idcode"/>
-                        </do_elseif>
-                      </do_if>
-                    </do_if>
-                    <do_if value="$currentTrade.$Ware? and $currentTrade.$Ware != null and $currentTrade.$Ware.id?">
-                      <set_value name="$rkWare" exact="'' + @$currentTrade.$Ware.id"/>
-                    </do_if>
-                    <do_if value="$rkWare == '' and $currentTrade.$SellOffer? and @$currentTrade.$SellOffer.exists and $currentTrade.$SellOffer.ware? and @$currentTrade.$SellOffer.ware != null">
-                      <set_value name="$rkWare" exact="'' + @$currentTrade.$SellOffer.ware.id"/>
-                    </do_if>
-                    <do_if value="$rkDest != '' and $rkWare != ''">
-                      <set_value name="$resCreateKey" exact="'$dest_' + $rkDest + '_' + $rkWare"/>
-                    </do_if>
-                    <do_if value="$resCreateKey != ''">
-                      <!-- Do NOT blind-write. The validation check ran before the dockcheck yields, so
-                           a peer may hold this dest+ware key now; the old unconditional write replaced
-                           its row and the peer's release then deleted the new holder's. Claim only when
-                           the slot is free or expired.
-                           DECIDED (project owner, 0.17.5 dev): a LIVE reservation is first-writer-wins
-                           - a peer must not steal it. The "single-slot (last-writer-wins)" note near
-                           the delivery-budget block below describes the OLD behaviour and the budget
-                           workaround that tolerated it; an EXPIRED row is still re-claimable, so that
-                           workaround remains valid. -->
-                      <set_value name="$resClaimTaken" exact="false"/>
-                      <do_if value="global.$GT_Reservations.{$resCreateKey}?">
-                        <do_if value="@global.$GT_Reservations.{$resCreateKey}.$Until != null and player.age lt @global.$GT_Reservations.{$resCreateKey}.$Until and @global.$GT_Reservations.{$resCreateKey}.$Ship != null and @global.$GT_Reservations.{$resCreateKey}.$Ship != this.ship">
-                          <set_value name="$resClaimTaken" exact="true"/>
-                          <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                            <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Fleet reservation key ' + $resCreateKey + ' was claimed by a peer during the dockcheck yields - not stealing it'" chance="100"/>
-                          </do_if>
-                        </do_if>
-                      </do_if>
-                      <do_if value="not $resClaimTaken">
-                        <set_value name="global.$GT_Reservations.{$resCreateKey}" exact="table[
-                          $Ship = this.ship,
-                          $Until = player.age + 10s,
-                          $Amount = if $finalSellAmount? and $finalSellAmount gt 0 then $finalSellAmount else (if $pendingTrade.$Amount? and $pendingTrade.$Amount gt 0 then $pendingTrade.$Amount else 1)
-                        ]"/>
-                        <set_value name="this.$activeReservationKey" exact="$resCreateKey"/>
-                        <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
-                          <debug_text text="'[GT-AI] ' + this.ship.idcode + ': Fleet reservation CREATED (TTL=10s, key=' + $resCreateKey + ')'" chance="100"/>
-                        </do_if>
-                        <do_if value="global.$GT_ReservationStats?">
-                          <set_value name="global.$GT_ReservationStats.$Active" operation="add"/>
-                        </do_if>
-                      </do_if>
+                    <do_if value="global.$GT_ReservationStats?">
+                      <set_value name="global.$GT_ReservationStats.$Active" operation="add"/>
                     </do_if>
                   </do_if>
                 </do_if>

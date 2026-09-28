@@ -3689,7 +3689,7 @@ RegisterEvent("gt.redistributeOrderCancelled", function(_, idcode)
     gtRefreshPilotExchangeBusyShipLists()
 end)
 
--- Always-on PE probe logging from MD (not gated by GT debug settings).
+-- PE probe logging from MD (raised only while GT debug logging is on).
 RegisterEvent("gt.peControlEntityProbe", function(_, msg)
     debugLog(tostring(msg or ""))
 end)

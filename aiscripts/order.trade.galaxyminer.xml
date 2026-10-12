@@ -1076,6 +1076,12 @@
       <!-- Cache miss: this ship holds the fill lock and resolves the station set for the fleet.
            Everything down to the matching </do_else> is the fill. -->
       <set_value name="this.$minerTargetSeen" exact="table[]"/>
+      <!-- Assigned home is always a primary. Additional targets are manual primaries beside it.
+           The sell-radius station scan runs only when neither is configured. -->
+      <do_if value="this.$homeStation? and this.$homeStation.exists and this.$homeStation.isoperational and ((not this.$playerStationsOnly) or (this.$homeStation.owner == this.owner))">
+        <append_to_list name="$targetStations" exact="this.$homeStation"/>
+        <set_value name="this.$minerTargetSeen.{this.$homeStation}" exact="true"/>
+      </do_if>
       <do_if value="this.$stationList? and this.$stationList.count gt 0">
         <do_all exact="this.$stationList.count" counter="$si">
           <set_value name="$stationCandidate" exact="this.$stationList.{$si}"/>
@@ -1102,13 +1108,8 @@
           </do_if>
         </do_all>
       </do_if>
-      <do_else>
-        <do_if value="this.$homeStation? and this.$homeStation.exists and this.$homeStation.isoperational and ((not this.$playerStationsOnly) or (this.$homeStation.owner == this.owner))">
-          <append_to_list name="$targetStations" exact="this.$homeStation"/>
-          <set_value name="this.$minerTargetSeen.{this.$homeStation}" exact="true"/>
-        </do_if>
-        <do_elseif value="this.$homeSector? and this.$homeSector.exists">
-          <!-- No home station: derive demand stations by sell radius around home sector. -->
+      <do_elseif value="$targetStations.count == 0 and this.$homeSector? and this.$homeSector.exists">
+          <!-- No home station and no additional targets: derive demand stations by sell radius. -->
           <run_script name="'lib.gt.miner_sectors_inrange'" result="$demandSectors">
             <param name="refobject" value="this.$homeSector"/>
             <param name="maxgatedistance" value="this.$maxSellDistance"/>
@@ -1137,8 +1138,8 @@
           </do_while>
           <remove_value name="this.$minerDemandSectorsScanList"/>
           <remove_value name="this.$minerDemandSectorsScanIndex"/>
-        </do_elseif>
-        <do_else>
+      </do_elseif>
+      <do_elseif value="$targetStations.count == 0">
           <find_station name="$sectorStations" space="this.sector" checkoperational="true" multiple="true"/>
           <set_value name="this.$minerSectorStationsScanList" exact="$sectorStations"/>
           <set_value name="this.$minerSectorStationsScanIndex" exact="1"/>
@@ -1159,8 +1160,7 @@
           </do_while>
           <remove_value name="this.$minerSectorStationsScanList"/>
           <remove_value name="this.$minerSectorStationsScanIndex"/>
-        </do_else>
-      </do_else>
+      </do_elseif>
 
       <do_if value="$minerBlockedStations? and $minerBlockedStations.count gt 0 and $targetStations.count gt 0">
         <set_value name="$targetStationsBeforeBlockedFilter" exact="$targetStations.count"/>
@@ -2382,9 +2382,6 @@
         <resume label="main_loop"/>
       </do_if>
       <do_if value="$demandOffCargoHasWillingBuyer?"><remove_value name="$demandOffCargoHasWillingBuyer"/></do_if>
-      <do_if value="$cargoOverflowSlice?"><remove_value name="$cargoOverflowSlice"/></do_if>
-      <do_if value="$cargoOverflowWare?"><remove_value name="$cargoOverflowWare"/></do_if>
-      <do_if value="$cargoOverflowAmount?"><remove_value name="$cargoOverflowAmount"/></do_if>
 
       <!-- Overflow exception:
            if all player demand stations are full, only mine wares that currently have sell opportunities.
@@ -2562,6 +2559,45 @@
           </do_else>
         </do_if>
 
+        <!-- Sector scan misses player stations a direct buyer query finds. Count those offers
+             before picking the overflow ware. Primaries stay on the primary path. -->
+        <do_if value="$overflowCandidates.count gt 0 and $overflowSellSpaces? and $overflowSellSpaces.count gt 0">
+          <run_script name="'lib.gt.miner.overflow.buyers'" result="$overflowDirectResult">
+            <param name="ship" value="this.ship"/>
+            <param name="sellSpaces" value="$overflowSellSpaces"/>
+            <param name="wares" value="$overflowCandidates"/>
+            <param name="excludeStations" value="if $demandStations? then $demandStations else []"/>
+            <param name="blockedStations" value="if $minerBlockedStations? then $minerBlockedStations else []"/>
+            <param name="debugchance" value="this.$debugchance"/>
+          </run_script>
+          <set_value name="$overflowDirectOffers" exact="[]"/>
+          <do_if value="@$overflowDirectResult != null">
+            <do_if value="$overflowDirectResult.$Offers?">
+              <set_value name="$overflowDirectOffers" exact="$overflowDirectResult.$Offers"/>
+            </do_if>
+          </do_if>
+          <do_if value="$overflowDirectOffers.count gt 0">
+            <do_if value="not this.$minerSellOffers?">
+              <set_value name="this.$minerSellOffers" exact="[]"/>
+            </do_if>
+            <do_all exact="$overflowDirectOffers.count" counter="$odi">
+              <set_value name="$odOffer" exact="$overflowDirectOffers.{$odi}"/>
+              <set_value name="$odDup" exact="false"/>
+              <do_if value="this.$minerSellOffers.count gt 0">
+                <do_all exact="this.$minerSellOffers.count" counter="$oddi">
+                  <do_if value="this.$minerSellOffers.{$oddi}? and this.$minerSellOffers.{$oddi} == $odOffer">
+                    <set_value name="$odDup" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+              </do_if>
+              <do_if value="not $odDup">
+                <append_to_list name="this.$minerSellOffers" exact="$odOffer"/>
+              </do_if>
+            </do_all>
+          </do_if>
+        </do_if>
+
         <set_value name="this.$minerOverflowBestWare" exact="null"/>
         <set_value name="this.$minerOverflowBestOffers" exact="0"/>
         <set_value name="this.$minerOverflowIndex" exact="1"/>
@@ -2660,6 +2696,9 @@
           <resume label="main_loop"/>
         </do_else>
       </do_if>
+      <do_if value="$cargoOverflowSlice?"><remove_value name="$cargoOverflowSlice"/></do_if>
+      <do_if value="$cargoOverflowWare?"><remove_value name="$cargoOverflowWare"/></do_if>
+      <do_if value="$cargoOverflowAmount?"><remove_value name="$cargoOverflowAmount"/></do_if>
 
       <do_if value="$overflowSellMode and not this.$allowOverflowSellToOthers">
         <!-- Genuine standby: full or near-full cargo cannot be delivered (primary capped,

@@ -86,8 +86,18 @@ local pendingDefaultApplies = {}
 local pendingOldCommanderReattach = {}
 local pendingPromotedCommanderAttach = {}
 local pendingPromotionReassign = {}
+local pendingStationPromote = {}
+-- Orders GT_PromoteStationStep (gt_context_diagnose.xml) can copy onto the promoted ship.
+local stationStepOrderIds = {
+    GalaxyMiner = true,
+    GalaxyTraderMK1 = true,
+    GalaxyTraderMK2 = true,
+    GalaxyTraderMK3 = true,
+    GalaxyTraderMK4Supply = true,
+}
 local orderAssignCommander -- forward declaration (used by deferred onUpdate path)
 local collectFleetSubordinatesRecursive -- forward declaration (used by onUpdate queue finalization)
+local continuePromotion -- forward declaration (used by the station step reply)
 
 local function buildDefaultOrderSnapshotFromShip(sourceShip)
     local ship = asComponentId(sourceShip)
@@ -625,8 +635,10 @@ local function processPendingPromotionReassign()
                     enqueueOldCommanderReattach(oldCommander, newCommander, job.promotedAssign, job.promotedGroup, job.issuedShips)
                     logFleetSnapshot("POST_OLD_COMMANDER_REASSIGN_DEFERRED_NEW_TREE", newCommander)
 
-                    applyCapturedDefaultOrder(newCommander, job.defaultOrderSnapshot)
-                    enqueueDefaultOrderApply(newCommander, job.defaultOrderSnapshot)
+                    if not job.orderSetByScript then
+                        applyCapturedDefaultOrder(newCommander, job.defaultOrderSnapshot)
+                        enqueueDefaultOrderApply(newCommander, job.defaultOrderSnapshot)
+                    end
                     applyFleetName(newCommander, job.originalFleetName)
                     logFleetSnapshot("POST_FINAL_DEFAULT_APPLY_NEW_TREE", newCommander)
                     local verifySubs = collectFleetSubordinatesRecursive(newCommander)
@@ -952,30 +964,74 @@ local function promoteSubordinateToCommander(subordinateComponent)
         DebugError(string.format("[GT Promote] Snapshot missing: no default order found in commander chain starting at %s", tostring(oldCommander)))
     end
 
-    -- 1) Make clicked ship commander first.
-    C.RemoveCommander2(newCommander)
-    debugLog(string.format("[GT Promote] Detached promoted ship=%s from commander=%s", tostring(newCommander), tostring(oldCommander)))
-    logFleetSnapshot("POST_DETACH_OLD_COMMANDER_TREE", oldCommander)
-    logFleetSnapshot("POST_DETACH_NEW_COMMANDER_TREE", newCommander)
+    local ctx = {
+        newCommander = newCommander,
+        oldCommander = oldCommander,
+        parent = oldCommanderParent,
+        parentAssign = oldCommanderAssign,
+        parentGroup = oldCommanderGroup,
+        promotedAssign = promotedAssign,
+        promotedGroup = promotedGroup,
+        fleetShips = fleetShips,
+        moved = moved,
+        failed = failed,
+        originalFleetName = originalFleetName,
+        snapshot = defaultOrderSnapshot,
+    }
 
-    -- Prime promoted commander with captured commander default order as early as possible.
-    applyCapturedDefaultOrder(newCommander, defaultOrderSnapshot)
-    applyFleetName(newCommander, originalFleetName)
+    -- Station-attached GT fleet: MD sets the order and the station in one step
+    -- (GT_PromoteStationStep), then replies with gt.promoteStationStepDone.
+    local parentIsStation = oldCommanderParent and oldCommanderParent ~= 0 and oldCommanderParent ~= newCommander
+        and (C.IsComponentClass(oldCommanderParent, "station") or C.IsComponentClass(oldCommanderParent, "buildstorage"))
+    if parentIsStation and defaultOrderSnapshot and defaultOrderSnapshot.sourceShip == oldCommander
+        and stationStepOrderIds[defaultOrderSnapshot.orderId] then
+        pendingStationPromote[tostring(newCommander)] = ctx
+        AddUITriggeredEvent("GT_Promote", "StationStep", {
+            ship = ConvertStringToLuaID(tostring(newCommander)),
+            source = ConvertStringToLuaID(tostring(oldCommander)),
+            jumpCap = pilotMaxJumps(getPilotLevel(newCommander)),
+        })
+        debugLog(string.format("[GT Promote] Station step requested ship=%s station=%s order=%s", formatComponentRef(newCommander), formatComponentRef(oldCommanderParent), tostring(defaultOrderSnapshot.orderId)))
+        return
+    end
 
-    -- If old commander was attached to a parent (e.g. station), attach promoted commander immediately.
-    -- This avoids a detached-fleet window where promoted fleets temporarily lose station attachment.
-    if oldCommanderParent and oldCommanderParent ~= 0 and oldCommanderParent ~= newCommander then
-        local attached = orderAssignCommander(newCommander, oldCommanderParent, oldCommanderAssign, oldCommanderGroup, false)
-        debugLog(string.format(
-            "[GT Promote] Promoted commander parent attach ship=%s parent=%s assignment=%s group=%s ok=%s cancelOrders=false",
-            formatComponentRef(newCommander),
-            formatComponentRef(oldCommanderParent),
-            tostring(oldCommanderAssign),
-            tostring(oldCommanderGroup),
-            tostring(attached)
-        ))
-        if not attached then
-            enqueuePromotedCommanderAttach(newCommander, oldCommanderParent, oldCommanderAssign, oldCommanderGroup)
+    continuePromotion(ctx, false)
+end
+
+continuePromotion = function(ctx, orderSetByScript)
+    local newCommander = ctx.newCommander
+    local oldCommander = ctx.oldCommander
+    local oldCommanderParent = ctx.parent
+    local defaultOrderSnapshot = ctx.snapshot
+
+    if orderSetByScript then
+        applyFleetName(newCommander, ctx.originalFleetName)
+    else
+        -- 1) Make clicked ship commander first.
+        C.RemoveCommander2(newCommander)
+        debugLog(string.format("[GT Promote] Detached promoted ship=%s from commander=%s", tostring(newCommander), tostring(oldCommander)))
+        logFleetSnapshot("POST_DETACH_OLD_COMMANDER_TREE", oldCommander)
+        logFleetSnapshot("POST_DETACH_NEW_COMMANDER_TREE", newCommander)
+
+        -- Prime promoted commander with captured commander default order as early as possible.
+        applyCapturedDefaultOrder(newCommander, defaultOrderSnapshot)
+        applyFleetName(newCommander, ctx.originalFleetName)
+
+        -- If old commander was attached to a parent, attach promoted commander immediately.
+        -- This avoids a detached-fleet window where promoted fleets temporarily lose their attachment.
+        if oldCommanderParent and oldCommanderParent ~= 0 and oldCommanderParent ~= newCommander then
+            local attached = orderAssignCommander(newCommander, oldCommanderParent, ctx.parentAssign, ctx.parentGroup, false)
+            debugLog(string.format(
+                "[GT Promote] Promoted commander parent attach ship=%s parent=%s assignment=%s group=%s ok=%s cancelOrders=false",
+                formatComponentRef(newCommander),
+                formatComponentRef(oldCommanderParent),
+                tostring(ctx.parentAssign),
+                tostring(ctx.parentGroup),
+                tostring(attached)
+            ))
+            if not attached then
+                enqueuePromotedCommanderAttach(newCommander, oldCommanderParent, ctx.parentAssign, ctx.parentGroup)
+            end
         end
     end
     logFleetSnapshot("POST_INITIAL_DEFAULT_APPLY_NEW_COMMANDER_TREE", newCommander)
@@ -983,7 +1039,7 @@ local function promoteSubordinateToCommander(subordinateComponent)
     -- 2) Reassign all former subordinate ships directly under new commander (flatten tree),
     --    paced one-by-one in onUpdate to avoid burst race conditions.
     local entries = {}
-    for _, shipEntry in ipairs(fleetShips) do
+    for _, shipEntry in ipairs(ctx.fleetShips) do
         local ship = asComponentId(shipEntry)
         if ship and ship ~= 0 and ship ~= newCommander and ship ~= oldCommander and C.IsComponentClass(ship, "controllable") then
             local assignment, group = GetComponentData(ship, "assignment", "subordinategroup")
@@ -1000,14 +1056,15 @@ local function promoteSubordinateToCommander(subordinateComponent)
         oldCommander = oldCommander,
         entries = entries,
         index = 1,
-        moved = moved,
-        failed = failed,
+        moved = ctx.moved,
+        failed = ctx.failed,
         delayFrames = 0,
-        promotedAssign = promotedAssign,
-        promotedGroup = promotedGroup,
+        promotedAssign = ctx.promotedAssign,
+        promotedGroup = ctx.promotedGroup,
         defaultOrderSnapshot = defaultOrderSnapshot,
+        orderSetByScript = orderSetByScript,
         issuedShips = {},
-        originalFleetName = originalFleetName,
+        originalFleetName = ctx.originalFleetName,
     }
     debugLog(string.format(
         "[GT Promote] Sequential subordinate reassignment queued commander=%s old=%s ships=%d paceFrames=%d",
@@ -1020,6 +1077,20 @@ end
 
 RegisterEvent("gt.openPromoteContext", function(_, subordinateComponent)
     promoteSubordinateToCommander(subordinateComponent)
+end)
+
+RegisterEvent("gt.promoteStationStepDone", function(_, shipComponent)
+    local ship = asComponentId(shipComponent)
+    local ctx = ship and pendingStationPromote[tostring(ship)] or nil
+    if not ctx then
+        return
+    end
+    pendingStationPromote[tostring(ship)] = nil
+    local done = getDefaultOrderId(ship) == ctx.snapshot.orderId and isShipAssignedToCommander(ship, ctx.parent)
+    if not done then
+        DebugError(string.format("[GT Promote] Station step did not apply ship=%s order=%s default=%s - using order apply and AssignCommander", formatComponentRef(ship), tostring(ctx.snapshot.orderId), tostring(getDefaultOrderId(ship))))
+    end
+    continuePromotion(ctx, done)
 end)
 
 local function onUpdate()

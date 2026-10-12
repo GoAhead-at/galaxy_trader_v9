@@ -87,7 +87,7 @@ local pendingOldCommanderReattach = {}
 local pendingPromotedCommanderAttach = {}
 local pendingPromotionReassign = {}
 local pendingStationPromote = {}
--- Orders GT_PromoteStationStep (gt_context_diagnose.xml) can copy onto the promoted ship.
+-- Orders GT_PromoteStationStep (md/gt_context_promote.xml) can copy onto the promoted ship.
 local stationStepOrderIds = {
     GalaxyMiner = true,
     GalaxyTraderMK1 = true,

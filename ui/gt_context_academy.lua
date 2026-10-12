@@ -53,8 +53,7 @@ local SHIPS_SELECTED_TEXT_ID       = 9925
 local ELIGIBLE_SHIPS_TEXT_ID       = 9926
 local NO_ELIGIBLE_SHIPS_TEXT_ID    = 9928
 
-local originalCreateContextFrame  = menu.createContextFrame
-local originalRefreshContextFrame = menu.refreshContextFrame
+local ACADEMY_CALLBACK_ID = "galaxytrader_academy"
 
 -- ---------------------------------------------------------------------------
 -- Local helpers
@@ -430,60 +429,29 @@ function menu.openGTAcademyContext(component)
     menu.refreshContextFrame()
 end
 
-menu.createContextFrame = function(width, height, xoffset, yoffset, noborder, startanimation, ...)
-    if menu.contextMenuMode == "gt_academy" then
-        local mousepos = C.GetCenteredMousePos()
-        menu.contextMenuData = menu.contextMenuData or {}
-        menu.contextMenuData.xoffset = xoffset or (mousepos.x + Helper.viewWidth / 2)
-        menu.contextMenuData.yoffset = yoffset or (mousepos.y + Helper.viewHeight / 2)
-        menu.contextMenuData.width   = width or Helper.scaleX(MENU_WIDTH)
-
-        if menu.contextMenuData.xoffset + menu.contextMenuData.width > Helper.viewWidth then
-            menu.contextMenuData.xoffset = Helper.viewWidth - menu.contextMenuData.width - Helper.frameBorder
-        end
-
-        local contextLayer = 2
-        Helper.removeAllWidgetScripts(menu, contextLayer)
-
-        menu.contextFrame = Helper.createFrameHandle(menu, {
-            x        = menu.contextMenuData.xoffset - (noborder and 0 or 2 * Helper.borderSize),
-            y        = menu.contextMenuData.yoffset,
-            width    = menu.contextMenuData.width + (noborder and 0 or 2 * Helper.borderSize),
-            layer    = contextLayer,
-            standardButtons       = { close = true },
-            closeOnUnhandledClick = true,
-            startAnimation        = startanimation,
-        })
-        menu.contextFrame:setBackground("solid", { color = GT_UI.COLORS.frameBg })
-
-        menu.createGTAcademyContext(menu.contextFrame)
-
-        menu.contextFrame.properties.height = math.min(
-            Helper.viewHeight - menu.contextFrame.properties.y,
-            menu.contextFrame:getUsedHeight() + Helper.borderSize
-        )
-
-        return menu.contextFrame
-    end
-
-    if originalCreateContextFrame then
-        return originalCreateContextFrame(width, height, xoffset, yoffset, noborder, startanimation, ...)
-    end
+local function finishGTAcademyFrame(frame)
+    frame:setBackground("solid", { color = GT_UI.COLORS.frameBg })
+    menu.createGTAcademyContext(frame)
+    frame.properties.height = math.min(
+        Helper.viewHeight - frame.properties.y,
+        frame:getUsedHeight() + Helper.borderSize
+    )
 end
 
-menu.refreshContextFrame = function(setrow, setcol, noborder, ...)
-    if menu.contextMenuMode == "gt_academy" then
-        local contextLayer = 2
-        Helper.removeAllWidgetScripts(menu, contextLayer)
-        if menu.contextFrame then
-            menu.contextFrame:display()
-        end
-        return
+local function onGTAcademyContextMode(frame, mode)
+    if mode ~= "gt_academy" then
+        return false
     end
+    finishGTAcademyFrame(frame or menu.contextFrame)
+    return true
+end
 
-    if originalRefreshContextFrame then
-        originalRefreshContextFrame(setrow, setcol, noborder, ...)
-    end
+if menu.registerCallback then
+    menu.registerCallback("createContextFrame_on_custom_mode", onGTAcademyContextMode, ACADEMY_CALLBACK_ID)
+    menu.registerCallback("refreshContextFrame_on_custom_mode", onGTAcademyContextMode, ACADEMY_CALLBACK_ID)
+    DebugError("[GT Academy] UIX callbacks registered")
+else
+    DebugError("[GT Academy] MapMenu.registerCallback missing")
 end
 
 RegisterEvent("gt.openAcademyContext", function(_, component)

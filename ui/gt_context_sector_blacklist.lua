@@ -304,28 +304,20 @@ function gtSectorBL.requestClearOrphans()
     SignalObject(playerSignalId, "gt_sector_bl_clear_orphans")
 end
 
--- Keep MapMenu from wiping our custom context frame (same pattern as ship diagnose).
-local origCreateCtx = menu.createContextFrame
-menu.createContextFrame = function(width, height, xoffset, yoffset, noborder, startanimation, ...)
-    if menu.contextMenuMode == "gt_sector_blacklist" then
-        return menu.contextFrame
+local function onGTSectorBlacklistContextMode(frame, mode)
+    if mode ~= "gt_sector_blacklist" then
+        return false
     end
-    if origCreateCtx then
-        return origCreateCtx(width, height, xoffset, yoffset, noborder, startanimation, ...)
-    end
+    gtSectorBL.createAndDisplayFrame()
+    return true
 end
 
-local origRefreshCtx = menu.refreshContextFrame
-menu.refreshContextFrame = function(setrow, setcol, noborder, ...)
-    if menu.contextMenuMode == "gt_sector_blacklist" then
-        if menu.contextFrame then
-            menu.contextFrame:display()
-        end
-        return
-    end
-    if origRefreshCtx then
-        origRefreshCtx(setrow, setcol, noborder, ...)
-    end
+if menu.registerCallback then
+    menu.registerCallback("createContextFrame_on_custom_mode", onGTSectorBlacklistContextMode, "galaxytrader_sector_blacklist")
+    menu.registerCallback("refreshContextFrame_on_custom_mode", onGTSectorBlacklistContextMode, "galaxytrader_sector_blacklist")
+    DebugError("[GT SectorBL] UIX callbacks registered")
+else
+    DebugError("[GT SectorBL] MapMenu.registerCallback missing")
 end
 
 RegisterEvent("gt.openSectorBlacklistReport", function(_, component)

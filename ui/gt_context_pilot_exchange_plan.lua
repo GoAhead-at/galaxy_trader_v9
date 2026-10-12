@@ -30,9 +30,8 @@ local CONTEXT_LAYER = 2
 local MAX_FRAME_HEIGHT_RATIO = 0.75
 local MAX_FRAME_HEIGHT_CAP = 860
 
-local originalCreateContextFrame = menu.createContextFrame
-local originalRefreshContextFrame = menu.refreshContextFrame
 local originalCloseContextMenu = menu.closeContextMenu
+local PLAN_CALLBACK_ID = "galaxytrader_pilot_exchange"
 local overlayClosing = false
 
 local function debugLog(msg)
@@ -270,55 +269,29 @@ function menu.openGTPilotExchangePlanContext(plan)
     return true
 end
 
-menu.createContextFrame = function(width, height, xoffset, yoffset, noborder, startanimation, ...)
-    if menu.contextMenuMode == "gt_pilot_exchange_plan" then
-        local mousepos = C.GetCenteredMousePos()
-        menu.contextMenuData = menu.contextMenuData or {}
-        menu.contextMenuData.xoffset = xoffset or (mousepos.x + Helper.viewWidth / 2)
-        menu.contextMenuData.yoffset = yoffset or (mousepos.y + Helper.viewHeight / 2)
-        menu.contextMenuData.width = width or Helper.scaleX(MENU_WIDTH)
-
-        if menu.contextMenuData.xoffset + menu.contextMenuData.width > Helper.viewWidth then
-            menu.contextMenuData.xoffset = Helper.viewWidth - menu.contextMenuData.width - Helper.frameBorder
-        end
-
-        Helper.removeAllWidgetScripts(menu, CONTEXT_LAYER)
-        Helper.clearFrame(menu, CONTEXT_LAYER)
-
-        local frameHeight = menu.contextMenuData.frameHeight
-            or math.min(Helper.viewHeight * MAX_FRAME_HEIGHT_RATIO, Helper.scaleY(MAX_FRAME_HEIGHT_CAP))
-        menu.contextFrame = Helper.createFrameHandle(menu, {
-            x = menu.contextMenuData.xoffset - (noborder and 0 or 2 * Helper.borderSize),
-            y = menu.contextMenuData.yoffset,
-            width = menu.contextMenuData.width + (noborder and 0 or 2 * Helper.borderSize),
-            height = frameHeight + (noborder and 0 or 2 * Helper.borderSize),
-            layer = CONTEXT_LAYER,
-            standardButtons = { close = true },
-            closeOnUnhandledClick = false,
-            startAnimation = startanimation,
-        })
-        menu.contextFrame:setBackground("solid", { color = GT_UI.COLORS.frameBg })
-
-        menu.populateGTPilotExchangePlanContext(menu.contextFrame)
-        return menu.contextFrame
-    end
-
-    if originalCreateContextFrame then
-        return originalCreateContextFrame(width, height, xoffset, yoffset, noborder, startanimation, ...)
-    end
+local function finishGTPlanFrame(frame)
+    local frameHeight = menu.contextMenuData.frameHeight
+        or math.min(Helper.viewHeight * MAX_FRAME_HEIGHT_RATIO, Helper.scaleY(MAX_FRAME_HEIGHT_CAP))
+    frame:setBackground("solid", { color = GT_UI.COLORS.frameBg })
+    frame.properties.closeOnUnhandledClick = false
+    frame.properties.height = frameHeight + (2 * Helper.borderSize)
+    menu.populateGTPilotExchangePlanContext(frame)
 end
 
-menu.refreshContextFrame = function(setrow, setcol, noborder, ...)
-    if menu.contextMenuMode == "gt_pilot_exchange_plan" then
-        Helper.removeAllWidgetScripts(menu, CONTEXT_LAYER)
-        if menu.contextFrame then
-            menu.contextFrame:display()
-        end
-        return
+local function onGTPlanContextMode(frame, mode)
+    if mode ~= "gt_pilot_exchange_plan" then
+        return false
     end
-    if originalRefreshContextFrame then
-        return originalRefreshContextFrame(setrow, setcol, noborder, ...)
-    end
+    finishGTPlanFrame(frame or menu.contextFrame)
+    return true
+end
+
+if menu.registerCallback then
+    menu.registerCallback("createContextFrame_on_custom_mode", onGTPlanContextMode, PLAN_CALLBACK_ID)
+    menu.registerCallback("refreshContextFrame_on_custom_mode", onGTPlanContextMode, PLAN_CALLBACK_ID)
+    DebugError("[GT PilotExchange Plan] UIX callbacks registered")
+else
+    DebugError("[GT PilotExchange Plan] MapMenu.registerCallback missing")
 end
 
 menu.closeContextMenu = function(dueToClose, ...)

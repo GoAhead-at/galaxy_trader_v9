@@ -263,23 +263,19 @@ end
 
 local function installCrewHighlightUpdateGuard()
     local menu = resolveMapMenu()
-    if not menu then
+    if not menu or menu.__gtCrewHighlightUpdateGuardInstalled then
         return
     end
-    if menu.__gtCrewHighlightUpdateGuardInstalled then
-        return
-    end
-    if type(menu.update) ~= "function" then
+    if not menu.registerCallback then
+        logRecolor("MapMenu.registerCallback missing - crew highlight will not reinstall")
         return
     end
 
-    local originalUpdate = menu.update
-    menu.update = function(...)
+    menu.registerCallback("onUpdate_on_end", function()
         installCrewHighlightHook()
-        return originalUpdate(...)
-    end
+    end, "galaxytrader_crew")
     menu.__gtCrewHighlightUpdateGuardInstalled = true
-    logRecolor("MapMenu update guard installed")
+    logRecolor("MapMenu onUpdate_on_end crew guard registered")
 end
 
 installCrewHighlightHook()

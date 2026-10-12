@@ -26,11 +26,8 @@ if not (_G.GT_PlayerBridge and _G.GT_PlayerBridge.GetPlayerBlackboardId and _G.G
     return
 end
 
--- Store original functions
-local originalCreateContextFrame = menu.createContextFrame
-local originalRefreshContextFrame = menu.refreshContextFrame
-local originalUpdate = menu.update
 local originalButtonRenameConfirm = menu.buttonRenameConfirm
+local RENAME_CALLBACK_ID = "galaxytrader_rename"
 
 -- GT Rename Context Menu Handler
 local gtRenameContext = {}
@@ -154,93 +151,33 @@ function menu.buttonGTRenameConfirm(isconfirmed)
     return true
 end
 
--- Hook into createContextFrame to add support for "gt_rename" mode
--- Following vanilla pattern: createContextFrame creates frame, refreshContextFrame populates and displays
-menu.createContextFrame = function(width, height, xoffset, yoffset, noborder, startanimation, ...)
-    -- Check if we're creating our rename context
-    if menu.contextMenuMode == "gt_rename" then
-        -- Use same pattern as vanilla - create the frame handle immediately
-        -- refreshContextFrame will populate it with content
-        
-        -- Set up data
-        local mousepos = C.GetCenteredMousePos()
-        menu.contextMenuData = menu.contextMenuData or {}
-        menu.contextMenuData.xoffset = xoffset or (mousepos.x + Helper.viewWidth / 2)
-        menu.contextMenuData.yoffset = yoffset or (mousepos.y + Helper.viewHeight / 2)
-        menu.contextMenuData.width = width or Helper.scaleX(400)
-        
-        -- Adjust position if needed
-        if menu.contextMenuData.xoffset + menu.contextMenuData.width > Helper.viewWidth then
-            menu.contextMenuData.xoffset = Helper.viewWidth - menu.contextMenuData.width - Helper.frameBorder
-        end
-        
-        -- CRITICAL: Create frame handle immediately (like vanilla does)
-        -- Use standard contextFrameLayer (2) - context menus render on top regardless of layer
-        local contextLayer = 2
-        Helper.removeAllWidgetScripts(menu, contextLayer)
-        
-        menu.contextFrame = Helper.createFrameHandle(menu, {
-            x = menu.contextMenuData.xoffset - (noborder and 0 or 2 * Helper.borderSize),
-            y = menu.contextMenuData.yoffset,
-            width = menu.contextMenuData.width + (noborder and 0 or 2 * Helper.borderSize),
-            layer = contextLayer,
-            standardButtons = { close = true },
-            closeOnUnhandledClick = true,
-            startAnimation = startanimation,
-        })
-        menu.contextFrame:setBackground("solid", { color = Color["frame_background_semitransparent"] })
-        
-        -- CRITICAL: Populate frame content immediately (like vanilla does)
-        menu.createGTRenameContext(menu.contextFrame)
-        
-        -- Adjust frame height
-        menu.contextFrame.properties.height = math.min(Helper.viewHeight - menu.contextFrame.properties.y, menu.contextFrame:getUsedHeight() + Helper.borderSize)
-        
-        return menu.contextFrame
-    end
-    
-    -- Call original for other contexts
-    if originalCreateContextFrame then
-        return originalCreateContextFrame(width, height, xoffset, yoffset, noborder, startanimation, ...)
-    end
+-- Vanilla creates the frame, then these callbacks fill gt_rename and return true
+-- so the vanilla mode chain is skipped. Vanilla displays afterwards.
+local function finishGTRenameFrame(frame)
+    menu.createGTRenameContext(frame)
+    frame.properties.height = math.min(Helper.viewHeight - frame.properties.y, frame:getUsedHeight() + Helper.borderSize)
 end
 
--- Hook into refreshContextFrame to handle our rename mode AND add button to vanilla rename context
-menu.refreshContextFrame = function(setrow, setcol, noborder, ...)
-    -- Handle our rename mode BEFORE calling original (so we can override)
-    if menu.contextMenuMode == "gt_rename" then
-        -- CRITICAL: Remove widget scripts first (like vanilla does)
-        local contextLayer = 2
-        Helper.removeAllWidgetScripts(menu, contextLayer)
-        
-        -- Frame was already created and populated in createContextFrame
-        -- refreshContextFrame just needs to display it (like vanilla does)
-        if menu.contextFrame then
-            menu.contextFrame:display()
-        end
-        return
+local function onGTRenameContextMode(frame, mode)
+    if mode ~= "gt_rename" then
+        return false
     end
-    
-    -- Call original for other contexts
-    if originalRefreshContextFrame then
-        originalRefreshContextFrame(setrow, setcol, noborder, ...)
-    end
-    
-    -- DO NOT add button to vanilla rename context - user wants to keep vanilla rename untouched
+    finishGTRenameFrame(frame or menu.contextFrame)
+    return true
 end
 
--- Hook into update to activate edit box after context menu is shown
-menu.update = function(...)
-    -- Call original update first
-    if originalUpdate then
-        originalUpdate(...)
-    end
-    
-    -- Activate edit box if we have one pending (following vanilla pattern)
-    if menu.contextMenuData and menu.contextMenuData.nameEditBox then
-        ActivateEditBox(menu.contextMenuData.nameEditBox.id)
-        menu.contextMenuData.nameEditBox = nil
-    end
+if menu.registerCallback then
+    menu.registerCallback("createContextFrame_on_custom_mode", onGTRenameContextMode, RENAME_CALLBACK_ID)
+    menu.registerCallback("refreshContextFrame_on_custom_mode", onGTRenameContextMode, RENAME_CALLBACK_ID)
+    menu.registerCallback("onUpdate_on_end", function()
+        if menu.contextMenuData and menu.contextMenuData.nameEditBox then
+            ActivateEditBox(menu.contextMenuData.nameEditBox.id)
+            menu.contextMenuData.nameEditBox = nil
+        end
+    end, RENAME_CALLBACK_ID)
+    DebugError("[GT Context Rename] UIX callbacks registered")
+else
+    DebugError("[GT Context Rename] MapMenu.registerCallback missing")
 end
 
 -- Function to open GT Rename context menu (can be called from anywhere)

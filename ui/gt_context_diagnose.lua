@@ -657,27 +657,20 @@ end
 -- MENU HOOKS
 -- =============================================================================
 
-local origCreateCtx = menu.createContextFrame
-menu.createContextFrame = function(width, height, xoffset, yoffset, noborder, startanimation, ...)
-    if menu.contextMenuMode == "gt_diagnose" then
-        return menu.contextFrame
+local function onGTDiagnoseContextMode(frame, mode)
+    if mode ~= "gt_diagnose" then
+        return false
     end
-    if origCreateCtx then
-        return origCreateCtx(width, height, xoffset, yoffset, noborder, startanimation, ...)
-    end
+    gtDiagnose.createAndDisplayFrame()
+    return true
 end
 
-local origRefreshCtx = menu.refreshContextFrame
-menu.refreshContextFrame = function(setrow, setcol, noborder, ...)
-    if menu.contextMenuMode == "gt_diagnose" then
-        if menu.contextFrame then
-            menu.contextFrame:display()
-        end
-        return
-    end
-    if origRefreshCtx then
-        origRefreshCtx(setrow, setcol, noborder, ...)
-    end
+if menu.registerCallback then
+    menu.registerCallback("createContextFrame_on_custom_mode", onGTDiagnoseContextMode, "galaxytrader_diagnose")
+    menu.registerCallback("refreshContextFrame_on_custom_mode", onGTDiagnoseContextMode, "galaxytrader_diagnose")
+    DebugError("[GT Diagnose] UIX callbacks registered")
+else
+    DebugError("[GT Diagnose] MapMenu.registerCallback missing")
 end
 
 -- =============================================================================

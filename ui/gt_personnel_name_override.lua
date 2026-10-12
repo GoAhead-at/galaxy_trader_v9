@@ -117,17 +117,17 @@ local function install()
         return
     end
 
-    if type(menu.getEmployeeList) == "function" then
-        local original = menu.getEmployeeList
-        menu.getEmployeeList = function(...)
-            local result = original(...)
+    if menu.registerCallback then
+        menu.registerCallback("getEmployeeList_on_end", function()
             applyPersonnelTaggedNames(menu)
-            return result
-        end
+        end, "galaxytrader_personnel")
+    else
+        DebugError("[GT Personnel Name Override] PlayerInfoMenu.registerCallback missing")
+        return
     end
 
     menu.__gtPersonnelNameOverrideInstalled = true
-    DebugError("[GT Personnel Name Override] PlayerInfoMenu hook installed")
+    DebugError("[GT Personnel Name Override] UIX callback registered")
 end
 
 install()

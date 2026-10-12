@@ -135,27 +135,20 @@ local function createFrame()
     menu.contextFrame:display()
 end
 
-local origCreateCtx = menu.createContextFrame
-menu.createContextFrame = function(width, height, xoffset, yoffset, noborder, startanimation, ...)
-    if menu.contextMenuMode == "gt_mk3_faction_blacklist" then
-        return menu.contextFrame
+local function onGTFactionBlacklistContextMode(frame, mode)
+    if mode ~= "gt_mk3_faction_blacklist" then
+        return false
     end
-    if origCreateCtx then
-        return origCreateCtx(width, height, xoffset, yoffset, noborder, startanimation, ...)
-    end
+    createFrame()
+    return true
 end
 
-local origRefreshCtx = menu.refreshContextFrame
-menu.refreshContextFrame = function(setrow, setcol, noborder, ...)
-    if menu.contextMenuMode == "gt_mk3_faction_blacklist" then
-        if menu.contextFrame then
-            menu.contextFrame:display()
-        end
-        return
-    end
-    if origRefreshCtx then
-        origRefreshCtx(setrow, setcol, noborder, ...)
-    end
+if menu.registerCallback then
+    menu.registerCallback("createContextFrame_on_custom_mode", onGTFactionBlacklistContextMode, "galaxytrader_faction_blacklist")
+    menu.registerCallback("refreshContextFrame_on_custom_mode", onGTFactionBlacklistContextMode, "galaxytrader_faction_blacklist")
+    DebugError("[GT MK3 FactionBlacklist] UIX callbacks registered")
+else
+    DebugError("[GT MK3 FactionBlacklist] MapMenu.registerCallback missing")
 end
 
 RegisterEvent("gt.openMK3FactionBlacklist", function()

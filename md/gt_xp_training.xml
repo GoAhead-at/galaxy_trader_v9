@@ -21,6 +21,38 @@
         </do_if>
       </actions>
     </cue>
+
+    <!-- Level 15 is the last rank (SkillThresholds.15). XP above that threshold does not
+         raise the rank, so awards stop at the threshold and a trade that would cross it
+         lands on it. Pilots held below 15 by a training gate are unchanged until an award. -->
+    <library name="GT_CapPilotXPAtMaxLevel" purpose="run_actions">
+      <params>
+        <param name="currentXP"/>
+        <param name="addAmount" default="0"/>
+      </params>
+      <actions>
+        <set_value name="$cap" exact="null"/>
+        <do_if value="global.$GT_Config? and global.$GT_Config.$XP? and global.$GT_Config.$XP.$SkillThresholds? and global.$GT_Config.$XP.$SkillThresholds.{15}?">
+          <set_value name="$cap" exact="global.$GT_Config.$XP.$SkillThresholds.{15}"/>
+        </do_if>
+        <set_value name="$awarded" exact="$addAmount"/>
+        <set_value name="$xp" exact="$currentXP + $addAmount"/>
+        <set_value name="$atCap" exact="false"/>
+        <do_if value="$cap != null">
+          <do_if value="$currentXP ge $cap">
+            <set_value name="$awarded" exact="0"/>
+            <set_value name="$xp" exact="$cap"/>
+            <set_value name="$atCap" exact="true"/>
+          </do_if>
+          <do_elseif value="$xp gt $cap">
+            <set_value name="$awarded" exact="$cap - $currentXP"/>
+            <set_value name="$xp" exact="$cap"/>
+            <set_value name="$atCap" exact="true"/>
+          </do_elseif>
+        </do_if>
+        <return value="table[$XP = $xp, $Awarded = $awarded, $AtCap = $atCap]"/>
+      </actions>
+    </library>
     
     <!-- Trading Academy / in-flight training save/load recovery.
          Re-dispatch DockAndTrain when enrollment or an active timer persists
@@ -33,6 +65,31 @@
       </conditions>
       <delay exact="2s"/>
       <actions>
+        <!-- Level 15 pilots already past the threshold keep that rank and drop the extra XP. -->
+        <do_if value="global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0 and global.$GT_Config? and global.$GT_Config.$XP? and global.$GT_Config.$XP.$SkillThresholds? and global.$GT_Config.$XP.$SkillThresholds.{15}?">
+          <set_value name="$xpLevelCap" exact="global.$GT_Config.$XP.$SkillThresholds.{15}"/>
+          <do_all exact="global.$GT_Pilots.keys.count" counter="$xci">
+            <set_value name="$xcpilot" exact="global.$GT_Pilots.keys.{$xci}"/>
+            <do_if value="global.$GT_Pilots.{$xcpilot}.$XP? and global.$GT_Pilots.{$xcpilot}.$XP gt $xpLevelCap">
+              <set_value name="$xcLevel" exact="if global.$GT_Pilots.{$xcpilot}.$Level? then global.$GT_Pilots.{$xcpilot}.$Level else 15"/>
+              <do_if value="$xcLevel ge 15">
+                <set_value name="global.$GT_Pilots.{$xcpilot}.$XP" exact="$xpLevelCap"/>
+                <set_value name="global.$GT_Pilots.{$xcpilot}.$Level" exact="15"/>
+                <remove_value name="global.$GT_Pilots.{$xcpilot}.$BlockedXPPending"/>
+                <do_if value="global.$GT_Pilots.{$xcpilot}.$Ship? and global.$GT_Pilots.{$xcpilot}.$Ship.exists and global.$GT_Pilots.{$xcpilot}.$Ship.pilot? and global.$GT_Pilots.{$xcpilot}.$Ship.pilot == $xcpilot">
+                  <run_actions ref="md.GT_Ship_Management.Update_Ship_Name">
+                    <param name="ship" value="global.$GT_Pilots.{$xcpilot}.$Ship"/>
+                    <param name="pilot" value="$xcpilot"/>
+                    <param name="xp" value="$xpLevelCap"/>
+                    <param name="level" value="15"/>
+                    <param name="nameType" value="'trader'"/>
+                  </run_actions>
+                </do_if>
+              </do_if>
+            </do_if>
+          </do_all>
+        </do_if>
+
         <!-- Stale DockAndTrain sanitizer: saved destination refs can resolve to
              component.{0x0L} after load; cancel and re-queue station search. -->
         <do_if value="global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
@@ -454,7 +511,18 @@
             <param name="ship" value="$ship"/>
             <param name="respect_hard_force" value="true"/>
           </run_actions>
-          <do_if value="$pilotTrainingGate.$XPGainBlocked">
+          <run_actions ref="GT_CapPilotXPAtMaxLevel" result="$xpCap">
+            <param name="currentXP" value="$currentXP"/>
+            <param name="addAmount" value="$amount"/>
+          </run_actions>
+          <do_if value="$xpCap.$AtCap and $xpCap.$Awarded == 0">
+            <set_value name="global.$GT_Pilots.{$pilot}.$XP" exact="$xpCap.$XP"/>
+            <remove_value name="global.$GT_Pilots.{$pilot}.$BlockedXPPending"/>
+            <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+              <debug_text text="'[GalaxyTrader MK3] (' + $ship.idcode + ') XP gain skipped for pilot ' + $pilot.name + ' - already at level 15 cap (' + $xpCap.$XP + ' XP)'" chance="100"/>
+            </do_if>
+          </do_if>
+          <do_elseif value="$pilotTrainingGate.$XPGainBlocked">
             <set_value name="$blockedLevel" exact="$pilotTrainingGate.$BlockedLevel"/>
             <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
               <debug_text text="'[GalaxyTrader MK3] (' + $ship.idcode + ')   XP gain blocked for pilot ' + $pilot.name + ' - training required at skill level ' + $blockedLevel + ' (attempted award: ' + $amount + ' XP)'" chance="100"/>
@@ -483,10 +551,11 @@
               </run_actions>
               
             </do_if>-->
-          </do_if>
+          </do_elseif>
           <do_else>
-            <!-- Add XP -->
-            <set_value name="$newXP" exact="$currentXP + $amount"/>
+            <!-- Add XP, stopping at the level 15 threshold. -->
+            <set_value name="$amount" exact="$xpCap.$Awarded"/>
+            <set_value name="$newXP" exact="$xpCap.$XP"/>
             <set_value name="global.$GT_Pilots.{$pilot}.$XP" exact="$newXP"/>
             <set_value name="global.$GT_SessionStats.$XPGained" exact="global.$GT_SessionStats.$XPGained + $amount"/>
             
@@ -559,7 +628,13 @@
                 <!-- Award bonus XP if not blocked and bonus > 0 -->
                 <do_if value="not $commanderXPBlocked and $commanderBonusXP gt 0">
                   <set_value name="$commanderCurrentXP" exact="global.$GT_Pilots.{$commanderPilot}.$XP"/>
-                  <set_value name="$commanderNewXP" exact="$commanderCurrentXP + $commanderBonusXP"/>
+                  <run_actions ref="GT_CapPilotXPAtMaxLevel" result="$commanderCap">
+                    <param name="currentXP" value="$commanderCurrentXP"/>
+                    <param name="addAmount" value="$commanderBonusXP"/>
+                  </run_actions>
+                  <do_if value="$commanderCap.$Awarded gt 0">
+                  <set_value name="$commanderBonusXP" exact="$commanderCap.$Awarded"/>
+                  <set_value name="$commanderNewXP" exact="$commanderCap.$XP"/>
                   <set_value name="global.$GT_Pilots.{$commanderPilot}.$XP" exact="$commanderNewXP"/>
                   <set_value name="global.$GT_SessionStats.$XPGained" exact="global.$GT_SessionStats.$XPGained + $commanderBonusXP"/>
                   
@@ -604,6 +679,11 @@
                       <param name="nameType" value="'trader'"/>
                     </run_actions>
                   </do_else>
+                  </do_if>
+                  <do_elseif value="$commanderCap.$AtCap">
+                    <set_value name="global.$GT_Pilots.{$commanderPilot}.$XP" exact="$commanderCap.$XP"/>
+                    <remove_value name="global.$GT_Pilots.{$commanderPilot}.$BlockedXPPending"/>
+                  </do_elseif>
                 </do_if>
                 <do_else>
                   <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
@@ -1277,9 +1357,14 @@
                     <debug_text text="'[GalaxyTrader MK3] (' + $ship.idcode + ') Awarding blocked XP: ' + $blockedXP + ' XP to pilot ' + $pilot.name + ' after training completion'" chance="100"/>
                   </do_if>
                   
-                  <!-- Award the blocked XP immediately -->
+                  <!-- Award the blocked XP immediately, stopping at the level 15 threshold. -->
                   <set_value name="$preTrainingXP" exact="global.$GT_Pilots.{$pilot}.$XP"/>
-                  <set_value name="$newTotalXP" exact="$preTrainingXP + $blockedXP"/>
+                  <run_actions ref="GT_CapPilotXPAtMaxLevel" result="$blockedCap">
+                    <param name="currentXP" value="$preTrainingXP"/>
+                    <param name="addAmount" value="$blockedXP"/>
+                  </run_actions>
+                  <set_value name="$newTotalXP" exact="$blockedCap.$XP"/>
+                  <set_value name="$blockedXP" exact="$blockedCap.$Awarded"/>
                   <set_value name="global.$GT_Pilots.{$pilot}.$XP" exact="$newTotalXP"/>
                   <set_value name="global.$GT_SessionStats.$XPGained" exact="global.$GT_SessionStats.$XPGained + $blockedXP"/>
                   

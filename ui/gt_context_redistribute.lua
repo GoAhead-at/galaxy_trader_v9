@@ -1280,14 +1280,18 @@ function gtShipIsPlayerOccupied(ship)
     return shipId and tostring(shipId) == tostring(occupied)
 end
 
+-- Level shown for a pilot with no GT row, from the vanilla piloting skill (0-100 -> 1-15).
+-- Returns nil when the skill cannot be read, so the caller skips the ship instead of
+-- showing an invented level.
 function gtVanillaPilotLevel(pilot)
     local pilotId = asComponentId(pilot)
     if not pilotId or pilotId == 0 then
-        return 1
+        return nil
     end
     local ok, adjusted = pcall(C.GetEntityCombinedSkill, pilotId, nil, "aipilot")
     if not ok or type(adjusted) ~= "number" then
-        return 1
+        debugLog("gtVanillaPilotLevel: skill read failed pilot=" .. tostring(pilotId) .. " err=" .. tostring(adjusted))
+        return nil
     end
     adjusted = math.floor(adjusted * 15 / 100)
     if adjusted < 1 then
@@ -1299,33 +1303,32 @@ function gtVanillaPilotLevel(pilot)
     return adjusted
 end
 
-function gtSelectedPairIncludesOccupiedShip()
-    local occupied = gtGetPlayerOccupiedShipId()
-    if not occupied then
+function gtAnyShipIsPlayerOccupied(ships)
+    if not ships then
         return false
     end
-    local occupiedKey = tostring(occupied)
-    local function isOccupied(ship)
-        local shipId = asComponentId(ship)
-        return shipId and tostring(shipId) == occupiedKey
+    for _, ship in ipairs(ships) do
+        if gtShipIsPlayerOccupied(ship) then
+            return true
+        end
+    end
+    return false
+end
+
+function gtSelectedPairIncludesOccupiedShip()
+    if not gtGetPlayerOccupiedShipId() then
+        return false
     end
     if menu and menu.selectedcomponents then
         for id, _ in pairs(menu.selectedcomponents) do
             local selectedComponent = ConvertStringTo64Bit(tostring(id))
-            if selectedComponent and selectedComponent ~= 0 and C.IsComponentClass(selectedComponent, "ship") and isOccupied(selectedComponent) then
+            if selectedComponent and selectedComponent ~= 0 and C.IsComponentClass(selectedComponent, "ship") and gtShipIsPlayerOccupied(selectedComponent) then
                 return true
             end
         end
     end
     local interactMenu = Helper.getMenu("InteractMenu")
-    if interactMenu and interactMenu.selectedplayerships then
-        for _, ship in ipairs(interactMenu.selectedplayerships) do
-            if isOccupied(ship) then
-                return true
-            end
-        end
-    end
-    return false
+    return interactMenu and gtAnyShipIsPlayerOccupied(interactMenu.selectedplayerships) or false
 end
 
 local function pilotDataIndicatesBlocked(pilotData)
@@ -1461,12 +1464,14 @@ tryAddEligibleGTShip = function(ship, ships, seen, pilotIndex, opts)
         or (order and isGTOrder(order))
         or (order == "Assist" and commanderOrder and isGTOrder(commanderOrder))
     local allowAnyPilot = opts.allowAnyPilot == true
-    -- A GalaxyTrader ship keeps the original acceptance path. The player-owned and
-    -- occupied checks apply only to a ship that is not already in GalaxyTrader service.
-    if allowAnyPilot and not isGTControlled then
-        if not GetComponentData(ship, "isplayerowned") or gtShipIsPlayerOccupied(ship) then
-            return
-        end
+    -- The ship the player is flying never takes part in a pilot exchange.
+    if gtShipIsPlayerOccupied(ship) then
+        return
+    end
+    -- A GalaxyTrader ship keeps the original acceptance path. The player-owned check
+    -- applies only to a ship that is not already in GalaxyTrader service.
+    if allowAnyPilot and not isGTControlled and not GetComponentData(ship, "isplayerowned") then
+        return
     end
     if pilot and (isGTControlled or allowAnyPilot) then
         local rank, size = classRank(ship)
@@ -3457,15 +3462,7 @@ local function collectSelectedShips(fallbackComponent)
     local seen = {}
     local pilotIndex = getGTPilotIndexByShipId()
     local snapshot = gtPendingSelectionShipIds
-    local snapshotOccupied = false
-    if snapshot then
-        for _, ship in ipairs(snapshot) do
-            if gtShipIsPlayerOccupied(ship) then
-                snapshotOccupied = true
-                break
-            end
-        end
-    end
+    local snapshotOccupied = gtAnyShipIsPlayerOccupied(snapshot)
     local exactPair = (snapshot and #snapshot == 2 and not snapshotOccupied)
         or (countRawMapSelectedShips() == 2 and not gtSelectedPairIncludesOccupiedShip())
     local collectOpts = { forPlanDisplay = true, quietReject = true, quietUnavailable = true, allowAnyPilot = exactPair }

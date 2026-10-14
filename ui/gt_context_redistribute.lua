@@ -44,6 +44,7 @@ ffi.cdef[[
     UICrewExchangeResult PerformCrewExchange2(UniverseID controllableid, UniverseID partnercontrollableid, NPCSeed* npcs, uint32_t numnpcs, NPCSeed* partnernpcs, uint32_t numpartnernpcs, NPCSeed captainfromcontainer, NPCSeed captainfrompartner, bool exchangecaptains, bool checkonly);
     bool IsCurrentOrderCritical(UniverseID controllableid);
 ]]
+pcall(ffi.cdef, "UniverseID GetPlayerOccupiedShipID(void);")
 
 local GT_ORDER_IDS = {
     GalaxyTraderMK1 = true,
@@ -156,6 +157,40 @@ local menu = Helper.getMenu("MapMenu")
 local asComponentId
 local tryAddEligibleGTShip
 local resolveSwapShipPair
+
+-- Click-time snapshot. The pilot-data refresh returns after the interact menu closes, and a
+-- Hold Position ship is not a GalaxyTrader order, so a later recount drops the non-GT ship.
+gtPendingSelectionShipIds = nil
+
+function gtGatherSelectedShipIds(triggerComponent)
+    local seen = {}
+    local ids = {}
+    local function addShip(ship)
+        ship = asComponentId(ship)
+        if not ship or ship == 0 or not C.IsComponentClass(ship, "ship") then
+            return
+        end
+        local key = tostring(ship)
+        if seen[key] then
+            return
+        end
+        seen[key] = true
+        table.insert(ids, ship)
+    end
+    if menu and menu.selectedcomponents then
+        for id, _ in pairs(menu.selectedcomponents) do
+            addShip(ConvertStringTo64Bit(tostring(id)))
+        end
+    end
+    local interactMenu = Helper.getMenu("InteractMenu")
+    if interactMenu and interactMenu.selectedplayerships then
+        for _, ship in ipairs(interactMenu.selectedplayerships) do
+            addShip(ship)
+        end
+    end
+    addShip(triggerComponent)
+    return ids
+end
 
 local function countRawMapSelectedShips()
     local seen = {}
@@ -568,6 +603,8 @@ local function publishPostSwapNameRefresh(leftCode, rightCode, leftShip, rightSh
     AddUITriggeredEvent("GT_Redistribute", "PostSwapNameRefresh", {
         left = tostring(leftCode or ""),
         right = tostring(rightCode or ""),
+        leftObj = toMdShipRef(leftShip),
+        rightObj = toMdShipRef(rightShip),
     })
     debugLog("PostSwapNameRefresh emitted left=" .. tostring(leftCode or "")
         .. " right=" .. tostring(rightCode or "")
@@ -1217,6 +1254,75 @@ local function getGTLevelByShip(ship, pilotIndex)
     return nil
 end
 
+function gtGetPlayerOccupiedShipId()
+    local ok, raw = pcall(C.GetPlayerOccupiedShipID)
+    if not ok or not raw then
+        return nil
+    end
+    local occupied = ConvertStringTo64Bit(tostring(raw))
+    if not occupied or occupied == 0 then
+        return nil
+    end
+    return occupied
+end
+
+function gtShipIsPlayerOccupied(ship)
+    local occupied = gtGetPlayerOccupiedShipId()
+    if not occupied then
+        return false
+    end
+    local shipId = asComponentId(ship)
+    return shipId and tostring(shipId) == tostring(occupied)
+end
+
+function gtVanillaPilotLevel(pilot)
+    local pilotId = asComponentId(pilot)
+    if not pilotId or pilotId == 0 then
+        return 1
+    end
+    local ok, adjusted = pcall(C.GetEntityCombinedSkill, pilotId, nil, "aipilot")
+    if not ok or type(adjusted) ~= "number" then
+        return 1
+    end
+    adjusted = math.floor(adjusted * 15 / 100)
+    if adjusted < 1 then
+        return 1
+    end
+    if adjusted > 15 then
+        return 15
+    end
+    return adjusted
+end
+
+function gtSelectedPairIncludesOccupiedShip()
+    local occupied = gtGetPlayerOccupiedShipId()
+    if not occupied then
+        return false
+    end
+    local occupiedKey = tostring(occupied)
+    local function isOccupied(ship)
+        local shipId = asComponentId(ship)
+        return shipId and tostring(shipId) == occupiedKey
+    end
+    if menu and menu.selectedcomponents then
+        for id, _ in pairs(menu.selectedcomponents) do
+            local selectedComponent = ConvertStringTo64Bit(tostring(id))
+            if selectedComponent and selectedComponent ~= 0 and C.IsComponentClass(selectedComponent, "ship") and isOccupied(selectedComponent) then
+                return true
+            end
+        end
+    end
+    local interactMenu = Helper.getMenu("InteractMenu")
+    if interactMenu and interactMenu.selectedplayerships then
+        for _, ship in ipairs(interactMenu.selectedplayerships) do
+            if isOccupied(ship) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 local function pilotDataIndicatesBlocked(pilotData)
     if not pilotData then
         return false, nil
@@ -1349,7 +1455,15 @@ tryAddEligibleGTShip = function(ship, ships, seen, pilotIndex, opts)
     local isGTControlled = isCommander
         or (order and isGTOrder(order))
         or (order == "Assist" and commanderOrder and isGTOrder(commanderOrder))
-    if pilot and isGTControlled then
+    local allowAnyPilot = opts.allowAnyPilot == true
+    -- A GalaxyTrader ship keeps the original acceptance path. The player-owned and
+    -- occupied checks apply only to a ship that is not already in GalaxyTrader service.
+    if allowAnyPilot and not isGTControlled then
+        if not GetComponentData(ship, "isplayerowned") or gtShipIsPlayerOccupied(ship) then
+            return
+        end
+    end
+    if pilot and (isGTControlled or allowAnyPilot) then
         local rank, size = classRank(ship)
         if rank > 0 then
             local pilot64 = ConvertIDTo64Bit(pilot)
@@ -1363,6 +1477,9 @@ tryAddEligibleGTShip = function(ship, ships, seen, pilotIndex, opts)
                 return
             end
             local gtLevel = getGTLevelByShip(ship, pilotIndex)
+            if not gtLevel and allowAnyPilot then
+                gtLevel = gtVanillaPilotLevel(pilot)
+            end
             if gtLevel then
                 local exchangeQueued = unavailable and unavailableReason == "pilot_exchange_queued"
                 local planExcludeReason = (unavailable and not exchangeQueued) and unavailableReason or nil
@@ -1413,12 +1530,19 @@ publishMapSelectionShipCount = function()
     local ships = {}
     local seen = {}
     local pilotIndex = getGTPilotIndexByShipId()
-    local menuOpts = { forPlanDisplay = true, quietReject = true, quietUnavailable = true }
-    appendMapAndInteractSelectedGTShips(ships, seen, pilotIndex, menuOpts)
+    local exactPair = countRawMapSelectedShips() == 2 and not gtSelectedPairIncludesOccupiedShip()
+    local menuOpts = { forPlanDisplay = true, quietReject = true, quietUnavailable = true, allowAnyPilot = exactPair }
+    if countRawMapSelectedShips() ~= 2 or exactPair then
+        appendMapAndInteractSelectedGTShips(ships, seen, pilotIndex, menuOpts)
+    end
     local count = #ships
     local bridge = _G.GT_PlayerBridge or GT_PlayerBridge
     if bridge and bridge.GetPlayerBlackboardId then
+        -- Exact pair is 1 only when the map selection itself is two eligible ships.
+        -- A larger selection that happens to contain two GT ships stays 0, so the
+        -- context menu does not offer the any-pilot exchange on a non-GT ship.
         SetNPCBlackboard(bridge.GetPlayerBlackboardId(), "$GT_PilotExchange_SelectionShipCount", count)
+        SetNPCBlackboard(bridge.GetPlayerBlackboardId(), "$GT_PilotExchange_SelectionExactPair", (exactPair and count == 2) and 1 or 0)
     end
     -- Muted: selection-count publish noise. Set to true to re-enable.
     if false then
@@ -3327,8 +3451,28 @@ local function collectSelectedShips(fallbackComponent)
     local ships = {}
     local seen = {}
     local pilotIndex = getGTPilotIndexByShipId()
-    local collectOpts = { forPlanDisplay = true, quietReject = true, quietUnavailable = true }
-    appendMapAndInteractSelectedGTShips(ships, seen, pilotIndex, collectOpts)
+    local snapshot = gtPendingSelectionShipIds
+    local snapshotOccupied = false
+    if snapshot then
+        for _, ship in ipairs(snapshot) do
+            if gtShipIsPlayerOccupied(ship) then
+                snapshotOccupied = true
+                break
+            end
+        end
+    end
+    local exactPair = (snapshot and #snapshot == 2 and not snapshotOccupied)
+        or (countRawMapSelectedShips() == 2 and not gtSelectedPairIncludesOccupiedShip())
+    local collectOpts = { forPlanDisplay = true, quietReject = true, quietUnavailable = true, allowAnyPilot = exactPair }
+    if snapshot and #snapshot == 2 and not snapshotOccupied then
+        for _, ship in ipairs(snapshot) do
+            tryAddEligibleGTShip(ship, ships, seen, pilotIndex, collectOpts)
+        end
+    end
+    -- Snapshot missed a ship: use the original map/interact collector so a GalaxyTrader pair still resolves.
+    if #ships < 2 then
+        appendMapAndInteractSelectedGTShips(ships, seen, pilotIndex, collectOpts)
+    end
 
     local fallbackId = "none"
     if fallbackComponent then
@@ -3467,6 +3611,7 @@ local function redistributeSelection(triggerComponent)
         planMode = PLAN_MODE.FORCED_PAIR
     end
     pendingSelectionForcedPair = false
+    gtPendingSelectionShipIds = nil
     logPilotExchangeMenu("redistributeSelection rawSelectedCount=" .. tostring(rawSelectedCount)
         .. " eligibleShipCount=" .. tostring(#ships)
         .. " planMode=" .. tostring(planMode))
@@ -3518,7 +3663,8 @@ local function requestFreshPilotDataAndRedistributeSelection(triggerComponent)
     end
 
     pendingRedistributeSelection = trigger
-    pendingSelectionForcedPair = (countRawMapSelectedShips() == 2)
+    gtPendingSelectionShipIds = gtGatherSelectedShipIds(trigger)
+    pendingSelectionForcedPair = gtPendingSelectionShipIds and #gtPendingSelectionShipIds == 2
     pendingRedistributeFleet = false
     pendingPilotExchangeCommanderFleet = nil
     pilotDataRefreshRequestedAt = getElapsedTime()
@@ -3603,6 +3749,7 @@ local function processPendingPilotDataRefreshTimeout()
         debugLog("GT pilot data refresh timeout for pilot exchange")
         pendingRedistributeSelection = false
         pendingSelectionForcedPair = false
+        gtPendingSelectionShipIds = nil
         pendingRedistributeFleet = false
         pendingPilotExchangeCommanderFleet = nil
         pilotDataRefreshRequestedAt = 0

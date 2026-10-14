@@ -413,6 +413,9 @@
       </conditions>
       <actions>
         <set_value name="$ship" exact="event.object"/>
+        <run_actions ref="md.GT_CoreSystem.WatchShipForCrewTransfer">
+          <param name="ship" value="$ship"/>
+        </run_actions>
         
         <!-- Validate ship -->
         <do_if value="$ship.isplayerowned and $ship.primarypurpose == purpose.trade">
@@ -2676,6 +2679,232 @@
       </actions>
     </library>
     
+    <!-- Player ships whose captain chair we watch. PerformCrewExchange2 (Mycu and the
+         vanilla map transfer) does not raise event_player_assigned_hired_actor. -->
+    <library name="EnsureCrewTransferWatchGroup" purpose="run_actions">
+      <actions>
+        <do_if value="not global.$GT_CrewTransferWatchGroup?">
+          <create_group groupname="global.$GT_CrewTransferWatchGroup"/>
+        </do_if>
+      </actions>
+    </library>
+
+    <library name="WatchShipForCrewTransfer" purpose="run_actions">
+      <params>
+        <param name="ship" default="null"/>
+      </params>
+      <actions>
+        <do_if value="$ship? and $ship.exists and $ship.isclass.ship and not $ship.isclass.spacesuit and not @$ship.isunit and not @$ship.isdeployable">
+          <run_actions ref="md.GT_CoreSystem.GT_ShipIsPlayerFleet" result="$watchFleet">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          <do_if value="$watchFleet">
+            <run_actions ref="md.GT_CoreSystem.EnsureCrewTransferWatchGroup"/>
+            <add_to_group groupname="global.$GT_CrewTransferWatchGroup" object="$ship"/>
+          </do_if>
+        </do_if>
+      </actions>
+    </library>
+
+    <cue name="RefreshCrewTransferWatch" instantiate="true">
+      <conditions>
+        <check_any>
+          <event_player_created/>
+          <event_game_loaded/>
+        </check_any>
+      </conditions>
+      <actions>
+        <run_actions ref="md.GT_CoreSystem.EnsureCrewTransferWatchGroup"/>
+        <find_ship name="$watchShips" space="player.galaxy" owner="faction.player" class="[class.ship_s, class.ship_m, class.ship_l, class.ship_xl]" multiple="true" recursive="true"/>
+        <do_if value="$watchShips?">
+          <do_all exact="$watchShips.count" counter="$wi">
+            <run_actions ref="md.GT_CoreSystem.WatchShipForCrewTransfer">
+              <param name="ship" value="$watchShips.{$wi}"/>
+            </run_actions>
+          </do_all>
+        </do_if>
+      </actions>
+    </cue>
+
+    <cue name="WatchClaimedShipForCrewTransfer" instantiate="true">
+      <conditions>
+        <event_player_owned_claimed_object/>
+      </conditions>
+      <actions>
+        <run_actions ref="md.GT_CoreSystem.WatchShipForCrewTransfer">
+          <param name="ship" value="event.param"/>
+        </run_actions>
+      </actions>
+    </cue>
+
+    <!-- Keep XP and the (T:n) tag when a crew transfer seats a new control entity.
+         A seed miss does not open a new level-1 registry row. -->
+    <library name="RebindPilotSeatedByExternalTransfer" purpose="run_actions">
+      <params>
+        <param name="ship"/>
+        <param name="pilot"/>
+      </params>
+      <actions>
+        <do_if value="$ship? and $pilot? and global.$GT_Pilots?">
+        <do_if value="$ship.exists and $pilot.exists">
+          <run_actions ref="md.GT_CoreSystem.DeterminePilotAssignmentHasGTOrder" result="$seatHasGTOrder">
+            <param name="ship" value="$ship"/>
+          </run_actions>
+          <do_if value="global.$GT_Pilots.{$pilot}?">
+            <run_actions ref="md.GT_CoreSystem.SyncPilotShipLinkState">
+              <param name="pilot" value="$pilot"/>
+              <param name="ship" value="$ship"/>
+              <param name="hasGTOrder" value="$seatHasGTOrder"/>
+              <param name="clearPausedFields" value="true"/>
+            </run_actions>
+            <run_actions ref="md.GT_CoreSystem.TryUpdatePilotNameTag">
+              <param name="pilot" value="$pilot"/>
+            </run_actions>
+            <run_actions ref="md.GT_InfoMenu_Loader.Raise_PilotIdMap_For_Registry_Row">
+              <param name="registryKey" value="$pilot"/>
+            </run_actions>
+          </do_if>
+          <do_elseif value="global.$GT_Pilots.keys.count gt 0">
+            <run_actions ref="md.GT_Pilot_Ecosystem.GT_Pilot_Bind_Live" result="$seatBind">
+              <param name="entity" value="$pilot"/>
+              <param name="ship" value="$ship"/>
+              <param name="status" value="'active'"/>
+              <param name="role" value="'captain'"/>
+            </run_actions>
+            <do_if value="$seatBind.$Success? and $seatBind.$Success">
+            <do_if value="$seatBind.$Rebound and global.$GT_Pilots.{$pilot}?">
+              <run_actions ref="md.GT_CoreSystem.SyncPilotShipLinkState">
+                <param name="pilot" value="$pilot"/>
+                <param name="ship" value="$ship"/>
+                <param name="hasGTOrder" value="$seatHasGTOrder"/>
+                <param name="clearPausedFields" value="true"/>
+              </run_actions>
+              <set_value name="$seatXP" exact="if global.$GT_Pilots.{$pilot}.$XP? then global.$GT_Pilots.{$pilot}.$XP else 0"/>
+              <set_value name="$seatLevel" exact="1"/>
+              <do_if value="md.GT_Ship_Management.Calculate_Skill_Level_From_XP?">
+                <run_actions ref="md.GT_Ship_Management.Calculate_Skill_Level_From_XP" result="$seatLevel">
+                  <param name="pilot" value="$pilot"/>
+                  <param name="xp" value="$seatXP"/>
+                </run_actions>
+              </do_if>
+              <set_value name="$seatVanillaMgmt" exact="if $pilot.skill.management? then $pilot.skill.management else 0"/>
+              <do_if value="$seatLevel gt $seatVanillaMgmt">
+                <set_skill entity="$pilot" type="skilltype.management" exact="$seatLevel"/>
+              </do_if>
+              <set_value name="global.$GT_Pilots.{$pilot}.$Level" exact="$seatLevel"/>
+              <run_actions ref="md.GT_CoreSystem.TryUpdatePilotNameTag">
+                <param name="pilot" value="$pilot"/>
+              </run_actions>
+              <run_actions ref="md.GT_Pilot_Ecosystem.GT_Pilot_On_Rescued">
+                <param name="ship" value="$ship"/>
+                <param name="entity" value="$pilot"/>
+              </run_actions>
+              <do_if value="@global.$GT_GlobalSettings.$Debug.$EnableDebugLogging">
+                <debug_text text="'[GT-Core] Crew transfer reattached pilot by seed: ship=' + $ship.idcode + ' pilot=' + $pilot.name + ' seed=' + $seatBind.$SeedKey + ' XP=' + $seatXP + ' level=' + $seatLevel" chance="100"/>
+              </do_if>
+            </do_if>
+            </do_if>
+          </do_elseif>
+        </do_if>
+        </do_if>
+      </actions>
+    </library>
+
+    <cue name="HandleExternalPilotControlChange" instantiate="true">
+      <conditions>
+        <check_any>
+          <event_control_entity_added group="global.$GT_CrewTransferWatchGroup"/>
+          <event_control_entity_removed group="global.$GT_CrewTransferWatchGroup"/>
+        </check_any>
+      </conditions>
+      <actions>
+        <set_value name="$xferShip" exact="null"/>
+        <set_value name="$xferEntity" exact="event.param"/>
+        <do_if value="event.object?">
+          <do_if value="event.object.exists and event.object.isclass.ship">
+            <set_value name="$xferShip" exact="event.object"/>
+          </do_if>
+        </do_if>
+        <do_if value="not $xferShip? or $xferShip == null">
+          <do_if value="$xferEntity?">
+            <do_if value="$xferEntity.exists and $xferEntity.assignedcontrolled?">
+              <do_if value="$xferEntity.assignedcontrolled.exists and $xferEntity.assignedcontrolled.isclass.ship">
+                <set_value name="$xferShip" exact="$xferEntity.assignedcontrolled"/>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_if>
+        <set_value name="$xferIsPilot" exact="false"/>
+        <do_if value="$xferEntity?">
+          <do_if value="$xferEntity.exists and $xferEntity.controlpost?">
+            <do_if value="$xferEntity.controlpost == controlpost.aipilot">
+              <set_value name="$xferIsPilot" exact="true"/>
+            </do_if>
+          </do_if>
+        </do_if>
+        <do_if value="not $xferIsPilot">
+          <do_if value="$xferShip? and $xferShip != null and $xferEntity?">
+            <do_if value="$xferShip.pilot?">
+              <do_if value="$xferShip.pilot == $xferEntity">
+                <set_value name="$xferIsPilot" exact="true"/>
+              </do_if>
+            </do_if>
+          </do_if>
+        </do_if>
+        <do_if value="$xferIsPilot and $xferShip? and $xferShip != null and $xferEntity?">
+          <do_if value="$xferEntity.exists">
+          <do_if value="event.name == 'event_control_entity_removed'">
+            <set_value name="$xferLeftChair" exact="true"/>
+            <do_if value="$xferShip.pilot?">
+              <do_if value="$xferShip.pilot == $xferEntity">
+                <set_value name="$xferLeftChair" exact="false"/>
+              </do_if>
+            </do_if>
+            <do_if value="$xferLeftChair and global.$GT_Pilots?">
+            <do_if value="global.$GT_Pilots.{$xferEntity}?">
+              <set_value name="$xferOldTemplate" exact="if $xferEntity.npctemplate? then $xferEntity.npctemplate else null"/>
+              <do_if value="$xferOldTemplate? and $xferOldTemplate != null">
+                <set_value name="global.$GT_Pilots.{$xferEntity}.$LastDemotedTemplate" exact="$xferOldTemplate"/>
+              </do_if>
+              <do_if value="$xferEntity.seed?">
+                <set_value name="global.$GT_Pilots.{$xferEntity}.$LastDemotedPeopleSeed" exact="$xferEntity.seed"/>
+              </do_if>
+              <set_value name="$xferBaseName" exact="if global.$GT_Pilots.{$xferEntity}.$OriginalPilotName? and global.$GT_Pilots.{$xferEntity}.$OriginalPilotName != '' then global.$GT_Pilots.{$xferEntity}.$OriginalPilotName else $xferEntity.name"/>
+              <run_actions ref="md.GT_Ship_Management.Normalize_GT_Pilot_Base_Name" result="$xferBaseName">
+                <param name="displayName" value="$xferBaseName"/>
+              </run_actions>
+              <set_value name="$xferStable" exact="if global.$GT_Pilots.{$xferEntity}.$StableIdentity? then global.$GT_Pilots.{$xferEntity}.$StableIdentity else ''"/>
+              <run_actions ref="md.GT_CoreSystem.QueueResolveDemotedPilotIdentity">
+                <param name="ship" value="$xferShip"/>
+                <param name="oldPilot" value="$xferEntity"/>
+                <param name="baseName" value="$xferBaseName"/>
+                <param name="oldStable" value="$xferStable"/>
+                <param name="oldTemplate" value="$xferOldTemplate"/>
+                <param name="attempt" value="1"/>
+              </run_actions>
+              <do_if value="$xferStable != ''">
+                <run_actions ref="md.GT_CoreSystem.QueueResolvePilotIdentityByStable">
+                  <param name="ship" value="$xferShip"/>
+                  <param name="stable" value="$xferStable"/>
+                  <param name="template" value="$xferOldTemplate"/>
+                  <param name="peopleSeed" value="if $xferEntity.seed? then $xferEntity.seed else null"/>
+                  <param name="source" value="'crew_transfer_pilot_removed'"/>
+                </run_actions>
+              </do_if>
+            </do_if>
+            </do_if>
+          </do_if>
+          <do_else>
+            <run_actions ref="md.GT_CoreSystem.RebindPilotSeatedByExternalTransfer">
+              <param name="ship" value="$xferShip"/>
+              <param name="pilot" value="$xferEntity"/>
+            </run_actions>
+          </do_else>
+          </do_if>
+        </do_if>
+      </actions>
+    </cue>
+
     <!-- Global vanilla crew assignment hook.
          Tracks pilot swaps even when no GT order is currently running. -->
     <cue name="HandleVanillaPilotAssignment" instantiate="true">
@@ -2804,9 +3033,9 @@
             </run_actions>
           </do_if>
           
-          <!-- Handle incoming pilot identity:
-               - Existing GT pilots: keep ship link; tag only on GT ships.
-               - Seed rebind / tag apply only when this ship is GT-controlled. -->
+          <!-- Handle incoming pilot identity. XP and the (T:n) tag follow the person
+               even when the destination ship is not in GalaxyTrader service. A seed
+               miss does not create a new level-1 row. -->
           <do_if value="$newPilot and $newPilot.exists? and $newPilot.exists">
             <run_actions ref="md.GT_CoreSystem.HandleRescueRebindForEjectedPilot" result="$rescuedEjected">
               <param name="livePilot" value="$newPilot"/>
@@ -2822,13 +3051,11 @@
                 <param name="hasGTOrder" value="$hasGTOrder"/>
                 <param name="clearPausedFields" value="false"/>
               </run_actions>
-              <do_if value="$hasGTOrder">
-                <run_actions ref="md.GT_CoreSystem.TryUpdatePilotNameTag">
-                  <param name="pilot" value="$newPilot"/>
-                </run_actions>
-              </do_if>
+              <run_actions ref="md.GT_CoreSystem.TryUpdatePilotNameTag">
+                <param name="pilot" value="$newPilot"/>
+              </run_actions>
             </do_if>
-            <do_elseif value="$hasGTOrder and global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
+            <do_elseif value="global.$GT_Pilots? and global.$GT_Pilots.keys.count gt 0">
               <!-- Seed-only rebind via ecosystem (no name / PilotID scoring). GT ships only. -->
               <run_actions ref="md.GT_Pilot_Ecosystem.GT_Pilot_Bind_Live" result="$ecoBind">
                 <param name="entity" value="$newPilot"/>
@@ -3635,6 +3862,9 @@
       </conditions>
       <actions>
         <set_value name="$ship" exact="event.param"/>
+        <do_if value="global.$GT_CrewTransferWatchGroup? and $ship?">
+          <remove_from_group group="global.$GT_CrewTransferWatchGroup" object="$ship"/>
+        </do_if>
         <set_value name="$killer" exact="event.param2"/>
         <set_value name="$killMethod" exact="if event.param3? then event.param3 else 'NONE'"/>
 

@@ -9,9 +9,12 @@
 
 local ffi = require("ffi")
 local C = ffi.C
+-- Types and PerformCrewExchange2 are also declared by Mycu Advanced Crew Transfer.
+-- One shared cdef block fails entirely if any name already exists, which aborts this
+-- file or Mycu's UI init depending on load order. Each shared name is its own pcall.
+pcall(ffi.cdef, "typedef uint64_t UniverseID;")
+pcall(ffi.cdef, "typedef uint64_t NPCSeed;")
 ffi.cdef[[
-    typedef uint64_t UniverseID;
-    typedef uint64_t NPCSeed;
     typedef struct {
         size_t queueidx;
         const char* state;
@@ -23,11 +26,6 @@ ffi.cdef[[
         bool issyncpointreached;
         bool istemporder;
     } Order;
-    typedef struct {
-        const char* reason;
-        NPCSeed person;
-        NPCSeed partnerperson;
-    } UICrewExchangeResult;
     bool IsComponentClass(UniverseID componentid, const char* classname);
     bool IsOrderSelectableFor(const char* orderdefid, UniverseID controllableid);
     UniverseID GetContextByClass(UniverseID componentid, const char* classname, bool includeself);
@@ -37,13 +35,20 @@ ffi.cdef[[
     UniverseID ConvertStringTo64Bit(const char* idcode);
     uint32_t GetNumAllFactionShips(const char* factionid);
     uint32_t GetAllFactionShips(UniverseID* result, uint32_t resultlen, const char* factionid);
-    uint32_t GetNumOrders(UniverseID controllableid);
     uint32_t GetOrders(Order* result, uint32_t resultlen, UniverseID controllableid);
     bool GetDefaultOrder(Order* result, UniverseID controllableid);
     int32_t GetEntityCombinedSkill(UniverseID entityid, const char* role, const char* postid);
-    UICrewExchangeResult PerformCrewExchange2(UniverseID controllableid, UniverseID partnercontrollableid, NPCSeed* npcs, uint32_t numnpcs, NPCSeed* partnernpcs, uint32_t numpartnernpcs, NPCSeed captainfromcontainer, NPCSeed captainfrompartner, bool exchangecaptains, bool checkonly);
     bool IsCurrentOrderCritical(UniverseID controllableid);
 ]]
+pcall(ffi.cdef, [[
+    typedef struct {
+        const char* reason;
+        NPCSeed person;
+        NPCSeed partnerperson;
+    } UICrewExchangeResult;
+]])
+pcall(ffi.cdef, "uint32_t GetNumOrders(UniverseID controllableid);")
+pcall(ffi.cdef, "UICrewExchangeResult PerformCrewExchange2(UniverseID controllableid, UniverseID partnercontrollableid, NPCSeed* npcs, uint32_t numnpcs, NPCSeed* partnernpcs, uint32_t numpartnernpcs, NPCSeed captainfromcontainer, NPCSeed captainfrompartner, bool exchangecaptains, bool checkonly);")
 pcall(ffi.cdef, "UniverseID GetPlayerOccupiedShipID(void);")
 
 local GT_ORDER_IDS = {

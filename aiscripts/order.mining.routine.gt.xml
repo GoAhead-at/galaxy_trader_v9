@@ -79,9 +79,8 @@
         <input_param name="type" value="'object'"/>
         <input_param name="class" value="[class.station]"/>
       </param>
-      <param name="overflowSellMode" default="false" type="internal" comment="When true, all primary stations are at/above overflow threshold for current ware."/>
+      <param name="overflowSellMode" default="false" type="internal" comment="When true, do not mine this ware for the primaries. Selling still uses a primary buy offer; other buyers only when none exists."/>
       <param name="allowOverflowSellToOthers" default="false" type="internal" comment="If true, overflow may be sold beyond primary target stations."/>
-      <param name="overflowThreshold" default="90" type="internal" comment="Primary station fill threshold (percent) before overflow behavior applies."/>
       <param name="physicalStorageAbortPercent" default="20" type="internal" comment="Headroom above station physical stock (percent) before level-6+ pilots stop collecting slice ware. 0 = disabled. Forwarded from GalaxyMiner order."/>
       <param name="checkDemandFirst" default="true" type="internal" comment="Forwarded from GalaxyMiner order. Physical storage gate is skipped when false (stockpile mode)."/>
       <param name="warebasket_override" default="[]" type="internal" comment="Wares (Manual). Only use this warebasket or a subset thereof.">
@@ -142,7 +141,16 @@
     </handler>
   </interrupts>
   <init>
-    <set_command command="command.freemining" />
+    <!-- Same test as the loop's sell-first rule: a delivery-only slice or a hold at least half full
+         sells before anything else, so it starts on a trade command. No partner: the commander is the
+         assignment, not the buyer, and naming it shows "Trading with" a ship this miner never sells to.
+         The mining run sets freemining when it starts. -->
+    <do_if value="($deliveryonly and this.assignedcontrolled.cargo.count gt 0) or this.assignedcontrolled.cargo.free.all le 0 or (this.assignedcontrolled.cargo.capacity.all gt 0 and ((this.assignedcontrolled.cargo.free.all)f / this.assignedcontrolled.cargo.capacity.all le 0.5))">
+      <set_command command="command.freetrade" />
+    </do_if>
+    <do_else>
+      <set_command command="command.freemining" />
+    </do_else>
     <!-- Mining for commander (Must to be Station) -->
     <do_if value="@this.assignedcontrolled.commander.isclass.[class.station, class.buildstorage]">
       <set_value name="$homebase" exact="this.assignedcontrolled.commander" />
@@ -499,7 +507,9 @@
         <resume label="prep"/>
       </do_if>
 
-      <set_value name="$samebuysellrange" exact="$minsell == $minbuy and $maxsell == $maxbuy"/>
+      <!-- Clone gather spaces as sell spaces only when both come from the same range search. A strict
+           gather lock or caller-filtered gather spaces must not narrow where the ship may sell. -->
+      <set_value name="$samebuysellrange" exact="$minsell == $minbuy and $maxsell == $maxbuy and not @$strictgathersector.isclass.sector and not @$precomputedgatherspaces.count"/>
       <do_if value="$strictgathersector? and $strictgathersector.exists and $strictgathersector.isclass.sector">
         <set_value name="$gatheringspaces" exact="[$strictgathersector]"/>
       </do_if>
@@ -625,6 +635,23 @@
         <resume label="finish"/>
       </do_if>
 
+      <!-- Last sale failed and the hold is at least half full: mining more would only add cargo we
+           already cannot move, and retrying the sale straight away just re-reads the same rejected
+           offers, so wait for the market to change first. Below half full we fall through and mine,
+           because topping up a light load is worth doing before the next attempt.
+           Must precede the delivery-only jump, which would otherwise retry the sale without waiting.
+           The wait is the single exit-rate control for a stranded miner: a sale becoming possible
+           ends it, and nothing here re-triggers itself faster than this interval. -->
+      <do_if value="$cannotsell? and this.assignedcontrolled.cargo.capacity.all gt 0 and ((this.assignedcontrolled.cargo.free.all)f / this.assignedcontrolled.cargo.capacity.all le 0.5)">
+        <remove_value name="$cannotsell"/>
+        <debug_text text="'[GT-MiningRoutine] ' + this.assignedcontrolled.idcode + ': Cannot sell with a full hold - waiting for buyers instead of mining more'" chance="$debugchance"/>
+        <run_script name="'move.idle'">
+          <param name="Min" value="90s"/>
+          <param name="Max" value="150s"/>
+        </run_script>
+        <resume label="sellwares"/>
+      </do_if>
+
       <!-- GalaxyMiner CARGO-FIRST: sell existing cargo without mining (no asteroid required). -->
       <do_if value="$deliveryonly? and $deliveryonly and this.assignedcontrolled.cargo.count gt 0">
         <debug_text text="'[GT-MiningRoutine] ' + this.assignedcontrolled.idcode + ': Delivery-only slice - selling in-bay cargo without mining'" chance="$debugchance"/>
@@ -674,31 +701,26 @@
         <set_value name="$next_resupply_check" exact="player.age + 30min"/>
       </do_if>
 
-      <!-- Last sale failed and the hold is at least half full: mining more would only add cargo we
-           already cannot move, and retrying the sale straight away just re-reads the same rejected
-           offers, so wait for the market to change first. Below half full we fall through and mine,
-           because topping up a light load is worth doing before the next attempt.
-           The wait is the single exit-rate control for a stranded miner: a sale becoming possible
-           ends it, and nothing here re-triggers itself faster than this interval. -->
-      <do_if value="$cannotsell? and this.assignedcontrolled.cargo.capacity.all gt 0 and ((this.assignedcontrolled.cargo.free.all)f / this.assignedcontrolled.cargo.capacity.all le 0.5)">
-        <remove_value name="$cannotsell"/>
-        <debug_text text="'[GT-MiningRoutine] ' + this.assignedcontrolled.idcode + ': Cannot sell with a full hold - waiting for buyers instead of mining more'" chance="$debugchance"/>
-        <run_script name="'move.idle'">
-          <param name="Min" value="90s"/>
-          <param name="Max" value="150s"/>
-        </run_script>
-        <resume label="sellwares"/>
-      </do_if>
-
-      <!-- sell wares first if cargo full or less than 50% free cargo -->
-      <do_if value="this.assignedcontrolled.cargo.free.all le 0 or (not $cannotsell? and this.assignedcontrolled.cargo.capacity.all gt 0 and ((this.assignedcontrolled.cargo.free.all)f / this.assignedcontrolled.cargo.capacity.all le 0.5))">
+      <!-- sell wares first if cargo full, the basket ware no longer fits, or less than 50% free cargo.
+           free.all stays above 0 when leftover volume is smaller than one unit, so the ware's own
+           free space is what decides that the hold is full. -->
+      <set_value name="$gtBasketCanMine" exact="not $warebasket.count"/>
+      <do_all exact="$warebasket.count" counter="$gtbi">
+        <do_if value="this.assignedcontrolled.cargo.{$warebasket.{$gtbi}}.free gt 0">
+          <set_value name="$gtBasketCanMine" exact="true"/>
+        </do_if>
+      </do_all>
+      <do_if value="this.assignedcontrolled.cargo.free.all le 0 or (not $gtBasketCanMine and this.assignedcontrolled.cargo.count gt 0) or (not $cannotsell? and this.assignedcontrolled.cargo.capacity.all gt 0 and ((this.assignedcontrolled.cargo.free.all)f / this.assignedcontrolled.cargo.capacity.all le 0.5))">
+        <remove_value name="$gtBasketCanMine"/>
         <resume label="sellwares" />
       </do_if>
       <do_else>
+        <remove_value name="$gtBasketCanMine"/>
         <debug_text text="player.age + ' looking good, starting new mining run'" chance="$debugchance" />
       </do_else>
       <remove_value name="$cannotsell"/>
 
+      <set_command command="command.freemining" />
       <!-- command action -->
       <set_command_action commandaction="commandaction.searchingresources" />
       <!-- Optional: vanilla leaves resourceprobescantime unused (disabled wait in order.mining.routine). When off, GT matches that. When on, apply engine wait (+5s per extra faction probe in sector), scaled by GT pilot level. -->
@@ -1078,9 +1100,17 @@
       <remove_value name="$failurereason"/>
 
       <!-- Re-check cargo before resource search: drones may have filled hold during prep -->
-      <do_if value="this.assignedcontrolled.cargo.free.all le 0">
+      <set_value name="$gtBasketCanMine" exact="not $miningbasket.count"/>
+      <do_all exact="$miningbasket.count" counter="$gtbi">
+        <do_if value="this.assignedcontrolled.cargo.{$miningbasket.{$gtbi}}.free gt 0">
+          <set_value name="$gtBasketCanMine" exact="true"/>
+        </do_if>
+      </do_all>
+      <do_if value="this.assignedcontrolled.cargo.free.all le 0 or (not $gtBasketCanMine and this.assignedcontrolled.cargo.count gt 0)">
+        <remove_value name="$gtBasketCanMine"/>
         <resume label="sellwares" />
       </do_if>
+      <remove_value name="$gtBasketCanMine"/>
 
       <!-- Unified resource locate (lib.gt.miner_find_target): single pass per ware, optional caller-resolved target, cooperative yields. -->
       <set_value name="$secwares" exact="[]"/>
@@ -1305,6 +1335,10 @@
           <set_value name="$gtSliceEndAfterSell" exact="true"/>
           <resume label="sellwares"/>
         </do_if>
+        <do_if value="$ware and this.assignedcontrolled.cargo.{$ware}.free le 0">
+          <debug_text text="'[GT-MiningRoutine] ' + this.assignedcontrolled.idcode + ': ' + $ware.name + ' no longer fits - selling instead of flying to the resource'" chance="$debugchance"/>
+          <resume label="sellwares"/>
+        </do_if>
         <add_yield_reservation reserver="this.assignedcontrolled" resourcearea="$resourcearea"/>
       </do_else>
 
@@ -1357,6 +1391,13 @@
       <wait exact="1ms" sinceversion="4"/>
 
       <label name="sellwares" />
+      <!-- The mining order's command stays up after it returns. A hold that cannot take another
+           unit is not gathering, so show a trade command with no partner until a sale is queued. -->
+      <do_if value="$ware?">
+        <do_if value="this.assignedcontrolled.cargo.{$ware}.free le 0">
+          <set_command command="command.freetrade" />
+        </do_if>
+      </do_if>
       <!-- Child-script aborts restart here without running this order's on_abort. -->
       <do_if value="this.$gtMinerSellFillKey?"><remove_value name="this.$gtMinerSellFillKey"/></do_if>
 
@@ -1396,20 +1437,21 @@
         <set_value name="$sellOwnerFilter" exact="'any'"/>
         <set_value name="$sellIgnoreTradeRules" exact="false"/>
         <set_value name="$blockedStationsForSell" exact="if $blockedstations? and $blockedstations != null then $blockedstations else []"/>
-        <!-- Policy:
-             - pre-overflow: sell only into primary stations
-             - overflow + playerOnly: expand to other player stations
-             - overflow + not playerOnly + allowOverflow: allow any faction -->
+        <!-- Home and additional targets are primary.
+             Automatic overflow buyers are everyone in range, or player stations only when that flag is on.
+             A primary that can still take the ware is preferred over an automatic buyer. -->
         <do_if value="$overflowSellMode and ($playerStationsOnly or (not $allowOverflowSellToOthers))">
           <set_value name="$sellOwnerFilter" exact="'player_only'"/>
           <set_value name="$sellIgnoreTradeRules" exact="true"/>
         </do_if>
-        <!-- Demand-first primary delivery: sector-wide live search caps at maxOffersPerWare (20)
-             and may never collect the home-station buyer. Query primary targets directly (same
-             loose tradepartner scan diagnose uses) and merge before policy filtering. -->
+        <!-- Query primary targets directly. The sector scan caps at maxOffersPerWare and can
+             miss the home station or an additional target. Runs in overflow mode too, so a listed
+             station that still has room stays ahead of automatic buyers. -->
         <create_list name="$primaryBuyOffers"/>
         <set_value name="$primaryDirectBuyOffers" exact="0"/>
-        <do_if value="not $overflowSellMode and $primaryTargetStations? and $primaryTargetStations.count gt 0 and $sellCargoWares.count gt 0">
+        <create_list name="$overflowPlayerBuyOffers"/>
+        <set_value name="$overflowPlayerDirectBuyOffers" exact="0"/>
+        <do_if value="$primaryTargetStations? and $primaryTargetStations.count gt 0 and $sellCargoWares.count gt 0">
           <do_all exact="$primaryTargetStations.count" counter="$pdsi">
             <set_value name="$pdsStation" exact="$primaryTargetStations.{$pdsi}"/>
             <do_if value="not $pdsStation? or not $pdsStation.exists">
@@ -1438,6 +1480,49 @@
               </do_all>
             </do_if>
           </do_all>
+        </do_if>
+        <!-- Per-ware primary capacity, computed once instead of per offer. Cargo already aboard
+             sells to a primary that posts a usable buy offer. The overflow threshold is not
+             applied here; it only stops mining that ware for the primaries. A primary with no
+             usable offer does not block overflow. -->
+        <set_value name="$sellWarePrimaryCapacity" exact="table[]"/>
+        <create_list name="$sellOverflowWares"/>
+        <do_if value="$allowOverflowSellToOthers">
+          <do_all exact="$primaryBuyOffers.count" counter="$pcoi">
+            <set_value name="$pcOffer" exact="$primaryBuyOffers.{$pcoi}"/>
+            <set_value name="$pcWare" exact="@$pcOffer.ware"/>
+            <do_if value="@$pcWare == null or $sellWarePrimaryCapacity.{$pcWare}?">
+              <continue/>
+            </do_if>
+            <set_value name="$pcAmount" exact="if $pcOffer.offeramount? and $pcOffer.offeramount.{this.assignedcontrolled}? then $pcOffer.offeramount.{this.assignedcontrolled} else $pcOffer.amount"/>
+            <do_if value="@$pcAmount gt 0">
+              <set_value name="$sellWarePrimaryCapacity.{$pcWare}" exact="true"/>
+            </do_if>
+          </do_all>
+          <do_all exact="$sellCargoWares.count" counter="$owi">
+            <do_if value="not $sellWarePrimaryCapacity.{$sellCargoWares.{$owi}}?">
+              <append_to_list name="$sellOverflowWares" exact="$sellCargoWares.{$owi}"/>
+            </do_if>
+          </do_all>
+        </do_if>
+        <!-- Automatic overflow buyers: other player stations in the sell spaces, probed only for wares
+             no primary can take. NPC buyers stay on the sector scan. Player Stations Only drops those
+             NPCs in the filter below. -->
+        <do_if value="$sellOverflowWares.count gt 0 and $sellspaces? and $sellspaces.count gt 0">
+          <run_script name="'lib.gt.miner.overflow.buyers'" result="$overflowBuyerResult">
+            <param name="ship" value="this.assignedcontrolled"/>
+            <param name="sellSpaces" value="$sellspaces"/>
+            <param name="wares" value="$sellOverflowWares"/>
+            <param name="excludeStations" value="if $primaryTargetStations? then $primaryTargetStations else []"/>
+            <param name="blockedStations" value="$blockedStationsForSell"/>
+            <param name="debugchance" value="$debugchance"/>
+          </run_script>
+          <do_if value="@$overflowBuyerResult != null">
+            <do_if value="$overflowBuyerResult.$Offers?">
+              <set_value name="$overflowPlayerBuyOffers" exact="$overflowBuyerResult.$Offers"/>
+              <set_value name="$overflowPlayerDirectBuyOffers" exact="$overflowPlayerBuyOffers.count"/>
+            </do_if>
+          </do_if>
         </do_if>
         <!-- Shared sell pool. Every miner selling out of the same range asks the identical question
              here - which stations in range buy these wares - once per trip, so uncached this was the
@@ -1623,7 +1708,7 @@
           <set_value name="$liveBuyOffers" exact="@$liveResult.$BuyOffers"/>
         </do_if>
         <set_value name="$liveBuyOffersFromSearch" exact="$liveBuyOffers.count"/>
-        <do_if value="$primaryBuyOffers.count gt 0 or $liveBuyOffers.count gt 0">
+        <do_if value="$primaryBuyOffers.count gt 0 or $liveBuyOffers.count gt 0 or $overflowPlayerBuyOffers.count gt 0">
           <create_list name="$mergedSellBuyOffers"/>
           <do_if value="$primaryBuyOffers.count gt 0">
             <do_all exact="$primaryBuyOffers.count" counter="$pmbi">
@@ -1647,9 +1732,26 @@
               </do_if>
             </do_all>
           </do_if>
+          <do_if value="$overflowPlayerBuyOffers.count gt 0">
+            <do_all exact="$overflowPlayerBuyOffers.count" counter="$ombi">
+              <set_value name="$ombOffer" exact="$overflowPlayerBuyOffers.{$ombi}"/>
+              <set_value name="$ombDup" exact="false"/>
+              <do_if value="$mergedSellBuyOffers.count gt 0">
+                <do_all exact="$mergedSellBuyOffers.count" counter="$omdi">
+                  <do_if value="$mergedSellBuyOffers.{$omdi}? and $mergedSellBuyOffers.{$omdi} == $ombOffer">
+                    <set_value name="$ombDup" exact="true"/>
+                    <break/>
+                  </do_if>
+                </do_all>
+              </do_if>
+              <do_if value="not $ombDup">
+                <append_to_list name="$mergedSellBuyOffers" exact="$ombOffer"/>
+              </do_if>
+            </do_all>
+          </do_if>
           <set_value name="$liveBuyOffers" exact="$mergedSellBuyOffers"/>
         </do_if>
-        <debug_text text="'[GT-Miner] ' + this.assignedcontrolled.idcode + ': Sell search result: playerOnly=' + $playerStationsOnly + ', overflow=' + $overflowSellMode + ', ownerFilter=' + $sellOwnerFilter + ', ignoreTradeRules=' + $sellIgnoreTradeRules + ', primaryTargets=' + (if $primaryTargetStations? then $primaryTargetStations.count else 0) + ', primaryDirectOffers=' + $primaryDirectBuyOffers + ', sellSpaces=' + (if $sellspaces? then $sellspaces.count else 0) + ', maxSell=' + $searchMaxDistance + ', home=' + (if $searchHomeSector? and $searchHomeSector.exists then $searchHomeSector.knownname else 'NONE') + ', cargoWares=' + $sellCargoWares.count + ' [' + $sellCargoDetail + '], liveBuyOffers=' + $liveBuyOffers.count + ' (sectorScan=' + $liveBuyOffersFromSearch + ')'" chance="$debugchance"/>
+        <debug_text text="'[GT-Miner] ' + this.assignedcontrolled.idcode + ': Sell search result: playerOnly=' + $playerStationsOnly + ', overflow=' + $overflowSellMode + ', ownerFilter=' + $sellOwnerFilter + ', ignoreTradeRules=' + $sellIgnoreTradeRules + ', primaryTargets=' + (if $primaryTargetStations? then $primaryTargetStations.count else 0) + ', primaryDirectOffers=' + $primaryDirectBuyOffers + ', overflowPlayerDirect=' + $overflowPlayerDirectBuyOffers + ', sellSpaces=' + (if $sellspaces? then $sellspaces.count else 0) + ', maxSell=' + $searchMaxDistance + ', home=' + (if $searchHomeSector? and $searchHomeSector.exists then $searchHomeSector.knownname else 'NONE') + ', cargoWares=' + $sellCargoWares.count + ' [' + $sellCargoDetail + '], liveBuyOffers=' + $liveBuyOffers.count + ' (sectorScan=' + $liveBuyOffersFromSearch + ')'" chance="$debugchance"/>
         <do_if value="$playerStationsOnly and $liveBuyOffers.count == 0">
           <do_all exact="$sellspaces.count" counter="$ssi" chance="$debugchance">
             <set_value name="$dbgSpace" exact="$sellspaces.{$ssi}"/>
@@ -1702,48 +1804,12 @@
                 <continue/>
               </do_if>
             </do_if>
-            <!-- Primary-first policy (per cargo ware):
-                 - before overflow for THIS ware: accept only primary stations below overflow threshold
-                 - overflow for THIS ware + playerOnly: accept only non-primary player stations -->
-            <set_value name="$sellWareOverflowMode" exact="$overflowSellMode"/>
-            <do_if value="not $sellWareOverflowMode and $allowOverflowSellToOthers and $sellWare? and this.assignedcontrolled.cargo.{$sellWare}.count gt 0">
-              <set_value name="$sellWareHasPrimaryCapacity" exact="false"/>
-              <do_if value="$primaryTargetStations? and $primaryTargetStations.count gt 0">
-                <do_all exact="$primaryTargetStations.count" counter="$swpsi">
-                  <set_value name="$swpsStation" exact="$primaryTargetStations.{$swpsi}"/>
-                  <do_if value="$swpsStation? and $swpsStation.exists">
-                    <set_value name="$swpsTarget" exact="@$swpsStation.cargo.{$sellWare}.target"/>
-                    <do_if value="$swpsTarget? and $swpsTarget gt 0">
-                      <set_value name="$swpsCurrent" exact="@$swpsStation.cargo.{$sellWare}.count"/>
-                      <set_value name="$swpsPercent" exact="($swpsCurrent * 100) / [$swpsTarget, 1].max"/>
-                      <do_if value="$swpsPercent lt $overflowThreshold">
-                        <set_value name="$sellWareHasPrimaryCapacity" exact="true"/>
-                        <break/>
-                      </do_if>
-                      <remove_value name="$swpsCurrent"/>
-                      <remove_value name="$swpsPercent"/>
-                    </do_if>
-                    <do_if value="$swpsTarget?"><remove_value name="$swpsTarget"/></do_if>
-                  </do_if>
-                </do_all>
-              </do_if>
-              <do_if value="not $sellWareHasPrimaryCapacity">
-                <set_value name="$sellWareOverflowMode" exact="true"/>
-              </do_if>
-              <remove_value name="$sellWareHasPrimaryCapacity"/>
-            </do_if>
+            <!-- Home and additional targets win while any of them has a usable buy offer for this
+                 ware, including when storage is already at the overflow threshold. Automatic buyers
+                 are used only when none of those primaries can take it. -->
+            <set_value name="$sellWareOverflowMode" exact="$allowOverflowSellToOthers and not $sellWarePrimaryCapacity.{$sellWare}?"/>
             <do_if value="not $sellWareOverflowMode">
               <do_if value="not $isPrimarySellStation">
-                <set_value name="$sellSkipPolicy" operation="add"/>
-                <continue/>
-              </do_if>
-              <set_value name="$stationTargetAmount" exact="$sellStation.cargo.{$sellWare}.target"/>
-              <do_if value="$stationTargetAmount le 0">
-                <set_value name="$sellSkipPolicy" operation="add"/>
-                <continue/>
-              </do_if>
-              <set_value name="$stationStoragePercent" exact="($sellStation.cargo.{$sellWare}.count * 100) / [$stationTargetAmount, 1].max"/>
-              <do_if value="$stationStoragePercent ge $overflowThreshold">
                 <set_value name="$sellSkipPolicy" operation="add"/>
                 <continue/>
               </do_if>
@@ -1972,6 +2038,8 @@
                flag and looped straight back into sellwares every idle period. -->
           <do_else>
             <set_value name="$cannotsell"/>
+            <!-- Drop freemining too: this run is waiting on a sale, and there is no buyer to name. -->
+            <set_command command="command.freetrade" />
           </do_else>
           <set_value name="$idle"/>
         </do_if>
@@ -1989,11 +2057,16 @@
         </run_script>
       </do_if>
 
-      <!-- Depleted field / delivery-only slice: sell then return to GalaxyMiner for re-score. -->
-      <do_if value="$gtSliceEndAfterSell? or this.assignedcontrolled.$gtDepletedMiningWare?">
-        <do_if value="$gtSliceEndAfterSell?">
-          <remove_value name="$gtSliceEndAfterSell"/>
+      <!-- Depleted field / delivery-only slice: sell then return to GalaxyMiner for re-score.
+           A failed sale with the hold at least half full stays in the loop instead: this is exactly the
+           $cannotsell wait condition, so the wait retries the sale until $duration ends the slice. -->
+      <do_if value="$gtSliceEndAfterSell?">
+        <remove_value name="$gtSliceEndAfterSell"/>
+        <do_if value="not ($cannotsell? and this.assignedcontrolled.cargo.capacity.all gt 0 and ((this.assignedcontrolled.cargo.free.all)f / this.assignedcontrolled.cargo.capacity.all le 0.5))">
+          <resume label="finish"/>
         </do_if>
+      </do_if>
+      <do_if value="this.assignedcontrolled.$gtDepletedMiningWare?">
         <resume label="finish"/>
       </do_if>
 

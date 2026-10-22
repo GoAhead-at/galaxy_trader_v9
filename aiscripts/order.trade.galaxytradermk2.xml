@@ -1034,7 +1034,7 @@
       <set_value name="this.$mk2_notifiedAllDestInvalid" exact="false"/>
       <set_value name="this.$activeDestinations" exact="$activeDestinations"/>
 
-      <!-- Assigned-station union for cargo clearance only (hold dump may land on any listed
+      <!-- Assigned-station union for bidirectional use (cargo clearance may land on any listed
            source or destination). Trade search stays bipartite: Source↔Dest, never peer. -->
       <create_list name="$mk2ActiveStations"/>
       <do_all exact="this.$activeSources.count" counter="$masi">
@@ -1100,8 +1100,11 @@
             <set_value name="$clearWxQueued" exact="false"/>
             <set_value name="$clearWxAmount" exact="0"/>
             <set_value name="$clearWxDistance" exact="0"/>
-            <do_all exact="if this.$bidirectional then $mk2ActiveStations.count else (if this.$mk2AutoSourceMode then this.$activeDestinations.count else this.$activeSources.count)" counter="$sci">
-              <set_value name="$clearSource" exact="if this.$bidirectional then $mk2ActiveStations.{$sci} else (if this.$mk2AutoSourceMode then this.$activeDestinations.{$sci} else this.$activeSources.{$sci})"/>
+            <!-- Clearance receivers follow the trade direction: bidirectional may unload at any listed
+                 station; unidirectional (manual or auto-source) only at destinations, so a hold picked
+                 up at one source never lands at another source. -->
+            <do_all exact="if this.$bidirectional then $mk2ActiveStations.count else this.$activeDestinations.count" counter="$sci">
+              <set_value name="$clearSource" exact="if this.$bidirectional then $mk2ActiveStations.{$sci} else this.$activeDestinations.{$sci}"/>
               <set_value name="$clearCandidate" exact="null"/>
               <set_value name="$clearUseWareExchange" exact="this.$mk2UseWareExchange and $clearSource.isplayerowned"/>
               <do_if value="$clearUseWareExchange">
@@ -2519,6 +2522,7 @@
                 $EffectiveDestOfferAmount = $effectiveDestOfferAmount,
                 $IncomingReservedAmount = $incomingReservedAmount,
                 $NormalMinimumTrade = $normalMinimumTrade,
+                $MinimumTrade = $minimumTrade,
                 $UsedLowVolume = $usedLowVolume,
                 $DeltaGates = $deltaGates,
                 $BacktrackPenalty = $backtrackPenalty,
@@ -3006,6 +3010,7 @@
                   $EffectiveDestOfferAmount = $effectiveDestOfferAmount,
                   $IncomingReservedAmount = $incomingReservedAmount,
                   $NormalMinimumTrade = $normalMinimumTrade,
+                  $MinimumTrade = $minimumTrade,
                   $UsedLowVolume = $usedLowVolume,
                   $DeltaGates = 0,
                   $BacktrackPenalty = 0,
@@ -3144,7 +3149,8 @@
               $SourceStorageDiscovery = if this.$mk2BestTrade.$SourceStorageDiscovery? then this.$mk2BestTrade.$SourceStorageDiscovery else false,
               $DestStorageDiscovery = if this.$mk2BestTrade.$DestStorageDiscovery? then this.$mk2BestTrade.$DestStorageDiscovery else false,
               $SourceOfferAmount = this.$mk2BestTrade.$SourceOfferAmount,
-              $DestOfferAmount = if this.$mk2BestTrade.$EffectiveDestOfferAmount? then this.$mk2BestTrade.$EffectiveDestOfferAmount else this.$mk2BestTrade.$DestOfferAmount
+              $DestOfferAmount = if this.$mk2BestTrade.$EffectiveDestOfferAmount? then this.$mk2BestTrade.$EffectiveDestOfferAmount else this.$mk2BestTrade.$DestOfferAmount,
+              $MinimumTrade = if this.$mk2BestTrade.$MinimumTrade? then this.$mk2BestTrade.$MinimumTrade else 0
             ]"/>
           </do_if>
           <do_if value="this.$mk2QueueTrades.count gt 0 and this.$mk2TradeList.count gt 1">
@@ -3305,11 +3311,15 @@
             <do_elseif value="this.$mk2QueuedTrade.$DestOffer? and this.$mk2QueuedTrade.$DestOffer.available">
               <set_value name="$mk2DestLegOk" exact="true"/>
             </do_elseif>
-            <do_if value="$mk2QueuedAmountClamped le 0 or not $mk2SourceLegOk or not $mk2DestLegOk">
+            <!-- The minimum load (Min Cargo Fill %, or the low-volume floor when allowed) was checked
+                 at selection; the live clamp above can shrink the amount, so re-apply it here. Only the
+                 primary carries $MinimumTrade; secondary legs keep their MIN_LEG_VOLUME floor. -->
+            <set_value name="$mk2QueueMinTrade" exact="if this.$mk2QueuedTrade.$MinimumTrade? then this.$mk2QueuedTrade.$MinimumTrade else 0"/>
+            <do_if value="$mk2QueuedAmountClamped le 0 or $mk2QueuedAmountClamped lt $mk2QueueMinTrade or not $mk2SourceLegOk or not $mk2DestLegOk">
               <do_if value="this.$mk2QueueIsPrimary">
                 <set_value name="this.$mk2DenyTrade" exact="true"/>
                 <do_if value="this.$debuglevel ge 1">
-                  <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': selected primary trade invalid before queueing (source/dest changed) -- retrying'" chance="this.$debugchance"/>
+                  <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': selected primary trade invalid before queueing (source/dest changed, amount=' + $mk2QueuedAmountClamped + ' min=' + $mk2QueueMinTrade + ') -- retrying'" chance="this.$debugchance"/>
                 </do_if>
               </do_if>
               <set_value name="this.$mk2QueueIdx" operation="add"/>
@@ -3428,6 +3438,9 @@
                 <set_value name="$mk2ResSrc" exact="this.$mk2QueuedTrade.$Source"/>
                 <set_value name="$mk2ResWare" exact="this.$mk2QueuedTrade.$Ware"/>
                 <set_value name="$mk2ResWant" exact="this.$mk2QueuedTrade.$QueuedAmount"/>
+                <!-- Commit clamps below shrink the amount again; a primary that drops under its
+                     minimum load is denied like one that drops to 0. -->
+                <set_value name="$mk2ResMin" exact="if this.$mk2QueuedTrade.$MinimumTrade? then this.$mk2QueuedTrade.$MinimumTrade else 0"/>
                 <!-- Ware-exchange delivery: clamp to the destination's remaining need after peers'
                      inbound claims before reserving the source, so the queued deliver leg (not just
                      the dest reservation below) cannot over-fill it. Official buy offers cap themselves. -->
@@ -3440,12 +3453,12 @@
                     <set_value name="$mk2ResWant" exact="$mk2DxMax"/>
                     <set_value name="this.$mk2QueuedTrade.$QueuedAmount" exact="$mk2ResWant"/>
                   </do_if>
-                  <do_if value="$mk2ResWant le 0">
+                  <do_if value="$mk2ResWant le 0 or $mk2ResWant lt $mk2ResMin">
                     <do_if value="$mqbi == 1">
                       <set_value name="this.$mk2DenyTrade" exact="true"/>
                     </do_if>
                     <do_if value="this.$debuglevel ge 1">
-                      <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': destination need already covered by inbound claims at commit (' + $mk2DxDest.idcode + ':' + $mk2ResWare + ' othersReserved=' + [$mk2DxTotal - $mk2DxSelf, 0].max + ')'" chance="this.$debugchance"/>
+                      <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': destination need already covered by inbound claims at commit (' + $mk2DxDest.idcode + ':' + $mk2ResWare + ' othersReserved=' + [$mk2DxTotal - $mk2DxSelf, 0].max + ' left=' + $mk2ResWant + ' min=' + $mk2ResMin + ')'" chance="this.$debugchance"/>
                     </do_if>
                     <continue/>
                   </do_if>
@@ -3460,12 +3473,12 @@
                   <set_value name="$mk2ResWant" exact="$mk2ResMaxAllowed"/>
                   <set_value name="this.$mk2QueuedTrade.$QueuedAmount" exact="$mk2ResWant"/>
                 </do_if>
-                <do_if value="$mk2ResWant le 0">
+                <do_if value="$mk2ResWant le 0 or $mk2ResWant lt $mk2ResMin">
                   <do_if value="$mqbi == 1">
                     <set_value name="this.$mk2DenyTrade" exact="true"/>
                   </do_if>
                   <do_if value="this.$debuglevel ge 1">
-                    <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': source static surplus exhausted at commit (' + $mk2ResSrc.idcode + ':' + $mk2ResWare + ' othersReserved=' + $mk2ResOthers + ' floor=' + $mk2ResFloor + ')'" chance="this.$debugchance"/>
+                    <debug_text text="'[GT-MK2] ' + this.ship.idcode + ': source static surplus exhausted at commit (' + $mk2ResSrc.idcode + ':' + $mk2ResWare + ' othersReserved=' + $mk2ResOthers + ' floor=' + $mk2ResFloor + ' left=' + $mk2ResWant + ' min=' + $mk2ResMin + ')'" chance="this.$debugchance"/>
                   </do_if>
                   <continue/>
                 </do_if>
@@ -3478,7 +3491,7 @@
                 <do_if value="$mk2ResSelfAfter gt $mk2ResMaxAfter">
                   <set_value name="$mk2ResWant" exact="$mk2ResMaxAfter"/>
                   <set_value name="this.$mk2QueuedTrade.$QueuedAmount" exact="$mk2ResWant"/>
-                  <do_if value="$mk2ResWant gt 0">
+                  <do_if value="$mk2ResWant gt 0 and $mk2ResWant ge $mk2ResMin">
                     <add_ware_reservation object="$mk2ResSrc" type="buy" reserver="this.ship" ware="$mk2ResWare" amount="$mk2ResWant" duration="4h" replace="true" virtual="false"/>
                   </do_if>
                   <do_else>

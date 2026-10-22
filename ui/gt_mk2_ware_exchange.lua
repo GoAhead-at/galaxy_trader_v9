@@ -207,23 +207,49 @@ local function collectLegs(legs)
     return items
 end
 
-local function prepareVirtualCargo(shipId, stationId)
-    if shipId ~= 0 then
-        local numTradeComputerTrades = 0
-        pcall(function()
-            numTradeComputerTrades = tonumber(C.GetNumTradeComputerOrders(shipId)) or 0
-        end)
-        SetVirtualCargoMode(shipId, true, numTradeComputerTrades > 0 and numTradeComputerTrades or -1)
+local function isOperational(componentId)
+    local operational = true
+    pcall(function()
+        operational = C.IsComponentOperational(componentId)
+    end)
+    return operational
+end
+
+-- Virtual cargo mode makes cargo reads (incl. the player's cargo UI) report the state after all
+-- queued trades. Vanilla menus pair every enable with a disable; every component enabled here is
+-- recorded in `touched` so the request handler can switch it back off on every exit path.
+local function markTouched(touched, componentId)
+    local key = tostring(componentId)
+    if not touched.seen[key] then
+        touched.seen[key] = true
+        table.insert(touched.ids, componentId)
     end
-    if stationId ~= 0 then
-        local operational = true
-        pcall(function()
-            operational = C.IsComponentOperational(stationId)
-        end)
-        if operational then
-            SetVirtualCargoMode(stationId, true, -1)
+end
+
+local function prepareVirtualCargo(shipId, stationId, touched)
+    if shipId ~= 0 then
+        -- -1 = predict over the whole trade queue, so deliver legs see pickups queued earlier
+        -- in this request (vanilla only limits it to trade-computer orders for immediate trades).
+        SetVirtualCargoMode(shipId, true, -1)
+        markTouched(touched, shipId)
+    end
+    if stationId ~= 0 and isOperational(stationId) then
+        SetVirtualCargoMode(stationId, true, -1)
+        markTouched(touched, stationId)
+    end
+end
+
+local function restoreVirtualCargo(touched)
+    for _, componentId in ipairs(touched.ids) do
+        if isOperational(componentId) then
+            local ok, err = pcall(SetVirtualCargoMode, componentId, false)
+            if not ok then
+                debugLog("virtual cargo restore failed for " .. tostring(componentId) .. ": " .. tostring(err))
+            end
         end
     end
+    touched.ids = {}
+    touched.seen = {}
 end
 
 local function offerMatchesDirection(tradeData, wantPickup)
@@ -257,7 +283,7 @@ local function canQueueOffer(tradeData, shipId, amount, wantPickup)
     return true
 end
 
-local function resolveWareExchangeLeg(shipId, leg)
+local function resolveWareExchangeLeg(shipId, leg, touched)
     local stationId = resolveStationId(leg)
     local amount = tonumber(legField(leg, "Amount")) or 0
     local reqWare = legField(leg, "Ware") or legField(leg, "WareName")
@@ -270,7 +296,7 @@ local function resolveWareExchangeLeg(shipId, leg)
             .. " stationId=" .. tostring(legField(leg, "StationId")) .. ")"
     end
 
-    prepareVirtualCargo(shipId, stationId)
+    prepareVirtualCargo(shipId, stationId, touched)
 
     local offers = GetWareExchangeTradeList(shipId, stationId) or {}
     local wantPickup = (direction == "pickup")
@@ -367,9 +393,10 @@ RegisterEvent("gt.mk2QueueWareExchange", function(_, entity)
     -- If deliver then fails, return error with whatever was queued; MK2 deny cancels leftover
     -- TradePerform so a pickup-only cycle cannot run.
     local queueLegs = {}
+    local touched = { ids = {}, seen = {} }
     local function resolveAndQueueBatch(batch)
         for _, leg in ipairs(batch) do
-            local offerId, err = resolveWareExchangeLeg(shipId, leg)
+            local offerId, err = resolveWareExchangeLeg(shipId, leg, touched)
             if not offerId then
                 return err or "resolve failed"
             end
@@ -393,13 +420,21 @@ RegisterEvent("gt.mk2QueueWareExchange", function(_, entity)
         debugLog(result.Error)
     end
 
-    local err = resolveAndQueueBatch(pickups)
-    if err then
-        fail(err)
+    -- Virtual cargo stays on for the whole request (deliver resolution needs the predicted
+    -- inbound from the queued pickups) and is restored before the result is published, on
+    -- success, resolve failure and Lua error alike.
+    local ok, err = pcall(function()
+        local batchErr = resolveAndQueueBatch(pickups)
+        if batchErr then
+            return batchErr
+        end
+        return resolveAndQueueBatch(delivers)
+    end)
+    restoreVirtualCargo(touched)
+    if not ok then
+        fail("lua error: " .. tostring(err))
         return
     end
-
-    err = resolveAndQueueBatch(delivers)
     if err then
         fail(err)
         return
